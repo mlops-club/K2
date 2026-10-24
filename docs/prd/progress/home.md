@@ -132,7 +132,37 @@ that scheduler is installed. Note the DB file is `k2so.db`, not `k2.db`.
 
 ## How to try it
 
-To be filled once the first slice works.
+From the worktree. Builds `k2-daemon` with the worker's toolchain (4
+jobs), boots it with `K2_HOME=/tmp/k2demo` and a cleared env whose `HOME`,
+`TMPDIR` and runtime dir are all inside `/tmp/k2demo`, waits for
+`/boot-status` to say `ready`, stops it (SIGTERM), lists every file under
+`/tmp/k2demo`, shows the sentinel `HOME` is empty, then removes
+`/tmp/k2demo`. The keychain kill switches keep it off the login keychain.
+It never reads or writes the real `~/.k2`.
+
+```sh
+cd /Users/eric/.superset/worktrees/8af91ef4-b71b-4734-b52d-5d40840fbde7/k2-dist/home && bash <<'EOF'
+set -u
+R=$HOME/.cache/k2-dist-rust
+env CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup CARGO_BUILD_JOBS=4 CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON \
+  PATH=$R/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin $R/cargo/bin/cargo build -q -p k2-daemon --bin k2-daemon || exit 1
+D=/tmp/k2demo; rm -rf $D; mkdir -p $D/sentinel-home $D/tmp $D/run; chmod 700 $D/run
+env -i HOME=$D/sentinel-home TMPDIR=$D/tmp/ XDG_RUNTIME_DIR=$D/run K2_RUNTIME_DIR=$D/run \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin USER=$USER LANG=en_US.UTF-8 K2_HOME=$D \
+  K2_TUNNEL_LEASE=off K2_LLM_ACCOUNTS_KEYCHAIN=0 K2_SUBSCRIPTION_PROBE=deny \
+  K2SO_WATCHDOG_DISABLED=1 K2_HEARTBEAT_NO_SELF_HEAL=1 \
+  ./target/debug/k2-daemon > $D/tmp/daemon.log 2>&1 &
+P=$!; trap 'kill $P 2>/dev/null; rm -rf $D' EXIT
+for i in $(seq 300); do
+  [ -s $D/daemon.port ] && curl -fsS "http://127.0.0.1:$(cat $D/daemon.port)/boot-status" 2>/dev/null \
+    | grep -o '"phase":"ready"' && break
+  sleep 0.2
+done
+kill $P; wait $P
+echo "== files under $D"; (cd $D && find . | sort)
+echo "== sentinel HOME ($D/sentinel-home), must be empty:"; ls -A $D/sentinel-home; echo "== end"
+EOF
+```
 
 ## Decisions (owner via coordinator, 2026-10-24)
 
