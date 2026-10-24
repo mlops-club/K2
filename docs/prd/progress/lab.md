@@ -137,11 +137,44 @@ scripts/lab/prove.sh G0 --topology solo --parity none
 tests/lab/run_tests.sh
 ```
 
+## Trace format (what wave 2 emits)
+
+The checker (`tests/lab/labkit/flows.py`) reads a JSONL trace, one event per
+line. Wave 2 only has to write these lines; the flows already name the events
+(`docs/prd/flows/<id>.json`, field `steps[].event`).
+
+```json
+{"ts": "2026-11-14T09:12:03.123Z", "event": "host.spawn", "src": "k2-host",
+ "agent_id": "a1b2", "msg_id": null, "host": "host-1", "session_id": "…",
+ "epoch": 3, "attrs": {"harness": "claude"}}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `ts` | yes | RFC 3339 UTC with milliseconds; events are ordered by it (stable) |
+| `event` | yes | dotted name, `<place>.<what>`, as in the flow files |
+| `src` | yes | emitter: `k2-daemon`, `k2-host`, `k2-ptyd`, `k2-fake-agent`, `lab` |
+| `agent_id`, `msg_id`, `host` | when known | correlation keys; a flow names one in `correlate` |
+| `session_id`, `epoch` | when known | provider session id; placement epoch (I1) |
+| `attrs` | no | anything else; a step's `match` fields are looked up here too |
+
+Matching: a flow passes when, for one value of its correlation key, the
+events with that value (plus events that carry no value for it, such as a CLI
+hook) contain every step's event in order. A trace with no event from the
+system under test (only `lab` and `k2-fake-agent`) leaves every flow
+"expected only"; that is wave 1's state. The fake agent already emits
+`cli.exec`, `cli.hook` (`attrs.hook` = SessionStart, UserPromptSubmit, Stop,
+SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
+`K2_FAKE_AGENT_TRACE` is set.
+
 ## Status
 
-- **Milestone:** diagrams written.
-- **Next:** fake agent crate, flows JSON and checker, prove.sh with S1.
-- **Open questions:** see the list below.
+- **Milestone:** first working slice. `prove.sh G0 --topology solo --parity none`
+  runs end to end: builds the daemon and fake agent, boots the solo sandbox,
+  S1 passes over the app's routes, and the bundle is written (gate red, as it
+  must be without parity). First full-parity run in progress.
+- **Next:** full parity run (Linux gate in Docker, `tests/cli/*.sh`, tiers,
+  must-not-break), record the I5 baseline, tests for the report writer.
 
 ### Decisions inside owned files
 
@@ -150,11 +183,40 @@ tests/lab/run_tests.sh
   (stable on 2026-10-22, what CI pins) under `lab-runs/.toolchain/` with
   `--no-modify-path`, after checking rustup-init's sha256. Nothing outside the
   repo changes.
+- **OpenSSL.** Homebrew's `openssl` is 4.x now, and llama.cpp's vendored
+  cpp-httplib does not compile against it. The lab sets
+  `OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3` in its own environment only.
 - **Lab kit language.** The runner is bash; scenario client, flow checker and
   report writer are Python 3 standard library only (`python3 -I`), so the lab
   needs no `npm`/`pip` install. The fake agent is Rust (it must be a real
   executable the daemon can spawn).
+- **S1 uses the app's path.** Attach is `/cli/sessions/grid` (what the
+  desktop app's terminal uses for v2 sessions; `/cli/sessions/bytes` serves
+  only the v1 registry), typing is `{"action":"input"}` on that socket, paste
+  then Enter 150 ms later.
+- **The fake agent fires hooks from Claude's settings files**, so the hooks
+  that run are the ones the daemon installed (`~/.k2/hooks/notify.sh`), with
+  `$PPID` = the agent, exactly as under Claude Code.
+- **Binaries are copied per run.** 27 `tests/cli` scripts rebuild
+  `target/debug/k2-daemon`, some with other features, so the topology and
+  must-not-break use a copy taken right after the build, and the cli scripts
+  run one at a time.
+- **`prove` flow not extracted.** The PRD's 12th diagram (`prove`, a gate
+  run) describes the runner itself, not the system under test; the 11 flows
+  the task names are extracted.
+- **demo.cast.** asciinema is not installed here; the report says so, and
+  `scenarios/S1.cast` (asciicast v2 of the client's screen, one frame per grid
+  update) is always written.
 
 ### Open questions
 
-- None yet.
+- **Docker disk.** The Docker VM has about 9 GB free; `test-gate-linux.sh`
+  refuses to start below 20 GB (`K2_GATE_MIN_FREE_GB`). Unless space is freed
+  (or the VM disk grown), the Linux gate is reported NOT RUN with that reason.
+- **S12 at G0.** The scenario matrix marks S12 (Postgres, Apps, mail, Sew,
+  front door) required from G0 on solo; wave 1 builds only S1, so G0 on solo
+  stays red with S12 NOT RUN. P0's proof list also names S2 and S7, which the
+  matrix requires from G1; the report shows them as reported, not required.
+- **Tier 1** finds its daemon only through `$HOME/.k2so/heartbeat.port`;
+  today's daemon writes `~/.k2/`, so tier 1 shows NOT RUN with that reason
+  unless the sandbox has a `.k2so/` (checked at run time).
