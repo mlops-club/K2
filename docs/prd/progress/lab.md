@@ -246,3 +246,25 @@ SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
 While the Linux gate is held, a baseline records the suites that ran and lists
 the rest under `not_recorded` with their reason. I5 is then NOT RUN (never
 pass) and names the suite it could not compare, even when the others match.
+
+## Hand-off: what `prove.sh G1 --topology solo` needs
+
+G1 (PRD P1: AgentHost interface, in-process only, zero behaviour change) on
+solo requires, per the PRD's P1 proof and scenario matrix:
+
+| Item | Status in wave 1 | To do |
+|---|---|---|
+| Parity suites, I5 against the **pre-refactor** baseline | done (`tests/lab/baselines/G0-solo.json`, recorded at the G0 sha) | Compare G1 runs against that G0 baseline, not a re-recorded one: point `run.json.baseline` at it for G1 |
+| S1 | done | none |
+| S2 hook events land on the right agent | not built | `labkit/s2.py`: two agents, check each agent's `cli.hook` lands on its own agent in the daemon (activity route or the new trace) |
+| S7 CLI killed mid-turn, next need resumes | not built | `labkit/s7.py`: start a turn with a long `K2_FAKE_AGENT_TURN_MS`, kill the fake agent's pid (in its trace, `cli.exec`), make a need (type again), check the respawn passes `--resume <same id>`; then I3: memory bytes and session id equal (the fake agent's `remember ` writes the memory) |
+| S12 Postgres, Apps, mail, Sew, front door parity | not built (required since G0) | its own task; on a Mac most of it is Linux-only, so solo S12 may need the container topology's Linux |
+| Trace diff for `spawn`, `hook` and the CLI-crash flow | checker done, flows `expected only` | Daemon emits the JSONL above to a file the lab names (for example an env var set by `topology/solo.sh` into `$RUN/topology/daemon.trace.jsonl`); scenarios merge it into `S*.trace.jsonl`; `report.py` gets a per-gate list of **required** flows (G1 solo: `spawn`, `hook`, `crash`) that must be `pass` |
+| Bench: no change in spawn latency or idle RSS (NFR1: within 5%) | one sample each in `metrics.csv` | N spawns per run (median, p95), the G0 run's numbers stored with the baseline, and a report row comparing them |
+
+Code seams: `report.SCENARIOS[("G1", "solo")]`, `report.INVARIANT_NA[("G1",
+"solo")]` (I3 no longer n/a once S7 exists), the gate/topology guard at the
+top of `prove.sh`, and a scenario loop in `prove.sh` instead of the S1
+block. Note for **trace**: commit 3105385e6 (on top of 66f48678a) lets
+`docs/prd/flows/` hold flow files beyond the 11 PRD flows; before it,
+`test_flows.py` failed on any extra file such as `crash.json`.
