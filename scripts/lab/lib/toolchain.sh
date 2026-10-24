@@ -14,6 +14,7 @@ LAB_RUST_VERSION=1.99.1
 
 lab_toolchain() {
     local repo=$1
+    lab_native_env
     if command -v cargo >/dev/null 2>&1; then
         LAB_RUST_SOURCE=path
         export LAB_RUST_SOURCE
@@ -51,4 +52,15 @@ lab_toolchain() {
     chmod +x "$init"
     "$init" -y --no-modify-path --profile minimal --default-toolchain "$LAB_RUST_VERSION" >&2 || return 1
     rm -f "$init"
+}
+
+# llama-cpp-sys-2 vendors cpp-httplib, which does not compile against
+# OpenSSL 4 headers (`const X509_NAME *`), and Homebrew's `openssl` is 4.x
+# since 2026-10. Point CMake at Homebrew's openssl@3 when it is there and the
+# caller set nothing. Environment only; the repo's build config is unchanged.
+lab_native_env() {
+    if [ "$(uname -s)" = Darwin ] && [ -z "${OPENSSL_ROOT_DIR:-}" ] \
+        && [ -d /opt/homebrew/opt/openssl@3 ]; then
+        export OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
+    fi
 }
