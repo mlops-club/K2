@@ -445,7 +445,7 @@ pub fn emit_lifecycle(pane_id: &str, canonical: &str, workspace_path: Option<&st
 /// [`install::check_hook_injections`] (DA17, DA18).
 pub fn check_hook_injections() -> serde_json::Value {
     match dirs::home_dir() {
-        Some(home) => install::check_hook_injections(&home),
+        Some(home) => install::check_hook_injections(&home, &crate::paths::k2_home()),
         None => serde_json::json!({
             "notify_script": { "path": "", "exists": false, "version": null },
             "claude": { "path": null, "exists": false, "injected": false, "events": [], "configUnreadable": false },

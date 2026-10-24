@@ -71,9 +71,7 @@ pub fn clean_user(raw: &str) -> String {
 }
 
 fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
+    crate::paths::k2_home()
 }
 
 /// `~/.k2/auth-audit.jsonl`

@@ -31,10 +31,7 @@ use rcgen::KeyPair;
 
 /// `~/.k2/federation/` (honors `$HOME`, like the rest of `federation`).
 pub fn identity_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("federation")
+    crate::paths::k2_home().join("federation")
 }
 
 /// `~/.k2/federation/identity.pem`.
