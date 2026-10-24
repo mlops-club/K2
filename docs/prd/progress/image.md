@@ -123,19 +123,20 @@ sequenceDiagram
 
 ## How to try it
 
-Not runnable yet (diagrams milestone). The commands the finished task gives:
-
 ```sh
-# Build (host arch; kind's nodes match it)
-packaging/oci/build.sh                        # → k2-daemon:dev
+# Build (host arch; kind's nodes match it). Default K2_BUILD_PROFILE=dev:
+# release without fat LTO, about 25 min cold, minutes warm.
+packaging/oci/build.sh                        # → k2-daemon:dev (≈290 MB)
 
 # Compose on this Mac
 docker compose -f deploy/compose/compose.solo.yaml up -d --wait \
   && curl -fsS http://127.0.0.1:7420/boot-status | jq .
-
-# Random UID
-docker run --rm -d --name k2-uid --user 54321:0 -e K2_DAEMON_PORT=7420 -e K2_LISTEN=lan \
-  -p 127.0.0.1:7430:7420 k2-daemon:dev
+# Through Docker's port mapping the daemon sees a non-loopback client and
+# answers the compat view (phase, version, features; no installKind or
+# capabilities), by design (boot_status::view_for). For the full view, send
+# the owner token:
+curl -fsS -H "Authorization: Bearer $(docker compose -f deploy/compose/compose.solo.yaml exec -T k2 cat /var/lib/k2/.k2/daemon.token)" \
+  http://127.0.0.1:7420/boot-status | jq '{phase, installKind, capabilities}'
 
 # kind k2lab, explicit kubeconfig only
 kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
@@ -143,18 +144,28 @@ kind load docker-image k2-daemon:dev --name k2lab
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f packaging/oci/kind/solo.yaml
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo rollout status sts/k2-solo
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward svc/k2-solo 7440:7420 &
-curl -fsS http://127.0.0.1:7440/boot-status | jq .
+curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilities}'   # full view: port-forward arrives on loopback
 ```
 
 ## Status
 
-- **Milestone:** settings modules, install-kind opt-outs, image, Compose and
-  kind manifest written; compiling and testing in a Linux container (no Rust
-  toolchain on this Mac, so every cargo command runs in `k2-oci-toolchain:dev`,
-  the Dockerfile's `toolchain` stage, as root with `env -i` like the gate).
-- **Next:** clippy, `cargo test -p k2-core` / `-p k2-daemon` and the
-  helper/engine/node tests; build the image; Compose, random UID, kind.
-- **Open questions:** none open. Clippy criterion changed (coordinator, 2026-10-24): see "Clippy baseline".
+- **Milestone:** k2lab pod Ready (critical path). Verified 2026-10-24:
+  - `k2-daemon:dev` built (dev profile, 293 MB).
+  - Compose: `up -d --wait` healthy; `/boot-status` phase `ready`; with the
+    owner token: `installKind` `package`, `listen.lan` true, capabilities
+    all `off` except vault `host-native (key store file)`; runs as
+    `uid=10000 gid=0`; `daemon.port` = 7420.
+  - k2lab: namespace `k2-solo` (Pod Security `restricted`, no warnings),
+    `sts/k2-solo` 1/1 Ready, PVC bound; through the port-forward:
+    `{"phase":"ready","installKind":"package","view":"full",…}`.
+  - The boot log has the one capability line.
+- **Left running:** `k2-solo` on k2lab and the Compose project `k2-solo`, for
+  the kind-app worker and the owner. Tear down with
+  `kubectl --kubeconfig … delete namespace k2-solo` and
+  `docker compose -f deploy/compose/compose.solo.yaml down -v`.
+- **Next:** random UID, `K2_ROLE` / `K2_DAEMON_PORT` failure checks, then the
+  test suites (`CARGO_BUILD_JOBS=4`, `--test-threads=4`, temp HOME) and head
+  clippy.
 
 ### Owner decisions (2026-10-24)
 
