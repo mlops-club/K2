@@ -255,3 +255,24 @@ run: the same 390 findings (file and message, line numbers ignored). The
 `is_multiple_of` warnings in `crates/k2-node/src/node/mod.rs` (a touched file)
 are fixed. In `k2-daemon` the only finding on a changed line (a doc comment
 attached to the wrong function in `daemon_main.rs`) is fixed.
+
+### Test runs
+
+All cargo runs are in `k2-oci-toolchain:dev` under `env -i` with a temp
+`HOME`/`TMPDIR` (no `K2_*`), `--memory=3g --cpus=4`, `CARGO_BUILD_JOBS≤3`,
+`--test-threads=3`, debuginfo 0 (as the gate), holding the shared k2-dist
+Docker lock.
+
+First run (as root):
+
+| crate | result |
+|---|---|
+| k2-root-proto | ok |
+| k2-app-engine | ok |
+| k2-root-helper | 204 passed, 1 failed + `tests/binary.rs` 1 failed: both assert "run as non-root" (`geteuid() != 0`) |
+| k2-node | `tests/cli.rs` 2 failed, `tests/servers_cli.rs` 1 failed: root-only refusals asserted as non-root |
+| k2-core | lib 3644 passed, 2 failed (`daemon_pty` fd tests need `lsof`, absent in the toolchain image); `tests/ptyd_backend.rs` 8 failed (needs `k2-ptyd` built first) |
+| k2-daemon | lib test build OOM-killed (debuginfo 2 under the 3 GB cap); re-running with debuginfo 0 |
+
+Every failure is the test environment, not this change; re-runs fix the
+environment (non-root user for helper/node, `lsof` and `k2-ptyd` for k2-core).
