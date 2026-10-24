@@ -41,12 +41,36 @@ pub enum HomeMigration {
     /// BOTH a real `~/.k2` and a real `~/.k2so` directory exist —
     /// ambiguous; nothing was touched. Carries both paths for the log.
     Conflict(PathBuf, PathBuf),
+    /// `K2_HOME` is set: the K2 home is not `~/.k2`, so there is no
+    /// legacy `~/.k2so` to move and no compat symlink to make. Only the
+    /// K2 home itself is created. Carries it for the log.
+    K2HomeSet(PathBuf),
 }
 
 /// Run the one-time migration against the real `$HOME`. See module docs.
+/// With `K2_HOME` set nothing under `$HOME` is touched (see
+/// [`migrate_home_dir_for`]).
 pub fn migrate_home_dir() -> Result<HomeMigration, String> {
+    if crate::paths::k2_home_overridden() {
+        return migrate_home_dir_for(&crate::paths::k2_home(), None);
+    }
     let home = dirs::home_dir().ok_or("no home dir")?;
     migrate_home_dir_at(&home)
+}
+
+/// Testable seam over both layouts: `home` is `Some($HOME)` in the default
+/// layout (the 0.40 migration and compat symlink, [`migrate_home_dir_at`]),
+/// `None` when `K2_HOME` names `k2_home` directly. The `~/.k2so` symlink
+/// exists only for the legacy `$HOME/.k2` location, so a `K2_HOME`
+/// install never gets one: the K2 home is created and nothing else.
+pub fn migrate_home_dir_for(k2_home: &Path, home: Option<&Path>) -> Result<HomeMigration, String> {
+    match home {
+        Some(home) => migrate_home_dir_at(home),
+        None => {
+            std::fs::create_dir_all(k2_home).map_err(|e| format!("create {}: {e}", k2_home.display()))?;
+            Ok(HomeMigration::K2HomeSet(k2_home.to_path_buf()))
+        }
+    }
 }
 
 /// Testable core — operates on an explicit home root.
@@ -249,5 +273,44 @@ mod tests {
         assert!(home.join(".k2/new").exists());
         assert!(!home.join(".k2so").symlink_metadata().unwrap().file_type().is_symlink());
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A fresh temp dir named by a uuid (never pid + time, which repeat
+    /// across test binaries).
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("k2-mig-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// K2_HOME set: the K2 home is created, and nothing appears beside it
+    /// or under `$HOME` (no `.k2so`, no `.k2`).
+    #[test]
+    fn k2_home_set_creates_only_the_k2_home_and_no_compat_symlink() {
+        let root = unique_tmp("k2home");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let k2 = root.join("var/lib/k2");
+
+        let out = migrate_home_dir_for(&k2, None).expect("ok");
+        assert_eq!(out, HomeMigration::K2HomeSet(k2.clone()));
+        assert!(k2.is_dir());
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "$HOME must stay empty");
+        assert!(root.join("var/lib/.k2so").symlink_metadata().is_err());
+        // Idempotent.
+        assert_eq!(migrate_home_dir_for(&k2, None).expect("again"), HomeMigration::K2HomeSet(k2.clone()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// K2_HOME unset: the seam is today's migration exactly.
+    #[test]
+    fn k2_home_unset_is_the_default_migration() {
+        let home = unique_tmp("default");
+        let out = migrate_home_dir_for(&home.join("ignored"), Some(&home)).expect("ok");
+        assert_eq!(out, HomeMigration::FreshInit);
+        assert!(home.join(".k2").is_dir());
+        assert!(home.join(".k2so").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(!home.join("ignored").exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
