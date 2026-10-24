@@ -24,6 +24,7 @@ out="$KIND_REPO/lab-runs/kind/$(date -u +%Y-%m-%dT%H-%M-%SZ)"
 mirror=$(mktemp -d "${TMPDIR:-/tmp}/k2-kind-s1-XXXXXX")
 mkdir -p "$out" "$mirror/home" "$mirror/stage"
 copier=""
+# shellcheck disable=SC2329  # called from the EXIT trap
 cleanup() {
     [ -n "$copier" ] && kill "$copier" 2>/dev/null
     rm -rf "$mirror"
