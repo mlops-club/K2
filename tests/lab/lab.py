@@ -4,7 +4,7 @@
     lab.py s1 --port P --token-file F --home H --cwd W --out DIR [--fake-trace T]
     lab.py flows --flows-dir D [--trace T] --out FILE
     lab.py report --run-dir DIR
-    lab.py junit-summary ...    (see report.py)
+    lab.py baseline --run-dir DIR --out FILE
 
 Standard library only; run with `python3 -I`.
 """
@@ -46,6 +46,16 @@ def cmd_report(a):
     return 0 if rep["verdict"] == "pass" else 1
 
 
+def cmd_baseline(a):
+    doc = report.baseline_from(a.run_dir)
+    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    with open(a.out, "w") as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write("\n")
+    print("baseline: %s" % a.out)
+    return 0
+
+
 def main(argv):
     p = argparse.ArgumentParser(prog="lab.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -65,6 +75,10 @@ def main(argv):
     r = sub.add_parser("report")
     r.add_argument("--run-dir", required=True)
     r.set_defaults(fn=cmd_report)
+    b = sub.add_parser("baseline")
+    b.add_argument("--run-dir", required=True)
+    b.add_argument("--out", required=True)
+    b.set_defaults(fn=cmd_baseline)
     a = p.parse_args(argv)
     return a.fn(a)
 
