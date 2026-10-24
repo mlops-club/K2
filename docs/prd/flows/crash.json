@@ -1,0 +1,163 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "crash",
+  "name": "The agent CLI crashes, the next need resumes it",
+  "note": "PRD section 6, 'Agent CLI crashes': session marked dead; the next need resumes it with the same session id. Not drawn in the PRD; written by the trace task (docs/prd/progress/trace.md).",
+  "proof": [
+    "S7"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, section 6 (When things die), row 'Agent CLI crashes'; flow by docs/prd/progress/trace.md",
+  "correlate": "agent_id",
+  "participants": [
+    {
+      "id": "client",
+      "name": "Client",
+      "role": "app, web, k2 CLI"
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "k2-daemon"
+    },
+    {
+      "id": "host",
+      "name": "Agent host",
+      "role": "k2-host"
+    },
+    {
+      "id": "ptyd",
+      "name": "PTY host",
+      "role": "k2-ptyd"
+    },
+    {
+      "id": "cli",
+      "name": "claude CLI",
+      "role": "unchanged"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "client",
+      "to": "ctl",
+      "kind": "call",
+      "label": "POST /cli/sessions/v2/spawn",
+      "event": "api.spawn_request",
+      "say": "The client opens the agent, exactly as in the spawn flow."
+    },
+    {
+      "n": 2,
+      "from": "ctl",
+      "to": "host",
+      "kind": "call",
+      "label": "Spawn{agent, harness, session_id}",
+      "event": "host.spawn",
+      "match": {
+        "resume": false
+      },
+      "say": "The agent's provider session id is fixed at spawn (claude --session-id)."
+    },
+    {
+      "n": 3,
+      "from": "host",
+      "to": "cli",
+      "kind": "call",
+      "label": "exec claude --session-id <id>",
+      "event": "cli.exec",
+      "match": {
+        "resumed": false
+      },
+      "say": "The CLI starts a new conversation with that id."
+    },
+    {
+      "n": 4,
+      "from": "cli",
+      "to": "cli",
+      "kind": "self",
+      "label": "a turn starts",
+      "event": "cli.turn.start",
+      "say": "A prompt arrives and the CLI begins a turn."
+    },
+    {
+      "n": 5,
+      "from": "cli",
+      "to": "ptyd",
+      "kind": "fail",
+      "label": "the CLI dies mid-turn (kill -9)",
+      "event": "ptyd.child_exit",
+      "match": {
+        "clean": false
+      },
+      "say": "The PTY host sees the child exit by a signal, not a clean exit. The turn in progress is what can be lost (PRD section 6)."
+    },
+    {
+      "n": 6,
+      "from": "ptyd",
+      "to": "host",
+      "kind": "reply",
+      "label": "session marked dead",
+      "event": "host.agent_exit",
+      "say": "The host marks the session dead and drops it from the live set; the agent's home and provider session id stay."
+    },
+    {
+      "n": 7,
+      "from": "client",
+      "to": "ctl",
+      "kind": "call",
+      "label": "the next need: POST /cli/sessions/v2/spawn (no command)",
+      "event": "api.spawn_request",
+      "match": {
+        "need": true
+      },
+      "say": "Today the need is a tab visit, a message or a heartbeat. Nothing respawns the CLI before that."
+    },
+    {
+      "n": 8,
+      "from": "ctl",
+      "to": "host",
+      "kind": "call",
+      "label": "Spawn{agent, resume_id}",
+      "event": "host.spawn",
+      "match": {
+        "resume": true
+      },
+      "say": "The controller resumes the saved provider session id instead of starting fresh."
+    },
+    {
+      "n": 9,
+      "from": "host",
+      "to": "cli",
+      "kind": "call",
+      "label": "exec claude --resume <id>",
+      "event": "cli.exec",
+      "match": {
+        "resumed": true
+      },
+      "say": "Same session id, same transcript and memory files (invariant I3)."
+    },
+    {
+      "n": 10,
+      "from": "cli",
+      "to": "host",
+      "kind": "call",
+      "label": "hook SessionStart (source resume)",
+      "event": "cli.hook",
+      "match": {
+        "hook": "SessionStart"
+      },
+      "say": "Hooks flow again, as in the hook flow."
+    },
+    {
+      "n": 11,
+      "from": "host",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "AgentEvent{SessionStart, attested}",
+      "event": "host.agent_event",
+      "match": {
+        "hook": "SessionStart"
+      },
+      "say": "The controller sees the agent back."
+    }
+  ]
+}

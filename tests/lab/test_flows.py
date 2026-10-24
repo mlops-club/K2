@@ -47,9 +47,14 @@ def spawn_trace(agent="a1", t0=0.0, skip=None, swap=None):
 
 class FlowFiles(unittest.TestCase):
     def test_one_file_per_prd_flow_and_in_sync(self):
+        # Every PRD flow has its file, generated from the PRD. Other flow
+        # files (added by later waves, e.g. crash.json) are allowed; they
+        # must validate (load_flows does) and must not claim the PRD source.
         loaded = flows.load_flows(FLOWS_DIR)
-        self.assertEqual(sorted(loaded), sorted(extract_flows.FLOW_IDS))
-        self.assertEqual(len(loaded), 11)
+        self.assertEqual(len(extract_flows.FLOW_IDS), 11)
+        self.assertTrue(set(extract_flows.FLOW_IDS) <= set(loaded), sorted(loaded))
+        for fid in set(loaded) - set(extract_flows.FLOW_IDS):
+            self.assertNotIn("FLOWS.", loaded[fid]["source"], "%s is not a PRD flow" % fid)
         for fid, text in extract_flows.expected_files().items():
             with open(os.path.join(FLOWS_DIR, fid + ".json"), encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), text, "%s.json is stale: run tests/lab/extract_flows.py" % fid)

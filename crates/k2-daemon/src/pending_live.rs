@@ -132,6 +132,7 @@ pub fn enqueue(signal: &AgentSignal, target_agent: &str) -> io::Result<PathBuf> 
     atomic_write(&path, &json)?;
     *state.entry(target_agent.to_string()).or_insert(0) += 1;
     drop(state);
+    k2_core::trace::emit(|| k2_core::trace::Event::new("pending_live.enqueue").agent(target_agent).msg(signal.id.to_string()));
 
     log_debug!(
         "[daemon/pending-live] queued signal id={} for agent={} at {:?}",
