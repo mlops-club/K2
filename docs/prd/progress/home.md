@@ -221,12 +221,12 @@ EOF
   `~/.k2/auth-audit.jsonl`, and a workspace lifecycle-seed test writes
   `~/.k2/wiki`. The worker's filtered `k2-core` runs around 11:20–11:30
   used the real `HOME` and very likely caused the writes the coordinator
-  saw. Since then every cargo test runs with a fresh `mktemp -d` `HOME`
+  saw. From now on every cargo test runs with a fresh `mktemp -d` `HOME`
   and `TMPDIR`. Follow-up owned by the coordinator.
 
 ## Checks so far
 
-| Command (HOME = fresh temp dir from 12:00 on) | Result |
+| Command (all run before the fresh-HOME rule, so with the real `HOME`; to be rerun under a temp `HOME`) | Result |
 |---|---|
 | `cargo check -p k2-client -p k2-core -p k2-daemon --all-targets` | clean, no warnings in these crates |
 | `cargo test -p k2-client --lib` | 99 passed |
