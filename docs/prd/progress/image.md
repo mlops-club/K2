@@ -154,7 +154,7 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq .
   the Dockerfile's `toolchain` stage, as root with `env -i` like the gate).
 - **Next:** clippy, `cargo test -p k2-core` / `-p k2-daemon` and the
   helper/engine/node tests; build the image; Compose, random UID, kind.
-- **Open questions:** see "Clippy baseline" below once measured.
+- **Open questions:** none open. Clippy criterion changed (coordinator, 2026-10-24): see "Clippy baseline".
 
 ### Owner decisions (2026-10-24)
 
@@ -210,3 +210,28 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq .
   Google isn't usable in `k2-daemon:dev`.
 - Random UID: state is `10000:0` mode `0770`, the user is in group 0, so
   `--user <any>:0` works (OpenShift style).
+
+### Clippy baseline (rustc/clippy 1.99.1, aarch64 Linux)
+
+The acceptance command
+`cargo clippy -p k2-daemon -p k2-root-helper -p k2-app-engine -p k2-node --all-targets -- -D warnings`
+already fails on `k2-dist/wave1` (`a6a3f3a9e`): clippy lints the workspace's
+path dependencies too, and CI never runs clippy. Without `-D warnings`, base has
+**390 findings** (k2-core 318, k2-root-helper 23, k2-node 20, k2-client 10,
+k2-app-engine 6, k2-vault 6, k2-node-proto 4, k2-ptyd 2, k2-root-proto 1), and
+**7 deny-level errors** that stop the build before `k2-daemon` is linted:
+
+- `crates/k2-core/src/deprecated/delegate.rs` lines 37, 61, 90, 115, 150: `deprecated_semver`
+- `crates/k2-core/src/terminal/grid_snapshot.rs:337`: `while_immutable_condition`
+- `crates/k2-node/src/packages.rs:500`: `never_loop`
+
+With those allowed, `k2-daemon` adds one more: `crates/k2-daemon/src/llm_routes.rs:316`
+(`ifs_same_cond`), plus 436 warnings.
+
+Criterion now (coordinator): no new findings in the files this task changed,
+compared with `k2-dist/wave1`; deny-level lints in untouched files don't
+count; k2-node files this task touched pass clippy. Head vs base on the plain
+run: the same 390 findings (file and message, line numbers ignored). The
+`is_multiple_of` warnings in `crates/k2-node/src/node/mod.rs` (a touched file)
+are fixed. In `k2-daemon` the only finding on a changed line (a doc comment
+attached to the wrong function in `daemon_main.rs`) is fixed.
