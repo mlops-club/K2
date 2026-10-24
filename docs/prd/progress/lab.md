@@ -233,11 +233,21 @@ set.
   NOT RUN with its own message). `hold` stays for iterating. The Docker path
   mounts the repo read-only at `/src/wt` (Docker Desktop cannot mount at a
   target under `/Users`) and finds the sha through `GIT_DIR`.
-- **CPU budget.** The Mac is shared by three workers. Every cargo command in
-  the lab gets `CARGO_BUILD_JOBS=4` (also passed into the suites' clean env);
-  test runs use 4 threads; the gate container gets `--cpus 4` and the gate's
-  own `K2_GATE_THREADS=4`; the Linux gate runs last, after the local suites,
-  never alongside another heavy build.
+- **CPU and Docker budget (coordinator, 2026-10-24, after the Docker VM
+  froze the owner's kind cluster).** Host cargo: `CARGO_BUILD_JOBS=3` and 3
+  test threads (also passed into the suites' clean env). Docker-heavy work
+  (the gate image build and the gate container) takes the shared lock
+  `$HOME/.cache/k2-dist-docker.lock` (`until mkdir …; do sleep 20; done`),
+  released on exit, INT or TERM; a run killed while still waiting never
+  removes another holder's lock. The gate container runs on 3 CPUs with the
+  gate's own `K2_GATE_THREADS=3`, last in the run, never alongside another
+  heavy build. The lab never uses kind (namespace `k2-kind` is the owner's).
+- **`lab_cargo` temp paths.** It uses `/tmp/k2c-*` (short) for the throwaway
+  HOME and TMPDIR: `macos_keychain_tests` puts the temp keychain path into a
+  `security -i` line capped at `INTERACTIVE_LINE_MAX`, and macOS's long
+  `$TMPDIR` made `a_wallet_add_and_restore_cycle_leaves_claudes_item_readable_by_security`
+  fail under the lab only (all 18 pass with short paths). Worth knowing for
+  anyone running k2-core tests under a deep TMPDIR.
 - **S12 at G0.** Confirmed: G0 on solo stays red with S12 NOT RUN until S12
   exists; S2 and S7 are reported, not required.
 - **Tier 1.** Today's daemon makes the `~/.k2so -> ~/.k2` compat link, so tier
