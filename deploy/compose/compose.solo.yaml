@@ -1,0 +1,43 @@
+# K2 in one container (PRD "K2 Distributed Runtime", stage P0 "Container").
+#
+# Today's architecture, unchanged: one k2-daemon that is the controller AND
+# runs agents in-process (K2_ROLE=all). The lab's "container" topology and
+# gate G0 run against this file. compose.yaml is the end state (G4) with a
+# separate controller and hosts; this file is the step before it.
+#
+# Build the image first (local only, never pushed):
+#   packaging/oci/build.sh                    # → k2-daemon:dev
+# Then:
+#   docker compose -f deploy/compose/compose.solo.yaml up -d --wait
+#   curl -fsS http://127.0.0.1:7420/boot-status | jq .
+#
+# Validate the syntax with: docker compose -f deploy/compose/compose.solo.yaml config -q
+
+name: k2-solo
+
+services:
+  k2:
+    image: ${K2_IMAGE:-k2-daemon:dev}            # packaging/oci/Dockerfile; binary at /usr/bin => install_kind="package", no self-update
+    restart: unless-stopped
+    init: true
+    environment:
+      HOME: /var/lib/k2                          # until K2_HOME lands (P0 `home` task): state goes to /var/lib/k2/.k2
+      K2_ROLE: all                               # new: "all" (default, today) | "controller" (refused until P2)
+      K2_LISTEN: lan                             # existing: bind 0.0.0.0 instead of loopback
+      K2_DAEMON_PORT: "7420"                     # new: fixed port instead of the sticky random one in daemon.port
+      # No K2_CAP_* overrides: there is no root helper in the container, so
+      # Postgres, mail, Sew, Apps and the front door detect as "off". Set
+      # e.g. K2_CAP_POSTGRES: external to see "delegated" in /boot-status.
+    ports:
+      - "127.0.0.1:7420:7420"  # API for a client on this machine
+    volumes:
+      - k2-data:/var/lib/k2                      # k2.db, vault.db, daemon.port, daemon.token, agent workspaces
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7420/boot-status"]  # existing route; ready when phase=ready
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 60s                          # first boot runs migrations before phase=ready
+
+volumes:
+  k2-data: {}

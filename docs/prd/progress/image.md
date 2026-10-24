@@ -148,23 +148,65 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq .
 
 ## Status
 
-- **Milestone:** diagrams written.
-- **Next:** env settings modules (`runtime_role.rs`, `daemon_port.rs`,
-  `capabilities.rs`) with unit tests, then the image, Compose and kind.
-- **Open questions (raised with the coordinator):**
-  1. `/boot-status` shape is pinned: `tests/golden/permission_off/daemon/boot_status.txt`
-     lists every top-level key of the full body, so an additive
-     `capabilities` key fails `permission_off_golden`. Where do capabilities go?
-  2. Sharing `classify_install_kind` with root helper, app engine and node:
-     those crates can't depend on `k2-daemon`; the common crate they all
-     depend on is `k2-root-proto`.
+- **Milestone:** settings modules, install-kind opt-outs, image, Compose and
+  kind manifest written; compiling and testing in a Linux container (no Rust
+  toolchain on this Mac, so every cargo command runs in `k2-oci-toolchain:dev`,
+  the Dockerfile's `toolchain` stage, as root with `env -i` like the gate).
+- **Next:** clippy, `cargo test -p k2-core` / `-p k2-daemon` and the
+  helper/engine/node tests; build the image; Compose, random UID, kind.
+- **Open questions:** see "Clippy baseline" below once measured.
+
+### Owner decisions (2026-10-24)
+
+- Q1, option A: `capabilities` is always in the full `/boot-status` view
+  (nothing removed or renamed). The one-line update to
+  `tests/golden/permission_off/daemon/boot_status.txt` adds `capabilities` to
+  its `keys:` line; nothing else in that golden changes.
+- Q2, option A: `classify_install_kind`, `is_package_path` and
+  `INSTALL_KIND_PACKAGE` live in `crates/k2-root-proto/src/install_kind.rs`;
+  `boot_status` re-exports them, so the daemon API is unchanged.
 
 ### Decisions inside owned files
 
+- `K2_ROLE`: unset, empty or `all` boot as today; `controller` exits 2 with
+  "K2_ROLE=controller needs agent hosts (PRD P2); not available yet"; anything
+  else exits 2 naming `all, controller`. Case-sensitive, like the docs.
+- `K2_DAEMON_PORT`: 1–65535. Taken ⇒ exit 2 with
+  `K2_DAEMON_PORT=<p>: can't listen on <addr>: <os error> (no fallback to another port)`.
+  A hand-off's inherited listener still wins (same port). `daemon.port` is
+  written as today. All three settings are checked together in
+  `daemon_main::run` before the runtime starts, so a bad value never
+  half-boots.
 - Capability values: the `K2_CAP_*` override values come from
-  `deploy/README.md` (`host`, `external`, `engine`, `kubernetes`, `listen`,
-  `off`). The report maps them onto the PRD's three states: `host` ⇒
-  `host-native`; `external`, `engine`, `kubernetes`, `listen` ⇒ `delegated`;
-  `off` ⇒ `off`. Anything else is a boot error naming the allowed values.
-- Image contents: `k2-daemon` and `k2-ptyd` only. No root helper (no sudo in a
-  container), so with no override every root-helper feature detects `off`.
+  `deploy/README.md`; each feature takes the subset its comments in
+  `compose.yaml` / `controller.yaml` use: Postgres, mail, Sew `host |
+  external | kubernetes | off`; Apps `host | engine | kubernetes | off`; front
+  `host | listen | off`. Anything else is a boot error naming that feature's
+  values. The report maps them onto the PRD's states: `host` ⇒ `host-native`;
+  `external`, `engine`, `kubernetes`, `listen` ⇒ `delegated`; `off` ⇒ `off`.
+- Detection without an override: the root helper (installed and `sudo -n`
+  allowed) ⇒ `host-native`, else `off`; Apps is also `host-native` when the
+  App engine's socket exists; the vault is `host-native` with the key store
+  it opened (`keychain`, `keeper`, `systemd-creds`, `file`, …), `off` if it
+  didn't open. Detected once, after the vault opens, logged as one line
+  (`[daemon] capabilities: postgres=off (no root helper), …`).
+- `/boot-status` shape: `"capabilities": {"postgres": {"state", "mode",
+  "via"}, "mail", "sew", "apps", "front", "vault"}`, full view only (compat
+  and public views unchanged).
+- Install-kind opt-outs (refusal code `package_owned` everywhere):
+  - root helper: `helper self-update` and `apps install-engine` refuse when
+    the helper itself is a package install (`Ctx::is_package_install`,
+    classified below the ctx root so tests work in temp roots);
+  - App engine: its `version` answer (CLI and socket) carries `installKind`;
+    the daemon's `engine_install::install_core` refuses to install over an
+    engine reporting `package`;
+  - k2-node: a package-installed node refuses `update_offer` and stops
+    advertising `self-update` (`node_features_for`). New refusal code
+    `k2_node_proto::admin::code::PACKAGE_OWNED` (additive).
+- Image contents: `k2-daemon` (embedding `k2-ptyd`, as release builds do)
+  and `k2-ptyd` under `/usr/bin`. No root helper, node or engine (the daemon
+  doesn't need them at boot). Dev builds bake no Gmail OAuth (the release
+  script's `require_mail_oauth_build_env` is not run), so mail linking with
+  Google isn't usable in `k2-daemon:dev`.
+- Random UID: state is `10000:0` mode `0770`, the user is in group 0, so
+  `--user <any>:0` works (OpenShift style).

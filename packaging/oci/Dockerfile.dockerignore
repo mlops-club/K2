@@ -1,0 +1,16 @@
+# Build context is the repo root; send only what cargo reads.
+.git
+**/target
+/target-*
+**/node_modules
+dist
+out
+lab-runs
+src-tauri/binaries
+**/*.dmg
+**/*.zip
+**/.DS_Store
+.claude
+.k2
+.k2so
+.codegraph
