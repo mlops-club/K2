@@ -813,6 +813,7 @@ pub async fn serve_session_grid_connection(
     params: HashMap<String, String>,
     owner_token: String,
 ) {
+    k2_core::trace::attach(params.get("session").map(String::as_str), "grid");
     // The token that authorized this connection. Re-validated on a timer
     // inside the loop so a revoked connect-user (disabled / removed /
     // role-changed) is dropped from their LIVE socket within seconds —

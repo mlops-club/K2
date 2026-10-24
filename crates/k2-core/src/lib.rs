@@ -321,6 +321,8 @@ pub mod skill_layers;
 pub mod skills;
 pub mod terminal;
 pub mod themes;
+// K2 Distributed Runtime P1: lab trace events, off unless K2_TRACE_FILE.
+pub mod trace;
 // prd-daemon-activity-and-thread-working-v1 S3: the one transcript
 // follower the Chat view and the activity store share.
 pub mod transcript_follow;
