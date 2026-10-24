@@ -267,12 +267,13 @@ FAIL; the suite is then NOT RUN, never green:
 - `node_admin_linux_container`: a build-box script that needs an output dir
   argument and podman.
 - `sign_app_engine`, `sign_k2_node`: need `minisign`, which this Mac does not
-  have. **Owner's call:** `brew install minisign` would let them run; the lab
-  does not install host tools.
+  have. Not installed (coordinator, 2026-10-24); they stay NOT RUN with that
+  reason while the coordinator raises it with the owner.
 
 Real failures (pre-existing): `app_runtime_cli_smoke` (expects the Linux App
 box doctor), `permission_off_golden` (its schema golden is stale against
-`k2 zen widget errors`).
+`k2 zen widget errors`). The image branch updates that golden for its new
+capabilities key: **recheck `permission_off_golden` after integration.**
 
 ### I5 baseline
 
