@@ -165,19 +165,68 @@ cargo test -p k2-core --lib -- trace::
 
 ## Status
 
-- **Milestone:** diagrams written.
-- **Next:** the sink (`k2-core/src/trace`), emission lines, `crash.json`,
-  the G1 scenario runner, then the solo run and the latency check.
-- **Open questions:** none yet.
+- **Milestone:** diagrams written; sink, emission lines and the G1 runner
+  written, first build in progress.
+- **Next:** unit tests green, first solo run, latency check (NFR1).
+- **Open questions (asked, waiting):**
+  1. Where `crash.json` lives. In `docs/prd/flows/` it fails the lab's
+     `test_one_file_per_prd_flow_and_in_sync` (exactly the 11 PRD flows).
+     Recommended: `docs/prd/flows/extra/` now, moved when G1 is wired.
+  2. `cli.hook` timing. The fake agent writes `cli.hook` after the hook
+     command returns; the daemon handles the hook inside that command, so
+     every daemon hook event precedes it and hook, spawn and crash fail on
+     order. Recommended: the lab worker writes `cli.hook` before running
+     the hook (and the exit code after, as its own event).
 
 ### New interface
 
 - `K2_TRACE_FILE`: absolute path; the daemon appends one JSONL event per
-  line. Unset (or not absolute) means no trace and no trace work. For
-  `deploy/README.md` at integration.
+  line. Unset or empty means off: no trace work at all. Set but not
+  absolute, or not openable for append, is an error, never a silent off
+  (coordinator, 2026-10-24): `k2_core::trace::boot_check()` returns it so
+  the daemon can refuse to start, and the first use logs
+  `[trace] ERROR: K2_TRACE_FILE="…" …` to stderr. **Integration:**
+  `daemon_main.rs` (not mine) should call `k2_core::trace::boot_check()`
+  at boot and exit non-zero on `Err`, as it does for a relative `K2_HOME`.
+  For `deploy/README.md` at integration.
+
+### Decisions inside owned files
+
+- **Writer.** A bounded queue (16384) and one writer thread; emission
+  points `try_send` and never wait. A full queue drops the event and the
+  next line written is `trace.dropped {count}`. One `write` per line on an
+  `O_APPEND` file, so lines never interleave (unit-tested with two sinks on
+  one file).
+- **Correlation.** `agent_id` comes from the HTTP spawn: `spawn_request`
+  opens a thread-local scope that `DaemonPtySession::spawn` (same thread)
+  reads, then pane → agent is kept for the hook plane. Spawns that do not
+  come through the HTTP route (heartbeat wakes, canonical chat) carry
+  `agent_id: null` until the AgentHost interface names the agent.
+- **Exit order.** `ptyd.child_exit` (trace watcher) and `host.agent_exit`
+  (`mark_child_exited`, from the daemon's exit observer) hear the same
+  broadcast on different threads. The trace module writes
+  `host.agent_exit` only after the pane's `ptyd.child_exit` (the session
+  is marked dead because the child exited), so the crash flow is never
+  flaky on that pair.
+- **`client.stream`** is the first PTY output after a client attached
+  (`api.attach`), so it means output reached an attached client, not just
+  that the socket opened.
+- **`host.inject`, `pending_live.enqueue`, `inbox.write`** are emitted for
+  the msg flow later (not G1). `workspace_msg.rs` has no inbox write today
+  (`k2 msg` is live-or-fail), so `inbox.write` is in
+  `k2-core/src/inbox.rs::compose`; `pending_live.enqueue` carries the
+  signal id as `msg_id`.
+- **`lib.rs`** gains one line, `pub mod trace;`.
+- **The crash scenario** uses a `tab-*` agent in a registered workspace,
+  because that is where today's daemon resumes a dead CLI on the next need
+  (`recovered_launch_ex`: harness command + provider session id in
+  `workspace_tab_sessions`). The turn is 30 s (`--turn-ms`), so the
+  `kill -9` lands mid-turn.
 
 ### Rebase notes (lines in files other workers own)
 
 - `crates/k2-daemon/src/v2_spawn.rs`: one line, first line of `spawn_session`.
 - `crates/k2-daemon/src/sessions_grid_ws.rs`: one line, first line of
   `serve_session_grid_connection`.
+- `crates/k2-core/src/terminal/daemon_pty.rs`: trace lines only, plus
+  `write` converts `bytes` once (to count them) and passes the `Cow` on.
