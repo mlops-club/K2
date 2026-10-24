@@ -51,7 +51,8 @@ suite_env() {
         "HOME=$h/home" "TMPDIR=$h/tmp" "USER=$(id -un)" "LANG=en_US.UTF-8" "TERM=dumb" \
         "PATH=$LAB_SHIM_DIR:$LAB_NODE_DIR:${CARGO_HOME:+$CARGO_HOME/bin:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         ${CARGO_HOME:+"CARGO_HOME=$CARGO_HOME"} ${RUSTUP_HOME:+"RUSTUP_HOME=$RUSTUP_HOME"} \
-        ${OPENSSL_ROOT_DIR:+"OPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR"}
+        ${OPENSSL_ROOT_DIR:+"OPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR"} \
+        ${CARGO_BUILD_JOBS:+"CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS"}
 }
 
 # run_clean <log> <cwd> <deadline-seconds> <cmd...>: run under a clean env
@@ -153,9 +154,9 @@ GATE_IMAGE_TAG=k2-lab-gate:1
 GATE_TARGET_VOL=k2-lab-gate-target
 GATE_REGISTRY_VOL=k2-lab-gate-cargo-registry
 
-# LAB_LINUX_GATE=hold (prove.sh --linux-gate hold, the default for now):
+# LAB_LINUX_GATE=hold (prove.sh --linux-gate hold):
 # never touch Docker; the gate is NOT RUN with LAB_LINUX_GATE_HOLD_REASON.
-LAB_LINUX_GATE_HOLD_REASON="held: the Docker VM disk is full (98%, under 1 GB free; it also hosts the owner's kind cluster) and the gate needs 20 GB; no gate container is started until the owner frees space (coordinator, 2026-10-24). Run with --linux-gate run once it is free."
+LAB_LINUX_GATE_HOLD_REASON="held by --linux-gate hold: no gate container was started (the gate needs Docker with 20 GB free in its VM); run with --linux-gate run"
 
 parity_linux_gate_start() {
     local log="$RUN/parity/linux-gate.log"
@@ -190,7 +191,7 @@ parity_linux_gate_start() {
         # sits at /src/wt and its git dir at /src/git; GIT_DIR/GIT_WORK_TREE
         # let the gate's `git rev-parse` and `git archive <sha>` work there.
         exec docker run --rm --name "k2-lab-gate-$$" \
-            --cap-add NET_ADMIN \
+            --cap-add NET_ADMIN --cpus "${CARGO_BUILD_JOBS:-4}" -e K2_GATE_THREADS="${LAB_TEST_THREADS:-4}" \
             -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
             -v "$wt:/src/wt:ro" -v "$common:/src/git:ro" \

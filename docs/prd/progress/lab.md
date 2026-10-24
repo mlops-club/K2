@@ -210,16 +210,21 @@ SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
 
 ### Answered (coordinator, 2026-10-24)
 
-- **Docker disk.** The Docker VM is at 98% (under 1 GB free) and hosts the
-  owner's kind cluster. Until the owner frees space, `prove.sh` defaults to
-  `--linux-gate hold`: it never touches Docker, and the report shows the Linux
-  gate NOT RUN with that reason. `--linux-gate run` starts it once space is
-  free. I removed what this task had put there (the pulled
-  `rust:1.99.1-bookworm`, the built `k2-lab-gate:1`, two empty volumes);
-  `gate.Dockerfile` rebuilds them. The Docker path was checked up to the
-  gate's own disk check: it mounts the repo read-only at `/src/wt` (Docker
-  Desktop cannot mount at a target under `/Users`), finds the sha through
-  `GIT_DIR`, and stops at "refusing to run: 2G free, need 20G".
+- **Docker disk.** Was full (98%); the owner restarted Docker and grew the
+  disk (56 GB free). While it was full, `prove.sh` held the gate
+  (`--linux-gate hold` never touches Docker and reports NOT RUN); I removed
+  what this task had put there (`rust:1.99.1-bookworm`, `k2-lab-gate:1`, two
+  empty volumes). **Decision: `--linux-gate run` is the default again**: with
+  space there, holding by default would leave the owner's try-it red on a
+  suite that can run, and the gate itself refuses below 20 GB free (reported
+  NOT RUN with its own message). `hold` stays for iterating. The Docker path
+  mounts the repo read-only at `/src/wt` (Docker Desktop cannot mount at a
+  target under `/Users`) and finds the sha through `GIT_DIR`.
+- **CPU budget.** The Mac is shared by three workers. Every cargo command in
+  the lab gets `CARGO_BUILD_JOBS=4` (also passed into the suites' clean env);
+  test runs use 4 threads; the gate container gets `--cpus 4` and the gate's
+  own `K2_GATE_THREADS=4`; the Linux gate runs last, after the local suites,
+  never alongside another heavy build.
 - **S12 at G0.** Confirmed: G0 on solo stays red with S12 NOT RUN until S12
   exists; S2 and S7 are reported, not required.
 - **Tier 1.** Today's daemon makes the `~/.k2so -> ~/.k2` compat link, so tier

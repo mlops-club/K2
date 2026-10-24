@@ -20,9 +20,10 @@
 # iterating on scenarios: parity then shows NOT RUN and the gate fails.
 # --record-baseline stores this run's parity results as the I5 baseline
 # (tests/lab/baselines/<gate>-<topology>.json); commit it deliberately.
-# --linux-gate hold (the default while this Mac's Docker disk is full) never
-# touches Docker and reports the Linux gate NOT RUN with the reason; run
-# starts it (scripts/lab/docker/gate.Dockerfile, then test-gate-linux.sh).
+# --linux-gate run (default) builds scripts/lab/docker/gate.Dockerfile and
+# runs test-gate-linux.sh in it AFTER the local suites (never alongside
+# another heavy build); hold never touches Docker and reports it NOT RUN.
+# CPU budget: CARGO_BUILD_JOBS=4 and 4 test threads unless set.
 #
 # Touches nothing outside the repo, lab-runs/ and temp dirs: the daemon and
 # every suite run under throwaway HOMEs; Rust comes from PATH or is installed
@@ -31,7 +32,7 @@ set -uo pipefail
 
 usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
-GATE="" TOPOLOGY="" CHAOS="" PARITY=full RECORD_BASELINE=0 LAB_LINUX_GATE=hold
+GATE="" TOPOLOGY="" CHAOS="" PARITY=full RECORD_BASELINE=0 LAB_LINUX_GATE=run
 while [ $# -gt 0 ]; do
     case "$1" in
         --topology) TOPOLOGY=${2:-}; shift 2 ;;
@@ -52,6 +53,7 @@ done
 case "$PARITY" in full|none) ;; *) echo "prove.sh: --parity is full or none" >&2; exit 2 ;; esac
 case "$LAB_LINUX_GATE" in hold|run) ;; *) echo "prove.sh: --linux-gate is hold or run" >&2; exit 2 ;; esac
 export LAB_LINUX_GATE
+export LAB_TEST_THREADS=${LAB_TEST_THREADS:-4}
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 if [ "$GATE" != G0 ] || [ "$TOPOLOGY" != solo ]; then
@@ -163,12 +165,6 @@ LAB_FAKE_AGENT_BIN="$LAB_TMP/bin/k2-fake-agent"
 LAB_SHIM_DIR="$LAB_TMP/shim"
 export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN LAB_SHIM_DIR
 
-# ── Linux gate first: it runs in Docker while the rest goes on here ─────
-if [ "$PARITY" = full ]; then
-    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "starting scripts/test-gate-linux.sh in Docker (log: parity/linux-gate.log)" || echo "held, NOT RUN (Docker disk full; --linux-gate run to start it)")"
-    parity_linux_gate_start
-fi
-
 # ── Topology up, scenario S1 ────────────────────────────────────────────
 say "topology $TOPOLOGY: up"
 echo "metric,value,unit,note" >"$RUN/metrics.csv"
@@ -218,7 +214,10 @@ if [ "$PARITY" = full ]; then
     parity_contract
     say "parity: tests/cli/*.sh, one at a time"
     parity_cli | tee -a "$RUN/prove.log"
-    say "parity: waiting for the Linux gate"
+    # Last, on its own: the gate is a full cold-or-warm build of k2-core and
+    # k2-daemon tests, and the Mac is shared (one heavy build at a time).
+    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "scripts/test-gate-linux.sh in Docker, 4 CPUs (log: parity/linux-gate.log)" || echo "held by --linux-gate hold, NOT RUN")"
+    parity_linux_gate_start
     parity_linux_gate_finish
 else
     parity_none

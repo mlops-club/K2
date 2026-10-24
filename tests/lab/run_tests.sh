@@ -12,7 +12,7 @@ echo "== flows in sync with the PRD"
 python3 -I tests/lab/extract_flows.py --check
 echo "== python: flow checker, report writer, S1 client model"
 python3 -I -m unittest discover -s tests/lab -p 'test_*.py' -t tests/lab
-echo "== cargo test -p k2-fake-agent"
+echo "== cargo test -p k2-fake-agent (4 jobs, 4 test threads: the Mac is shared)"
 source scripts/lab/lib/toolchain.sh
 lab_toolchain "$REPO"
-cargo test -p k2-fake-agent
+cargo test -p k2-fake-agent -- --test-threads=4

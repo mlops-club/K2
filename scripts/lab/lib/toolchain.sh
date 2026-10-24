@@ -15,6 +15,9 @@ LAB_RUST_VERSION=1.99.1
 lab_toolchain() {
     local repo=$1
     lab_native_env
+    # CPU budget (coordinator, 2026-10-24): the Mac is shared by several
+    # workers; four build jobs per cargo command unless the caller set one.
+    export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
     if command -v cargo >/dev/null 2>&1; then
         LAB_RUST_SOURCE=path
         export LAB_RUST_SOURCE
