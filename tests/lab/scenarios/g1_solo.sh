@@ -64,7 +64,7 @@ up() {
 kit() {
     local dir=$1
     shift
-    python3 -I "$LAB_REPO/tests/lab/scenarios/g1_solo.py" --port "$LAB_PORT" --token-file "$dir/token" \
+    python3 -I -B "$LAB_REPO/tests/lab/scenarios/g1_solo.py" --port "$LAB_PORT" --token-file "$dir/token" \
         --home "$LAB_HOME" --cwd "$LAB_WORKSPACE" --crash-cwd "$LAB_CRASH_CWD" \
         --daemon-trace "$dir/daemon.trace.jsonl" --fake-trace "$LAB_FAKE_TRACE" \
         --flows-dir "$LAB_REPO/docs/prd/flows" --out "$dir/out" "$@"
@@ -83,7 +83,7 @@ if [ "$BENCH" -gt 0 ]; then
         kit "$dir" --bench "$BENCH" | tee "$dir/bench.txt" || rc=1
         topo_down
     done
-    python3 -I - "$RUN/bench-off/out/bench.json" "$RUN/bench-on/out/bench.json" <<'EOF' || rc=1
+    python3 -I -B - "$RUN/bench-off/out/bench.json" "$RUN/bench-on/out/bench.json" <<'EOF' || rc=1
 import json, sys
 off, on = (json.load(open(p))["median"] for p in sys.argv[1:3])
 delta = (on - off) / off * 100

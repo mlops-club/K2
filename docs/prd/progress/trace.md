@@ -171,12 +171,10 @@ cargo test -p k2-core --lib -- trace::
 - **Answered:** `crash.json` lives in `docs/prd/flows/` (coordinator,
   2026-10-24); the lab's `3105385e6` (cherry-picked here, drops out at
   rebase) lets `test_flows.py` accept flow files beyond the 11 PRD ones.
-- **Open questions (asked, waiting):**
-  1. `cli.hook` timing. The fake agent writes `cli.hook` after the hook
-     command returns; the daemon handles the hook inside that command, so
-     every daemon hook event precedes it and hook, spawn and crash fail on
-     order. Recommended: the lab worker writes `cli.hook` before running
-     the hook (and the exit code after, as its own event).
+- **Answered:** `cli.hook` timing (coordinator, 2026-10-24, option A): the
+  fake agent now writes `cli.hook` before running the hook and
+  `cli.hook.done {exit}` after (lab `9cb30dde7`, cherry-picked here).
+- **Open questions:** none.
 
 ### New interface
 
