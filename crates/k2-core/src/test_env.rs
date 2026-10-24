@@ -710,7 +710,10 @@ pub fn k2_home_path_lines(src: &str) -> Vec<usize> {
             .iter()
             .flat_map(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
             .any(names_a_home);
-        let default_layout_literal = ["$HOME/.k2", "${HOME}/.k2", "{home}/.k2"].iter().any(|p| line.contains(p));
+        // concat! so this line never matches itself.
+        let default_layout_literal = [concat!("$HOME/.", "k2"), concat!("${HOME}/.", "k2"), concat!("{home}/.", "k2")]
+            .iter()
+            .any(|p| line.contains(p));
         let after_home_dir = line.contains(".join(\".k2")
             && code[i.saturating_sub(12)..i].iter().any(|l| l.contains("home_dir()"));
         if names_home || default_layout_literal || after_home_dir {
