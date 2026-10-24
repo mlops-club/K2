@@ -37,6 +37,12 @@ RUN set -eux; \
     git -C /work/lab-agent init -q; \
     chown -R 10000:0 /work/lab-agent; \
     chmod -R g+rwX /work
+# A test daemon (K2_TEST_AGENT_SHIM_DIR set) refuses to run with HOME at
+# its user's real home (k2_core::zen::sync::guard_real_home, which reads
+# the passwd entry). The lab's solo topology uses a temp HOME for that;
+# here the k2 user's passwd home moves, and HOME stays /var/lib/k2 on the
+# volume.
+RUN usermod -d /home/k2-fake k2
 USER 10000:0
 # The daemon's spawn guard resolves agent CLIs only inside this dir.
 ENV K2_TEST_AGENT_SHIM_DIR=/opt/k2-fake/shim \

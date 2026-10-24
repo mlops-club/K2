@@ -11,6 +11,8 @@ Lab only: `deploy/kubernetes/` is the end state.
 | `Dockerfile.agents` | `k2-agents:dev`: `k2-daemon:dev` plus Claude Code 2.1.308 (the native linux binary) at `/usr/local/bin/claude`, with `DISABLE_AUTOUPDATER=1` |
 | `agents/kustomization.yaml` | Overlay over `packaging/oci/kind/solo.yaml`: namespace `k2-kind`, image `k2-agents:dev` |
 | `Dockerfile.fake`, `fake/` | TEST ONLY: `k2-agents:fake` with the lab's `k2-fake-agent` as every agent CLI, in namespace `k2-kind-fake`, for `scripts/kind/s1.sh` |
+| `components/no-k2dev` | Shared by both overlays: `K2_TUNNEL_LEASE=off`, `K2_FEDERATION=off`, relay list and DNS API pointed at a closed local port. Nothing here talks to k2.dev |
+| `agents-egress-locked/` | Opt-in: `agents` plus a NetworkPolicy allowing only DNS and TCP 443 out |
 | `scripts/kind/up.sh`, `down.sh` | One command up, one command down |
 
 ## 1. Bring it up
@@ -51,6 +53,12 @@ sends that as `?token=` on every request and WebSocket. `http://` on
 not treated as your local daemon (`src/renderer/lib/connect-validate.ts`
 `parseServerUrl`). The app's version check needs `/boot-status`
 `phase=ready`. The daemon's version string doesn't have to match the app's.
+
+**Always use `http://127.0.0.1:7440`** (or your `K2_KIND_PORT`). Never use
+`https://` or a `*.k2.dev` address: this host has no tunnel, and the app
+never routes `http://127.0.0.1` through k2.dev. Don't run `k2 tunnel` in the
+pod. Push, publish URLs, custom domains and federation are unavailable here.
+`K2_AIRGAP` stays unset on purpose, because it would block `/login`.
 
 1. Open **Settings**. In the group **Network**, click **Connected Servers**.
    Shortcut: open the server menu in the top bar (⌘L) and click
@@ -149,6 +157,18 @@ scripts/kind/down.sh --keep-data  # stops the port-forward, scales to 0, keeps t
 ```
 
 Then remove **kind k2lab** in **Settings → Connected Servers**.
+
+## Optional: prove it needs nothing but HTTPS
+
+```sh
+kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egress-locked \
+  | kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f -
+```
+
+This adds a NetworkPolicy that denies the pod every egress except DNS and
+TCP 443. The port-forward goes through the kubelet, so the app's connection
+is unaffected. Remove it with
+`kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind delete networkpolicy k2-solo-egress`.
 
 ## Proof without a real agent (S1)
 

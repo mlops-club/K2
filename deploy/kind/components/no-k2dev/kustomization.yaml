@@ -1,0 +1,27 @@
+# K2 on kind needs nothing from k2.dev: the app reaches the pod at
+# http://127.0.0.1:<port> through kubectl port-forward, never through a
+# tunnel. These settings make that explicit (envFrom the solo ConfigMap):
+#
+#   K2_TUNNEL_LEASE=off      no daemon-side tunnel lease (k2_core::tunnel::lease)
+#   K2_FEDERATION=off        the default; the env can only switch it ON
+#                            (k2_core::federation::enabled), so this documents
+#                            intent rather than forcing it off
+#   K2_RELAY_LIST_URL, K2_DNS_API_BASE
+#                            point the relay list and the DNS API at a closed
+#                            local port (discard, 9), so neither reaches k2.dev
+#
+# K2_AIRGAP is deliberately NOT set: it blocks the LLM logins (/login).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+patches:
+  - target: {kind: ConfigMap, name: k2-solo}
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: k2-solo
+      data:
+        K2_TUNNEL_LEASE: "off"
+        K2_FEDERATION: "off"
+        K2_RELAY_LIST_URL: http://127.0.0.1:9/disabled
+        K2_DNS_API_BASE: http://127.0.0.1:9

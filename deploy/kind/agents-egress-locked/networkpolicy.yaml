@@ -1,0 +1,16 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: k2-solo-egress
+  namespace: k2-kind
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: k2-solo
+  policyTypes: [Egress]
+  egress:
+    - ports:                       # cluster DNS
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - ports:                       # HTTPS out (Claude sign-in and API)
+        - {protocol: TCP, port: 443}

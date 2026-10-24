@@ -139,35 +139,92 @@ scripts/kind/down.sh          # stops the port-forward, deletes namespace k2-kin
 - **Login storage:** `/var/lib/k2/.claude/.credentials.json`, the wallet's
   "live store" (`llm_accounts/mod.rs`), on the PVC.
 
+## Evidence (2026-10-24)
+
+S1 against the fake pod through the port-forward, from a clean namespace
+(`down.sh --fake` then `up.sh --fake`), evidence in
+`lab-runs/kind/2026-10-24T18-55-43Z/` (first run: `…T18-45-52Z`, same result):
+
+```text
+S1 PASS
+  ok   spawn returns a session
+  ok   spawn is fresh, not reused
+  ok   attach to /cli/sessions/grid
+  ok   the fake agent runs as claude (banner on the grid)
+  ok   the agent shows its prompt
+  ok   the reply comes back on the grid
+  ok   transcript in the agent home has the prompt
+  ok   close is accepted
+```
+
+The first run took 1070 ms from spawn to banner and 601 ms from typing to
+the reply. The SessionStart, UserPromptSubmit and Stop hooks ran inside the
+pod with exit 0. Daemon `k2-daemon 0.46.3` (`/boot-status`: phase ready,
+protocol 1–1, installKind package).
+
+Other checks:
+
+| Check | How | Result |
+|---|---|---|
+| App login | `up.sh` on `k2-kind`, then `POST /cli/auth/login` as the app does | 64-char session token, role owner, `mustChangePassword` false; `/boot-status`, `/cli/auth/whoami`, `/cli/fs/info` (home `/var/lib/k2`) all 200 with it |
+| Claude in the agents image | `ls` in the `k2-kind` pod (claude not run) | `/usr/local/bin/claude` 2.1.308, `DISABLE_AUTOUPDATER=1`, `~/.k2/bin/{k2-open,xdg-open}` staged |
+| Login URL reaches the app | fake pod: subscribe to `/cli/sessions/events` through the port-forward, run `~/.k2/bin/xdg-open <url>` in the pod | `{"kind":"open_url","url":…,"source":"shim"}` arrived at the client |
+| Survives a restart | fake pod: write `~/.claude/persist-probe`, `kubectl delete pod`, wait | file still there; port-forward reconnected by itself (ready after 4 s); app login still works |
+| `down.sh --fake` | then `kubectl get ns`, `lsof :7441` | namespace gone, port free |
+
+The agent's PTY gets `~/.k2/bin` first on its PATH, so Claude's `xdg-open` is
+the shim. That comes from reading `open_shim.rs` and `daemon_pty`; the fake
+agent never calls `xdg-open`.
+
 ## Status
 
-- **Milestone:** code written (Dockerfiles, overlays, `up.sh`, `down.sh`,
-  `port-forward.sh`, `s1.sh`, runbook). Not yet built or run: the
-  coordinator asked for no Docker builds until `image`'s `k2-daemon:dev`
-  exists.
-- **Next:** build `k2-agents:fake`, run `up.sh --fake` and `s1.sh`, and
-  record the S1 output here. Then run `up.sh`, check the login, and run
-  `down.sh`.
+- **Milestone:** first working slice, done for the owner's path.
+  `up.sh` gave a working URL and login on `k2-kind`, and the coordinator now
+  owns that pod. S1 passes through the port-forward.
+- **Added on request:** `deploy/kind/components/no-k2dev` (shared by both
+  overlays) and the opt-in `deploy/kind/agents-egress-locked` overlay.
+  Checked by rendering with `kubectl kustomize` only, because the
+  coordinator paused cluster work (the Docker VM was overloaded).
+  On RESUME: apply to `k2-kind-fake` (`up.sh --fake`), check the env in the
+  pod, and re-run S1. Do not re-apply `k2-kind`: the owner is in it. A
+  later `up.sh` there changes only the ConfigMap, and `envFrom` takes effect
+  at the next pod restart, not at apply.
+- **Fixes found by running it:**
+  - The login step in `up.sh` exited silently: SIGPIPE from
+    `tr </dev/urandom | head` under `pipefail`, and a JSON literal that
+    brace-expanded. The script now uses Python `secrets`, and builds the
+    bodies with `json.dumps`, with values passed through the environment so
+    the password never appears on argv.
+  - A run that died left an orphaned `kubectl port-forward` holding the port.
+    `kind_stop_forward` now also kills by this variant's own kubeconfig path.
+  - The fake pod crash-looped because a test daemon (`K2_TEST_AGENT_SHIM_DIR`
+    set) panics when HOME is its user's real home (`zen::sync::
+    guard_real_home`). `Dockerfile.fake` now moves the k2 user's passwd home
+    to `/home/k2-fake`; HOME stays `/var/lib/k2`. This affects the fake
+    image only.
 - **Decisions (mine, inside owned files):**
   - Own namespaces (`k2-kind`, and `k2-kind-fake` for the S1 proof) so this
     never collides with `image`'s `k2-solo` namespace on the same cluster.
     The overlays rename the namespace with kustomize; `solo.yaml` is
     untouched.
   - Claude Code 2.1.308 (npm `stable` tag on 2026-10-24), the native linux
-    binary from `@anthropic-ai/claude-code-linux-<arch>`, at
-    `/usr/local/bin/claude`. The daemon always puts that directory on an
-    agent's PATH (`login_path::known_fallback_dirs`).
+    binary, at `/usr/local/bin/claude`. The daemon always puts that
+    directory on an agent's PATH (`login_path::known_fallback_dirs`).
     `DISABLE_AUTOUPDATER=1`, because a self-update would land in
     `~/.local/bin` on the volume, which is also on the agent PATH. No codex:
     it needs Node at runtime plus its own binary, which isn't cheap.
   - `up.sh` builds `k2-daemon:dev` only when it is missing (or with
-    `--rebuild-daemon`). It is the `image` task's long release build;
-    `k2-agents` is rebuilt every time. A pod-template annotation with the
-    image id rolls the pod only when the image changed (the tag stays `dev`).
+    `--rebuild-daemon`), because it is the `image` task's long release
+    build. A pod-template annotation with the image id rolls the pod only
+    when the image changed (the tag stays `dev`). That is how the fixed fake
+    image replaced the crash-looping pod.
   - S1 runs unchanged from `tests/lab`. A copy loop mirrors the pod's
-    `~/.claude/projects` and the fake trace into a local temp dir while it
-    runs, and the agent's cwd is `/work/lab-agent`, so the pod and the Mac
-    compute the same project slug.
+    `~/.claude/projects` and the fake trace into a local temp dir, and the
+    agent's cwd is `/work/lab-agent`, so the pod and the Mac compute the
+    same project slug.
+  - `K2_FEDERATION=off` is set as asked, but the env can only turn
+    federation on; a persisted app setting would still win. Off is the
+    default anyway.
   - Owner decision 2026-10-24: no credential Secret; login is `/login` in a
     claude session opened from the app.
 - **Open questions:** none.

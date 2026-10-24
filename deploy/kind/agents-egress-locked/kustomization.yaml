@@ -1,0 +1,16 @@
+# OPT-IN: deploy/kind/agents plus a NetworkPolicy that denies the pod all
+# egress except DNS and TCP 443, to show K2 on kind depends on nothing else
+# (no k2.dev tunnel or relay ports). Claude's sign-in and API calls are
+# HTTPS (443), so /login and agent work still run.
+#
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egress-locked \
+#     | kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f -
+#
+# kubectl port-forward goes through the kubelet, not the pod network, so the
+# app's connection is unaffected. Enforcement needs a CNI that implements
+# NetworkPolicy (kind's kindnet does, from kind v0.24).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../agents
+  - networkpolicy.yaml
