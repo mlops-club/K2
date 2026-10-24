@@ -1,3 +1,4 @@
+# shellcheck shell=bash disable=SC2034  # sourced; the KIND_* vars are for the callers
 # Shared settings for scripts/kind/*.sh (sourced, not run).
 #
 # Only ever the kind cluster k2lab, only ever through an explicit kubeconfig

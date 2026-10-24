@@ -24,6 +24,7 @@
 # Claude in with /login from the app, and the daemon token is read into
 # memory only, never printed or put on a command line.
 set -euo pipefail
+# shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
 variant=agents rebuild_daemon=0 reset_password=0

@@ -13,6 +13,7 @@
 # path with no symlinks on either side, so the pod and S1 agree on Claude's
 # project slug for it.
 set -euo pipefail
+# shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 kind_variant fake
 kind_kubeconfig
@@ -69,5 +70,5 @@ kill "$copier" 2>/dev/null; wait "$copier" 2>/dev/null || true; copier=""
     echo "sha: $(git rev-parse HEAD)"
 } > "$out/topology.txt"
 curl -s --connect-timeout 2 "http://127.0.0.1:$port/boot-status" > "$out/boot-status.json" || true
-say "evidence: ${out#$KIND_REPO/}/"
+say "evidence: ${out#"$KIND_REPO"/}/"
 exit "$rc"

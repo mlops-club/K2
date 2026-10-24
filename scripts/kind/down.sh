@@ -10,6 +10,7 @@
 # Local images (k2-daemon:dev, k2-agents:*) stay in Docker; remove them with
 # `docker image rm` if you want the space back.
 set -euo pipefail
+# shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
 variant=agents keep=0

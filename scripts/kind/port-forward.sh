@@ -5,6 +5,7 @@
 #
 #   scripts/kind/port-forward.sh <agents|fake>
 set -uo pipefail
+# shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 kind_variant "${1:?usage: port-forward.sh <agents|fake>}" || exit 2
 trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
