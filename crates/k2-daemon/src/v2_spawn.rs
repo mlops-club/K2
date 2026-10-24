@@ -619,6 +619,7 @@ pub fn handle_v2_spawn(body: &[u8]) -> HandlerResult {
 /// `/v1/sandboxes` calls it directly with a host-trusted request from the
 /// policy-resolver.
 pub fn spawn_session(req: SpawnRequest) -> HandlerResult {
+    let _trace = k2_core::trace::spawn_request(&req.agent_name, req.command.as_deref());
     if req.agent_name.is_empty() {
         return HandlerResult {
             status: "400 Bad Request",

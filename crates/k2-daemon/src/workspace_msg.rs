@@ -1519,6 +1519,7 @@ fn inject_framed_locked(live: &session_lookup::LiveSession, payload: &str) -> In
         }
     };
     let actions = k2_core::inject_flow::compile_inject_flow(&flow, &body);
+    k2_core::trace::emit(|| k2_core::trace::Event::new("host.inject").pane(&live.session_id().to_string()).attr("bytes", body.len()));
     match crate::agent_host::host().inject(live, actions) {
         crate::agent_host::InjectResult::Delivered => InjectOutcome::Delivered,
         crate::agent_host::InjectResult::ChildGone => InjectOutcome::PtyDied,
