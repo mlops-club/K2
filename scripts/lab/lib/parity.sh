@@ -64,10 +64,13 @@ run_clean() {
     local envs=(); while IFS= read -r l; do envs+=("$l"); done < <(suite_env "$h")
     ( cd "$cwd" && exec env -i "${envs[@]}" "$@" ) >"$log" 2>&1 &
     local pid=$! rc
-    ( sleep "$deadline"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) &
+    # The watchdog holds no stdout/stderr (a caller piping our output, e.g.
+    # through tee, would otherwise wait for its sleep), and its sleep dies
+    # with it.
+    ( sleep "$deadline"; kill -TERM "$pid" 2>/dev/null; sleep 5; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 </dev/null &
     local dog=$!
     wait "$pid"; rc=$?
-    kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null
+    pkill -P "$dog" 2>/dev/null; kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null
     if [ $rc -eq 143 ] || [ $rc -eq 137 ]; then
         echo "lab: stopped after ${deadline}s (hung?)" >>"$log"; rc=124
     fi
