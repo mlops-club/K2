@@ -171,12 +171,23 @@ set.
 
 ## Status
 
-- **Milestone:** first working slice. `prove.sh G0 --topology solo --parity none`
-  runs end to end: builds the daemon and fake agent, boots the solo sandbox,
-  S1 passes over the app's routes, and the bundle is written (gate red, as it
-  must be without parity). First full-parity run in progress.
-- **Next:** full parity run (Linux gate in Docker, `tests/cli/*.sh`, tiers,
-  must-not-break), record the I5 baseline, tests for the report writer.
+- **Milestone:** first working slice, hardened. `prove.sh G0 --topology solo`
+  (and `--parity none`) runs end to end; S1 passes over the app's routes.
+- **Waiting on:** the coordinator's go (the Mac is shared; image's kind build
+  is the critical path) before the next heavy runs: `cargo test -p k2-core` and
+  `-p k2-daemon` under `lab_cargo`, then `prove.sh --record-baseline`, then a
+  verification run for I5.
+- **Safety incident (2026-10-24, fixed):** an early host `cargo test -p
+  k2-core` here ran with the real HOME; pre-existing tests
+  (`garden_data/signer_gate.rs`, a workspace lifecycle-seed test) wrote
+  `~/.k2/auth-audit.jsonl` and `~/.k2/wiki`. Since commit 2078ac05b every lab
+  cargo command goes through `lab_cargo` (env -i, throwaway HOME and TMPDIR,
+  as the Linux gate's `clean_cargo`); the two tests are the coordinator's
+  follow-up, not lab files.
+- **First full run (exploratory, pre-fixes):** S1 pass; must-not-break pass
+  (its 3 `k2 db` checks are reported not run off Linux, by the suite itself);
+  tier 3 and tier 1 fail (pre-existing, below); `tests/cli` 156 scripts, a few
+  Linux-only ones fail; the Linux gate did not run (old invocation).
 
 ### Decisions inside owned files
 
