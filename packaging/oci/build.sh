@@ -3,6 +3,7 @@
 #
 #   packaging/oci/build.sh [tag]        # default k2-daemon:dev
 #   CARGO_BUILD_JOBS=8 packaging/oci/build.sh   # more parallel rustc jobs (default 4)
+#   K2_BUILD_PROFILE=ship packaging/oci/build.sh k2-daemon:0.46.3   # shipping profile (fat LTO, slow)
 #
 # Local only: never pushes. Cargo's registry and target dir are BuildKit
 # cache mounts, so a rebuild after a small change is incremental.
@@ -13,6 +14,7 @@ DOCKER_BUILDKIT=1 docker build \
     -f "$root/packaging/oci/Dockerfile" \
     -t "$tag" \
     --build-arg "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}" \
+    --build-arg "K2_BUILD_PROFILE=${K2_BUILD_PROFILE:-dev}" \
     --label "org.opencontainers.image.revision=$(git -C "$root" rev-parse HEAD)" \
     --label "org.opencontainers.image.version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/crates/k2-daemon/Cargo.toml" | head -1)" \
     "$root"
