@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # K2 in a container (PRD "K2 Distributed Runtime", stage P0, "Container"
 # topology): today's daemon, controller plus in-process agent host
 # (K2_ROLE=all), as one image for Docker Compose and Kubernetes.
