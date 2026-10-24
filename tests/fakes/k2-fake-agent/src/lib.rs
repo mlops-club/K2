@@ -25,7 +25,10 @@
 //!   it.
 //!
 //! With `K2_FAKE_AGENT_TRACE=<file>` it also appends its own trace events
-//! (the lab trace format, `docs/prd/progress/lab.md`) to that file.
+//! (the lab trace format, `docs/prd/progress/lab.md`) to that file:
+//! `cli.exec`, `cli.hook` (before the hook command runs), `cli.hook.done`
+//! (after, with its exit status), `cli.turn.start`, `cli.turn.end`,
+//! `cli.exit`.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -516,12 +519,17 @@ impl Session {
     }
 
     /// Fire every hook registered for `event`. Returns how many ran.
+    ///
+    /// Trace order matches a real CLI: `cli.hook` is written BEFORE the hook
+    /// command starts (so it precedes anything the daemon logs on receiving
+    /// it, e.g. `cell.*`), and `cli.hook.done` with the exit status after.
     pub fn fire(&self, event: &str, source: Option<&str>, extra: Value) -> usize {
         let hooks = hooks_for(&self.settings_files, event, source);
         let payload = self.payload(event, extra);
         for h in &hooks {
+            self.trace("cli.hook", json!({ "hook": event, "async": h.is_async }));
             let code = run_hook(h, &payload, &self.cwd);
-            self.trace("cli.hook", json!({ "hook": event, "exit": code, "async": h.is_async }));
+            self.trace("cli.hook.done", json!({ "hook": event, "exit": code, "async": h.is_async }));
         }
         if hooks.is_empty() {
             self.trace("cli.hook", json!({ "hook": event, "registered": 0 }));

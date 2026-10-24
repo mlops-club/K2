@@ -345,3 +345,49 @@ fn trace_events_use_the_lab_format() {
     assert_eq!(t[1]["attrs"]["hook"], "SessionStart");
     assert_eq!(t[1]["attrs"]["registered"], 0);
 }
+
+/// `cli.hook` is traced before the hook command runs and `cli.hook.done`
+/// (with the exit status) after: the hook's own side effect, written to the
+/// same trace file, lands between them. Wave 2's flows rely on `cli.hook`
+/// preceding whatever the daemon records on receiving the hook.
+#[test]
+fn cli_hook_is_traced_before_the_hook_runs_and_done_after() {
+    let b = Box_::new();
+    let trace = b.home().join("trace.jsonl");
+    let mark = |tag: &str| {
+        format!("printf '{{\"ts\":\"x\",\"event\":\"hook.ran\",\"attrs\":{{\"tag\":\"{tag}\"}}}}\\n' >> '{}'; exit 3", trace.display())
+    };
+    let settings = serde_json::json!({ "hooks": {
+        "SessionStart": [{ "hooks": [{ "type": "command", "command": mark("start") }] }],
+        "Stop": [{ "hooks": [{ "type": "command", "command": mark("stop") }] }],
+    }});
+    fs::create_dir_all(b.home().join(".claude")).unwrap();
+    fs::write(b.home().join(".claude/settings.json"), settings.to_string()).unwrap();
+    let o = b.run_in(BIN, &["--session-id", SID], "x\n", &[("K2_FAKE_AGENT_TRACE", trace.to_str().unwrap())]);
+    assert!(o.status.success(), "{o:?}");
+    let seq: Vec<String> = lines(&trace)
+        .iter()
+        .filter(|v| v["event"].as_str().unwrap().starts_with("cli.hook") || v["event"] == "hook.ran")
+        .map(|v| {
+            let a = &v["attrs"];
+            match v["event"].as_str().unwrap() {
+                "hook.ran" => format!("ran {}", a["tag"].as_str().unwrap()),
+                "cli.hook.done" => format!("done {} exit={}", a["hook"].as_str().unwrap(), a["exit"]),
+                e => format!("{e} {}", a["hook"].as_str().unwrap()),
+            }
+        })
+        .collect();
+    assert_eq!(
+        seq,
+        [
+            "cli.hook SessionStart",
+            "ran start",
+            "done SessionStart exit=3",
+            "cli.hook UserPromptSubmit", // registered: 0, nothing runs
+            "cli.hook Stop",
+            "ran stop",
+            "done Stop exit=3",
+            "cli.hook SessionEnd",
+        ]
+    );
+}
