@@ -134,14 +134,61 @@ that scheduler is installed. Note the DB file is `k2so.db`, not `k2.db`.
 
 To be filled once the first slice works.
 
+## Decisions (owner via coordinator, 2026-10-24)
+
+1. **`~/.k2so` compat symlink:** not created when `K2_HOME` is set
+   (`migrate_home_dir` only creates the K2 home, `HomeMigration::K2HomeSet`).
+   Unset `K2_HOME` keeps today's migration exactly. Tested both ways.
+2. **Runtime dir:** keeps its own `K2_RUNTIME_DIR`; not folded into `K2_HOME`.
+3. **Provider homes** (`~/.claude`, `~/.cursor`, `~/.codex`, `~/.grok`,
+   `~/.hermes`, the claude-auth LaunchAgent): stay under `$HOME`, out of
+   scope. See follow-ups.
+4. **Clippy:** no new findings in changed files compared with `k2-dist/wave1`.
+
+## Semantics (worker's call, inside owned files)
+
+- `K2_HOME` set and absolute: that dir is the K2 home.
+- `K2_HOME` unset or empty: `$HOME/.k2`, as before.
+- `K2_HOME` relative: refused. `k2_home()` panics with
+  `K2_HOME must be an absolute path, got "…"`; `k2-daemon` checks first
+  and exits 2 with `[daemon] FATAL: …` before touching any path.
+  Reason: a relative home follows the working directory, so the daemon and
+  a CLI could silently disagree.
+- Seams that take an explicit `$HOME` (tests) use `paths::k2_home_for(home)`:
+  `$K2_HOME` when set, else `home/.k2`.
+- Callers that used to refuse when there is no home dir use
+  `paths::k2_home_opt()` and keep refusing (byte-for-byte fallbacks).
+- `notify.sh` (agent hook) keeps `"$HOME/.k2/heartbeat.port"` when unset;
+  with `K2_HOME` it names the absolute, shell-quoted port file, because the
+  agent CLI's `$HOME` is not the K2 home.
+
+## Follow-ups (outside this task's files)
+
+- Provider homes stay under `$HOME` (decision 3). A container sets `HOME`
+  to its volume for `~/.claude` and friends.
+- `cli/**` (the `k2` CLI), `src-tauri/**`, `crates/k2-menubar`,
+  `crates/k2-node`, `crates/k2-app-engine`, `crates/k2-vault`,
+  `crates/k2-root-helper`: their own `~/.k2` resolution is not touched;
+  they should call `k2_client::paths` so a client with `K2_HOME` finds the
+  daemon's `daemon.port`/`daemon.token`. `k2-ptyd` already takes
+  `K2_HOME` from the daemon (`paths::k2_home()`), unchanged.
+- `k2_core::compute::local::HOME_SPOTS` lists `.k2` among `$HOME` dirs a
+  compute node never syncs; a `K2_HOME` outside `$HOME` is not on that list.
+- The macOS keychain: the boot keychain probe (`tunnel::lease`) is gated by
+  `K2_TUNNEL_LEASE=off`, not by `K2_HOME`. Containers should set it.
+
 ## Status
 
-- **Milestone:** diagrams written.
-- **Next:** measure what a fresh daemon writes on boot; settle provider
-  homes and the `~/.k2so` symlink with the owner; then the resolver,
-  call sites and ratchet.
-- **Open questions:** provider/OS homes written on boot; `~/.k2so`
-  compat symlink when `K2_HOME` is set.
+- **Milestone:** first working slice. The resolver and every converted call
+  site compile (`cargo check -p k2-client -p k2-core -p k2-daemon
+  --all-targets`); ratchet tests written.
+- **Next:** run the ratchet and new tests, the integration test that boots
+  `k2-daemon` with `K2_HOME`, the full `k2-core`/`k2-daemon` suites, clippy
+  diff against `k2-dist/wave1`, then the try-it.
+- **Open questions:** none.
 - **Toolchain note:** this Mac had no Rust toolchain. The worker installed
   rustup into `~/.cache/k2-dist-rust` (`RUSTUP_HOME`/`CARGO_HOME` there,
-  nothing in `~/.cargo` or `~/.rustup`, no shell profile edits).
+  nothing in `~/.cargo` or `~/.rustup`, no shell profile edits). Building
+  `llama-cpp-sys-2` needs `CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON` here
+  (Homebrew OpenSSL 3.6 headers break cpp-httplib). Builds use
+  `CARGO_BUILD_JOBS=4`, tests `--test-threads=4`.
