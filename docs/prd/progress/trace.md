@@ -168,11 +168,11 @@ cargo test -p k2-core --lib -- trace::
 - **Milestone:** diagrams written; sink, emission lines and the G1 runner
   written, first build in progress.
 - **Next:** unit tests green, first solo run, latency check (NFR1).
+- **Answered:** `crash.json` lives in `docs/prd/flows/` (coordinator,
+  2026-10-24); the lab's `3105385e6` (cherry-picked here, drops out at
+  rebase) lets `test_flows.py` accept flow files beyond the 11 PRD ones.
 - **Open questions (asked, waiting):**
-  1. Where `crash.json` lives. In `docs/prd/flows/` it fails the lab's
-     `test_one_file_per_prd_flow_and_in_sync` (exactly the 11 PRD flows).
-     Recommended: `docs/prd/flows/extra/` now, moved when G1 is wired.
-  2. `cli.hook` timing. The fake agent writes `cli.hook` after the hook
+  1. `cli.hook` timing. The fake agent writes `cli.hook` after the hook
      command returns; the daemon handles the hook inside that command, so
      every daemon hook event precedes it and hook, spawn and crash fail on
      order. Recommended: the lab worker writes `cli.hook` before running
