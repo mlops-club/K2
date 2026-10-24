@@ -355,6 +355,9 @@ impl Engine {
             "podman": podman,
             "seccomp": crate::seccomp::file_name(),
             "uid": unsafe { libc::getuid() },
+            // K2 distributed runtime P0: "package" means a package manager
+            // owns this binary and the daemon must not install over it.
+            "installKind": crate::install_kind(),
         }))
     }
 

@@ -165,6 +165,9 @@ fn helper_dir(ctx: &Ctx) -> HResult<Dir> {
 /// §9.2. Every check runs before any write; the candidate is never
 /// executed (this function has no `Exec` in reach).
 pub fn self_update(ctx: &Ctx, payload: &[u8]) -> HResult<serde_json::Value> {
+    if ctx.is_package_install() {
+        return Err(Fail::sig("package_owned"));
+    }
     let (sig, elf) = decode_payload(payload).map_err(Fail::sig)?;
     let keys = trusted_keys(ctx.test_keys);
     let built = verify_signed_build(elf, sig, &keys, ctx.arch).map_err(Fail::sig)?;

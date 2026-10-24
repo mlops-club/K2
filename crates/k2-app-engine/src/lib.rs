@@ -45,6 +45,13 @@ pub static BUILD_MARKER: &str = concat!("K2_APP_ENGINE_BUILD v=", env!("K2_PRODU
 #[used]
 pub static TEST_KEYS_FLAG: &str = "K2_APP_ENGINE_TEST_KEYS_ENABLED";
 
+/// How this engine binary was installed (`k2_root_proto::install_kind`,
+/// the daemon's rule). Reported in `version`; the daemon won't install
+/// over a `"package"` engine.
+pub fn install_kind() -> &'static str {
+    k2_root_proto::install_kind::classify_install_kind(std::env::current_exe().ok().as_deref())
+}
+
 /// Referenced from `version` so the linker keeps both strings.
 pub fn build_strings() -> (&'static str, Option<&'static str>) {
     #[cfg(feature = "test-keys")]

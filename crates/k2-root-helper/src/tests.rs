@@ -2124,3 +2124,24 @@ mod front_tests;
 // The several-majors verbs (protocol 9, `namespaces.pgmajor`), same fakes.
 #[path = "pg_major_tests.rs"]
 mod pg_major_tests;
+
+/// K2 distributed runtime P0: a helper a package manager (or an OCI image)
+/// installed under `/usr/` refuses `helper self-update` with
+/// `package_owned`, the daemon's install-kind rule, and changes nothing.
+#[test]
+fn self_update_refuses_a_package_installed_helper() {
+    for exe in ["/usr/bin/k2-root-helper", "/usr/lib/k2/k2-root-helper", "/usr/libexec/k2-root-helper"] {
+        let mut t = box_root();
+        t.ctx.self_exe = t.p(exe);
+        assert!(t.ctx.is_package_install(), "{exe}");
+        let before = std::fs::read(t.p(HELPER_PATH)).unwrap();
+        let nv = next_version();
+        let o = t.call_in(&["helper", "self-update"], &payload(&build(&nv, PROTOCOL), &nv, PROTOCOL));
+        assert_eq!(o.code, exit::SIGNATURE, "{exe}: {}", o.stderr);
+        assert!(o.stderr.contains("package_owned"), "{exe}: {}", o.stderr);
+        assert_eq!(std::fs::read(t.p(HELPER_PATH)).unwrap(), before, "{exe}: helper untouched");
+    }
+    // The canonical path is not a package install (production and tests).
+    let t = box_root();
+    assert!(!t.ctx.is_package_install());
+}

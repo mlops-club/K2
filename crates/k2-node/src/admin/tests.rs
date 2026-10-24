@@ -517,3 +517,24 @@ fn auto_update_off_refuses_auto_offers_only() {
     assert_eq!(code_of(&r.exec.handle_update(&update_cmd(&r, &new, "99.0.0", "auto"), &sig, &new)), code::AUTO_UPDATE_OFF);
     assert_eq!(r.exec.handle_update(&update_cmd(&r, &new, "99.0.0", "explicit"), &sig, &new).state, "done");
 }
+
+/// K2 distributed runtime P0: a package-installed node (under `/usr/`, as
+/// in the OCI image) refuses update offers and stops advertising
+/// `self-update`; any other install keeps both, exactly as before.
+#[test]
+fn a_package_installed_node_never_self_updates() {
+    use std::path::Path;
+    for exe in ["/usr/bin/k2-node", "/usr/lib/k2/k2-node", "/nix/store/abc-k2/bin/k2-node"] {
+        let m = crate::admin::courier::package_owned(Some(Path::new(exe))).expect(exe);
+        assert!(m.contains("package manager"), "{m}");
+        let f = crate::node::node_features_for(Some(Path::new(exe)));
+        assert!(!f.iter().any(|x| x == k2_node_proto::admin::FEATURE_SELF_UPDATE), "{exe}: {f:?}");
+        assert!(f.iter().any(|x| x == k2_node_proto::admin::FEATURE_ADMIN), "{exe}: other features stay");
+    }
+    for exe in ["/usr/local/bin/k2-node", "/home/u/.k2/bin/k2-node"] {
+        assert_eq!(crate::admin::courier::package_owned(Some(Path::new(exe))), None, "{exe}");
+        let f = crate::node::node_features_for(Some(Path::new(exe)));
+        assert!(f.iter().any(|x| x == k2_node_proto::admin::FEATURE_SELF_UPDATE), "{exe}: {f:?}");
+    }
+    assert_eq!(code::PACKAGE_OWNED, "package_owned");
+}

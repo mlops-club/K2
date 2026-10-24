@@ -256,6 +256,12 @@ pub struct Node {
 
 /// What this node understands beyond protocol 1 (the offer says it).
 pub fn node_features() -> Vec<String> {
+    node_features_for(std::env::current_exe().ok().as_deref())
+}
+
+/// [`node_features`] for a binary at `exe`: a package-installed node
+/// (`k2_root_proto::install_kind`) doesn't offer `self-update`.
+pub fn node_features_for(exe: Option<&std::path::Path>) -> Vec<String> {
     let mut f = vec![
         k2_node_proto::needs::FEATURE_NEEDS.to_string(),
         k2_node_proto::admin::FEATURE_ADMIN.to_string(),
@@ -264,6 +270,9 @@ pub fn node_features() -> Vec<String> {
         results::FEATURE_ARTIFACTS.to_string(),
         k2_node_proto::frames::FEATURE_STALL.to_string(),
     ];
+    if k2_root_proto::install_kind::is_package_install(exe) {
+        f.retain(|x| x != k2_node_proto::admin::FEATURE_SELF_UPDATE);
+    }
     if crate::packages::installer_present() {
         f.push(k2_node_proto::needs::FEATURE_SYSTEM_PACKAGES.to_string());
     }
@@ -741,15 +750,15 @@ impl Node {
             loop {
                 tokio::time::sleep(node.opts.config_poll).await;
                 n += 1;
-                let power = n % 5 == 0;
+                let power = n.is_multiple_of(5);
                 node.refresh_local(power);
-                if n % 300 == 0 {
+                if n.is_multiple_of(300) {
                     node.probe_tools().await;
                 }
-                if n % 1800 == 0 {
+                if n.is_multiple_of(1800) {
                     node.janitor_pass().await;
                 }
-                if n % 5 == 0 {
+                if n.is_multiple_of(5) {
                     node.write_status();
                 }
                 crate::admin::housekeeping::process_gc_request(&node).await;

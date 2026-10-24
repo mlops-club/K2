@@ -1806,3 +1806,17 @@ fn nft_app_box_ports_join_the_apps_rule_and_a_new_list_replaces_the_old() {
         assert_ne!(t.call(&["apps", "nft", "app", "hearth", "38602", bad]).code, 0, "{bad}");
     }
 }
+
+/// K2 distributed runtime P0: a packaged helper means a packaged K2, so
+/// `apps install-engine` refuses `package_owned` and writes nothing.
+#[test]
+fn install_engine_refuses_from_a_package_installed_helper() {
+    let mut t = box_root();
+    engine_box(&t);
+    t.ctx.self_exe = t.p("/usr/bin/k2-root-helper");
+    let o = t.call_in(&["apps", "install-engine"], &engine_payload("0.46.1"));
+    assert_eq!(o.code, exit::SIGNATURE, "{}", o.stderr);
+    assert!(o.stderr.contains("package_owned"), "{}", o.stderr);
+    assert!(!t.p(ENGINE_PATH).exists(), "no engine written");
+    assert!(calls_of(&t, k2_root_proto::paths::RUNUSER).is_empty(), "nothing started");
+}
