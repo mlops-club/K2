@@ -164,8 +164,10 @@ hook) contain every step's event in order. A trace with no event from the
 system under test (only `lab` and `k2-fake-agent`) leaves every flow
 "expected only"; that is wave 1's state. The fake agent already emits
 `cli.exec`, `cli.hook` (`attrs.hook` = SessionStart, UserPromptSubmit, Stop,
-SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
-`K2_FAKE_AGENT_TRACE` is set.
+SessionEnd; written BEFORE the hook command starts, as a real CLI starts the
+hook before the daemon receives it), `cli.hook.done` (after, `attrs.exit`),
+`cli.turn.start`, `cli.turn.end` and `cli.exit` when `K2_FAKE_AGENT_TRACE` is
+set.
 
 ## Status
 
