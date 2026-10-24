@@ -265,6 +265,9 @@ fn full_body(settings: &k2_core::app_settings::AppSettings) -> serde_json::Value
         "connectLogin": {
             "ingress": settings.connect_login_ingress().as_wire(),
         },
+        // K2 distributed runtime P0: where each root-helper feature runs
+        // (host-native | delegated | off). Read-only; see `capabilities`.
+        "capabilities": crate::capabilities::report().to_json(),
     })
 }
 
@@ -470,38 +473,9 @@ pub fn install_kind() -> &'static str {
     classify_install_kind(exe.as_deref())
 }
 
-/// Pure classifier behind [`install_kind`], split out so it's unit-
-/// testable without depending on the test binary's own path. Returns one
-/// of `"bundled-app" | "package" | "standalone" | "unknown"`.
-pub fn classify_install_kind(exe: Option<&std::path::Path>) -> &'static str {
-    let Some(exe) = exe else {
-        return "unknown";
-    };
-    // A macOS app bundle nests the executable at
-    // `…/K2.app/Contents/MacOS/<bin>` (or, for the daemon since 0.43.2,
-    // `…/K2.app/Contents/Helpers/K2 Daemon.app/Contents/MacOS/k2-daemon`).
-    // Detect the `.app/Contents/`
-    // segment anywhere in the path — robust to the bundle name and to a
-    // sidecar daemon binary placed elsewhere under Contents/.
-    let s = exe.to_string_lossy();
-    if s.contains(".app/Contents/") {
-        return "bundled-app";
-    }
-    if is_package_path(&s) {
-        return INSTALL_KIND_PACKAGE;
-    }
-    "standalone"
-}
-
-/// `installKind` of a package-manager install (0.46.3).
-pub const INSTALL_KIND_PACKAGE: &str = "package";
-
-/// True for a path a package manager owns: under `/usr/` but not
-/// `/usr/local/` (FHS: `/usr` is the distribution's, `/usr/local` the
-/// admin's — where the standalone installers put K2), or the Nix store.
-fn is_package_path(s: &str) -> bool {
-    (s.starts_with("/usr/") && !s.starts_with("/usr/local/")) || s.starts_with("/nix/store/")
-}
+// The classifier lives in `k2-root-proto` so the root helper, the App
+// engine install and k2-node apply the same rule (K2 distributed runtime P0).
+pub use k2_root_proto::install_kind::{classify_install_kind, INSTALL_KIND_PACKAGE};
 
 /// Home M4/M5: `sessions/v2/spawn` honours `attach_only` (a live session
 /// is returned as-is; anything else is `404 session_not_live`). Released

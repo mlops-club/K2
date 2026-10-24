@@ -44,6 +44,7 @@ pub mod apps;
 pub mod caller;
 pub mod cli;
 pub mod engine;
+pub mod install_kind;
 pub mod keys;
 pub mod node_build;
 pub mod paths;
