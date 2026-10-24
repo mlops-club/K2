@@ -2,7 +2,7 @@
 //! keeps its whole K2 home there (DB, ports, tokens, vault, lock) and
 //! writes nothing under `$HOME`. A relative `K2_HOME` is refused at boot.
 //!
-//! The spawned daemon gets an empty temp `$HOME`, its own TMPDIR /
+//! The spawned daemon gets a cleared env, an empty temp `$HOME`, its own TMPDIR /
 //! XDG_RUNTIME_DIR (`DaemonRuntime`) and the usual test-daemon knobs, so
 //! it never reaches the production daemon, keychain or runtime dir.
 
@@ -71,7 +71,14 @@ fn spawn(root: &Path, k2_home: &std::ffi::OsStr) -> Daemon {
     let shim = root.join("agent-shim-empty");
     std::fs::create_dir_all(&shim).expect("shim dir");
     let rt = k2_core::test_env::DaemonRuntime::new(root);
+    // A clean env, as the Linux gate's `env -i`: an inherited SHELL /
+    // ZDOTDIR would make the daemon's login-shell PATH probe run the
+    // developer's own rc files, which may write under this `$HOME`
+    // (nvm's installer does), and that is not K2 writing.
     let child = Command::new(env!("CARGO_BIN_EXE_k2-daemon"))
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LANG", "C.UTF-8")
         .env("HOME", &home)
         .env("K2_HOME", k2_home)
         .envs(rt.envs())
