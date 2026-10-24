@@ -207,14 +207,42 @@ EOF
 - The macOS keychain: the boot keychain probe (`tunnel::lease`) is gated by
   `K2_TUNNEL_LEASE=off`, not by `K2_HOME`. Containers should set it.
 
+## Findings
+
+- **A login shell can write under `$HOME`.** At boot the daemon runs the
+  login shell (`k2_client::login_path`) to learn the user's `PATH`. With an
+  inherited `ZDOTDIR` (the owner's is `/Users/eric`) that runs the real
+  `~/.zshrc`, whose nvm hook wrote `$HOME/.nvm/{nvm.sh,nvm-exec}` into the
+  sentinel home. This is the user's shell, not K2, but it means "nothing
+  under `$HOME`" only holds with a clean env. The integration test and the
+  try-it clear the env (`env -i`), as the Linux gate does.
+- **Real-home test leaks (pre-existing, not this task's files):** run
+  with the real `HOME`, `garden_data/signer_gate.rs` writes
+  `~/.k2/auth-audit.jsonl`, and a workspace lifecycle-seed test writes
+  `~/.k2/wiki`. The worker's filtered `k2-core` runs around 11:20–11:30
+  used the real `HOME` and very likely caused the writes the coordinator
+  saw. Since then every cargo test runs with a fresh `mktemp -d` `HOME`
+  and `TMPDIR`. Follow-up owned by the coordinator.
+
+## Checks so far
+
+| Command (HOME = fresh temp dir from 12:00 on) | Result |
+|---|---|
+| `cargo check -p k2-client -p k2-core -p k2-daemon --all-targets` | clean, no warnings in these crates |
+| `cargo test -p k2-client --lib` | 99 passed |
+| `cargo test -p k2-core --lib -- k2_home` (7 env tests, lint, both ratchets) | 12 passed |
+| `cargo test -p k2-daemon --test k2_home_integration` | 2 passed |
+| `cargo test -p k2-daemon --lib -- no_new_k2_home_paths no_new_raw_env` | 2 passed |
+
 ## Status
 
 - **Milestone:** first working slice. The resolver and every converted call
   site compile (`cargo check -p k2-client -p k2-core -p k2-daemon
   --all-targets`); ratchet tests written.
-- **Next:** run the ratchet and new tests, the integration test that boots
-  `k2-daemon` with `K2_HOME`, the full `k2-core`/`k2-daemon` suites, clippy
-  diff against `k2-dist/wave1`, then the try-it.
+- **Next (paused):** heavy builds wait for the coordinator (the image
+  worker's kind build is the critical path). Then: the ratchet probe, the
+  full `k2-core`/`k2-daemon` suites with every `K2_*` unset, the clippy
+  diff against `k2-dist/wave1`, and the try-it run.
 - **Open questions:** none.
 - **Toolchain note:** this Mac had no Rust toolchain. The worker installed
   rustup into `~/.cache/k2-dist-rust` (`RUSTUP_HOME`/`CARGO_HOME` there,
