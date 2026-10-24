@@ -124,10 +124,137 @@ for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+'); do unset $v; done
 CARGO_BUILD_JOBS=4 cargo test -p k2-daemon --lib -- agent_host:: --test-threads=4
 ```
 
+## The interface
+
+`crates/k2-daemon/src/agent_host/mod.rs` (it lives in `k2-daemon`: every
+caller is daemon code, and `k2-core` needs none of it).
+
+| Group | `AgentHost` methods | In-process implementation (unchanged code it calls) |
+|---|---|---|
+| spawn and placement | `spawn`, `place`, `unplace`, `find_agent`, `find_session`, `placements` | `DaemonPtySession::spawn`; `v2_session_map::{register, unregister, lookup_*, snapshot}` |
+| attach and stream | `attach` (returns an `Attachment`: viewer registration, events, labels, pins), `detach`, `stream` (shared grid frames), `events`, `read_screen` | `attach_viewer`, `subscribe_*`, `detach_subscriber`, `grid_emitter::attach`, `snapshot_term` |
+| input, inject, resize, kill | `write`, `inject` (a compiled inject flow as one unit), `resize` (debounced), `resize_now`, `size`, `claimed_size`, `set_claimed_size`, `pin`, `set_label`, `mark_exited`, `kill` | `write`, the inject loop from `workspace_msg`, `request_resize`, `apply_resize_now`, `active_cols/rows`, `set_pinned`, `set_label`, `mark_child_exited`, `kill` |
+| hook events | `hook_events` | `hook_ingest::subscribe` |
+| the agent's home | `read_home`, `write_home` (relative paths only, atomic replace) | `std::fs` under `AgentHome::root` |
+
+Ids are explicit: an agent id (the placement key), the `SessionId`, and a
+`PlacementEpoch` (I1). Every in-process placement has `IN_PROCESS_EPOCH`
+(1). Sessions travel as `AgentSession` handles; `session_lookup::LiveSession`
+is now the same type under its older name, so its ~30 callers did not
+change. The trait is `pub(crate)` and object safe; the daemon holds one
+`&'static dyn AgentHost` (`agent_host::host()`).
+
+## Call sites moved
+
+| Group | File | What goes through `AgentHost` now |
+|---|---|---|
+| 1 spawn | `v2_spawn.rs` | find-or-spawn, evict, spawn, claimer seed, place, pending-live drain writes, close, refresh, child-exit observer (`events`, `mark_exited`, `unplace`), reuse fit (`size`, `resize_now`, claimed size) |
+| 1 spawn | `spawn.rs` | the same for the canonical workspace spawn |
+| 1 spawn | `agents_routes.rs` | no direct use: it spawns through `spawn.rs` (`spawn_agent_session_v2_blocking`) |
+| 1 spawn | `wake_headless.rs` | post-spawn lookup (`find_session`) |
+| 2 attach, stream | `sessions_grid_ws.rs` | lookup, `attach`, `stream`, pre-snap resize, input `write`, resize frames, input-claim resize, `detach` |
+| 2 attach, stream | `grid_emitter.rs` | unchanged: it is the in-process host's `stream` implementation (host-side code, see below) |
+| 3 input, kill | `terminal_routes.rs` | read (`read_screen`), label, pin, resize, write, reap (`unplace`) |
+| 3 input, kill | `workspace_msg.rs` | the injection call (`inject`) |
+| 3 input, kill | `watchdog.rs` | Ctrl-C (`write`), `kill`, `unplace` |
+| 3 input, kill | `active_reaper.rs` | `placements`, `unplace` |
+| 4 lookups | `session_lookup.rs` | every lookup; `LiveSession` = `AgentSession` |
+| 4 lookups | `v2_session_map.rs` | unchanged: it is the in-process host's placement table |
+
+### Host-side code that still reads the session directly
+
+`AgentSession::pty()` is the one escape hatch, used only by code that runs
+on the host in P2: the Term-reading half of `sessions_grid_ws.rs` (initial
+and resync snapshots, label and pin frames, the viewport arbitration in
+`apply_set_active` / `apply_claim_pin`) and `grid_emitter.rs`. In P2 that
+code moves into `k2-host` with the grid emitter, and the controller relays
+pre-encoded frames.
+
+### Other users of `DaemonPtySession` / `v2_session_map`, not moved
+
+| File | Uses | What moving it would take |
+|---|---|---|
+| `activity_events.rs`, `activity_store.rs`, `activity_transcript.rs`, `hook_ingest.rs` | `lookup_by_session_id` for pane facts and cwd | `host().find_session`; mechanical |
+| `agent_retire.rs`, `db_routes.rs`, `workspace_routes.rs` | `unregister`, `stop_workspace_sessions` | add `stop_workspace` to the trait (it is a placement sweep), or `unplace` per key |
+| `chat_overlay_ws.rs`, `llm_accounts_routes.rs`, `zen_agent_routes.rs` | `lookup_by_agent_name` | `host().find_agent`; mechanical |
+| `chat_routes.rs`, `companion_routes.rs`, `misc_routes.rs` | `LiveSession.0.label()`, `.set_label()` | `AgentSession::label()`, `host().set_label`; mechanical |
+| `compute_manage.rs`, `ops_routes.rs`, `publish_runtime.rs`, `v1_ws_message.rs`, `vault/mod.rs`, `sql/pgmove/k2.rs`, `sql/versions_access.rs`, `handoff/mod.rs` | `snapshot()` for cwd, program, session id | `host().placements()`; mechanical |
+| `feedback_routes.rs`, `remote_session_sessions.rs` | `unregister` | `host().unplace` |
+| `heartbeat_launch.rs` | `lookup_by_session_id` + `LiveSession(..)` | `host().find_session` |
+| `pinned_chat.rs`, `sidecar_routes.rs` | lookup, `unregister`, take `&Arc<DaemonPtySession>` | handles instead of `Arc`s; small |
+| `sandbox_reaper.rs`, `v1_host_sessions.rs`, `v1_sandboxes.rs` | `register`, `unregister`, `reconcile_dead_children`, `agent_name_for_session_id`, spawn | trait methods for reconcile and reverse lookup; the `/v1` API spawn path joins `spawn`/`place` |
+| `overlay_routes.rs` (test), `codex_no_daemon_tests.rs`, `triage.rs`, `routes/dispatcher.rs` (doc) | tests and comments | nothing, or test-only edits |
+| `session_activity.rs` | observer over `subscribe_events` (spawned by `register`) | host-side (title/bell → activity); moves with the host in P2 |
+| `llm_accounts_runtime.rs`, `person_wallet_runtime.rs` | their own login PTYs, never placed | not agent sessions; stay local in every topology |
+| `canonical_session.rs`, `session_events.rs` | comments only | nothing |
+| `daemon_main.rs` (image worker owns it) | `migrate_legacy_keys_to_bare_pid` at boot | in-process placement-table upkeep; stays |
+
+## What P2's remote host needs that the in-process host hides
+
+- **Blocking calls.** `spawn` returns after the PTY opened (a round trip
+  for a remote host); `kill` sleeps about 100 ms in the SIGHUP → SIGKILL
+  reap; `inject` sleeps through its settles (about 520 ms) while the caller
+  holds the injection lock. Their callers run on blocking threads today
+  (route handlers, `spawn_blocking`), so a remote host can block the same
+  way first and go async later; `write` and `resize` must stay
+  enqueue-and-return.
+- **Shared memory.** Metadata reads (`is_child_alive`, `label`, `cwd`,
+  `args`, `subscriber_count`, `ever_attached`, `bracketed_paste_active`,
+  `visible_text_rows`) are atomic loads or a Term lock today. A remote
+  handle needs a cached copy kept current by host events, and
+  `visible_text_rows`/`read_screen` become requests or a mirrored screen.
+  The claimed-size atomics and the viewport registry (grid arbitration)
+  must live on the host with the grid emitter.
+- **Events.** `events` hands out alacritty's `AlacEvent` stream; a remote
+  host sends a typed subset (output wakeup, title, bell, child exit with
+  code) over the channel. `Attachment` and `GridStream` become frames on
+  the attach channel; the grid snapshot and its version floor come from
+  the host.
+- **No fd passing.** Nothing crosses the trait as a file descriptor. The
+  per-cell hook socket (`cell_uds`) is bound by the spawn route next to the
+  PTY; in P2 it is bound by `k2-host` (FR3), so that block moves into the
+  remote `spawn`.
+- **Data, not handles.** `spawn` takes `DaemonPtyConfig` (plain data); P2
+  needs it serialisable, including `SandboxSpec` and `WorkspaceMountSpec`.
+  `place`/`unplace` also run controller-side bookkeeping (activity row,
+  `SessionAdded`, DB stamps): P2 splits that from the host's half.
+- **Epochs.** Every placement returns a `Placement` with an epoch; P2 must
+  store it and refuse a host frame with a stale one (I1).
+
+## Trace points (for the `trace` worker)
+
+Natural trace points on the trait, none added here: `spawn` (spawn
+requested / PTY opened), `place` and `unplace` (placement changes, with the
+epoch), `attach`/`detach` (viewer attach), `inject` (delivery attempt and
+result), `kill`, and `mark_exited` (CLI exit seen).
+
 ## Status
 
-- **Milestone:** diagrams written. Design settled; no code yet.
-- **Next:** the trait and the in-process host with their tests, then move
-  the call sites in priority order (spawn, attach and stream, input and
-  kill, lookups).
-- **Open questions:** none yet.
+- **Milestone:** first working slice. The trait, the in-process host and
+  its 10 tests pass (`cargo test -p k2-daemon --lib -- agent_host::`);
+  groups 1 to 4 are moved and the daemon builds with no new warnings.
+- **Next:** both crates' full suites, clippy against the base, then
+  `prove.sh G0 --topology solo` and the metrics on base and head.
+- **Open questions:** none.
+
+### Decisions inside owned files
+
+- **The trait lives in `k2-daemon`**, not `k2-core`: no `k2-core` caller
+  drives sessions.
+- **`LiveSession` became `AgentSession`** instead of a second wrapper, so
+  the ~30 existing users of `LiveSession` (including files I don't own)
+  compile unchanged; its `.0` stays crate-visible for them.
+- **Sync, object-safe trait.** Every caller is synchronous code on a
+  blocking thread or a short non-blocking call inside the grid WS loop;
+  making the trait async would have added `block_on`s on those paths for no
+  P1 benefit. P2 can add async methods next to the sync ones.
+- **The child-exit observer keeps its shape** (a weak handle, a receiver
+  taken inside the task, `mark_exited` on `ChildExit`) so its diff stays
+  small for the `home` rebase.
+- **The hook-events test publishes nothing.** `hook_ingest`'s own tests
+  assert on the first frame of that process-wide bus; a publishing test
+  here would make them flaky. It checks that the owner check finds panes
+  through the placement, and that the receiver is live.
+- **Two test lines in `v2_spawn.rs` adapted**: `current_dims` now takes an
+  `AgentSession`, so the attach-only test wraps its `Arc` (no assertion
+  changed).

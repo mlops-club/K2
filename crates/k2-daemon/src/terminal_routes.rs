@@ -28,7 +28,8 @@ use k2_core::log_debug;
 use k2_core::session::{registry, Frame, SessionId};
 
 use crate::cli_response::CliResponse;
-use crate::session_lookup;
+use crate::agent_host::host;
+use crate::session_lookup::{self, LiveSession};
 
 /// Handler for `GET /cli/terminal/read?id=<session>&lines=<n>[&scrollback=true]`.
 ///
@@ -160,7 +161,7 @@ pub(crate) fn resolve_screen_lines(
                 if let Some(live) =
                     crate::workspace_msg::lookup_live_for_sidecar(&project_id, &conversation_key)
                 {
-                    return Ok(v2_grid_lines(&live.0, requested_lines));
+                    return Ok(v2_grid_lines(&live, requested_lines));
                 }
             }
             return Err(CliResponse::bad_request(format!(
@@ -171,7 +172,7 @@ pub(crate) fn resolve_screen_lines(
             crate::workspace_msg::resolve_msg_target(ws)
         {
             if let Some(sid) = k2_core::session::SessionId::parse(&session_id) {
-                if let Some(session) = crate::v2_session_map::lookup_by_session_id(&sid) {
+                if let Some(session) = host().find_session(&sid) {
                     return Ok(v2_grid_lines(&session, requested_lines));
                 }
             }
@@ -197,7 +198,7 @@ pub(crate) fn resolve_screen_lines(
             .map(String::as_str)
             .filter(|s| !s.is_empty());
         let key = build_canonical_read_key(&project_id, agent);
-        return match crate::v2_session_map::lookup_by_agent_name(&key) {
+        return match host().find_agent(&key) {
             Some(session) => Ok(v2_grid_lines(&session, requested_lines)),
             None => Err(CliResponse::bad_request(format!(
                 "no live session for workspace '{ws}'{} — it may be asleep \
@@ -226,7 +227,7 @@ pub(crate) fn resolve_screen_lines(
     if id_str.contains(':')
         && k2_core::session::SessionId::parse(id_str).is_none()
     {
-        if let Some(session) = crate::v2_session_map::lookup_by_agent_name(id_str) {
+        if let Some(session) = host().find_agent(id_str) {
             return Ok(v2_grid_lines(&session, requested_lines));
         }
         return Err(CliResponse::bad_request(format!(
@@ -242,7 +243,7 @@ pub(crate) fn resolve_screen_lines(
         None => return Err(CliResponse::bad_request("invalid session id (expected UUID or canonical key)")),
     };
 
-    if let Some(session) = crate::v2_session_map::lookup_by_session_id(&session_id) {
+    if let Some(session) = host().find_session(&session_id) {
         return Ok(v2_grid_lines(&session, requested_lines));
     }
 
@@ -325,46 +326,8 @@ pub(crate) fn resolve_screen_lines(
 /// `read_v2_grid_lines` so `classify_routes` can read the SAME text a
 /// human/agent sees via `/cli/terminal/read` without re-wrapping a
 /// `CliResponse`.
-fn v2_grid_lines(
-    session: &std::sync::Arc<k2_core::terminal::daemon_pty::DaemonPtySession>,
-    requested_lines: usize,
-) -> Vec<String> {
-    use k2_core::terminal::grid_snapshot::snapshot_term;
-
-    // Lock the Term briefly, take a snapshot, drop the lock fast.
-    // The snapshot returns owned data so we can hold it across the
-    // unlock without keeping the Term blocked.
-    let term_arc = session.term();
-    let snapshot = {
-        let term = term_arc.lock();
-        snapshot_term(&session.session_id.to_string(), &*term, 0)
-    };
-
-    // Concatenate scrollback + live grid in order (scrollback
-    // first = oldest at top), render each row by joining its
-    // CellRun.text values.
-    let mut lines: Vec<String> = Vec::with_capacity(
-        snapshot.scrollback.len() + snapshot.grid.len(),
-    );
-    for row in &snapshot.scrollback {
-        let text: String = row.iter().map(|run| run.text.as_str()).collect();
-        lines.push(text.trim_end().to_string());
-    }
-    for row in &snapshot.grid {
-        let text: String = row.iter().map(|run| run.text.as_str()).collect();
-        lines.push(text.trim_end().to_string());
-    }
-
-    // Trim trailing empty rows — alacritty pads the live grid to
-    // its full row count, so an idle terminal returns dozens of
-    // empty rows that are noise to the caller. The first non-empty
-    // row from the end is the last meaningful line.
-    while lines.last().map(String::is_empty).unwrap_or(false) {
-        lines.pop();
-    }
-
-    let start = lines.len().saturating_sub(requested_lines);
-    lines[start..].to_vec()
+fn v2_grid_lines(session: &LiveSession, requested_lines: usize) -> Vec<String> {
+    host().read_screen(session, requested_lines)
 }
 
 /// Handler for `GET /cli/sessions/resize?session=<uuid>&cols=N&rows=N`.
@@ -406,7 +369,7 @@ pub fn handle_sessions_label(params: &HashMap<String, String>) -> CliResponse {
         .map(|v| !matches!(v.as_str(), "false" | "0"))
         .unwrap_or(true);
 
-    let v2_session = match crate::v2_session_map::lookup_by_session_id(&session_id) {
+    let v2_session = match host().find_session(&session_id) {
         Some(s) => s,
         None => {
             return CliResponse::bad_request(
@@ -415,7 +378,7 @@ pub fn handle_sessions_label(params: &HashMap<String, String>) -> CliResponse {
         }
     };
 
-    let new_label = v2_session.set_label(label, lock);
+    let new_label = host().set_label(&v2_session, label, lock);
     CliResponse::ok_json(
         serde_json::json!({
             "success": true,
@@ -452,7 +415,7 @@ pub(crate) const PIN_ROWS_MAX: u16 = 200;
 /// Handler for `POST /cli/terminal/pin-size` (S7a).
 ///
 /// Pins (or unpins) a v2 session's PTY to fixed cols×rows:
-/// applies LIVE via [`DaemonPtySession::set_pinned`] (whose
+/// applies LIVE via the host's `pin` (`DaemonPtySession::set_pinned`, whose
 /// `request_resize` clamp then holds the grid there against every
 /// resize path) AND persists to `workspace_tab_sessions`
 /// (migration 0065) so the pin survives daemon restart —
@@ -487,9 +450,10 @@ pub fn handle_pin_size(body: &[u8], set_by: &str) -> CliResponse {
     };
     // Resolve the session AND its map key (the key drives the
     // persistence row lookup below).
-    let entry = crate::v2_session_map::snapshot()
+    let entry = host()
+        .placements()
         .into_iter()
-        .find(|(_, s)| s.session_id == session_id);
+        .find(|(_, s)| s.session_id() == session_id);
     let Some((agent_name, session)) = entry else {
         return CliResponse::bad_request(
             "session not found in v2_session_map (pin-size is v2-only)",
@@ -497,7 +461,7 @@ pub fn handle_pin_size(body: &[u8], set_by: &str) -> CliResponse {
     };
 
     if req.clear {
-        k2_core::terminal::DaemonPtySession::set_pinned(&session, None, None);
+        host().pin(&session, None, None);
         let persisted = persist_pin(&agent_name, &session, None);
         return CliResponse::ok_json(
             serde_json::json!({
@@ -526,11 +490,7 @@ pub fn handle_pin_size(body: &[u8], set_by: &str) -> CliResponse {
         ));
     }
 
-    k2_core::terminal::DaemonPtySession::set_pinned(
-        &session,
-        Some((cols, rows)),
-        Some(set_by.to_string()),
-    );
+    host().pin(&session, Some((cols, rows)), Some(set_by.to_string()));
     let persisted = persist_pin(&agent_name, &session, Some((cols, rows, set_by)));
     CliResponse::ok_json(
         serde_json::json!({
@@ -553,14 +513,10 @@ pub fn handle_pin_size(body: &[u8], set_by: &str) -> CliResponse {
 /// the live pin.
 fn persist_pin(
     agent_name: &str,
-    session: &std::sync::Arc<k2_core::terminal::daemon_pty::DaemonPtySession>,
+    session: &LiveSession,
     pin: Option<(u16, u16, &str)>,
 ) -> bool {
-    let Some(cwd) = session
-        .cwd
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
+    let Some(cwd) = Some(session.cwd()).filter(|s| !s.is_empty())
     else {
         return false;
     };
@@ -571,7 +527,7 @@ fn persist_pin(
     else {
         log_debug!(
             "[pin-size] session={} cwd={} resolves to no workspace; pin is live-only",
-            session.session_id,
+            session.session_id(),
             cwd,
         );
         return false;
@@ -590,7 +546,7 @@ fn persist_pin(
         Err(e) => {
             log_debug!(
                 "[pin-size] persist failed for session={} (project={} pane_group={}): {e}",
-                session.session_id,
+                session.session_id(),
                 project_id,
                 pane_group_id,
             );
@@ -891,7 +847,7 @@ pub fn handle_agents_running(_params: &HashMap<String, String>) -> CliResponse {
         // operator's `agents running` query never reports zombies.
         if !session.is_child_alive() {
             reaped.push(agent_name.clone());
-            crate::v2_session_map::unregister(&agent_name);
+            host().unplace(&agent_name);
             continue;
         }
         // v2 sessions don't register in `k2_core::session::registry`
@@ -947,7 +903,7 @@ pub fn handle_agents_reap(_params: &HashMap<String, String>) -> CliResponse {
     let mut reaped: Vec<String> = Vec::new();
     for (agent_name, session) in sessions {
         if !session.is_child_alive() {
-            crate::v2_session_map::unregister(&agent_name);
+            host().unplace(&agent_name);
             reaped.push(agent_name);
         }
     }

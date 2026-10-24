@@ -64,7 +64,6 @@ use tokio::task::JoinHandle;
 use k2_core::log_debug;
 
 use crate::session_events::{self, SessionEvent};
-use crate::v2_session_map;
 
 /// Grace period between a workspace becoming reap-eligible and the
 /// reaper force-closing its chat PTY. Moved daemon-side from the
@@ -470,7 +469,7 @@ async fn reconcile_pass(armed: &mut HashMap<String, ArmState>, grace_dur: Durati
         // route-level v2/close close-guard (reaper is Active-authoritative).
         let agent = chat.agent_name.clone();
         let removed = tokio::task::spawn_blocking(move || {
-            v2_session_map::unregister(&agent).is_some()
+            crate::agent_host::host().unplace(&agent).is_some()
         })
         .await
         .unwrap_or(false);
@@ -513,8 +512,8 @@ fn collect_snapshot(now_ms: i64, window: u32) -> Snapshot {
     let db = k2_core::db::shared();
     let conn = db.lock();
     let mut live_chats = Vec::new();
-    for (agent_name, session) in v2_session_map::snapshot() {
-        let cwd = match session.cwd.as_ref() {
+    for (agent_name, session) in crate::agent_host::host().placements() {
+        let cwd = match session.cwd_path() {
             Some(p) => p.to_string_lossy().into_owned(),
             None => continue,
         };
@@ -533,7 +532,7 @@ fn collect_snapshot(now_ms: i64, window: u32) -> Snapshot {
         live_chats.push(LiveChat {
             agent_name,
             project_id,
-            session_id: session.session_id.to_string(),
+            session_id: session.session_id().to_string(),
             last_interaction_secs,
         });
     }
