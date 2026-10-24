@@ -32,6 +32,17 @@ with open(os.path.join(os.environ["RUN"], "parity", sid + ".json"), "w") as fh:
 PY
 }
 
+# fail_reason <exit> <log>: empty on success, else the log's summary lines.
+fail_reason() {
+    [ "$1" -eq 0 ] && return
+    if [ ! -s "$2" ]; then
+        echo "exit $1 with no output"
+    else
+        grep -aE 'FAIL|Passed:|Failed:|PASS:|error' "$2" | tail -3 | sed 's/\x1b\[[0-9;]*m//g' | tr '\n' ' '
+        echo "(exit $1)"
+    fi
+}
+
 # A clean environment for one suite: prints env -i arguments.
 suite_env() {
     local h=$1
@@ -92,7 +103,7 @@ parity_tier3() {
     local t0=$SECONDS rc
     run_clean "$RUN/parity/tier3.log" "$LAB_REPO" 1800 bash tests/behavior-test-tier3.sh; rc=$?
     result_json tier3 "tests/behavior-test-tier3.sh" "$([ $rc -eq 0 ] && echo pass || echo fail)" \
-        "$([ $rc -ne 0 ] && tail -3 "$RUN/parity/tier3.log" | tr '\n' ' ')" "parity/tier3.log" $rc $((SECONDS - t0))
+        "$(fail_reason $rc "$RUN/parity/tier3.log")" "parity/tier3.log" $rc $((SECONDS - t0))
 }
 
 # Tier 1 needs a running daemon it finds through $HOME/.k2so/heartbeat.port.
@@ -108,7 +119,8 @@ parity_tier1() {
     ( cd "$LAB_REPO" && env -i HOME="$LAB_HOME" PATH="$LAB_SHIM_DIR:/usr/bin:/bin:/usr/sbin:/sbin" \
         TEST_WORKSPACE="$LAB_WORKSPACE" bash tests/behavior-test-tier1.sh ) >"$RUN/parity/tier1.log" 2>&1; rc=$?
     result_json tier1 "tests/behavior-test-tier1.sh (against the solo daemon)" \
-        "$([ $rc -eq 0 ] && echo pass || echo fail)" "" "parity/tier1.log" $rc $((SECONDS - t0))
+        "$([ $rc -eq 0 ] && echo pass || echo fail)" "$(fail_reason $rc "$RUN/parity/tier1.log")" \
+        "parity/tier1.log" $rc $((SECONDS - t0))
 }
 
 # ── must-not-break ───────────────────────────────────────────────────────
@@ -125,14 +137,15 @@ parity_contract() {
     run_clean "$RUN/parity/contract.log" "$LAB_REPO" 1800 bash tests/contract/run_sandbox.sh "$LAB_DAEMON_BIN"; rc=$?
     result_json contract "tests/contract/must-not-break.ts (run_sandbox.sh, node $("$LAB_NODE_DIR/node" --version))" \
         "$([ $rc -eq 0 ] && echo pass || echo fail)" \
-        "$([ $rc -ne 0 ] && grep -E 'FAIL|not run' "$RUN/parity/contract.log" | head -3 | tr '\n' ' ')" \
+        "$( { fail_reason $rc "$RUN/parity/contract.log"; n=$(grep -c '^  --  ' "$RUN/parity/contract.log"); \
+              [ "${n:-0}" -gt 0 ] && echo "$n check(s) the suite itself reports as not run here: $(grep -m1 '^  --  ' "$RUN/parity/contract.log" | sed 's/.*(not run: //; s/)$//')"; } | tr '\n' ' ')" \
         "parity/contract.log" $rc $((SECONDS - t0))
 }
 
 # ── scripts/test-gate-linux.sh <sha>, in Docker ──────────────────────────
 # Owner decision (2026-10-24): unchanged, as root, in a Linux container on
 # this Mac's Docker. The repo is mounted read-only (the worktree and its git
-# dir, at their own paths, so `git archive <sha>` works); the target dir and
+# dir, so `git archive <sha>` works); the target dir and
 # cargo registry live in named volumes so later runs are warm. Nothing from
 # $HOME is mounted. The gate's workdir is fresh each run; its `target` is a
 # symlink into the volume (the gate removes the link, not the cache).
@@ -164,14 +177,18 @@ parity_linux_gate_start() {
             echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
             echo "volumes: $GATE_TARGET_VOL (target), $GATE_REGISTRY_VOL (cargo registry)"
         } >"$RUN/topology/linux-gate.txt"
+        # Docker Desktop cannot mount at a target under /Users, so the repo
+        # sits at /src/wt and its git dir at /src/git; GIT_DIR/GIT_WORK_TREE
+        # let the gate's `git rev-parse` and `git archive <sha>` work there.
         exec docker run --rm --name "k2-lab-gate-$$" \
             --cap-add NET_ADMIN \
+            -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
-            -v "$wt:$wt:ro" -v "$common:$common:ro" \
+            -v "$wt:/src/wt:ro" -v "$common:/src/git:ro" \
             -v "$GATE_TARGET_VOL:/cache/target" -v "$GATE_REGISTRY_VOL:/usr/local/cargo/registry" \
             "$GATE_IMAGE_TAG" \
             bash -c 'rm -rf /gate/work && mkdir -p /gate/work && ln -s /cache/target /gate/work/target \
-                     && exec "$0"/scripts/test-gate-linux.sh "$1" /gate/work' "$wt" "$LAB_SHA"
+                     && exec bash /src/wt/scripts/test-gate-linux.sh "$0" /gate/work' "$LAB_SHA"
     ) >"$log" 2>&1 &
     GATE_PID=$!
 }
