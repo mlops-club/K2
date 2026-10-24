@@ -16,8 +16,9 @@ lab_toolchain() {
     local repo=$1
     lab_native_env
     # CPU budget (coordinator, 2026-10-24): the Mac is shared by several
-    # workers; four build jobs per cargo command unless the caller set one.
-    export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
+    # workers and the owner's kind cluster; three build jobs per cargo
+    # command unless the caller set one.
+    export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3}
     if command -v cargo >/dev/null 2>&1; then
         # Pin the toolchain dirs to the caller's HOME now, so lab_cargo can
         # run cargo under a throwaway HOME and keep the build cache.
@@ -82,7 +83,7 @@ lab_cargo() {
     h=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-cargo-home-XXXXXX") || return 1
     t=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-cargo-tmp-XXXXXX") || return 1
     env -i HOME="$h" TMPDIR="$t" PATH="$PATH" USER="$(id -un)" LANG=en_US.UTF-8 \
-        CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
+        CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}" \
         ${CARGO_TARGET_DIR:+CARGO_TARGET_DIR="$CARGO_TARGET_DIR"} \
         ${OPENSSL_ROOT_DIR:+OPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"} \
         ${MACOSX_DEPLOYMENT_TARGET:+MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"} \

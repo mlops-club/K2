@@ -23,7 +23,8 @@
 # --linux-gate run (default) builds scripts/lab/docker/gate.Dockerfile and
 # runs test-gate-linux.sh in it AFTER the local suites (never alongside
 # another heavy build); hold never touches Docker and reports it NOT RUN.
-# CPU budget: CARGO_BUILD_JOBS=4 and 4 test threads unless set.
+# CPU budget: CARGO_BUILD_JOBS=3 and 3 test threads unless set; Docker jobs
+# take the shared lock $HOME/.cache/k2-dist-docker.lock (one at a time).
 #
 # Touches nothing outside the repo, lab-runs/ and temp dirs: the daemon and
 # every suite run under throwaway HOMEs; Rust comes from PATH or is installed
@@ -53,7 +54,7 @@ done
 case "$PARITY" in full|none) ;; *) echo "prove.sh: --parity is full or none" >&2; exit 2 ;; esac
 case "$LAB_LINUX_GATE" in hold|run) ;; *) echo "prove.sh: --linux-gate is hold or run" >&2; exit 2 ;; esac
 export LAB_LINUX_GATE
-export LAB_TEST_THREADS=${LAB_TEST_THREADS:-4}
+export LAB_TEST_THREADS=${LAB_TEST_THREADS:-3}
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 if [ "$GATE" != G0 ] || [ "$TOPOLOGY" != solo ]; then
@@ -216,7 +217,7 @@ if [ "$PARITY" = full ]; then
     parity_cli | tee -a "$RUN/prove.log"
     # Last, on its own: the gate is a full cold-or-warm build of k2-core and
     # k2-daemon tests, and the Mac is shared (one heavy build at a time).
-    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "scripts/test-gate-linux.sh in Docker, 4 CPUs (log: parity/linux-gate.log)" || echo "held by --linux-gate hold, NOT RUN")"
+    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "scripts/test-gate-linux.sh in Docker, 3 CPUs, after taking the shared Docker lock (log: parity/linux-gate.log)" || echo "held by --linux-gate hold, NOT RUN")"
     parity_linux_gate_start
     parity_linux_gate_finish
 else

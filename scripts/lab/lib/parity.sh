@@ -210,6 +210,14 @@ parity_linux_gate_start() {
     common=$(cd "$LAB_REPO" && cd "$(git rev-parse --git-common-dir)" && pwd)
     (
         set -o pipefail
+        # Shared Docker lock (coordinator, 2026-10-24): one Docker-heavy job
+        # at a time across all workers, to protect the owner's live kind
+        # cluster. Held for the image build and the gate container.
+        mkdir -p "$HOME/.cache"
+        until mkdir "$HOME/.cache/k2-dist-docker.lock" 2>/dev/null; do sleep 20; done
+        trap 'rmdir "$HOME/.cache/k2-dist-docker.lock"' EXIT
+        trap 'exit 143' INT TERM
+        echo "lab: holding the shared Docker lock ($HOME/.cache/k2-dist-docker.lock) from $(date -u +%H:%M:%SZ)"
         docker build -q -t "$GATE_IMAGE_TAG" -f "$LAB_REPO/scripts/lab/docker/gate.Dockerfile" "$LAB_REPO/scripts/lab/docker" \
             >"$RUN/parity/linux-gate.image.log" 2>&1 || { echo "lab: building the gate image failed" ; cat "$RUN/parity/linux-gate.image.log"; exit 3; }
         {
@@ -222,8 +230,8 @@ parity_linux_gate_start() {
         # Docker Desktop cannot mount at a target under /Users, so the repo
         # sits at /src/wt and its git dir at /src/git; GIT_DIR/GIT_WORK_TREE
         # let the gate's `git rev-parse` and `git archive <sha>` work there.
-        exec docker run --rm --name "k2-lab-gate-$$" \
-            --cap-add NET_ADMIN --cpus "${CARGO_BUILD_JOBS:-4}" -e K2_GATE_THREADS="${LAB_TEST_THREADS:-4}" \
+        docker run --rm --name "k2-lab-gate-$$" \
+            --cap-add NET_ADMIN --cpus "${CARGO_BUILD_JOBS:-3}" -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
             -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
             -v "$wt:/src/wt:ro" -v "$common:/src/git:ro" \
