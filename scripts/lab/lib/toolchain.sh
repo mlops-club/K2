@@ -80,8 +80,11 @@ lab_native_env() {
 # Call lab_toolchain first.
 lab_cargo() {
     local h t rc
-    h=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-cargo-home-XXXXXX") || return 1
-    t=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-cargo-tmp-XXXXXX") || return 1
+    # Short paths under /tmp, not macOS's long $TMPDIR: some tests put the
+    # temp path into a length-limited line (macos_keychain_tests feeds the
+    # test keychain's path to `security -i`, capped at INTERACTIVE_LINE_MAX).
+    h=$(mktemp -d /tmp/k2c-h.XXXXXX) || return 1
+    t=$(mktemp -d /tmp/k2c-t.XXXXXX) || return 1
     env -i HOME="$h" TMPDIR="$t" PATH="$PATH" USER="$(id -un)" LANG=en_US.UTF-8 \
         CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}" \
         ${CARGO_TARGET_DIR:+CARGO_TARGET_DIR="$CARGO_TARGET_DIR"} \
@@ -89,6 +92,9 @@ lab_cargo() {
         ${MACOSX_DEPLOYMENT_TARGET:+MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"} \
         cargo "$@"
     rc=$?
+    # Tests leave read-only files and dirs behind (seed stores); make them
+    # writable so the throwaway dirs really go.
+    chmod -R u+w "$h" "$t" 2>/dev/null
     rm -rf "$h" "$t"
     return $rc
 }
