@@ -71,15 +71,18 @@ def _maybe(path):
 
 def compare_baseline(parity, baseline):
     """I5: every suite (and every cli script) has the baseline's status.
-    Returns (status, reason, diffs)."""
-    diffs = []
+    Returns (status, reason, diffs). A suite that did not run now, or was
+    not recorded in the baseline, cannot be compared: I5 is then not_run
+    (never pass), with the compared suites' differences still listed."""
+    diffs, uncompared = [], []
     for sid, _ in PARITY_SUITES:
         cur, base = parity.get(sid), baseline["suites"].get(sid)
         if base is None:
-            diffs.append("%s: not in the baseline" % sid)
+            why = baseline.get("not_recorded", {}).get(sid, "not in the baseline")
+            uncompared.append("%s: not in the baseline (%s)" % (sid, why))
             continue
         if cur is None or cur["status"] == "not_run":
-            diffs.append("%s: not run now" % sid)
+            uncompared.append("%s: not run now" % sid)
             continue
         if cur["status"] != base["status"]:
             diffs.append("%s: %s, baseline %s" % (sid, cur["status"], base["status"]))
@@ -89,22 +92,30 @@ def compare_baseline(parity, baseline):
             if base_items.get(name) != cur_items.get(name):
                 diffs.append("%s/%s: %s, baseline %s" % (sid, name, cur_items.get(name, "absent"),
                                                          base_items.get(name, "absent")))
-    if any(d.endswith("not run now") for d in diffs):
-        return "not_run", "a parity suite did not run, so it cannot be compared", diffs
-    return ("pass", "", diffs) if not diffs else ("fail", "%d difference(s) from the baseline" % len(diffs), diffs)
+    if diffs:
+        return "fail", "%d difference(s) from the baseline" % len(diffs), diffs + uncompared
+    if uncompared:
+        return "not_run", "not every suite could be compared (%s); the others match" % "; ".join(uncompared), uncompared
+    return "pass", "", []
 
 
 def baseline_from(run_dir):
-    """The baseline document for this run's parity results."""
+    """The baseline document for this run's parity results. Suites that did
+    not run are listed under not_recorded with their reason; at least one
+    suite must have run."""
     run = _load(os.path.join(run_dir, "run.json"))
-    suites = {}
+    suites, not_recorded = {}, {}
     for sid, _ in PARITY_SUITES:
         r = _maybe(os.path.join(run_dir, "parity", sid + ".json"))
         if r is None or r["status"] == "not_run":
-            raise ValueError("cannot record a baseline: %s did not run" % sid)
+            not_recorded[sid] = (r or {}).get("reason") or "no result written"
+            continue
         suites[sid] = {"status": r["status"], "items": {i["name"]: i["status"] for i in r.get("items", [])}}
+    if not suites:
+        raise ValueError("cannot record a baseline: no parity suite ran")
     return {"gate": run["gate"], "topology": run["topology"], "sha": run["sha"],
-            "crates_tree": run.get("crates_tree"), "recorded": run["started"], "suites": suites}
+            "crates_tree": run.get("crates_tree"), "recorded": run["started"], "suites": suites,
+            "not_recorded": not_recorded}
 
 
 def build(run_dir):

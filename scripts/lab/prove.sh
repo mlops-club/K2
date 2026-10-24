@@ -5,6 +5,7 @@
 #
 #   scripts/lab/prove.sh <gate> --topology <solo|container|fleet|kind>
 #                        [--chaos seed=N] [--parity full|none] [--record-baseline]
+#                        [--linux-gate hold|run]
 #
 # Wave 1 implements gate G0 on topology solo. Anything else exits 2.
 #
@@ -19,15 +20,18 @@
 # iterating on scenarios: parity then shows NOT RUN and the gate fails.
 # --record-baseline stores this run's parity results as the I5 baseline
 # (tests/lab/baselines/<gate>-<topology>.json); commit it deliberately.
+# --linux-gate hold (the default while this Mac's Docker disk is full) never
+# touches Docker and reports the Linux gate NOT RUN with the reason; run
+# starts it (scripts/lab/docker/gate.Dockerfile, then test-gate-linux.sh).
 #
 # Touches nothing outside the repo, lab-runs/ and temp dirs: the daemon and
 # every suite run under throwaway HOMEs; Rust comes from PATH or is installed
 # under lab-runs/.toolchain; the Linux gate runs in Docker with named volumes.
 set -uo pipefail
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
-GATE="" TOPOLOGY="" CHAOS="" PARITY=full RECORD_BASELINE=0
+GATE="" TOPOLOGY="" CHAOS="" PARITY=full RECORD_BASELINE=0 LAB_LINUX_GATE=hold
 while [ $# -gt 0 ]; do
     case "$1" in
         --topology) TOPOLOGY=${2:-}; shift 2 ;;
@@ -37,6 +41,8 @@ while [ $# -gt 0 ]; do
         --parity) PARITY=${2:-}; shift 2 ;;
         --parity=*) PARITY=${1#*=}; shift ;;
         --record-baseline) RECORD_BASELINE=1; shift ;;
+        --linux-gate) LAB_LINUX_GATE=${2:-}; shift 2 ;;
+        --linux-gate=*) LAB_LINUX_GATE=${1#*=}; shift ;;
         -h|--help) usage ;;
         -*) echo "prove.sh: unknown option $1" >&2; usage ;;
         *) [ -z "$GATE" ] && GATE=$1 || { echo "prove.sh: unexpected argument $1" >&2; usage; }; shift ;;
@@ -44,6 +50,8 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$GATE" ] && [ -n "$TOPOLOGY" ] || usage
 case "$PARITY" in full|none) ;; *) echo "prove.sh: --parity is full or none" >&2; exit 2 ;; esac
+case "$LAB_LINUX_GATE" in hold|run) ;; *) echo "prove.sh: --linux-gate is hold or run" >&2; exit 2 ;; esac
+export LAB_LINUX_GATE
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 if [ "$GATE" != G0 ] || [ "$TOPOLOGY" != solo ]; then
@@ -157,7 +165,7 @@ export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN LAB_SHIM_DIR
 
 # ── Linux gate first: it runs in Docker while the rest goes on here ─────
 if [ "$PARITY" = full ]; then
-    say "parity: starting scripts/test-gate-linux.sh in Docker (log: parity/linux-gate.log)"
+    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "starting scripts/test-gate-linux.sh in Docker (log: parity/linux-gate.log)" || echo "held, NOT RUN (Docker disk full; --linux-gate run to start it)")"
     parity_linux_gate_start
 fi
 

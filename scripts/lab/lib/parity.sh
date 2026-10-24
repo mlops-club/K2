@@ -153,9 +153,18 @@ GATE_IMAGE_TAG=k2-lab-gate:1
 GATE_TARGET_VOL=k2-lab-gate-target
 GATE_REGISTRY_VOL=k2-lab-gate-cargo-registry
 
+# LAB_LINUX_GATE=hold (prove.sh --linux-gate hold, the default for now):
+# never touch Docker; the gate is NOT RUN with LAB_LINUX_GATE_HOLD_REASON.
+LAB_LINUX_GATE_HOLD_REASON="held: the Docker VM disk is full (98%, under 1 GB free; it also hosts the owner's kind cluster) and the gate needs 20 GB; no gate container is started until the owner frees space (coordinator, 2026-10-24). Run with --linux-gate run once it is free."
+
 parity_linux_gate_start() {
     local log="$RUN/parity/linux-gate.log"
     mkdir -p "$RUN/topology"
+    if [ "${LAB_LINUX_GATE:-hold}" != run ]; then
+        echo "$LAB_LINUX_GATE_HOLD_REASON" >"$log"
+        GATE_PID=""; GATE_NOT_RUN=$LAB_LINUX_GATE_HOLD_REASON
+        return
+    fi
     if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
         echo "docker is not available" >"$log"
         GATE_PID=""; GATE_NOT_RUN="Docker is not available on this machine"

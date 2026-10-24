@@ -208,15 +208,36 @@ SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
   `scenarios/S1.cast` (asciicast v2 of the client's screen, one frame per grid
   update) is always written.
 
-### Open questions
+### Answered (coordinator, 2026-10-24)
 
-- **Docker disk.** The Docker VM has about 9 GB free; `test-gate-linux.sh`
-  refuses to start below 20 GB (`K2_GATE_MIN_FREE_GB`). Unless space is freed
-  (or the VM disk grown), the Linux gate is reported NOT RUN with that reason.
-- **S12 at G0.** The scenario matrix marks S12 (Postgres, Apps, mail, Sew,
-  front door) required from G0 on solo; wave 1 builds only S1, so G0 on solo
-  stays red with S12 NOT RUN. P0's proof list also names S2 and S7, which the
-  matrix requires from G1; the report shows them as reported, not required.
-- **Tier 1** finds its daemon only through `$HOME/.k2so/heartbeat.port`;
-  today's daemon writes `~/.k2/`, so tier 1 shows NOT RUN with that reason
-  unless the sandbox has a `.k2so/` (checked at run time).
+- **Docker disk.** The Docker VM is at 98% (under 1 GB free) and hosts the
+  owner's kind cluster. Until the owner frees space, `prove.sh` defaults to
+  `--linux-gate hold`: it never touches Docker, and the report shows the Linux
+  gate NOT RUN with that reason. `--linux-gate run` starts it once space is
+  free. I removed what this task had put there (the pulled
+  `rust:1.99.1-bookworm`, the built `k2-lab-gate:1`, two empty volumes);
+  `gate.Dockerfile` rebuilds them. The Docker path was checked up to the
+  gate's own disk check: it mounts the repo read-only at `/src/wt` (Docker
+  Desktop cannot mount at a target under `/Users`), finds the sha through
+  `GIT_DIR`, and stops at "refusing to run: 2G free, need 20G".
+- **S12 at G0.** Confirmed: G0 on solo stays red with S12 NOT RUN until S12
+  exists; S2 and S7 are reported, not required.
+- **Tier 1.** Today's daemon makes the `~/.k2so -> ~/.k2` compat link, so tier
+  1 does reach the solo sandbox daemon (confirmed in the first full run). It
+  then fails on its own stale expectations (retired `k2so agents triage`
+  verbs), a pre-existing result. The run-time check stays.
+
+### Pre-existing suite results seen on this Mac (not caused by the lab)
+
+- `tests/behavior-test-tier3.sh` exits 1 with no output: it `cat`s
+  `crates/k2so-core/...`, renamed to `crates/k2-core`, under `set -e`.
+- `tests/behavior-test-tier1.sh` fails its triage checks: the verbs it calls
+  are retired.
+- Some `tests/cli` scripts expect Linux (for example `app_runtime_cli_smoke`
+  wants the App-box doctor's helper check).
+
+### I5 baseline
+
+While the Linux gate is held, a baseline records the suites that ran and lists
+the rest under `not_recorded` with their reason. I5 is then NOT RUN (never
+pass) and names the suite it could not compare, even when the others match.

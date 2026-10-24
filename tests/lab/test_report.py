@@ -135,14 +135,36 @@ class Report(unittest.TestCase):
         self.assertEqual(rep["verdict"], "fail")
         self.assertEqual(required(rep, "S1")["reason"], "c: d")
 
-    def test_baseline_from_refuses_a_run_with_a_not_run_suite(self):
+    def test_baseline_from_lists_suites_that_did_not_run(self):
         self.r.all_parity()
         doc = report.baseline_from(self.r.d)
         self.assertEqual(doc["suites"]["cli"], {"status": "pass", "items": {"a": "pass", "b": "pass"}})
         self.assertEqual(doc["sha"], "a" * 40)
-        self.r.parity("tier1", "not_run", reason="x")
-        with self.assertRaisesRegex(ValueError, "tier1 did not run"):
+        self.assertEqual(doc["not_recorded"], {})
+        self.r.parity("linux-gate", "not_run", reason="held: disk full")
+        doc = report.baseline_from(self.r.d)
+        self.assertNotIn("linux-gate", doc["suites"])
+        self.assertEqual(doc["not_recorded"], {"linux-gate": "held: disk full"})
+        for s in SUITES:
+            self.r.parity(s, "not_run", reason="x")
+        with self.assertRaisesRegex(ValueError, "no parity suite ran"):
             report.baseline_from(self.r.d)
+
+    def test_i5_is_not_run_while_a_suite_is_missing_from_the_baseline(self):
+        self.r.all_parity()
+        self.r.parity("linux-gate", "not_run", reason="held: disk full")
+        self.r.baseline()
+        path = os.path.join(self.repo, "baselines", "G0-solo.json")
+        with open(path) as fh:
+            doc = json.load(fh)
+        del doc["suites"]["linux-gate"]
+        doc["not_recorded"] = {"linux-gate": "held: disk full"}
+        with open(path, "w") as fh:
+            json.dump(doc, fh)
+        inv = next(i for i in report.build(self.r.d)["invariants"] if i["id"] == "I5")
+        self.assertEqual(inv["status"], "not_run")
+        self.assertIn("linux-gate: not in the baseline (held: disk full)", inv["reason"])
+        self.assertIn("the others match", inv["reason"])
 
     def test_write_produces_the_three_files(self):
         self.r.parity("cli", "fail", items={"a": "pass", "<b&c>": "fail"})
