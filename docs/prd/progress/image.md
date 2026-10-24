@@ -159,11 +159,20 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilit
     `sts/k2-solo` 1/1 Ready, PVC bound; through the port-forward:
     `{"phase":"ready","installKind":"package","view":"full",…}`.
   - The boot log has the one capability line.
+  - Any UID: `docker run --user 54321:0` and `--user 0:0` both reach
+    phase `ready`, `installKind` `package`.
+  - Boot refusals, each exit 2 before anything starts:
+    `K2_ROLE=controller` → `K2_ROLE=controller needs agent hosts (PRD P2); not available yet`;
+    `K2_ROLE=host` → `K2_ROLE="host" is not a role; allowed values: all, controller`;
+    `K2_CAP_FRONT=engine` → `… allowed values: host, listen, off`;
+    `K2_DAEMON_PORT=abc` → `… is not a port; use a number from 1 to 65535`.
+  - Occupied port (second daemon in the Compose container's network):
+    `K2_DAEMON_PORT=7420: can't listen on 0.0.0.0:7420: Address already in use (os error 98) (no fallback to another port)`, exit 2; the first daemon keeps serving.
 - **Left running:** `k2-solo` on k2lab and the Compose project `k2-solo`, for
   the kind-app worker and the owner. Tear down with
   `kubectl --kubeconfig … delete namespace k2-solo` and
   `docker compose -f deploy/compose/compose.solo.yaml down -v`.
-- **Next:** random UID, `K2_ROLE` / `K2_DAEMON_PORT` failure checks, then the
+- **Next:** the
   test suites (`CARGO_BUILD_JOBS=4`, `--test-threads=4`, temp HOME) and head
   clippy.
 
