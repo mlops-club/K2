@@ -29,7 +29,7 @@ graph TD
         UP -- builds k2-agents:dev --> DFA
         UP -- "--fake: k2-agents:fake" --> DFF
         UP -- starts --> PF
-        APP -- "http://127.0.0.1:7440 + token" --> PF
+        APP -- "http://127.0.0.1:7440 · owner + password" --> PF
         APP -- opens --> BR
     end
 
@@ -47,7 +47,7 @@ graph TD
         CL -- "/login: xdg-open URL" --> SHIM
         SHIM -- POST /cli/browser/open-url --> D
         CL -- credentials.json --> PVC
-        D -- daemon.token, k2.db --> PVC
+        D -- "connect users, k2.db, daemon.token" --> PVC
     end
 
     UP -- kind load + kubectl apply -k --> KZ
@@ -80,12 +80,15 @@ sequenceDiagram
     U->>K: rollout status, then port-forward 127.0.0.1:7440
     U->>D: GET /boot-status
     D-->>U: phase=ready
-    U->>K: exec cat /var/lib/k2/.k2/daemon.token
-    U-->>O: URL http://127.0.0.1:7440 and the token
+    U->>K: exec cat daemon.token (into memory only)
+    U->>D: POST /cli/users/add, /cli/users/set-role owner (first run)
+    U-->>O: URL http://127.0.0.1:7440, user owner, password (once)
 
     Note over O,A: Phase 2: connect the app
-    O->>A: add the host (URL + token), see deploy/kind/README.md
-    A->>D: /cli/... ?token=…, WS /cli/sessions/events
+    O->>A: Settings → Connected Servers → + Add a server (URL, owner, password)
+    A->>D: POST /cli/auth/login
+    D-->>A: session token
+    A->>D: /cli/... ?token=<session>, WS /cli/sessions/events
     D-->>A: workspaces, sessions, app-level events
 
     Note over A,C: Phase 3: sign Claude in (once; survives restarts)
@@ -107,24 +110,64 @@ sequenceDiagram
 ## How to try it
 
 ```sh
-scripts/kind/up.sh            # builds, loads, applies, waits, port-forwards; prints URL and token
+scripts/kind/up.sh            # builds, loads, applies, waits, port-forwards; prints URL, user, password
 # then follow deploy/kind/README.md in the desktop app
 scripts/kind/down.sh          # stops the port-forward, deletes namespace k2-kind (and its PVC)
 ```
 
+## What the app needs from a self-hosted host (read from code)
+
+- **URL:** `http://127.0.0.1:<port>` is accepted (`connect-validate.ts`
+  `parseServerUrl`: http or https; loopback is not special, and the host key
+  is `127.0.0.1:<port>`, never the local daemon). So `kubectl port-forward`
+  to loopback works with today's app, with no cluster change.
+- **Credential:** a K2 Connect username and password, not `daemon.token`.
+  The app calls `POST /cli/auth/login` and sends the session token as
+  `?token=`. `up.sh` creates an Owner login once, through `/cli/users/add` and
+  `/cli/users/set-role` with the owner token. That token is read into memory
+  only and passed to curl through a `-K` pipe, never on argv.
+- **Daemon side:** `K2_LISTEN=lan` binds `0.0.0.0`. A port-forward peer
+  arrives as loopback inside the pod, and Lan has the same access. Spawn
+  (`/cli/sessions/v2/spawn`) and grid (`/cli/sessions/grid`) need Member;
+  Owner passes.
+- **Login URL:** Claude on Linux runs `xdg-open`. The daemon's staged shim
+  posts the URL to `/cli/browser/open-url`, the daemon broadcasts `open_url`,
+  and the app (local or remote) opens it in an in-app browser tab. The
+  automatic URL's callback is `localhost:<port>` in the pod, so the runbook
+  uses Claude's printed fallback URL plus "Paste code here". No daemon or
+  app change is needed.
+- **Login storage:** `/var/lib/k2/.claude/.credentials.json`, the wallet's
+  "live store" (`llm_accounts/mod.rs`), on the PVC.
+
 ## Status
 
-- **Milestone:** diagrams written.
-- **Next:** Dockerfiles, overlays, up/down scripts, runbook; then build and run
-  S1 against the fake-agent pod through the port-forward.
+- **Milestone:** code written (Dockerfiles, overlays, `up.sh`, `down.sh`,
+  `port-forward.sh`, `s1.sh`, runbook). Not yet built or run: the
+  coordinator asked for no Docker builds until `image`'s `k2-daemon:dev`
+  exists.
+- **Next:** build `k2-agents:fake`, run `up.sh --fake` and `s1.sh`, and
+  record the S1 output here. Then run `up.sh`, check the login, and run
+  `down.sh`.
 - **Decisions (mine, inside owned files):**
   - Own namespaces (`k2-kind`, and `k2-kind-fake` for the S1 proof) so this
     never collides with `image`'s `k2-solo` namespace on the same cluster.
-    The overlays rename the namespace with kustomize; `solo.yaml` is untouched.
-  - Claude Code 2.1.308 (npm `stable` tag on 2026-10-24) as the native
-    linux binary from `@anthropic-ai/claude-code-<linux-arch>`, copied to
-    `/usr/local/bin/claude` (a directory the daemon's PATH always includes),
-    with `DISABLE_AUTOUPDATER=1`: the image tag is the version.
+    The overlays rename the namespace with kustomize; `solo.yaml` is
+    untouched.
+  - Claude Code 2.1.308 (npm `stable` tag on 2026-10-24), the native linux
+    binary from `@anthropic-ai/claude-code-linux-<arch>`, at
+    `/usr/local/bin/claude`. The daemon always puts that directory on an
+    agent's PATH (`login_path::known_fallback_dirs`).
+    `DISABLE_AUTOUPDATER=1`, because a self-update would land in
+    `~/.local/bin` on the volume, which is also on the agent PATH. No codex:
+    it needs Node at runtime plus its own binary, which isn't cheap.
+  - `up.sh` builds `k2-daemon:dev` only when it is missing (or with
+    `--rebuild-daemon`). It is the `image` task's long release build;
+    `k2-agents` is rebuilt every time. A pod-template annotation with the
+    image id rolls the pod only when the image changed (the tag stays `dev`).
+  - S1 runs unchanged from `tests/lab`. A copy loop mirrors the pod's
+    `~/.claude/projects` and the fake trace into a local temp dir while it
+    runs, and the agent's cwd is `/work/lab-agent`, so the pod and the Mac
+    compute the same project slug.
   - Owner decision 2026-10-24: no credential Secret; login is `/login` in a
     claude session opened from the app.
-- **Open questions:** none yet.
+- **Open questions:** none.

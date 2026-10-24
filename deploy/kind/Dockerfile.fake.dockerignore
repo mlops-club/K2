@@ -1,0 +1,4 @@
+*
+!Cargo.lock
+!tests/fakes/k2-fake-agent/
+tests/fakes/k2-fake-agent/target/
