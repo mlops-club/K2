@@ -125,10 +125,28 @@ scripts/kind/down.sh --dist
 
 ## Status
 
-- **Milestone:** diagrams written.
-- **Next:** overlays (`deploy/kind/dist`, `deploy/kind/dist-fake`), the
-  `--dist` flag in the scripts, the placement and host-restart checks.
-  Build and run once `dist-link` publishes its env contract.
+- **Milestone:** code written, manifests checked against the API.
+  `deploy/kind/dist` and `deploy/kind/dist-fake` (over
+  `deploy/kubernetes/core/{controller,hosts}.yaml`, untouched), the shared
+  no-k2dev component (now on every ConfigMap: `k2-controller`, `k2-host`),
+  and `--dist` in `up.sh`, `down.sh` and `s1.sh`. `s1.sh --dist` runs S1,
+  then a placement check (/proc scan of both pods while an agent is alive),
+  then deletes `k2-host-0` and runs S1 again.
+- **Checked on `k2-kind-dist-fake` (by hand, then deleted):**
+  - The namespace, then the Secret `k2-secrets` (piped to `kubectl create`,
+    no annotations, token not shown), then the rest applied cleanly.
+  - Both pods pass `restricted` Pod Security, schedule, mount the Secret
+    and their PVCs, and start.
+  - Today's daemon then refuses both roles, which is what `dist-link`
+    adds:
+    - `k2-controller-0`: `FATAL: K2_ROLE=controller needs agent hosts (PRD P2); not available yet`
+    - `k2-host-0`: `FATAL: K2_ROLE="host" is not a role; allowed values: all, controller`
+  - The solo fake path still passes after the refactor (`up.sh --fake`,
+    S1 PASS `lab-runs/kind/2026-10-24T22-35-04Z/`, `down.sh --fake`).
+- **Next:** when `dist-link` publishes its env contract, align the
+  provisional names, rebuild `k2-daemon:dev` from a tree that has
+  `dist-link`, then run `up.sh --dist --fake` and `s1.sh --dist` on
+  `k2-kind-dist-fake` (7442).
 - **Provisional names** (from `deploy/README.md` and what the coordinator
   relayed; set side by side until `dist-link` confirms):
   - host: `K2_ROLE=host`, `K2_CONTROLLER_URL=ws://k2-controller:7420`,
@@ -137,13 +155,28 @@ scripts/kind/down.sh --dist
     `K2_HOST_NAME` (pod name), `K2_HOST_LABELS`, `K2_HOST_MAX_AWAKE`.
   - controller: `K2_ROLE=controller`, `K2_HOSTS=1`,
     `K2_HOST_BOOTSTRAP_TOKEN_FILE`, `K2_PROVISIONER=static`.
+  - `up.sh --dist` reads `GET /cli/hosts` for an informational report.
+    It creates the demo workspace on the host, assuming workspaces live
+    there.
 - **Decisions (mine):**
   - Port 7443 for the non-fake dist variant: 7440 is the owner's live
     `k2-kind` port-forward.
-  - Lab-sized: one host, small requests, a 60 s grace period (the end
-    state's 600 s would make "delete k2-host-0" slow), no `k2-host health`
-    readiness probe (no such binary in our image; provisional).
+  - Lab-sized:
+    - one host; requests 250m/512Mi; limits 2 Gi (controller) and 3 Gi
+      (host), because the Docker VM is 8 GB and shared with the owner's pod;
+    - a 60 s grace period (the end state's 600 s would make "delete
+      k2-host-0" slow);
+    - no `k2-host health` readiness probe (no such binary in our image;
+      provisional);
+    - no PodDisruptionBudget.
+  - Both pods use the `default` ServiceAccount with no token
+    (`rbac.yaml` is out: the static provisioner never calls the API).
+  - Host UID 10001 (the end state's). The fake image's `/work` is
+    group-0 writable and a git `safe.directory` for that reason.
+  - Docker: builds hold `~/.cache/k2-dist-docker.lock`; the fake agent's
+    cargo build is capped at `CARGO_BUILD_JOBS=3` (BuildKit can't cap
+    memory).
 - **Open questions (for dist-link):** where the controller resolves a
   spawn's `cwd` (on the host, I assume); what a host's readiness check is;
   whether the controller needs `K2_KEK_FILE` (not set here; solo runs
-  without it).
+  without it); `K2_HOST_ENROLL_TOKEN_FILE` vs `K2_HOST_TOKEN_FILE`.

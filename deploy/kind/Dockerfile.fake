@@ -15,6 +15,10 @@ ARG RUST_IMAGE=rust:1.99.1-bookworm
 # ── build: the fake agent on its own (its only dependency is serde_json,
 #    resolved from the workspace's Cargo.lock) ─────────────────────────────
 FROM ${RUST_IMAGE} AS build
+# The Docker VM is shared with kind (8 GB): BuildKit can't cap a build's
+# memory, so cap cargo's parallelism instead.
+ARG CARGO_BUILD_JOBS=3
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /src
 COPY tests/fakes/k2-fake-agent/ ./
 COPY Cargo.lock ./Cargo.lock

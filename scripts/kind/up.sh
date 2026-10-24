@@ -60,7 +60,7 @@ until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep
 trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
 if [ "$rebuild_daemon" = 1 ] || ! docker image inspect k2-daemon:dev >/dev/null 2>&1; then
     say "building k2-daemon:dev (packaging/oci/build.sh; a cold build takes a while)"
-    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4} packaging/oci/build.sh k2-daemon:dev >&2
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3} packaging/oci/build.sh k2-daemon:dev >&2
 else
     say "k2-daemon:dev exists (--rebuild-daemon to rebuild it)"
 fi
