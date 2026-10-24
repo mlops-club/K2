@@ -210,6 +210,12 @@ parity_linux_gate_start() {
     common=$(cd "$LAB_REPO" && cd "$(git rev-parse --git-common-dir)" && pwd)
     (
         set -o pipefail
+        # Memory cap (coordinator, 2026-10-24: the 8 GB Docker VM is shared
+        # with the owner's kind cluster): the container runs with 3 GB and no
+        # extra swap, on 3 CPUs (cargo inside sizes its jobs to the CPU quota).
+        # If it is OOM-killed, lower K2_GATE_THREADS / CPUs, never the cap.
+        # The image build only runs apt-get (no compile) and BuildKit has no
+        # --memory flag, so it is not capped beyond the lock.
         # Shared Docker lock (coordinator, 2026-10-24): one Docker-heavy job
         # at a time across all workers, to protect the owner's live kind
         # cluster. Held for the image build and the gate container.
@@ -231,6 +237,7 @@ parity_linux_gate_start() {
         # sits at /src/wt and its git dir at /src/git; GIT_DIR/GIT_WORK_TREE
         # let the gate's `git rev-parse` and `git archive <sha>` work there.
         docker run --rm --name "k2-lab-gate-$$" \
+            --memory=3g --memory-swap=3g \
             --cap-add NET_ADMIN --cpus "${CARGO_BUILD_JOBS:-3}" -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
             -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
@@ -253,6 +260,8 @@ parity_linux_gate_finish() {
     local secs=$((SECONDS - GATE_T0))
     if grep -q '^GATE GREEN' "$log"; then
         result_json linux-gate "$title" pass "" "parity/linux-gate.log" $rc $secs
+    elif [ "$rc" -eq 137 ] || grep -qiE 'out of memory|oom-?kill|signal: 9, SIGKILL' "$log"; then
+        result_json linux-gate "$title" fail "OOM-killed under the 3 GB cap (exit $rc): lower the gate's parallelism (CARGO_BUILD_JOBS / LAB_TEST_THREADS), never the cap" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run' "$log"; then
         result_json linux-gate "$title" not_run "the gate refused to start: $(grep -m1 '^refusing to run' "$log")" "parity/linux-gate.log" $rc $secs
     else
