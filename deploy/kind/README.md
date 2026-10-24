@@ -167,7 +167,8 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egre
 
 This adds a NetworkPolicy that denies the pod every egress except DNS and
 TCP 443. The port-forward goes through the kubelet, so the app's connection
-is unaffected. Remove it with
+is unaffected. Verified on the fake variant: port 80 out times out, 443
+out answers, the daemon boots and S1 passes. Remove it with
 `kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind delete networkpolicy k2-solo-egress`.
 
 ## Proof without a real agent (S1)

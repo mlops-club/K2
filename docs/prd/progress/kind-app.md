@@ -171,6 +171,8 @@ Other checks:
 | Login URL reaches the app | fake pod: subscribe to `/cli/sessions/events` through the port-forward, run `~/.k2/bin/xdg-open <url>` in the pod | `{"kind":"open_url","url":…,"source":"shim"}` arrived at the client |
 | Survives a restart | fake pod: write `~/.claude/persist-probe`, `kubectl delete pod`, wait | file still there; port-forward reconnected by itself (ready after 4 s); app login still works |
 | `down.sh --fake` | then `kubectl get ns`, `lsof :7441` | namespace gone, port free |
+| no-k2.dev settings | `up.sh --fake` after RESUME; env and log in the pod | `K2_TUNNEL_LEASE=off`, `K2_FEDERATION=off`, relay list and DNS API at `127.0.0.1:9`, no `K2_AIRGAP`; no `tunnel.json`, no frpc; log: "tunnel/relays boot refresh skipped: no tunnel token"; S1 PASS (`lab-runs/kind/2026-10-24T22-04-40Z/`) |
+| Egress lock | the opt-in NetworkPolicy applied to `k2-kind-fake`, pod restarted | `http://example.com` (80) times out, `https://api.anthropic.com` (443) answers 404; boot ready in 4 s; S1 PASS (`…T22-05-22Z/`) |
 
 The agent's PTY gets `~/.k2/bin` first on its PATH, so Claude's `xdg-open` is
 the shim. That comes from reading `open_shim.rs` and `daemon_pty`; the fake
@@ -178,17 +180,24 @@ agent never calls `xdg-open`.
 
 ## Status
 
-- **Milestone:** first working slice, done for the owner's path.
+- **Milestone:** done. Everything below is verified on `k2-kind-fake`, which
+  is now taken down; `k2-kind` (the owner's) was left alone after the
+  coordinator took it over.
+- **Earlier:** first working slice, done for the owner's path.
   `up.sh` gave a working URL and login on `k2-kind`, and the coordinator now
   owns that pod. S1 passes through the port-forward.
 - **Added on request:** `deploy/kind/components/no-k2dev` (shared by both
   overlays) and the opt-in `deploy/kind/agents-egress-locked` overlay.
-  Checked by rendering with `kubectl kustomize` only, because the
-  coordinator paused cluster work (the Docker VM was overloaded).
-  On RESUME: apply to `k2-kind-fake` (`up.sh --fake`), check the env in the
-  pod, and re-run S1. Do not re-apply `k2-kind`: the owner is in it. A
-  later `up.sh` there changes only the ConfigMap, and `envFrom` takes effect
-  at the next pod restart, not at apply.
+  Verified on `k2-kind-fake` after RESUME (see Evidence). `k2-kind` has
+  not been re-applied. A later `up.sh` there changes only the ConfigMap,
+  and `envFrom` takes effect at the next pod restart, not at apply.
+- **Shared Docker lock:** `up.sh` holds `~/.cache/k2-dist-docker.lock`
+  around its builds and `kind load` (coordinator rule), and frees it before
+  touching the cluster.
+- **Observed:** in the fake pod, the daemon's subscription-usage probe runs
+  `codex app-server` (`subscription_usage.rs`), finds the fake `codex`
+  symlink and waits for its timeout. That is harmless. The real image has
+  no `codex`.
 - **Fixes found by running it:**
   - The login step in `up.sh` exited silently: SIGPIPE from
     `tr </dev/urandom | head` under `pipefail`, and a JSON literal that

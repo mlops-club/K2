@@ -46,6 +46,12 @@ kind_kubeconfig
 cd "$KIND_REPO"
 
 # ── 1. images ───────────────────────────────────────────────────────────
+# Docker-heavy steps (builds, kind load) take the machine-wide lock the
+# k2-dist workers share, so only one runs in the Docker VM at a time.
+DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
+mkdir -p "$HOME/.cache"
+until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
+trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
 if [ "$rebuild_daemon" = 1 ] || ! docker image inspect k2-daemon:dev >/dev/null 2>&1; then
     say "building k2-daemon:dev (packaging/oci/build.sh; a cold build takes a while)"
     CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4} packaging/oci/build.sh k2-daemon:dev >&2
@@ -60,6 +66,7 @@ image_id=$(docker image inspect -f '{{.Id}}' "$KIND_IMAGE")
 # ── 2. load and apply ───────────────────────────────────────────────────
 say "loading $KIND_IMAGE into kind cluster $KIND_CLUSTER"
 kind load docker-image "$KIND_IMAGE" --name "$KIND_CLUSTER" >&2
+rmdir "$DOCKER_LOCK"; trap - EXIT
 say "applying $KIND_OVERLAY (namespace $KIND_NS)"
 kubectl kustomize --load-restrictor LoadRestrictionsNone "$KIND_OVERLAY" | kc apply -f - >&2
 # Same tag, new image: the pod template carries the image id, so a rebuilt
