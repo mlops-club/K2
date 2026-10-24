@@ -1,0 +1,132 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "msg",
+  "name": "Message wakes a sleeping agent",
+  "note": "Agent A on host 1 messages agent B, who is asleep and will wake on host 2.",
+  "proof": [
+    "S3",
+    "S4",
+    "S8"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.msg",
+  "correlate": "msg_id",
+  "participants": [
+    {
+      "id": "a",
+      "name": "Agent A",
+      "role": "on host 1"
+    },
+    {
+      "id": "h1",
+      "name": "Host 1",
+      "role": "k2-host"
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "outbox"
+    },
+    {
+      "id": "h2",
+      "name": "Host 2",
+      "role": "k2-host"
+    },
+    {
+      "id": "b",
+      "name": "Agent B",
+      "role": "asleep"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "a",
+      "to": "h1",
+      "kind": "call",
+      "label": "k2 talk B \"review PR 42\"",
+      "event": "cli.msg_send",
+      "say": "Agent A runs the CLI verb exactly as today. It talks to its host's cell socket, not to the controller directly."
+    },
+    {
+      "n": 2,
+      "from": "h1",
+      "to": "ctl",
+      "kind": "call",
+      "label": "Deliver{msg_id, to: B}",
+      "event": "ctl.deliver",
+      "say": "The host forwards the message with a fresh id."
+    },
+    {
+      "n": 3,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "outbox.append(msg_id)",
+      "event": "outbox.append",
+      "say": "New: the message is written down before anything else happens. Today k2 msg has no queue; with more moving parts, failures get more common, so delivery becomes durable."
+    },
+    {
+      "n": 4,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "wake(B): make sure host 2 is up",
+      "event": "lifecycle.wake",
+      "say": "B is asleep. On one machine, host 2 is the same process and is always up. On Kubernetes, the controller starts B's host pod first if it is stopped (see the Provisioner inside the controller)."
+    },
+    {
+      "n": 5,
+      "from": "ctl",
+      "to": "h2",
+      "kind": "call",
+      "label": "Spawn{B, resume}",
+      "event": "host.spawn",
+      "say": "Same spawn as the previous flow, with B's saved session id."
+    },
+    {
+      "n": 6,
+      "from": "h2",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "Ready{B}",
+      "event": "host.ready",
+      "say": "The host reports ready once the CLI accepts input, using today's readiness wait (20 s ceiling)."
+    },
+    {
+      "n": 7,
+      "from": "ctl",
+      "to": "h2",
+      "kind": "call",
+      "label": "Inject{msg_id, text}",
+      "event": "host.inject",
+      "say": "The controller asks host 2 to type the message."
+    },
+    {
+      "n": 8,
+      "from": "h2",
+      "to": "b",
+      "kind": "call",
+      "label": "paste, wait 150 ms, Enter",
+      "event": "cli.paste",
+      "say": "Exactly today's injection pattern, now run on the host."
+    },
+    {
+      "n": 9,
+      "from": "h2",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "Delivered{msg_id}",
+      "event": "outbox.delivered",
+      "say": "The outbox entry closes. If host 2 died before this, the entry would still be open and the controller would retry on the next placement, and B would dedupe on the id."
+    },
+    {
+      "n": 10,
+      "from": "ctl",
+      "to": "a",
+      "kind": "reply",
+      "label": "delivered",
+      "event": "cli.msg_result",
+      "say": "A sees the same success it sees today."
+    }
+  ]
+}

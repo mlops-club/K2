@@ -1,0 +1,98 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "move",
+  "name": "Move an agent to another host",
+  "note": "For portable agents on plain machines, or Kubernetes without replicated storage.",
+  "proof": [
+    "S10"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.move",
+  "correlate": "agent_id",
+  "participants": [
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": ""
+    },
+    {
+      "id": "h1",
+      "name": "Old host",
+      "role": ""
+    },
+    {
+      "id": "blob",
+      "name": "Home store",
+      "role": "controller or S3"
+    },
+    {
+      "id": "h2",
+      "name": "New host",
+      "role": ""
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "ctl",
+      "to": "h1",
+      "kind": "call",
+      "label": "Release{agent}",
+      "event": "host.release",
+      "say": "The same release used for sleeping."
+    },
+    {
+      "n": 2,
+      "from": "h1",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "Released{session_id}",
+      "event": "host.released",
+      "say": "The CLI has ended; the home is quiet."
+    },
+    {
+      "n": 3,
+      "from": "h1",
+      "to": "blob",
+      "kind": "call",
+      "label": "push home (git bundle, .k2/, provider dir)",
+      "event": "home.push",
+      "say": "Content-addressed, so unchanged files cost nothing. The provider dir holds MEMORY.md and the transcripts."
+    },
+    {
+      "n": 4,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "placement.epoch += 1",
+      "event": "placement.epoch_bump",
+      "say": "The old host's claim is now stale (I1 and I4)."
+    },
+    {
+      "n": 5,
+      "from": "ctl",
+      "to": "h2",
+      "kind": "call",
+      "label": "Spawn{agent, home_ref, epoch}",
+      "event": "host.spawn",
+      "say": "The new host gets a pointer to the home."
+    },
+    {
+      "n": 6,
+      "from": "h2",
+      "to": "blob",
+      "kind": "call",
+      "label": "fetch home",
+      "event": "home.fetch",
+      "say": "On Kubernetes with replicated storage, steps 3 and 6 become a volume reattach instead."
+    },
+    {
+      "n": 7,
+      "from": "h2",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "Ready",
+      "event": "host.ready",
+      "say": "The runner then checks memory files and the session id byte for byte (I3)."
+    }
+  ]
+}

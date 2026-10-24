@@ -1,0 +1,116 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "spawn",
+  "name": "Spawn on a remote host",
+  "note": "The client asks for an agent; the controller picks the host that holds its home.",
+  "proof": [
+    "S1",
+    "S2"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.spawn",
+  "correlate": "agent_id",
+  "participants": [
+    {
+      "id": "client",
+      "name": "Client",
+      "role": "app, web, k2 CLI"
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "k2-daemon"
+    },
+    {
+      "id": "host",
+      "name": "Agent host",
+      "role": "k2-host"
+    },
+    {
+      "id": "ptyd",
+      "name": "PTY host",
+      "role": "k2-ptyd"
+    },
+    {
+      "id": "cli",
+      "name": "claude CLI",
+      "role": "unchanged"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "client",
+      "to": "ctl",
+      "kind": "call",
+      "label": "POST /cli/sessions/v2/spawn",
+      "event": "api.spawn_request",
+      "say": "The same route the client uses today. It doesn't know or care where the agent will run."
+    },
+    {
+      "n": 2,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "placement.choose(agent)",
+      "event": "placement.choose",
+      "say": "Placement picks the host that holds the agent's home. A laptop-pinned agent only ever goes to that laptop."
+    },
+    {
+      "n": 3,
+      "from": "ctl",
+      "to": "host",
+      "kind": "call",
+      "label": "Spawn{agent, harness, resume_id, epoch}",
+      "event": "host.spawn",
+      "say": "Sent over the WebSocket the host opened when it enrolled. The envelope is signed and sequenced, like k2-node compute frames today. The epoch enforces invariant I1."
+    },
+    {
+      "n": 4,
+      "from": "host",
+      "to": "ptyd",
+      "kind": "call",
+      "label": "open_session(cols, rows)",
+      "event": "ptyd.open_session",
+      "say": "The host asks its local PTY host for a terminal. The PTY host owns the output ring, so output survives the host link dropping."
+    },
+    {
+      "n": 5,
+      "from": "ptyd",
+      "to": "cli",
+      "kind": "call",
+      "label": "exec claude --resume <id>",
+      "event": "cli.exec",
+      "say": "The CLI starts exactly as it does today, with K2_CELL, K2_HOOK_SOCK and K2_HOOK_TOKEN set."
+    },
+    {
+      "n": 6,
+      "from": "cli",
+      "to": "host",
+      "kind": "call",
+      "label": "hook SessionStart (cell socket)",
+      "event": "cli.hook",
+      "match": {
+        "hook": "SessionStart"
+      },
+      "say": "Hooks reach the host's per-cell socket. The /proc ancestry owner check runs here, on the same kernel as the CLI."
+    },
+    {
+      "n": 7,
+      "from": "host",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "AgentEvent{SessionStart, attested}",
+      "event": "host.agent_event",
+      "say": "The controller only accepts events the host has already attributed to the right agent."
+    },
+    {
+      "n": 8,
+      "from": "ctl",
+      "to": "client",
+      "kind": "reply",
+      "label": "activity + PTY stream",
+      "event": "client.stream",
+      "say": "The client sees the agent start and can attach to its terminal through the controller."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "k2-fake-agent"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "TEST ONLY: a fake agent CLI (claude-shaped) for the K2 lab (PRD k2-distributed-runtime section 3). Takes pasted input, runs a timed turn, writes a transcript and memory file, fires hooks, resumes with --resume. No API keys. Never shipped."
+
+[[bin]]
+name = "k2-fake-agent"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
