@@ -45,11 +45,18 @@ say() { printf '%s kind: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 # Stop the port-forward loop this variant started, if any.
 kind_stop_forward() {
-    local pid
-    pid=$(cat "$KIND_STATE/port-forward.pid" 2>/dev/null) || return 0
+    local pid _
+    pid=$(cat "$KIND_STATE/port-forward.pid" 2>/dev/null) || pid=""
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        pkill -P "$pid" 2>/dev/null || true
         kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     fi
     rm -f "$KIND_STATE/port-forward.pid"
+    # Any kubectl port-forward left on this variant's own kubeconfig (an
+    # interrupted up.sh can orphan one); nothing else uses that path.
+    pkill -f -- "--kubeconfig $KIND_KUBECONFIG -n $KIND_NS port-forward" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        pgrep -f -- "--kubeconfig $KIND_KUBECONFIG -n $KIND_NS port-forward" >/dev/null || break
+        sleep 0.1
+    done
 }

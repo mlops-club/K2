@@ -109,17 +109,21 @@ expect_success() {  # expect_success <what> <response>
 }
 users=$(k2_call /cli/users)
 exists=$(python3 -I -c 'import json,sys; print(any(u.get("username")==sys.argv[2] for u in json.loads(sys.argv[1]).get("users",[])))' "$users" "$user")
+# JSON bodies from Python, never from a shell string ({a,b} would brace-expand).
+# Values come in through the environment (B_<key>), so the password is on
+# no process's argv.
+body() { python3 -I -c 'import json,os,sys; print(json.dumps({k: os.environ["B_" + k] for k in sys.argv[1:]}))' "$@"; }
 password=""
 if [ "$exists" != True ] || [ "$reset_password" = 1 ]; then
-    password=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
+    password=$(python3 -I -c 'import secrets,string; a=string.ascii_letters+string.digits; print("".join(secrets.choice(a) for _ in range(24)))')
 fi
 if [ "$exists" != True ]; then
-    expect_success "creating login $user" "$(k2_call /cli/users/add "{\"username\":\"$user\",\"password\":\"$password\"}")"
-    expect_success "making $user an Owner" "$(k2_call /cli/users/set-role "{\"username\":\"$user\",\"role\":\"owner\"}")"
+    expect_success "creating login $user" "$(k2_call /cli/users/add "$(B_username="$user" B_password="$password" body username password)")"
+    expect_success "making $user an Owner" "$(k2_call /cli/users/set-role "$(B_username="$user" B_role=owner body username role)")"
     say "created K2 login '$user' (Owner)"
 elif [ "$reset_password" = 1 ]; then
     expect_success "resetting the password of $user" \
-        "$(k2_call /cli/users/set-password "{\"username\":\"$user\",\"password\":\"$password\",\"mustChangePassword\":false}")"
+        "$(k2_call /cli/users/set-password "$(B_username="$user" B_password="$password" body username password)" )"
     say "set a new password for K2 login '$user'"
 fi
 unset owner_token
