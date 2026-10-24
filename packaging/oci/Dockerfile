@@ -25,6 +25,9 @@ RUN apt-get update \
 
 # ── build: k2-ptyd first, then k2-daemon embedding it (P84) ──────────────
 FROM toolchain AS build
+# Parallel rustc jobs; keep it modest on a shared laptop (build.sh passes it).
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,id=k2-oci-cargo-registry,target=/usr/local/cargo/registry \
