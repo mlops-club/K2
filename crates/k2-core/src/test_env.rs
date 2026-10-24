@@ -536,6 +536,239 @@ pub fn thread_id_line_names_something(line: &str) -> bool {
     false
 }
 
+// ── K2-home path ratchet (K2 Distributed Runtime P0) ──────────────────
+
+/// `src` with every comment and the contents of every string and char
+/// literal replaced by spaces (newlines kept, so line numbers still
+/// match). Raw strings (`r#"…"#`) and nested block comments included.
+/// Lifetimes (`'a`) are left alone.
+pub fn blank_comments_and_literals(src: &str) -> String {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut o = b.to_vec();
+    let blank = |o: &mut Vec<u8>, from: usize, to: usize| {
+        for c in o.iter_mut().take(to.min(n)).skip(from) {
+            if *c != b'\n' {
+                *c = b' ';
+            }
+        }
+    };
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < n {
+        if b[i..].starts_with(b"//") {
+            let end = b[i..].iter().position(|&c| c == b'\n').map_or(n, |p| i + p);
+            blank(&mut o, i, end);
+            i = end;
+            continue;
+        }
+        if b[i..].starts_with(b"/*") {
+            let (mut depth, mut j) = (1, i + 2);
+            while j < n && depth > 0 {
+                if b[j..].starts_with(b"/*") {
+                    depth += 1;
+                    j += 2;
+                } else if b[j..].starts_with(b"*/") {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            blank(&mut o, i, j);
+            i = j;
+            continue;
+        }
+        let prev_ident = i > 0 && ident(b[i - 1]);
+        if !prev_ident && (b[i] == b'r' || b[i..].starts_with(b"br")) {
+            let r = if b[i] == b'r' { i } else { i + 1 };
+            let hashes = b[r + 1..].iter().take_while(|&&c| c == b'#').count();
+            if b.get(r + 1 + hashes) == Some(&b'"') {
+                let start = r + 2 + hashes;
+                let mut close = vec![b'"'];
+                close.extend(std::iter::repeat_n(b'#', hashes));
+                let end = b[start..].windows(close.len()).position(|w| w == close.as_slice()).map_or(n, |p| start + p);
+                blank(&mut o, start, end);
+                i = end + close.len();
+                continue;
+            }
+        }
+        if b[i] == b'"' {
+            let mut j = i + 1;
+            while j < n && b[j] != b'"' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            blank(&mut o, i + 1, j);
+            i = j + 1;
+            continue;
+        }
+        if b[i] == b'\'' {
+            if b.get(i + 1) == Some(&b'\\') {
+                let end = b[i + 2..].iter().position(|&c| c == b'\'').map_or(n, |p| i + 2 + p);
+                blank(&mut o, i + 1, end);
+                i = end + 1;
+                continue;
+            }
+            // A one-char literal (`'{'`); multi-byte chars are not braces.
+            if b.get(i + 2) == Some(&b'\'') {
+                blank(&mut o, i + 1, i + 2);
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&o).into_owned()
+}
+
+/// Does `line` hold a `.k2` path segment inside a literal (`".k2"`,
+/// `".k2/…`, `…/.k2"`, `…/.k2/…`)? Not `.k2so`, `.k2.dev`, `.k2-…`.
+fn has_dot_k2_segment(line: &str) -> bool {
+    let b = line.as_bytes();
+    line.match_indices(".k2").any(|(at, _)| {
+        let before = at.checked_sub(1).map(|p| b[p]);
+        let after = b.get(at + 3).copied();
+        matches!(before, Some(b'"') | Some(b'/')) && matches!(after, Some(b'"') | Some(b'/'))
+    })
+}
+
+/// An identifier that names a home directory (`home`, `HOME`, `real_home`,
+/// `home_dir`, …), but not the K2 home itself (`k2_home`).
+fn names_a_home(ident: &str) -> bool {
+    !ident.contains("k2_home")
+        && (ident == "home" || ident == "HOME" || ident.ends_with("_home") || ident.starts_with("home_"))
+}
+
+/// Lines of `#[cfg(test)]` / `#[cfg(all(test, …))]` items (attribute
+/// through the item's closing brace or `;`), from blanked `code` lines.
+fn cfg_test_lines(code: &[&str]) -> Vec<bool> {
+    let mut skip = vec![false; code.len()];
+    let mut i = 0;
+    while i < code.len() {
+        let t = code[i].trim();
+        if !(t.starts_with("#[cfg(test") || t.starts_with("#[cfg(all(test")) {
+            i += 1;
+            continue;
+        }
+        let mut k = i + 1;
+        while k < code.len() && code[k].trim().starts_with("#[") {
+            k += 1;
+        }
+        let (mut depth, mut opened) = (0i64, false);
+        while k < code.len() {
+            let c = code[k];
+            depth += c.matches('{').count() as i64 - c.matches('}').count() as i64;
+            opened |= c.contains('{');
+            if (opened && depth <= 0) || (!opened && c.trim_end().ends_with(';')) {
+                break;
+            }
+            k += 1;
+        }
+        let end = k.min(code.len() - 1);
+        skip[i..=end].iter_mut().for_each(|s| *s = true);
+        i = end + 1;
+    }
+    skip
+}
+
+/// 1-based lines of non-test code in `src` that build a K2-home path by
+/// hand instead of through `k2_client::paths` (`k2_core::paths`). A line
+/// counts when it holds a `.k2` path segment in a literal AND either
+///
+/// - its statement (back and forward to the nearest `;`, `{` or `}`, up
+///   to 8 lines each way) names a home dir in code (`home_dir()`, `home`,
+///   `real_home`, …) — `dirs::home_dir().unwrap().join(".k2")`,
+///   `home.join(".k2/x")`, `format!("{}/.k2", home.display())`;
+/// - it spells `$HOME/.k2`, `${HOME}/.k2` or `{home}/.k2` (a generated
+///   script or plist naming the default layout); or
+/// - it is a `.join(".k2…")` within 12 lines after a `home_dir()` call
+///   (`Some(h) => h.join(".k2")`).
+///
+/// A workspace dot-dir (`ws.join(".k2")`, `".k2/wiki/Home.md"`) is not
+/// flagged. `#[cfg(test)]` items are skipped: tests build the default
+/// layout under a temp `$HOME` on purpose.
+pub fn k2_home_path_lines(src: &str) -> Vec<usize> {
+    let code_text = blank_comments_and_literals(src);
+    let code: Vec<&str> = code_text.split('\n').collect();
+    let raw: Vec<&str> = src.split('\n').collect();
+    let skip = cfg_test_lines(&code);
+    let ends_stmt = |l: &str| l.trim_end().is_empty() || l.trim_end().ends_with([';', '{', '}']);
+    let mut out = Vec::new();
+    for (i, line) in raw.iter().enumerate() {
+        if skip[i] || code[i].trim().is_empty() || !has_dot_k2_segment(line) {
+            continue;
+        }
+        let mut a = i;
+        while a > 0 && i - a < 8 && !ends_stmt(code[a - 1]) {
+            a -= 1;
+        }
+        let mut b = i;
+        while b + 1 < code.len() && b - i < 8 && !ends_stmt(code[b]) {
+            b += 1;
+        }
+        let names_home = code[a..=b]
+            .iter()
+            .flat_map(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+            .any(names_a_home);
+        let default_layout_literal = ["$HOME/.k2", "${HOME}/.k2", "{home}/.k2"].iter().any(|p| line.contains(p));
+        let after_home_dir = line.contains(".join(\".k2")
+            && code[i.saturating_sub(12)..i].iter().any(|l| l.contains("home_dir()"));
+        if names_home || default_layout_literal || after_home_dir {
+            out.push(i + 1);
+        }
+    }
+    out
+}
+
+/// Walk `src_root` and report every K2-home path built outside
+/// `paths.rs` ([`k2_home_path_lines`]) over the per-file `allow` count
+/// (path relative to `src_root`, `/`-separated; files not listed allow 0).
+/// Test files (`tests.rs`, `*_tests.rs`, anything under a `tests/` dir)
+/// are skipped like `#[cfg(test)]` items. One `file:line: text` per
+/// finding; empty = pass. A count only ever goes down.
+pub fn k2_home_path_violations(src_root: &Path, allow: &[(&str, usize)]) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![src_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let rel = path.strip_prefix(src_root).expect("under src root").to_string_lossy().replace('\\', "/");
+        let name = rel.rsplit('/').next().unwrap_or(&rel);
+        let test_file = name == "tests.rs" || name.ends_with("_tests.rs") || rel.starts_with("tests/") || rel.contains("/tests/");
+        if test_file || rel == "paths.rs" {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let lines = k2_home_path_lines(&src);
+        let max = allow.iter().find(|(f, _)| *f == rel).map_or(0, |(_, n)| *n);
+        let found = lines.len();
+        if found > max {
+            let text: Vec<&str> = src.split('\n').collect();
+            for n in lines {
+                out.push(format!(
+                    "{}:{n}: {} — build K2-home paths with k2_core::paths (k2_home, k2_file, k2_home_for), \
+                     never $HOME/.k2 ({} found, {max} allowed)",
+                    path.display(),
+                    text[n - 1].trim(),
+                    found
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// A loopback TCP port that is RESERVED but not listening: connects to it
 /// are refused at once, and no other test can take it while the guard
 /// lives. Use it for "nothing listens there" tests instead of binding a
@@ -980,6 +1213,73 @@ mod tests {
             "raw env mutation over the ratchet:\n{}",
             violations.join("\n")
         );
+    }
+
+    #[test]
+    fn k2_home_lint_flags_home_rooted_paths_only() {
+        let flagged = |src: &str| k2_home_path_lines(src);
+        // Home-rooted: every shape a K2-home path took before P0.
+        assert_eq!(flagged("fn a() -> P {\n    dirs::home_dir().unwrap().join(\".k2\")\n}\n"), vec![2]);
+        assert_eq!(
+            flagged("fn a() -> P {\n    dirs::home_dir()\n        .unwrap_or_default()\n        .join(\".k2\")\n        .join(\"x\")\n}\n"),
+            vec![4]
+        );
+        assert_eq!(flagged("fn a(home: &Path) -> P {\n    home.join(\".k2/daemon.port\")\n}\n"), vec![2]);
+        assert_eq!(flagged("fn a(real_home: &Path) -> P { real_home.join(\".k2\") }\n"), vec![1]);
+        assert_eq!(flagged("fn a() -> P {\n    let h = dirs::home_dir()?;\n    h.join(\".k2\")\n}\n"), vec![3]);
+        assert_eq!(flagged("fn a() -> S {\n    format!(\"{}/.k2/x\", home.display())\n}\n"), vec![2]);
+        assert_eq!(flagged("const S: &str = r#\"PORT=\"$HOME/.k2/heartbeat.port\"\"#;\n"), vec![1]);
+        assert_eq!(flagged("fn a() -> S {\n    format!(\"LOG={home}/.k2/x.log\")\n}\n"), vec![2]);
+        // Not home-rooted: workspace dot-dirs, fixtures, other names.
+        assert!(flagged("fn a(ws: &Path) -> P {\n    ws.join(\".k2\").join(\"wiki\")\n}\n").is_empty());
+        assert!(flagged("fn a(ws: &Path) -> P {\n    let home_md = 1;\n    ws.join(\".k2/wiki/Home.md\")\n}\n").is_empty());
+        assert!(flagged("fn a() -> P {\n    crate::paths::k2_home().join(\"x\")\n}\n").is_empty());
+        assert!(flagged("const P: &str = \"/home/u/.k2/bin\";\n").is_empty());
+        assert!(flagged("fn a(home: &Path) -> P {\n    home.join(\".k2so\").join(\".k2.dev\")\n}\n").is_empty());
+        assert!(flagged("// home.join(\".k2\") in prose\nfn a() {}\n").is_empty());
+        // Test items are skipped, even past a raw string holding braces.
+        let src = "#[cfg(test)]\nmod tests {\n    const J: &str = r#\"{\"a\":{}\"#;\n    fn t(home: &Path) { home.join(\".k2\"); }\n}\nfn prod(home: &Path) -> P { home.join(\".k2\") }\n";
+        assert_eq!(flagged(src), vec![6]);
+    }
+
+    #[test]
+    fn blanking_keeps_lines_and_code() {
+        let src = "let a = \"x{\"; // c {\nlet b = r#\"y\"}\"#; /* {\n} */ let c = '{';\nlet d: &'a str;\n";
+        let out = blank_comments_and_literals(src);
+        assert_eq!(out.lines().count(), src.lines().count());
+        assert!(!out.contains('{') && !out.contains('}'), "{out}");
+        assert!(out.contains("let d: &'a str;"), "lifetimes are kept: {out}");
+    }
+
+    /// RATCHET (K2 Distributed Runtime P0): every K2-home path in k2-core
+    /// and k2-client goes through `paths` (`K2_HOME`, else `~/.k2`). A
+    /// hand-built `home_dir().join(".k2")` fails here with its file and
+    /// line. The few legitimate default-layout spellings are listed with
+    /// their counts; lower a count when you remove one, never raise it.
+    #[test]
+    fn no_new_k2_home_paths_outside_paths_in_k2_core() {
+        const ALLOW: &[(&str, usize)] = &[
+            // `TempHome` pre-creates `<temp HOME>/.k2` for the default layout.
+            ("test_env.rs", 1),
+            // `notify.sh` keeps `"$HOME/.k2/heartbeat.port"` byte for byte
+            // when K2_HOME is unset (`hook_port_file`).
+            ("agent_hooks/install.rs", 1),
+        ];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let v = k2_home_path_violations(&src, ALLOW);
+        assert!(v.is_empty(), "K2-home path built outside k2_core::paths:\n{}", v.join("\n"));
+    }
+
+    #[test]
+    fn no_new_k2_home_paths_outside_paths_in_k2_client() {
+        const ALLOW: &[(&str, usize)] = &[
+            // The 0.40 `~/.k2so` → `~/.k2` move works on `$HOME` itself; it
+            // is skipped when K2_HOME is set (`migrate_home_dir_for`).
+            ("migration_home.rs", 1),
+        ];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../k2-client/src");
+        let v = k2_home_path_violations(&src, ALLOW);
+        assert!(v.is_empty(), "K2-home path built outside k2_client::paths:\n{}", v.join("\n"));
     }
 }
 
