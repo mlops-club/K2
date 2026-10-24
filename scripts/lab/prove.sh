@@ -149,8 +149,8 @@ if ! lab_toolchain "$LAB_REPO" >>"$RUN/build.log" 2>&1; then
     [ "$PARITY" = none ] && parity_none
     finish
 fi
-say "building k2-daemon and k2-fake-agent (rust: $LAB_RUST_SOURCE, $(rustc --version))"
-if ! lab_cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent >>"$RUN/build.log" 2>&1; then
+say "building k2-daemon, k2-fake-agent, and k2-node + k2-provider-fakes (tests/cli needs them) (rust: $LAB_RUST_SOURCE, $(rustc --version))"
+if ! lab_cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent -p k2-node -p k2-provider-fakes >>"$RUN/build.log" 2>&1; then
     say "build failed (see build.log)"
     NOTES+=("Build failed (build.log). Nothing ran.")
     finish

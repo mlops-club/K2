@@ -254,6 +254,26 @@ set.
 - Some `tests/cli` scripts expect Linux (for example `app_runtime_cli_smoke`
   wants the App-box doctor's helper check).
 
+### tests/cli on this Mac (first full run, 156 scripts)
+
+147 pass. The lab now builds `k2-node` and `k2-provider-fakes` with the daemon
+(`compute_cli_smoke` and `mail_calendar_providers` failed only because they
+were not built). Scripts that exit after printing their own refusal to run
+here are NOT RUN with that line as the reason (`parity/cli/not-run.txt`), not
+FAIL; the suite is then NOT RUN, never green:
+
+- `compute_node_install_linux`, `node_admin_linux`: refuse outside a
+  disposable Linux box (`K2_DISPOSABLE_BOX`), by design.
+- `node_admin_linux_container`: a build-box script that needs an output dir
+  argument and podman.
+- `sign_app_engine`, `sign_k2_node`: need `minisign`, which this Mac does not
+  have. **Owner's call:** `brew install minisign` would let them run; the lab
+  does not install host tools.
+
+Real failures (pre-existing): `app_runtime_cli_smoke` (expects the Linux App
+box doctor), `permission_off_golden` (its schema golden is stale against
+`k2 zen widget errors`).
+
 ### I5 baseline
 
 While the Linux gate is held, a baseline records the suites that ran and lists

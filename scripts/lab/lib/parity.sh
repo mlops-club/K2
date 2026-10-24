@@ -83,22 +83,51 @@ run_clean() {
 # ── tests/cli/*.sh ───────────────────────────────────────────────────────
 # One script at a time: 27 of them rebuild k2-daemon, some with other
 # features, so running them in parallel would race on target/debug.
+#
+# A script that exits non-zero after printing its OWN refusal to run here
+# (not a check failing) is recorded not_run with that line as the reason:
+# the disposable-Linux-box guard, a tool "required for this test", or a
+# build-box script called without its arguments. Anything else non-zero is
+# a failure. Either way the suite is not green.
+cli_not_run_reason() {
+    local log=$1 line
+    line=$(grep -m1 -aE '^refusing: set K2_DISPOSABLE_BOX=1' "$log") \
+        && { echo "refuses outside a disposable Linux box: $line"; return; }
+    line=$(grep -m1 -aE '^FAIL: .* is required for this test' "$log") \
+        && { echo "a tool this test needs is missing here: ${line#FAIL: }"; return; }
+    line=$(grep -m1 -aE 'line [0-9]+: 1: ' "$log") \
+        && { echo "build-box script, needs arguments (${line##*: 1: }); not runnable from this harness"; return; }
+    return 1
+}
+
 parity_cli() {
-    local dir="$RUN/parity/cli" items="$RUN/parity/cli.items" t0=$SECONDS f name rc st skips fails=0 n=0
-    mkdir -p "$dir"; : >"$items"
+    local dir="$RUN/parity/cli" items="$RUN/parity/cli.items" t0=$SECONDS f name rc st skips why
+    local fails=0 notrun=0 n=0
+    mkdir -p "$dir"; : >"$items"; : >"$dir/not-run.txt"
     for f in "$LAB_REPO"/tests/cli/*.sh; do
         name=$(basename "$f" .sh)
         case "$name" in _*) continue ;; esac
         n=$((n + 1))
         run_clean "$dir/$name.log" "$LAB_REPO" 900 bash "$f"; rc=$?
-        if [ $rc -eq 0 ]; then st=pass; else st=fail; fails=$((fails + 1)); fi
+        if [ $rc -eq 0 ]; then
+            st=pass
+        elif why=$(cli_not_run_reason "$dir/$name.log"); then
+            st=not_run; notrun=$((notrun + 1)); printf '%s: %s\n' "$name" "$why" >>"$dir/not-run.txt"
+        else
+            st=fail; fails=$((fails + 1))
+        fi
         skips=$(grep -ciE '(^|[^a-z])skip(ped)?([^a-z]|$)' "$dir/$name.log" || true)
         printf '%s\t%s\t%s\t%s\n' "$name" "$st" "parity/cli/$name.log" "${skips:-0}" >>"$items"
         printf '  cli %-48s %s\n' "$name" "$st"
     done
     local status=pass reason=""
-    [ $fails -gt 0 ] && { status=fail; reason="$fails of $n scripts failed"; }
-    result_json cli "tests/cli/*.sh ($n scripts)" "$status" "$reason" "" "$fails" $((SECONDS - t0)) "$items"
+    if [ $fails -gt 0 ]; then
+        status=fail; reason="$fails of $n scripts failed"
+        [ $notrun -gt 0 ] && reason+="; $notrun could not run here (parity/cli/not-run.txt)"
+    elif [ $notrun -gt 0 ]; then
+        status=not_run; reason="$notrun of $n scripts could not run here (parity/cli/not-run.txt); the rest passed"
+    fi
+    result_json cli "tests/cli/*.sh ($n scripts)" "$status" "$reason" "parity/cli/not-run.txt" "$fails" $((SECONDS - t0)) "$items"
     rm -f "$items"
 }
 
