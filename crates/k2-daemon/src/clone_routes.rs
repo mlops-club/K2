@@ -218,7 +218,7 @@ fn build_workspace_bundle(
     };
 
     // Temp bundle path: ~/.k2so/clone-tmp/<name>-<ts>.tar.gz
-    let tmp_dir = home.join(".k2").join("clone-tmp");
+    let tmp_dir = k2_core::paths::k2_home_for(home).join("clone-tmp");
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| BundleError::Internal(format!("create clone-tmp dir: {e}")))?;
 
