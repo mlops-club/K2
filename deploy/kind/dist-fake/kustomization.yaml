@@ -1,0 +1,16 @@
+# TEST ONLY: distributed K2 on kind with the lab's k2-fake-agent as every
+# agent CLI on the host (k2-agents:fake), for scenario S1 through
+# 127.0.0.1:7442 (scripts/kind/s1.sh --dist). Its own namespace, so a test
+# run never touches k2-kind or k2-kind-dist.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k2-kind-dist-fake
+resources:
+  - ../dist
+images:
+  - name: k2-agents
+    newTag: fake
+labels:
+  - pairs:
+      k2.dev/deploy: kind-dist-fake
+    includeSelectors: false

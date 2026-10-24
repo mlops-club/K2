@@ -8,26 +8,53 @@
 KIND_CLUSTER=k2lab
 KIND_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
-# Variant: "agents" (k2-agents:dev, the owner's) or "fake" (k2-agents:fake,
-# test only). Each has its own namespace, port and state dir.
+# Variant (each has its own namespace, port and state dir):
+#   agents      one pod, k2-agents:dev (the owner's)            k2-kind            7440
+#   fake        one pod, k2-agents:fake (test only)             k2-kind-fake       7441
+#   dist        controller + host, host on k2-agents:dev        k2-kind-dist       7443
+#   dist-fake   controller + host, host on k2-agents:fake       k2-kind-dist-fake  7442
+# KIND_POD is where the daemon token lives (the pod the app talks to);
+# KIND_AGENT_POD is where agents run. KIND_ROLLOUT pairs each StatefulSet
+# with the image whose id rolls it.
 kind_variant() {
     case "$1" in
-        agents)
-            KIND_NS=k2-kind KIND_IMAGE=k2-agents:dev KIND_OVERLAY=deploy/kind/agents
-            KIND_DOCKERFILE=deploy/kind/Dockerfile.agents KIND_CONTEXT=deploy/kind
-            KIND_PORT=${K2_KIND_PORT:-7440} ;;
-        fake)
-            KIND_NS=k2-kind-fake KIND_IMAGE=k2-agents:fake KIND_OVERLAY=deploy/kind/fake
-            KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=.
-            KIND_PORT=${K2_KIND_PORT:-7441} ;;
+        agents|dist)
+            KIND_IMAGE=k2-agents:dev KIND_DOCKERFILE=deploy/kind/Dockerfile.agents KIND_CONTEXT=deploy/kind ;;
+        fake|dist-fake)
+            KIND_IMAGE=k2-agents:fake KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=. ;;
         *) echo "unknown variant $1" >&2; return 2 ;;
+    esac
+    case "$1" in
+        agents) KIND_NS=k2-kind KIND_OVERLAY=deploy/kind/agents KIND_PORT=${K2_KIND_PORT:-7440} KIND_FLAGS="" ;;
+        fake) KIND_NS=k2-kind-fake KIND_OVERLAY=deploy/kind/fake KIND_PORT=${K2_KIND_PORT:-7441} KIND_FLAGS=" --fake" ;;
+        dist) KIND_NS=k2-kind-dist KIND_OVERLAY=deploy/kind/dist KIND_PORT=${K2_KIND_PORT:-7443} KIND_FLAGS=" --dist" ;;
+        dist-fake) KIND_NS=k2-kind-dist-fake KIND_OVERLAY=deploy/kind/dist-fake KIND_PORT=${K2_KIND_PORT:-7442} KIND_FLAGS=" --dist --fake" ;;
+    esac
+    case "$1" in
+        agents|fake)
+            KIND_DIST=0 KIND_SVC=k2-solo KIND_POD=k2-solo-0
+            KIND_AGENT_POD=k2-solo-0 KIND_AGENT_CONTAINER=k2-daemon KIND_AGENT_HOME=/var/lib/k2
+            KIND_ROLLOUT="k2-solo=$KIND_IMAGE" KIND_LOAD="$KIND_IMAGE" ;;
+        dist|dist-fake)
+            KIND_DIST=1 KIND_SVC=k2-controller KIND_POD=k2-controller-0
+            KIND_AGENT_POD=k2-host-0 KIND_AGENT_CONTAINER=k2-host KIND_AGENT_HOME=/var/lib/k2-host
+            KIND_ROLLOUT="k2-controller=k2-daemon:dev k2-host=$KIND_IMAGE" KIND_LOAD="k2-daemon:dev $KIND_IMAGE" ;;
     esac
     KIND_VARIANT=$1
     KIND_STATE="${TMPDIR:-/tmp}/k2-kind/$KIND_VARIANT"
     KIND_KUBECONFIG="$KIND_STATE/kubeconfig"
-    KIND_POD=k2-solo-0
     mkdir -p "$KIND_STATE"
     chmod 700 "$KIND_STATE"
+}
+
+# Variant from the common flags: kind_variant_from_flags <fake 0|1> <dist 0|1>
+kind_variant_from_flags() {
+    case "$1$2" in
+        00) kind_variant agents ;;
+        10) kind_variant fake ;;
+        01) kind_variant dist ;;
+        11) kind_variant dist-fake ;;
+    esac
 }
 
 kind_kubeconfig() {
