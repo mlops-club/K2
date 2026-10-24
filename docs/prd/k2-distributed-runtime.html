@@ -1,0 +1,1497 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>K2 Distributed Runtime</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one long PRD page; a level-of-abstraction explorer pairs each level's entity diagram with step-through sequence diagrams. */
+:root {
+  --bg: #EEF1EC;
+  --panel: #FBFCFA;
+  --ink: #1C2427;
+  --muted: #5B6662;
+  --line: #CBD2CA;
+  --line-strong: #9AA59E;
+  --l0: #A85A12;
+  --l1: #23705F;
+  --l2: #6A4A9C;
+  --l3: #3F5F86;
+  --good: #2F7A3E;
+  --warn: #9A6A00;
+  --bad: #B23A3A;
+  --code-bg: #1B2124;
+  --code-fg: #DCE3DE;
+  --code-dim: #7F8C87;
+  --code-ok: #86CDB9;
+  --font-display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+  --font-body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131819; --panel: #1A2022; --ink: #E4EAE6; --muted: #9AA6A0;
+    --line: #2E3A39; --line-strong: #52605D;
+    --l0: #E39C57; --l1: #5DB8A3; --l2: #AE92E0; --l3: #87A8D0;
+    --good: #6CC27D; --warn: #E0B54A; --bad: #EE8A8A;
+    --code-bg: #0E1213; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131819; --panel: #1A2022; --ink: #E4EAE6; --muted: #9AA6A0;
+  --line: #2E3A39; --line-strong: #52605D;
+  --l0: #E39C57; --l1: #5DB8A3; --l2: #AE92E0; --l3: #87A8D0;
+  --good: #6CC27D; --warn: #E0B54A; --bad: #EE8A8A;
+  --code-bg: #0E1213; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: 16px; line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 32px 64px;
+}
+.wrap { max-width: 1180px; margin: 0 auto; display: flex; flex-direction: column; gap: 56px; }
+h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; line-height: 1.12; }
+h1 { font-size: clamp(2rem, 4.6vw, 3.1rem); font-weight: 800; letter-spacing: -0.02em; }
+h2 { font-size: clamp(1.45rem, 2.6vw, 1.9rem); font-weight: 800; letter-spacing: -0.01em; }
+h3 { font-size: 1.1rem; font-weight: 600; }
+p { margin: 0; }
+code { font-family: var(--font-mono); font-size: 0.86em; }
+a { color: var(--l3); }
+.eyebrow { font-size: 0.78rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.lede { max-width: 70ch; font-size: 1.05rem; }
+.note { color: var(--muted); font-size: 0.9rem; max-width: 74ch; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2.5px solid var(--l1); outline-offset: 2px; border-radius: 6px; }
+
+header { display: flex; flex-direction: column; gap: 14px; }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.88rem; color: var(--muted); }
+.meta b { color: var(--ink); }
+.status { font-family: var(--font-mono); font-size: 0.74rem; font-weight: 600; border: 1.2px solid var(--l0); color: var(--l0); border-radius: 5px; padding: 1px 7px; }
+.chapters { display: flex; flex-wrap: wrap; gap: 6px 8px; }
+.chapters a { color: var(--ink); text-decoration: none; font-size: 0.9rem; border: 1.2px solid var(--line-strong); border-radius: 999px; padding: 3px 12px; background: var(--panel); }
+.chapters a span { font-family: var(--font-mono); color: var(--muted); margin-right: 6px; font-size: 0.78rem; }
+.chapters a:hover { border-color: var(--l1); }
+
+.chapter { display: flex; flex-direction: column; gap: 18px; scroll-margin-top: 20px; }
+.chapter > .eyebrow { color: var(--l1); }
+.chapter-num { font-family: var(--font-mono); font-size: 0.8rem; color: var(--muted); }
+.prose { display: flex; flex-direction: column; gap: 12px; max-width: 74ch; }
+.prose ul, .prose ol { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 6px; }
+h3.sub { font-size: 1.22rem; margin-top: 8px; }
+dfn { font-style: normal; font-weight: 700; background: color-mix(in srgb, var(--l0) 16%, transparent); border-radius: 4px; padding: 0 3px; }
+.payoff { border: 1px solid var(--line); border-left: 4px solid var(--l1); background: var(--panel); border-radius: 10px; padding: 12px 16px; max-width: 80ch; display: flex; flex-direction: column; gap: 6px; }
+.payoff.warn { border-left-color: var(--warn); }
+.payoff b.title { font-family: var(--font-display); font-size: 1rem; }
+.payoff ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; font-size: 0.95rem; }
+.in-project { font-size: 0.95rem; max-width: 80ch; padding: 10px 14px; border-radius: 10px; background: color-mix(in srgb, var(--l2) 9%, var(--panel)); border: 1px dashed color-mix(in srgb, var(--l2) 50%, transparent); }
+.in-project b { color: var(--l2); }
+
+.two { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (min-width: 960px) { .two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px 18px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.panel h3 { font-size: 1.06rem; }
+.panel p, .panel li { font-size: 0.94rem; }
+.panel ul, .panel ol { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.fact { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+.fact b { font-family: var(--font-display); font-size: 1.5rem; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.fact span { font-size: 0.86rem; color: var(--muted); }
+.fact small { font-family: var(--font-mono); font-size: 0.7rem; color: var(--muted); }
+
+table.grid { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+table.grid th, table.grid td { text-align: left; vertical-align: top; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+table.grid th { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+table.grid td:first-child { font-weight: 700; }
+table.grid code { font-size: 0.8rem; }
+table.grid td.c { text-align: center; font-family: var(--font-mono); }
+.table-scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 4px 6px; }
+.table-scroll table { min-width: 720px; }
+.req { color: var(--l1); font-weight: 700; }
+.opt { color: var(--muted); }
+.lost { color: var(--bad); }
+.kept { color: var(--good); }
+.pill { display: inline-block; font-size: 0.72rem; font-weight: 700; border-radius: 999px; padding: 1px 8px; border: 1.2px solid var(--c); color: var(--c); background: color-mix(in srgb, var(--c) 10%, var(--panel)); white-space: nowrap; }
+
+.spec { background: var(--code-bg); color: var(--code-fg); border-radius: 14px; padding: 14px 18px; font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.7; overflow-x: auto; margin: 0; white-space: pre; }
+.spec .d { color: var(--code-dim); }
+.spec .ok { color: var(--code-ok); }
+
+/* Gates */
+.gates { display: flex; flex-direction: column; gap: 14px; }
+.gate { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+@media (min-width: 900px) { .gate { grid-template-columns: 220px minmax(0, 1fr) minmax(0, 1fr); } }
+.gate-id { display: flex; flex-direction: column; gap: 4px; }
+.gate-id .tag { font-family: var(--font-mono); font-weight: 600; font-size: 0.8rem; color: var(--l0); }
+.gate-id b { font-family: var(--font-display); font-size: 1.12rem; line-height: 1.2; }
+.gate-id span { font-size: 0.86rem; color: var(--muted); }
+.gate h4 { margin: 0 0 4px; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.gate ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 0.92rem; }
+.gate .demo { font-family: var(--font-mono); font-size: 0.78rem; background: color-mix(in srgb, var(--line) 40%, transparent); border-radius: 6px; padding: 4px 8px; display: inline-block; margin-top: 6px; word-break: break-all; }
+
+.rules { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px 28px; }
+@media (min-width: 820px) { .rules { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.rules li { padding: 10px 0; border-top: 1px solid var(--line); font-size: 0.95rem; }
+.rules b { display: block; font-family: var(--font-display); font-size: 1.02rem; margin-bottom: 2px; }
+.rules span { color: var(--muted); }
+
+/* Explorer */
+.explorer { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (min-width: 1080px) { .explorer { grid-template-columns: 250px minmax(0, 1fr); } }
+.picker { display: flex; flex-direction: column; gap: 10px; }
+@media (min-width: 1080px) { .picker { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px); } }
+.picker .hint { font-size: 0.86rem; color: var(--muted); }
+.map { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 14px 12px; }
+.map .eyebrow { display: block; margin-bottom: 8px; }
+.map ul { list-style: none; margin: 0; padding: 0; }
+.map ul ul { margin-left: 15px; padding-left: 11px; border-left: 1.5px solid var(--line); }
+.map li { margin: 2px 0; }
+.map button { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; background: none; border: 0; padding: 5px 8px; border-radius: 7px; cursor: pointer; font-size: 0.95rem; }
+.map button:hover { background: color-mix(in srgb, var(--line) 45%, transparent); }
+.map button[aria-current="true"] { background: color-mix(in srgb, var(--c) 16%, var(--panel)); font-weight: 700; }
+.lvl { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 600; padding: 1px 6px; border-radius: 5px; color: var(--c); border: 1.2px solid var(--c); line-height: 1.5; }
+.level-frame { border: 2.5px solid var(--c); border-radius: 18px; background: color-mix(in srgb, var(--c) 4%, var(--bg)); padding: 0 16px 18px; display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.frame-banner { margin: 0 -16px; padding: 10px 16px; border-radius: 15px 15px 0 0; background: var(--c); color: var(--panel); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.frame-banner b { font-family: var(--font-display); font-size: 1.08rem; }
+.frame-banner span { font-size: 0.86rem; opacity: 0.95; }
+.viewhead { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 0.9rem; color: var(--muted); }
+.crumbs button { background: none; border: 0; padding: 2px 4px; cursor: pointer; color: var(--muted); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-strong); }
+.crumbs .here { color: var(--ink); font-weight: 700; padding: 2px 4px; }
+.today { font-size: 0.86rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.today code { color: var(--ink); background: color-mix(in srgb, var(--line) 50%, transparent); padding: 1px 6px; border-radius: 4px; font-size: 0.76rem; }
+.frame-part { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.part-tag { display: inline-flex; align-items: center; gap: 8px; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--c); }
+.part-tag em { font-style: normal; font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--muted); }
+
+.erd-scroll { overflow-x: auto; border-radius: 14px; border: 1px solid var(--line); background: var(--panel); }
+.erd { position: relative; min-width: 720px; height: 500px; background-image: radial-gradient(color-mix(in srgb, var(--line-strong) 45%, transparent) 1px, transparent 1.2px); background-size: 22px 22px; }
+.erd svg.edges { position: absolute; inset: 0; pointer-events: none; overflow: visible; z-index: 2; }
+.edge { stroke: var(--line-strong); stroke-width: 1.6; fill: none; }
+.m-fill { fill: var(--line-strong); }
+.elabel { font-family: var(--font-body); font-size: 12.5px; fill: var(--muted); font-style: italic; paint-order: stroke; stroke: var(--panel); stroke-width: 6px; stroke-linejoin: round; }
+.group { position: absolute; border: 1.6px dashed var(--c); border-radius: 16px; z-index: 0; background: color-mix(in srgb, var(--c) 5%, transparent); }
+.group-label { position: absolute; top: 7px; left: 14px; font-size: 0.78rem; font-weight: 700; color: var(--c); letter-spacing: 0.04em; }
+.card { position: absolute; width: 170px; transform: translateX(-50%); background: var(--panel); border: 1.6px solid var(--c); border-radius: 11px; padding: 9px 11px 10px; display: flex; flex-direction: column; gap: 5px; z-index: 3; font-size: 0.84rem; line-height: 1.38; }
+/* Deployment architecture: machine > pod/container > process */
+.arch-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.86rem; color: var(--muted); align-items: center; }
+.arch-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 22px; height: 14px; border-radius: 4px; display: inline-block; }
+.sw.m { border: 2px solid var(--ink); }
+.sw.c { border: 1.6px dashed var(--l2); background: color-mix(in srgb, var(--l2) 8%, transparent); }
+.sw.p { border: 1.4px solid var(--line-strong); background: var(--panel); border-radius: 999px; }
+.arch { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.mode { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.mode-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.mode-head b { font-family: var(--font-display); font-size: 1.15rem; }
+.mode-head span { color: var(--muted); font-size: 0.88rem; }
+.machines { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; align-items: start; }
+.mach { border: 2px solid var(--ink); border-radius: 12px; padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; background: var(--bg); }
+.mach > .t, .ctr > .t { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 8px; }
+.mach > .t b { font-family: var(--font-display); font-size: 1rem; }
+.kind { font-family: var(--font-mono); font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.ctr { border: 1.6px dashed var(--l2); border-radius: 10px; padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 6px; background: color-mix(in srgb, var(--l2) 6%, var(--panel)); }
+.ctr > .t b { font-size: 0.92rem; }
+.ctr .kind { color: var(--l2); }
+.procs { display: flex; flex-direction: column; gap: 5px; }
+.proc { border: 1.4px solid var(--line-strong); border-radius: 9px; padding: 5px 9px; background: var(--panel); display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.proc .n { font-family: var(--font-mono); font-size: 0.8rem; font-weight: 600; }
+.proc .r { font-size: 0.8rem; color: var(--muted); }
+.proc.ctl { border-color: var(--l0); box-shadow: inset 3px 0 0 var(--l0); }
+.proc.hst { border-color: var(--l1); box-shadow: inset 3px 0 0 var(--l1); }
+.proc .kids { margin: 4px 0 0 10px; padding-left: 10px; border-left: 1.5px solid var(--line); display: flex; flex-direction: column; gap: 4px; }
+.proc .kids .proc { padding: 3px 8px; }
+.mode .note b { color: var(--ink); }
+.chain { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.chain .box { border: 1.6px solid var(--c, var(--line-strong)); border-radius: 10px; padding: 8px 12px; background: var(--panel); display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.chain .box b { font-family: var(--font-display); font-size: 1rem; }
+.chain .box span { font-size: 0.82rem; color: var(--muted); }
+.chain .box.new { border-style: dashed; }
+.chain .arrow { color: var(--line-strong); font-weight: 700; }
+.chain .inner { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; padding-top: 6px; border-top: 1px dashed var(--line); }
+.card.open { z-index: 6; width: 250px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.card-name { font-family: var(--font-display); font-weight: 800; font-size: 1.02rem; letter-spacing: -0.01em; }
+.card-role { color: var(--muted); }
+.card-runs { font-size: 0.78rem; line-height: 1.35; border-top: 1px dashed var(--line); padding-top: 5px; }
+.card-runs span { display: block; font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.info { width: 24px; height: 24px; flex: none; border-radius: 50%; border: 1.4px solid var(--c); background: var(--panel); color: var(--c); cursor: pointer; font-family: var(--font-mono); font-weight: 600; font-size: 0.8rem; display: grid; place-items: center; padding: 0; }
+.info[aria-expanded="true"] { background: var(--c); color: var(--panel); }
+.drill { align-self: flex-start; border: 0; background: color-mix(in srgb, var(--to) 15%, var(--panel)); border-radius: 6px; padding: 3px 9px; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+.drill:hover { background: color-mix(in srgb, var(--to) 28%, var(--panel)); }
+.drill .lvl { font-size: 0.62rem; padding: 0 4px; color: var(--to); border-color: var(--to); }
+.details { border-top: 1px dashed var(--line-strong); padding-top: 7px; margin-top: 2px; display: flex; flex-direction: column; gap: 7px; }
+.dgroup { display: grid; grid-template-columns: 50px minmax(0, 1fr); gap: 6px; align-items: start; }
+.dlabel { font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 700; padding-top: 2px; }
+.dgroup ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.dgroup code { font-size: 0.74rem; word-break: break-word; }
+
+.flows-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs button { border: 1.4px solid var(--line-strong); background: var(--panel); border-radius: 999px; padding: 4px 13px; cursor: pointer; font-size: 0.88rem; }
+.tabs button[aria-selected="true"] { border-color: var(--c); background: color-mix(in srgb, var(--c) 15%, var(--panel)); font-weight: 700; }
+
+/* Sequence diagrams */
+.seqbox { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 14px 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.seqbox .seq-note { color: var(--muted); font-size: 0.9rem; }
+.seq-scroll { overflow-x: auto; }
+.seq-scroll svg { display: block; }
+.seq .head rect { fill: color-mix(in srgb, var(--c) 10%, var(--panel)); stroke: var(--c); stroke-width: 1.6; }
+.seq .head .hname { font-family: var(--font-display); font-weight: 800; font-size: 14px; fill: var(--ink); }
+.seq .head .hsub { font-family: var(--font-body); font-size: 11px; fill: var(--muted); }
+.seq .life { stroke: var(--line-strong); stroke-width: 1.3; stroke-dasharray: 4 5; }
+.seq .msg { cursor: pointer; }
+.seq .msg .ln { stroke: var(--line-strong); stroke-width: 1.7; fill: none; }
+.seq .msg.reply .ln { stroke-dasharray: 6 4; }
+.seq .msg.fail .ln { stroke: var(--bad); stroke-dasharray: 3 4; }
+.seq .msg .lb { font-family: var(--font-body); font-size: 12.5px; fill: var(--ink); }
+.seq .msg.fail .lb { fill: var(--bad); }
+.seq .msg .nb { font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; fill: var(--muted); }
+.seq .msg .hit { fill: transparent; }
+.seq .msg.future { opacity: 0.42; }
+.seq .msg.active .ln { stroke: var(--c); stroke-width: 2.8; }
+.seq .msg.active .lb { font-weight: 700; }
+.seq .msg.active .nb { fill: var(--c); }
+.seq .msg.active .hit { fill: color-mix(in srgb, var(--c) 10%, transparent); }
+.seq .mk { fill: var(--line-strong); }
+.seq .mk-act { fill: var(--c); }
+.seq .mk-bad { fill: var(--bad); }
+.controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.controls button { border: 1.4px solid var(--line-strong); background: var(--panel); border-radius: 7px; padding: 3px 11px; cursor: pointer; font-size: 0.85rem; }
+.controls button:hover:not(:disabled) { border-color: var(--c); }
+.controls button:disabled { opacity: 0.45; cursor: default; }
+.controls .progress { font-size: 0.8rem; color: var(--muted); font-variant-numeric: tabular-nums; margin-left: 4px; }
+.narration { border-left: 3px solid var(--c); padding: 4px 0 4px 12px; font-size: 0.97rem; max-width: 80ch; min-height: 3.2em; }
+.narration b { font-family: var(--font-display); }
+.proof { font-size: 0.84rem; color: var(--muted); }
+.proof code { color: var(--ink); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .card, .tabs button, .map button, .drill { transition: background-color .2s ease, box-shadow .2s ease; }
+}
+</style>
+
+<main class="wrap">
+  <header>
+    <span class="eyebrow">Product requirements · K2 runtime</span>
+    <h1>K2 Distributed Runtime</h1>
+    <p class="lede">Split the K2 daemon into a controller and agent hosts so permanent agents can run on a laptop, one VM, a fixed set of VMs or a Kubernetes cluster, with every feature working the way it does today. Each stage ships with proof that runs, not a promise.</p>
+    <div class="meta">
+      <span class="status">DRAFT</span>
+      <span>Updated <b>2026-10-23</b></span>
+      <span>Branch <code>k2-kubernetes-native</code> · base <code>v0.46.3</code></span>
+      <span>Lab: kind 3 nodes, Kubernetes 1.37, agent-sandbox v1.0.8</span>
+    </div>
+    <nav class="chapters" aria-label="Chapters">
+      <a href="#problem"><span>1</span>Problem and goals</a>
+      <a href="#levels"><span>2</span>The design, level by level</a>
+      <a href="#deploy"><span>2b</span>What runs where</a>
+      <a href="#proof"><span>3</span>How we prove it</a>
+      <a href="#gates"><span>4</span>Stages and gates</a>
+      <a href="#density"><span>5</span>Density: pods vs processes</a>
+      <a href="#death"><span>6</span>When things die</a>
+      <a href="#laptop"><span>7</span>Laptops</a>
+      <a href="#parity"><span>8</span>Feature parity</a>
+      <a href="#endstate"><span>8b</span>Decisions and end state</a>
+      <a href="#reqs"><span>9</span>Requirements</a>
+      <a href="#open"><span>10</span>Open questions</a>
+    </nav>
+  </header>
+
+  <!-- 1 -->
+  <section class="chapter" id="problem">
+    <span class="eyebrow"><span class="chapter-num">1</span> · Problem and goals</span>
+    <h2>K2 assumes one machine. Its agents don't have to.</h2>
+    <div class="prose">
+      <p>Today one <code>k2-daemon</code> process owns everything: the SQLite database behind one mutex, a singleton lock file, every agent's PTY, the scheduler, the tunnel and Caddy. A root helper edits the host through systemd. Agents run as the daemon's own user and the hook owner check walks <code>/proc</code> on the same kernel. That design is why K2 is light, and it is also why K2 cannot spread across machines.</p>
+      <p>Two facts make distribution practical. First, K2 already treats agent processes as disposable: on restart it kills them and relaunches with <code>claude --resume</code>, and agents untouched for 24 hours have no process at all. A <dfn>permanent agent</dfn> in K2 is a durable identity, a durable home directory and a resumable conversation, not a process that never dies. Second, <code>k2-node</code> already is a remote worker built the right way: it dials out, signs every frame and syncs code with git. It runs jobs, not agents.</p>
+    </div>
+    <div class="two">
+      <div class="panel">
+        <h3>Goals</h3>
+        <ul>
+          <li>One design that runs as a single laptop or VM, a fixed fleet of VMs, or on Kubernetes. Same binaries, different wiring.</li>
+          <li>Every feature that works today keeps working in every mode: Postgres, Apps, mail, Sew, Connect, vault, heartbeats, messaging, federation.</li>
+          <li>Single-machine mode stays exactly as light as it is now. 500 mostly-sleeping agents on one node stays normal.</li>
+          <li>Agents survive controller restarts. A daemon upgrade stops killing agent sessions.</li>
+          <li>Kubernetes is optional and native when used: StatefulSets, Gateway API, the Zalando postgres-operator, node autoscaling.</li>
+          <li>Docker Compose is a first-class mode: one file shows the whole end-state architecture on one machine.</li>
+          <li>Each stage is proven with runnable evidence the original authors can rerun with one command.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Non-goals for this PRD</h3>
+        <ul>
+          <li>Live migration of a running CLI process between machines. Agents move by stopping and resuming, as they restart today.</li>
+          <li>Controller high availability. One controller replica plus disposable hosts covers the need; HA is a later, separate decision.</li>
+          <li>Multi-tenant hosting for K2 Connect. The first Kubernetes target is self-hosted, for example a home k3s cluster.</li>
+          <li>Choosing pod-per-agent now. Section 5 gathers the evidence; the decision is made at gate G4 with real numbers.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="in-project"><b>Decisions so far · </b>Kubernetes users are self-hosters first (an owner's own k3s cluster). Postgres, Apps, mail and every other root-helper feature must work there. Pod granularity is on hold pending evidence. Laptops: recommendation in section 7.</div>
+  </section>
+
+  <!-- 2 -->
+  <section class="chapter" id="levels">
+    <span class="eyebrow"><span class="chapter-num">2</span> · The design, level by level</span>
+    <h2>See the runtime one level of abstraction at a time</h2>
+    <div class="prose">
+      <p>Each level shows about five things and how they connect, then the main flows at that level as sequence diagrams you can step through. Use <b>i</b> on a box for what it holds, what it does and where it lives in today's code. Use <b>Look inside</b> to go down a level.</p>
+      <p>The sequence diagrams are not just illustrations. Section 3 turns each one into an expected trace that the conformance runner checks against the real system.</p>
+    </div>
+    <h3 class="sub">The whole change is one split</h3>
+    <div class="prose">
+      <p>K2 today is a client talking to one daemon, and that daemon also runs every agent's terminal and CLI. The proposal cuts the daemon in two. The <dfn>controller</dfn> is today's daemon minus the agent processes; there is exactly one. An <dfn>agent host</dfn> is the code that runs agent terminals and CLIs, pulled out so it can sit on another machine. On a single laptop or VM the host stays inside the same process, so nothing changes there.</p>
+    </div>
+    <div class="two">
+      <div class="panel" style="--c: var(--line-strong)">
+        <span class="eyebrow">Today</span>
+        <div class="chain">
+          <div class="box"><b>Client</b><span>app, web, k2 CLI</span></div>
+          <span class="arrow" aria-hidden="true">→</span>
+          <div class="box" style="--c: var(--l0)"><b>k2-daemon</b><span>database, scheduler, tunnel, messaging</span>
+            <div class="inner"><span>and every agent's terminal and CLI</span></div>
+          </div>
+        </div>
+        <p class="note">One process on one machine.</p>
+      </div>
+      <div class="panel">
+        <span class="eyebrow">Proposed</span>
+        <div class="chain">
+          <div class="box"><b>Client</b><span>unchanged</span></div>
+          <span class="arrow" aria-hidden="true">→</span>
+          <div class="box" style="--c: var(--l0)"><b>Controller</b><span>today's daemon, minus agent processes</span></div>
+          <span class="arrow" aria-hidden="true">→</span>
+          <div class="box new" style="--c: var(--l1)"><b>Agent host</b><span>agent terminals and CLIs</span>
+            <div class="inner"><span>in the same process, on a VM, a laptop or a pod</span></div>
+          </div>
+        </div>
+        <p class="note">One controller, any number of hosts. The dashed box is the only new piece.</p>
+      </div>
+    </div>
+
+    <h3 class="sub" id="deploy">What actually runs where</h3>
+    <div class="prose">
+      <p>The same two programs, <code>k2-daemon</code> (the controller) and <code>k2-host</code>, run in four arrangements. Outlines show what each thing is: a machine, a container or pod, or a plain process. The orange stripe marks the controller, the green stripe marks an agent host.</p>
+    </div>
+    <div class="arch-legend" aria-hidden="true">
+      <span><i class="sw m"></i>Machine (laptop, VM, Kubernetes node)</span>
+      <span><i class="sw c"></i>Container or pod</span>
+      <span><i class="sw p"></i>Process</span>
+    </div>
+    <div class="arch">
+      <div class="mode">
+        <div class="mode-head"><b>A · One laptop or one VM</b><span>Today's setup. Still the default. No containers needed.</span></div>
+        <div class="machines">
+          <div class="mach">
+            <div class="t"><b>Your Mac or a Linux VM</b><span class="kind">machine</span></div>
+            <div class="procs">
+              <div class="proc ctl"><span class="n">k2-daemon</span><span class="r">Background service (launchd on macOS, systemd on Linux). Controller and agent host in one process.</span>
+                <div class="kids">
+                  <div class="proc"><span class="n">claude / codex ×N</span><span class="r">Child processes in PTYs, one per awake agent. Sleeping agents have none.</span></div>
+                </div>
+              </div>
+              <div class="proc"><span class="n">K2 desktop app</span><span class="r">The client. Optional; the web app and <code>k2</code> CLI work too.</span></div>
+              <div class="proc"><span class="n">k2-root-helper</span><span class="r">Linux only. Runs briefly through sudo when the daemon needs a host change.</span></div>
+              <div class="proc"><span class="n">Postgres, Stalwart, Sew</span><span class="r">Linux only. systemd services the daemon manages.</span></div>
+            </div>
+            <div class="ctr"><div class="t"><b>One per K2 App</b><span class="kind">container</span></div><div class="procs"><div class="proc"><span class="n">app process</span><span class="r">Rootless Podman, started by <code>k2-app-engine</code>.</span></div></div></div>
+          </div>
+        </div>
+        <p class="note"><b>Change from today:</b> none visible. The host code is split out inside <code>k2-daemon</code> but runs in the same process.</p>
+      </div>
+
+      <div class="mode">
+        <div class="mode-head"><b>B · A few VMs, plus laptops</b><span>No Kubernetes. Each machine runs one K2 service.</span></div>
+        <div class="machines">
+          <div class="mach">
+            <div class="t"><b>Controller VM</b><span class="kind">machine</span></div>
+            <div class="procs">
+              <div class="proc ctl"><span class="n">k2-daemon</span><span class="r">systemd service. Controller only: database, scheduler, messaging, tunnel. Runs no agents itself.</span></div>
+              <div class="proc"><span class="n">k2-root-helper, Postgres, Stalwart, Sew</span><span class="r">Same as today, on this VM.</span></div>
+            </div>
+            <div class="ctr"><div class="t"><b>One per K2 App</b><span class="kind">container</span></div><div class="procs"><div class="proc"><span class="n">app process</span><span class="r">Rootless Podman, as today.</span></div></div></div>
+          </div>
+          <div class="mach">
+            <div class="t"><b>Host VM (one or more)</b><span class="kind">machine</span></div>
+            <div class="procs">
+              <div class="proc hst"><span class="n">k2-host</span><span class="r">systemd service under its own user. Dials out to the controller.</span>
+                <div class="kids">
+                  <div class="proc"><span class="n">k2-ptyd</span><span class="r">Holds the terminals, so agents outlive a k2-host restart.</span></div>
+                  <div class="proc"><span class="n">claude / codex ×N</span><span class="r">One per awake agent, often 100 or more per VM.</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="mach">
+            <div class="t"><b>Your laptop</b><span class="kind">machine</span></div>
+            <div class="procs">
+              <div class="proc hst"><span class="n">k2-host</span><span class="r">launchd background service. Runs only the agents pinned to this laptop.</span>
+                <div class="kids"><div class="proc"><span class="n">claude / codex ×N</span><span class="r">Uses this laptop's own logins.</span></div></div>
+              </div>
+              <div class="proc"><span class="n">K2 desktop app</span><span class="r">The client, pointed at the controller VM.</span></div>
+            </div>
+          </div>
+        </div>
+        <p class="note"><b>Arrows go one way:</b> every k2-host dials out to the controller over the K2 Connect tunnel or a private network. Hosts open no ports.</p>
+      </div>
+
+      <div class="mode">
+        <div class="mode-head"><b>C · Docker Compose</b><span>One machine, every piece in its own container. The whole end state in one file: <code>deploy/compose/compose.yaml</code>.</span></div>
+        <div class="machines">
+          <div class="mach">
+            <div class="t"><b>One Docker host</b><span class="kind">machine</span></div>
+            <div class="ctr"><div class="t"><b>controller</b><span class="kind">container</span></div>
+              <div class="procs"><div class="proc ctl"><span class="n">k2-daemon</span><span class="r"><code>K2_ROLE=controller</code>. Publishes 443 for the front door.</span></div></div>
+            </div>
+            <div class="ctr"><div class="t"><b>host-1, host-2</b><span class="kind">containers</span></div>
+              <div class="procs"><div class="proc hst"><span class="n">k2-host</span><span class="r">Each with its own volume of agent homes.</span>
+                <div class="kids"><div class="proc"><span class="n">k2-ptyd, claude / codex ×N</span><span class="r">Processes inside the container.</span></div></div>
+              </div></div>
+            </div>
+            <div class="ctr"><div class="t"><b>postgres, mail, sew, apps</b><span class="kind">containers</span></div>
+              <div class="procs"><div class="proc"><span class="n">postgres:17, Stalwart 0.16.25, Sew 0.3.0, k2-app-engine</span><span class="r">Apps run as nested rootless Podman inside <code>apps</code>, the one service with raised privileges.</span></div></div>
+            </div>
+          </div>
+          <div class="mach">
+            <div class="t"><b>Your laptop</b><span class="kind">machine</span></div>
+            <div class="procs">
+              <div class="proc hst"><span class="n">k2-host</span><span class="r">Optional: joins the same controller with <code>k2-host enroll</code>.</span></div>
+            </div>
+          </div>
+        </div>
+        <p class="note"><b>Same programs, same wiring as the VM fleet,</b> with containers in place of VMs. This is also the "Fleet" topology in the lab.</p>
+      </div>
+
+      <div class="mode">
+        <div class="mode-head"><b>D · Kubernetes (for example your k3s cluster)</b><span>Everything is a pod. Laptops can still join as hosts.</span></div>
+        <div class="machines">
+          <div class="mach">
+            <div class="t"><b>Any node</b><span class="kind">machine</span></div>
+            <div class="ctr"><div class="t"><b>k2-controller-0</b><span class="kind">pod · StatefulSet, 1 replica</span></div>
+              <div class="procs"><div class="proc ctl"><span class="n">k2-daemon</span><span class="r">The container's only process. Database and vault on a volume.</span></div></div>
+            </div>
+            <div class="ctr"><div class="t"><b>k2-pg-0</b><span class="kind">pod · Zalando postgres-operator</span></div>
+              <div class="procs"><div class="proc"><span class="n">postgres</span><span class="r">Replaces the root helper's Postgres management.</span></div></div>
+            </div>
+            <div class="ctr"><div class="t"><b>stalwart-0, sew</b><span class="kind">pods</span></div>
+              <div class="procs"><div class="proc"><span class="n">mail and TURN servers</span><span class="r">Exposed through LoadBalancer services.</span></div></div>
+            </div>
+          </div>
+          <div class="mach">
+            <div class="t"><b>Agent nodes</b><span class="kind">machines</span></div>
+            <div class="ctr"><div class="t"><b>k2-host-0 … k2-host-N</b><span class="kind">pods · StatefulSet</span></div>
+              <div class="procs">
+                <div class="proc hst"><span class="n">k2-host</span><span class="r">Main process of the container. Volume holds agent homes and <code>~/.claude</code>.</span>
+                  <div class="kids">
+                    <div class="proc"><span class="n">k2-ptyd</span><span class="r">Same container.</span></div>
+                    <div class="proc"><span class="n">claude / codex ×~100</span><span class="r">Processes inside the pod, not pods of their own.</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="ctr"><div class="t"><b>agent-&lt;name&gt; (optional)</b><span class="kind">pod · Sandbox, one per agent</span></div>
+              <div class="procs"><div class="proc hst"><span class="n">k2-host + one CLI</span><span class="r">Opt-in isolation tier. Decided at gate G4.</span></div></div>
+            </div>
+            <div class="ctr"><div class="t"><b>One per K2 App</b><span class="kind">pod · Deployment</span></div>
+              <div class="procs"><div class="proc"><span class="n">app process</span><span class="r">Replaces rootless Podman on Kubernetes.</span></div></div>
+            </div>
+          </div>
+          <div class="mach">
+            <div class="t"><b>Your laptop</b><span class="kind">machine, outside the cluster</span></div>
+            <div class="procs">
+              <div class="proc hst"><span class="n">k2-host</span><span class="r">launchd service, dialing into the controller pod through the Gateway.</span></div>
+              <div class="proc"><span class="n">K2 desktop app</span><span class="r">The client.</span></div>
+            </div>
+          </div>
+        </div>
+        <p class="note"><b>Agents are processes inside host pods,</b> the same way they are processes on a VM. That keeps the density of section 5. One pod per agent is the optional Sandbox tier only.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="explorer" aria-label="Level of abstraction explorer">
+    <div class="picker">
+      <nav class="map" aria-label="Pick a level of abstraction">
+        <span class="eyebrow">Pick a level</span>
+        <div id="tree"></div>
+      </nav>
+      <p class="hint">L0 is the whole system: three boxes. L1 opens the controller (and the agent data it keeps) or the agent host. L2 shows where hosts come from: Kubernetes, or VMs and laptops.</p>
+    </div>
+    <div class="level-frame" id="level-frame">
+      <div class="frame-banner"><b id="banner-title"></b><span>Everything in this frame belongs to this level.</span></div>
+      <div class="viewhead">
+        <div class="crumbs" id="crumbs"></div>
+        <h2 id="view-title"></h2>
+        <p class="lede" id="view-summary"></p>
+        <div class="today" id="view-today"></div>
+      </div>
+      <div class="frame-part">
+        <span class="part-tag">The entities at this level <em>· and how they connect</em></span>
+        <div class="erd-scroll"><div class="erd" id="erd"><svg class="edges" id="edges" aria-hidden="true"></svg></div></div>
+      </div>
+      <div class="frame-part">
+        <div class="flows-head">
+          <span class="part-tag">The main flows at this level <em>· step through each message</em></span>
+          <div class="tabs" id="tabs" role="tablist" aria-label="Flows"></div>
+        </div>
+        <div id="flowbox"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3 -->
+  <section class="chapter" id="proof">
+    <span class="eyebrow"><span class="chapter-num">3</span> · How we prove it</span>
+    <h2>Every stage proves itself on five topologies</h2>
+    <div class="prose">
+      <p>Nobody gets a change this size right in one pass, so the plan is built around evidence. Each stage ends at a <dfn>gate</dfn>. A gate passes only when a single command, <code>scripts/lab/prove.sh &lt;gate&gt;</code>, brings up the topologies, runs the scenarios and writes an evidence bundle anyone can open. The authors don't have to trust a summary; they rerun the command.</p>
+    </div>
+    <ul class="rules">
+      <li><b>1. Parity first</b><span>Single-machine mode must stay identical. Every gate reruns the existing suites unchanged: <code>scripts/test-gate-linux.sh</code>, <code>tests/cli/*</code> (158 scripts), the <code>must-not-break</code> contract and the behavior tiers.</span></li>
+      <li><b>2. One scenario suite, many topologies</b><span>The same scenarios run against solo, container, fleet, Kubernetes host pods and Kubernetes per-agent sandboxes. A scenario that only passes on one topology is a failure.</span></li>
+      <li><b>3. A fake agent that behaves like a real one</b><span><code>k2-fake-agent</code> grows from today's <code>AgentShim</code> (<code>exec cat</code>). It takes pasted input, runs a timed "turn", writes a transcript JSONL and a memory file, fires SessionStart, UserPromptSubmit and Stop hooks, and resumes with <code>--resume &lt;id&gt;</code>. No API keys, so 500 of them fit in a lab.</span></li>
+      <li><b>4. The diagrams are the tests</b><span>Controller and hosts emit trace events tagged with agent and message ids. Each sequence diagram in this page is stored as data in <code>docs/prd/flows/*.json</code>. The runner checks that the observed events contain the diagram's steps in order, and the report draws observed next to expected.</span></li>
+      <li><b>5. Chaos with a fixed seed</b><span><code>--chaos</code> kills a random CLI, host or controller during scenarios S3 to S10. The seed is in the report, so any failure replays exactly.</span></li>
+      <li><b>6. Real CLIs at the end of each gate</b><span>After the fake-agent run, a short smoke test with real <code>claude</code> and <code>codex</code> sessions confirms resume and hooks with the real tools. It needs keys, so it runs on the owner's machine or cluster.</span></li>
+    </ul>
+
+    <h3 class="sub">Invariants every run checks</h3>
+    <div class="facts">
+      <div class="fact"><b>I1</b><span>An agent has at most one live placement. Each placement carries an epoch; a host with a stale epoch is refused.</span></div>
+      <div class="fact"><b>I2</b><span>Every message reaches a final state: delivered, or failed loudly. None vanish.</span></div>
+      <div class="fact"><b>I3</b><span>A resumed agent keeps its provider session id and its memory files byte for byte.</span></div>
+      <div class="fact"><b>I4</b><span>An agent's home is written by one host at a time.</span></div>
+      <div class="fact"><b>I5</b><span>Solo mode output matches the pre-change baseline on every existing suite.</span></div>
+    </div>
+
+    <h3 class="sub">Scenario matrix</h3>
+    <p class="note"><span class="req">●</span> must pass at its gate and every later gate. <span class="opt">○</span> runs and is reported, not yet required. – does not apply.</p>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead><tr><th>Scenario</th><th>From</th><th>Solo</th><th>Container</th><th>Fleet</th><th>K8s host pods</th><th>K8s sandbox</th><th>Laptop host</th></tr></thead>
+        <tbody>
+          <tr><td>S1 Spawn, attach, type, see output</td><td>G0</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S2 Hook events land on the right agent</td><td>G1</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S3 <code>k2 msg</code> between agents on different hosts</td><td>G2</td><td class="c req">●</td><td class="c">–</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S4 Message wakes a sleeping agent</td><td>G2</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S5 Heartbeat fires on a sleeping agent</td><td>G2</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S6 Inbox delivery survives restarts</td><td>G2</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S7 CLI killed mid-turn, next need resumes</td><td>G1</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S8 Host killed mid-turn, nothing lost silently</td><td>G2</td><td class="c">–</td><td class="c">–</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S9 Controller restart, agents keep running</td><td>G2</td><td class="c">–</td><td class="c">–</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td></tr>
+          <tr><td>S10 Node drained, agent returns with memory intact</td><td>G3</td><td class="c">–</td><td class="c">–</td><td class="c req">●</td><td class="c req">●</td><td class="c opt">○</td><td class="c">–</td></tr>
+          <tr><td>S11 Laptop offline: queued, never rescheduled</td><td>G3</td><td class="c">–</td><td class="c">–</td><td class="c">–</td><td class="c">–</td><td class="c">–</td><td class="c req">●</td></tr>
+          <tr><td>S12 Postgres, Apps, mail, Sew, front door parity</td><td>G0, G4</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c">–</td><td class="c">–</td></tr>
+          <tr><td>S14 Controller unreachable: local app attaches to its own host</td><td>G3</td><td class="c">–</td><td class="c">–</td><td class="c req">●</td><td class="c">–</td><td class="c">–</td><td class="c req">●</td></tr>
+          <tr><td>S13 Density bench: 500 agents, 100 awake</td><td>G3</td><td class="c req">●</td><td class="c opt">○</td><td class="c req">●</td><td class="c req">●</td><td class="c req">●</td><td class="c">–</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Topologies in the lab: <b>Solo</b> is today's daemon with the in-process host. <b>Container</b> is the same daemon in one pod. <b>Fleet</b> is Docker Compose with one controller and two hosts standing in for VMs. <b>K8s host pods</b> and <b>K8s sandbox</b> run on a 3-node kind cluster, then on the owner's k3s cluster. <b>Laptop host</b> is a Compose host whose network is cut and restored by the runner.</p>
+
+    <h3 class="sub">What a gate run produces</h3>
+    <div class="two">
+      <pre class="spec"><span class="d">$</span> scripts/lab/prove.sh G2 --topology fleet --chaos seed=4117
+<span class="d">lab-runs/G2/2026-11-14T09-12Z/</span>
+  report.html        <span class="d"># pass/fail matrix, open this first</span>
+  report.json        <span class="d"># same, machine-readable</span>
+  parity/            <span class="d"># existing suites, before vs after</span>
+  scenarios/S3.trace.jsonl
+  scenarios/S3.diff.svg  <span class="d"># observed vs expected flow</span>
+  invariants.txt     <span class="ok">I1 ok  I2 ok  I3 ok  I4 ok  I5 ok</span>
+  chaos.log          <span class="d"># what was killed, when</span>
+  topology/          <span class="d"># compose ps, kubectl get -o yaml</span>
+  metrics.csv        <span class="d"># RSS, CPU, wake latency</span>
+  demo.cast          <span class="d"># terminal recording of the demo</span></pre>
+      <div class="seqbox" id="prove-flow" style="--c: var(--l0)"></div>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section class="chapter" id="gates">
+    <span class="eyebrow"><span class="chapter-num">4</span> · Stages and gates</span>
+    <h2>Six stages, each ending in something you can watch work</h2>
+    <p class="note">Stages are ordered so that each one is useful alone, and so that Kubernetes arrives last, on top of a design already proven on plain machines.</p>
+    <div class="gates">
+      <div class="gate">
+        <div class="gate-id"><span class="tag">P0 → G0</span><b>K2 in a container</b><span>Today's architecture, in one pod.</span></div>
+        <div><h4>Build</h4><ul>
+          <li><code>K2_HOME</code> honoured everywhere: about 300 <code>~/.k2</code> and <code>home_dir()</code> call sites move behind <code>k2_client::paths</code>, with a ratchet test like the existing env-mutation ratchet.</li>
+          <li>Capability detection at boot: each root-helper feature reports host-native, delegated or off.</li>
+          <li>OCI image with binaries under <code>/usr/bin</code>, so <code>install_kind="package"</code> turns self-update off. Same opt-out for root helper, app engine and node.</li>
+          <li>Kubernetes manifests: one StatefulSet with a PVC, Postgres through the Zalando postgres-operator or an external URL. A Helm chart wraps the same manifests later.</li>
+        </ul></div>
+        <div><h4>Proof</h4><ul>
+          <li>All existing suites green inside the container, as root and as a random UID.</li>
+          <li><code>must-not-break</code> passes against the pod, including the Postgres checks.</li>
+          <li>S1, S2, S7, S12 on solo and container.</li>
+          <li>Demo: <code>helm install</code> on kind, sign in, run an agent.</li>
+        </ul><span class="demo">prove.sh G0 --topology container</span></div>
+      </div>
+      <div class="gate">
+        <div class="gate-id"><span class="tag">P1 → G1</span><b>Agent host interface, in-process only</b><span>A refactor with zero behavior change.</span></div>
+        <div><h4>Build</h4><ul>
+          <li>An <code>AgentHost</code> interface inside the daemon: spawn, attach, stream, resize, inject, kill, hook events, read and write the home.</li>
+          <li>The in-process implementation wraps today's <code>DaemonPtySession</code> path.</li>
+          <li>Trace events at every hop; flows stored as JSON; <code>k2-fake-agent</code>.</li>
+        </ul></div>
+        <div><h4>Proof</h4><ul>
+          <li>I5: every existing suite matches the pre-refactor baseline.</li>
+          <li>Trace diff passes for spawn, hook event and CLI-crash flows on solo.</li>
+          <li>Bench: no measurable change in spawn latency or idle RSS.</li>
+        </ul><span class="demo">prove.sh G1 --topology solo</span></div>
+      </div>
+      <div class="gate">
+        <div class="gate-id"><span class="tag">P2 → G2</span><b>Remote hosts on plain machines</b><span>The real distribution work. No Kubernetes.</span></div>
+        <div><h4>Build</h4><ul>
+          <li><code>k2-host</code>: <code>k2-node</code>'s enrollment, signed channel and git sync, plus <code>k2-ptyd</code>'s PTYs and rings, plus the per-cell hook socket. The <code>/proc</code> owner check runs on the host.</li>
+          <li>Remote implementation of <code>AgentHost</code> over the signed WebSocket.</li>
+          <li>A durable delivery outbox with message ids, modelled on the federation outbox. Today <code>k2 msg</code> has no queue.</li>
+          <li>Hosts keep agents running while the controller restarts, then replay from ring offsets.</li>
+        </ul></div>
+        <div><h4>Proof</h4><ul>
+          <li>S1 to S9 on fleet and solo, chaos on, all invariants.</li>
+          <li>Demo: three VMs, kill the controller mid-conversation, the agent keeps typing.</li>
+        </ul><span class="demo">prove.sh G2 --topology fleet --chaos</span></div>
+      </div>
+      <div class="gate">
+        <div class="gate-id"><span class="tag">P3 → G3</span><b>Portable agents, sleep and laptops</b><span>Agents move, sleep and wake on any host.</span></div>
+        <div><h4>Build</h4><ul>
+          <li>Portable home: git bundle plus <code>.k2/</code> plus the provider's project directory (memory and transcripts), content-addressed.</li>
+          <li>Sleep and wake through a provisioner interface: Local, Static (enrolled VMs and laptops), later Kubernetes.</li>
+          <li>Laptop enrollment with "away" state, pinning, and outbox hold.</li>
+        </ul></div>
+        <div><h4>Proof</h4><ul>
+          <li>S10, S11 and S13 on fleet. Density report with fake agents and with ten real CLIs.</li>
+          <li>Demo: close the laptop lid, message its agent from the cloud, open the lid, watch it arrive.</li>
+        </ul><span class="demo">prove.sh G3 --topology fleet,laptop</span></div>
+      </div>
+      <div class="gate">
+        <div class="gate-id"><span class="tag">P4 → G4</span><b>Kubernetes provisioner</b><span>Kubernetes supplies hosts; everything else is already proven.</span></div>
+        <div><h4>Build</h4><ul>
+          <li>Host pods: a StatefulSet of <code>k2-host</code>, each running many agents, with a PodDisruptionBudget and a SIGTERM drain.</li>
+          <li>Optional per-agent tier on agent-sandbox <code>Sandbox</code>, with gVisor or Kata through RuntimeClass.</li>
+          <li>Capabilities: the Zalando postgres-operator, an app-engine driver that deploys each App as a Deployment with a NetworkPolicy, Stalwart as a StatefulSet behind a LoadBalancer, Sew on UDP, the front door through Gateway API.</li>
+        </ul></div>
+        <div><h4>Proof</h4><ul>
+          <li>Full matrix on kind, then on the owner's k3s cluster.</li>
+          <li>Pod-granularity decision record, with S13 numbers from both tiers and real CLIs.</li>
+          <li>Demo: drain a k3s node during a conversation; the agent returns with its memory.</li>
+        </ul><span class="demo">prove.sh G4 --topology kind,k3s</span></div>
+      </div>
+      <div class="gate">
+        <div class="gate-id"><span class="tag">P5 → G5</span><b>Scale and hardening</b><span>Only what G4 shows is needed.</span></div>
+        <div><h4>Build</h4><ul>
+          <li>Node autoscaling for host pools (cluster-autoscaler or Karpenter) driven by wake demand.</li>
+          <li>Optional controller store on Postgres with a leader lease.</li>
+        </ul></div>
+        <div><h4>Proof</h4><ul>
+          <li>Soak: 7 days, 500 agents, chaos every hour, invariants hold.</li>
+          <li>Wake latency p95 within the targets in section 9.</li>
+        </ul><span class="demo">prove.sh G5 --soak 7d</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section class="chapter" id="density">
+    <span class="eyebrow"><span class="chapter-num">5</span> · Density: pods vs processes</span>
+    <h2>Containers cost about 3% more memory. The real costs are elsewhere.</h2>
+    <div class="prose">
+      <p>The worry: 500 agents run on one node today, and wrapping each in a pod could throw that away. We measured on the lab cluster rather than guessed. Each kind node is a Docker container, so absolute numbers on a real k3s node will differ, but the ratios hold.</p>
+    </div>
+    <div class="facts">
+      <div class="fact"><b>~12 MiB</b><span>fixed cost per pod. 100 idle pods on one node added 1.16 GiB, almost all in <code>containerd-shim</code>.</span><small>kind node, busybox sleep</small></div>
+      <div class="fact"><b>~0.3 MiB</b><span>per extra process inside one pod. 100 processes in a single pod added 26 MiB.</span><small>same node, same image</small></div>
+      <div class="fact"><b>330–490 MB</b><span>resident memory of one live <code>claude</code> CLI, sampled from three running sessions.</span><small>macOS, Oct 2026</small></div>
+      <div class="fact"><b>0</b><span>processes for a sleeping agent today. Agents leave the active set after 24 hours untouched.</span><small>active_reaper.rs</small></div>
+      <div class="fact"><b>13–23%</b><span>of a core for kubelet work with 100 idle pods, against 2–4% with one pod running 100 processes.</span><small>idle node, 3 samples</small></div>
+      <div class="fact"><b>110</b><span>default pod limit per node in kubelet and k3s. Raising it needs a bigger per-node pod CIDR.</span><small>/24 → about 120, /23 → 250</small></div>
+    </div>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead><tr><th>500 agents, 100 awake</th><th>One host pod per ~100 agents</th><th>One pod per agent</th><th>Today, one VM</th></tr></thead>
+        <tbody>
+          <tr><td>Agent CLI memory</td><td>~40 GB</td><td>~40 GB</td><td>~40 GB</td></tr>
+          <tr><td>Container overhead</td><td>5 pods × 12 MiB ≈ 60 MiB</td><td>100 pods × 12 MiB ≈ 1.2 GB (sleeping agents have no pod)</td><td>none</td></tr>
+          <tr><td>Pods per node</td><td>a handful</td><td>100 awake; up to 500 if all wake at once</td><td>–</td></tr>
+          <tr><td>Kubelet CPU</td><td>negligible</td><td>~0.15–0.2 core per 100 pods</td><td>–</td></tr>
+          <tr><td>Volumes</td><td>one per host pod</td><td>one per agent; cloud nodes cap attachments (roughly 25–128 per node)</td><td>one disk</td></tr>
+          <tr><td>Wake</td><td>start a CLI in a running pod (seconds)</td><td>schedule a pod, attach a volume, start a CLI. Lab: 6 s fresh, 34 s after a pod delete</td><td>start a CLI</td></tr>
+          <tr><td>Shared login wallet, skills, plugins</td><td>shared inside the pod, as today</td><td>must be mounted or copied into every pod</td><td>shared</td></tr>
+          <tr><td>Isolation between agents</td><td>process level, as today</td><td>pod level; gVisor or Kata possible</td><td>process level</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="two">
+      <div class="payoff">
+        <b class="title">What the numbers say</b>
+        <ul>
+          <li>The memory fear does not hold. The CLI dominates: about 400 MB per awake agent against 12 MiB of pod overhead.</li>
+          <li>The CPU and pod-count fears partly hold. Kubelet does real work per pod, and 500 awake agents as pods needs a raised pod limit or more nodes.</li>
+          <li>The bigger costs of pod-per-agent are volumes per agent, slower wake, and duplicating the shared home that makes K2 cheap.</li>
+          <li>Hardened runtimes are not free: gVisor adds about 47 MB per sandbox and makes git roughly 3× slower in one third-party benchmark; Kata adds 120–300 MB per pod.</li>
+        </ul>
+      </div>
+      <div class="payoff warn">
+        <b class="title">Working recommendation, decided at G4</b>
+        <ul>
+          <li>Default to host pods: a few pods each running many agents. Kubernetes then looks like a fleet of VMs, and K2's density and semantics stay as they are.</li>
+          <li>Offer pod-per-agent on agent-sandbox as an opt-in isolation tier for untrusted or shared clusters.</li>
+          <li>Both tiers sit behind the same <code>AgentHost</code> interface, so this choice never leaks into the rest of K2.</li>
+          <li>Precedent: Gitpod left Kubernetes in 2024 because stateful, spiky dev environments fit pods poorly; Coder runs several agents per workspace.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6 -->
+  <section class="chapter" id="death">
+    <span class="eyebrow"><span class="chapter-num">6</span> · When things die</span>
+    <h2>Pods die. Agents should only notice a pause.</h2>
+    <div class="prose">
+      <p>An agent's identity, relationships and learning do not live in its process. Its <code>AGENT.md</code>, skills, inbox and <code>MEMORY.md</code> live in its home, its conversation lives in the provider's transcript, and its connections, heartbeats and pins live in the controller's database. So the question for each failure is what was in flight, and whether it is lost silently. The distributed design must lose no more than today and, for controller restarts, much less.</p>
+    </div>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead><tr><th>Event</th><th>Today (one machine)</th><th>Distributed design</th><th>Can be lost</th><th>Tested by</th></tr></thead>
+        <tbody>
+          <tr><td>Agent CLI crashes</td><td>Session marked dead; the next need resumes it with the same session id.</td><td>Same, on its host.</td><td class="lost">The turn in progress</td><td>S7</td></tr>
+          <tr><td>Controller or daemon restarts</td><td>Every agent PTY is killed, including during the zero-downtime hand-off; agents resume when needed.</td><td>Agents keep running on their hosts. Hosts buffer output and replay it when the controller is back.</td><td class="kept">Nothing</td><td>S9</td></tr>
+          <tr><td>Host pod stopped (rollout, drain)</td><td>Same as a daemon restart.</td><td>SIGTERM starts a drain: no new deliveries, wait for each turn's Stop hook up to the grace period (default 10 min), save session ids, exit. The replacement resumes agents that were awake.</td><td class="lost">A turn longer than the grace period</td><td>S8</td></tr>
+          <tr><td>Node fails hard</td><td>The machine is down until it comes back.</td><td>Host goes "away". Portable agents (network volume or synced home) are placed elsewhere; pinned agents wait.</td><td class="lost">The turn in progress; home changes since the last sync</td><td>S10</td></tr>
+          <tr><td>Message in flight</td><td><code>k2 msg</code> fails loudly; there is no queue. Inbox and pending-live files survive.</td><td>Durable outbox with a message id, at-least-once delivery, receiver dedupes on the id.</td><td class="kept">Nothing</td><td>S3, S8</td></tr>
+          <tr><td>Laptop lid closes</td><td>All agents stop with the machine.</td><td>Laptop agents show as paused. Cloud agents carry on. Messages to laptop agents wait in the outbox.</td><td class="kept">Nothing</td><td>S11</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="payoff warn">
+      <b class="title">Seen live in the lab, and what it means for a k3s cluster</b>
+      <ul>
+        <li>Draining a node left a Sandbox pod Pending for good: its volume used local-path storage, which pins it to one node. k3s uses local-path by default.</li>
+        <li>So on k3s, an agent can only move between nodes with replicated storage (for example Longhorn) or with K2's own home sync from stage P3. Either is fine; the chart has to choose one explicitly.</li>
+        <li>agent-sandbox reported <code>Ready</code> during a resume while the old pod was still terminating. K2 must gate on its own host handshake, never on the custom resource's status.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 7 -->
+  <section class="chapter" id="laptop">
+    <span class="eyebrow"><span class="chapter-num">7</span> · Laptops</span>
+    <h2>Recommendation: laptops enroll as hosts</h2>
+    <div class="prose">
+      <p>Mature systems with machines that come and go all use the same shape: the machine dials out to one controller with a revocable credential and keeps its own data. GitHub Actions runners long-poll over 443. Buildkite marks a silent agent lost after 3 minutes. Coder's external workspaces attach machines it doesn't control and never start or stop them. None use peer-to-peer federation for one owner's machines. K2 already has both pieces: <code>k2-node</code> enrollment, and federation between independently owned daemons.</p>
+    </div>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead><tr><th>Option</th><th>How it works</th><th>Good for</th><th>Costs</th></tr></thead>
+        <tbody>
+          <tr><td>Laptop enrolls as a host <span class="pill" style="--c: var(--good)">recommended</span></td><td>The laptop runs <code>k2-host</code> and dials out to the team's or the owner's controller. Its agents are pinned to it.</td><td>One owner or team; one place to see every agent; messages between laptop and cloud agents.</td><td>New agents need the controller reachable. Running agents keep working offline.</td></tr>
+          <tr><td>Laptop stays solo</td><td>Today's mode: the laptop runs its own controller and host.</td><td>People who want nothing remote.</td><td>Cloud agents are a separate K2.</td></tr>
+          <tr><td>Federation between controllers</td><td>Two independent K2s exchange signed agent signals (exists today, behind <code>K2_FEDERATION</code>).</td><td>Crossing ownership lines: personal and work, two companies.</td><td>Separate identities and databases; not a fleet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul class="rules">
+      <li><b>Away is not dead</b><span>A silent laptop host becomes "away" after 90 seconds. Its agents show as paused and are never placed elsewhere, because their repo and memory live on the laptop.</span></li>
+      <li><b>Identity is a key, not an address</b><span>Hosts are known by their enrolled key, so a new IP after wake changes nothing.</span></li>
+      <li><b>Secrets stay where they are used</b><span>The laptop's own provider logins and SSH keys stay on the laptop. The controller sends commands, not credentials.</span></li>
+      <li><b>Messages wait</b><span>The outbox holds messages for an away host (default 7 days) and drains them on reconnect.</span></li>
+      <li><b>Offline still works locally</b><span>If the laptop can't reach the controller, its agents keep running and the local app attaches straight to the laptop's own host: live terminals, typing, scrollback (FR11). New agents, messages to other machines and heartbeats wait as "pending" until the controller is back.</span></li>
+    </ul>
+  </section>
+
+  <!-- 8 -->
+  <section class="chapter" id="parity">
+    <span class="eyebrow"><span class="chapter-num">8</span> · Feature parity</span>
+    <h2>Where each feature runs in each mode</h2>
+    <p class="note">Every feature behind the root helper today needs a home in every mode. On Kubernetes, the root helper's host edits become Kubernetes objects the controller creates through a capability driver.</p>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead><tr><th>Feature</th><th>Today (solo)</th><th>Fixed VM fleet</th><th>Kubernetes</th><th>Gate</th></tr></thead>
+        <tbody>
+          <tr><td>Agent PTYs and CLIs</td><td>Inside the daemon</td><td><code>k2-host</code> on each VM</td><td>Host pods; per-agent Sandbox optional</td><td>G2, G4</td></tr>
+          <tr><td>Controller database</td><td>SQLite <code>~/.k2/k2.db</code></td><td>Same, controller VM</td><td>SQLite on the controller's PVC</td><td>G0</td></tr>
+          <tr><td>Postgres (App databases, <code>/cli/db</code>)</td><td>Root helper <code>pg</code> verbs, distro cluster</td><td>Same, controller VM</td><td>Zalando <code>postgresql</code> object; each App adds a user and database to it. Or an external URL.</td><td>G0</td></tr>
+          <tr><td>K2 Apps</td><td>Rootless Podman and Quadlet through <code>k2-app-engine</code></td><td>Same, on the controller VM or an app host</td><td>App-engine Kubernetes driver: Deployment, Service and NetworkPolicy per App</td><td>G4</td></tr>
+          <tr><td>Mail (Stalwart)</td><td>Root helper <code>mail</code> verbs</td><td>Same</td><td>StatefulSet behind a LoadBalancer on 25, 465 and 993</td><td>G4</td></tr>
+          <tr><td>Sew (TURN and media)</td><td>Root helper <code>sew</code> verbs</td><td>Same</td><td>Deployment on host network or a UDP LoadBalancer</td><td>G4</td></tr>
+          <tr><td>Front door on 443</td><td>systemd socket and SNI router</td><td>Same</td><td>Gateway API TLS passthrough to the controller</td><td>G4</td></tr>
+          <tr><td>Vault key storage</td><td>Keychain or root helper <code>keep</code></td><td>Same</td><td>Kubernetes Secret, or an external KMS</td><td>G0</td></tr>
+          <tr><td>K2 Connect tunnel</td><td><code>frpc</code> in the daemon</td><td>Same</td><td>Same; it works from inside a pod</td><td>G0</td></tr>
+          <tr><td>Self-update</td><td>Signed binary swap</td><td>Same, per binary</td><td>New image tag; <code>install_kind="package"</code> turns the swap off</td><td>G0</td></tr>
+          <tr><td>MicroVM cells</td><td>Dedicated tier with <code>/dev/kvm</code></td><td>Hosts with KVM</td><td>Kata through RuntimeClass on the Sandbox tier</td><td>G4</td></tr>
+          <tr><td>Compute nodes (jobs)</td><td><code>k2-node</code></td><td>Merged into <code>k2-host</code></td><td>Host pods, later Jobs</td><td>G2</td></tr>
+          <tr><td>Federation</td><td>Daemon to daemon</td><td>Unchanged</td><td>Unchanged</td><td>–</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 8b -->
+  <section class="chapter" id="endstate">
+    <span class="eyebrow"><span class="chapter-num">8b</span> · Decisions and end state</span>
+    <h2>Decided, and written down before the code</h2>
+    <div class="two">
+      <div class="panel">
+        <h3>ADR-0001 · Agent isolation inside host pods</h3>
+        <p><b>Decision:</b> agents in a host pod share one UID with no added capabilities, as every K2 install does today. Per-agent UIDs (root plus <code>SETUID</code>, <code>SETGID</code>, <code>CHOWN</code>, reusing <code>cell_uid_pool</code>) are an opt-in profile. One pod per agent on agent-sandbox is the strong-isolation tier.</p>
+        <p><b>Tradeoff:</b> the default passes Pod Security "restricted" and costs nothing per agent, but an agent can read its neighbours' homes and the host's link key. The controller limits a stolen key to agents already placed on that host.</p>
+        <p class="note"><code>docs/adr/adr-0001-agent-isolation-inside-host-pods.md</code></p>
+      </div>
+      <div class="panel">
+        <h3>ADR-0002 · One controller, no high availability</h3>
+        <p><b>Decision:</b> exactly one controller in every mode, on SQLite. Postgres stays a capability for Apps, not the controller's store.</p>
+        <p><b>Tradeoff:</b> while it is down, awake agents keep working and the local app can attach directly (FR11), but spawns, wakes, heartbeats and cross-host messages wait. HA would need a Postgres store, leader election and shared in-memory state. Revisit if the G5 soak shows outages hurting.</p>
+        <p class="note"><code>docs/adr/adr-0002-single-controller.md</code></p>
+      </div>
+    </div>
+    <h3 class="sub">The declared end state</h3>
+    <div class="prose">
+      <p>The finished system is already written as files, so the interfaces can be reviewed before any code exists. The images don't exist yet, so nothing runs; every object was checked against the real APIs on the lab cluster, and the Postgres contract the controller relies on was run for real.</p>
+    </div>
+    <div class="table-scroll">
+      <table class="grid">
+        <thead><tr><th>File</th><th>What it declares</th><th>Checked</th></tr></thead>
+        <tbody>
+          <tr><td><code>deploy/compose/compose.yaml</code></td><td>controller, host-1, host-2, postgres:17, Stalwart 0.16.25, Sew 0.3.0, apps (k2-app-engine)</td><td><code>docker compose config</code> passes</td></tr>
+          <tr><td><code>deploy/kubernetes/core/</code></td><td>Controller StatefulSet (1 replica), host StatefulSet with a PodDisruptionBudget and 10-minute drain, Zalando <code>postgresql</code>, Stalwart, Gateway with TLS passthrough, NetworkPolicies, namespace-scoped RBAC</td><td>25 objects pass a server-side dry run (Kubernetes 1.37, Gateway API 1.6.3, Zalando 2.0.3)</td></tr>
+          <tr><td><code>deploy/kubernetes/edge/</code></td><td>Sew on the node's network, in its own namespace</td><td>dry run passes</td></tr>
+          <tr><td><code>deploy/kubernetes/examples/</code></td><td>What the controller creates at runtime: a per-agent Sandbox, and one App (Deployment, Service, NetworkPolicy, database)</td><td>dry run passes; App database created for real: user <code>app_notes</code> logged in to PostgreSQL 17.9</td></tr>
+          <tr><td><code>deploy/README.md</code></td><td>Every interface: which settings and routes exist today, which are new</td><td>–</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <pre class="spec"><span class="d"># deploy/compose/compose.yaml, abridged</span>
+services:
+  controller:   <span class="d"># k2-daemon, K2_ROLE=controller, publishes 443</span>
+    image: ghcr.io/alakazam-211/k2-daemon:0.47.0
+    environment: { K2_ROLE: controller, K2_HOSTS: "1", K2_PROVISIONER: static, K2_CAP_POSTGRES: external, ... }
+  host-1:       <span class="d"># k2-host, dials out to the controller; agents are processes inside</span>
+    image: ghcr.io/alakazam-211/k2-host:0.47.0
+    environment: { K2_CONTROLLER_URL: ws://controller:7420, K2_HOST_MAX_AWAKE: "100", K2_HOST_LOCAL_ATTACH: 0.0.0.0:7421 }
+    stop_grace_period: 10m   <span class="d"># drain: wait for each turn to end</span>
+  host-2:       <span class="d"># same as host-1, own volume</span>
+  postgres:     <span class="d"># postgres:17</span>
+  mail:         <span class="d"># stalwartlabs/stalwart:v0.16.25</span>
+  sew:          <span class="d"># network_mode: host, for TURN</span>
+  apps:         <span class="d"># k2-app-engine, nested rootless Podman</span></pre>
+  </section>
+
+  <!-- 9 -->
+  <section class="chapter" id="reqs">
+    <span class="eyebrow"><span class="chapter-num">9</span> · Requirements</span>
+    <h2>Requirements</h2>
+    <div class="two">
+      <div class="panel">
+        <h3>Functional</h3>
+        <ol>
+          <li><b>FR1</b> The controller places, starts, attaches, sleeps, wakes and moves agents through one <code>AgentHost</code> interface with an in-process and a remote implementation.</li>
+          <li><b>FR2</b> Hosts dial out over a signed WebSocket, enroll with a one-time code and a confirmation string, and are known by key.</li>
+          <li><b>FR3</b> Hook owner checks run on the host; the controller accepts only host-attested events.</li>
+          <li><b>FR4</b> Messages between agents use a durable outbox with ids, at-least-once delivery and receiver dedupe.</li>
+          <li><b>FR5</b> Agents keep running through controller restarts; clients replay output from ring offsets.</li>
+          <li><b>FR6</b> An agent's home (workspace, <code>.k2/</code>, provider memory and transcripts) can be exported, moved and restored.</li>
+          <li><b>FR7</b> Provisioners: Local, Static (enrolled VMs and laptops), Kubernetes host pods, Kubernetes Sandbox.</li>
+          <li><b>FR8</b> Agents can be marked pinned or portable. Laptop agents are pinned.</li>
+          <li><b>FR9</b> Every root-helper feature has a capability driver per mode, as in section 8.</li>
+          <li><b>FR10</b> Declarative installs: <code>deploy/compose/compose.yaml</code> for Docker Compose and <code>deploy/kubernetes</code> for k3s and managed clusters, later wrapped in a Helm chart.</li>
+          <li><b>FR11</b> When the controller is unreachable, the local app attaches directly to the agents on its own machine's host (<code>K2_HOST_LOCAL_ATTACH</code>): live terminals, typing, scrollback. Actions that need the controller (new agents, messages to other hosts, heartbeats) queue and show as pending until it returns.</li>
+        </ol>
+      </div>
+      <div class="panel">
+        <h3>Non-functional</h3>
+        <ol>
+          <li><b>NFR1</b> Solo mode: no regression on any existing suite; idle RSS and spawn latency within 5% of baseline.</li>
+          <li><b>NFR2</b> A sleeping agent costs no process on any topology.</li>
+          <li><b>NFR3</b> Wake to ready, p95: 10 s on a running host, 30 s when a pod must be scheduled. Today's injection waits up to 20 s for CLI readiness.</li>
+          <li><b>NFR4</b> No silent message loss under chaos (invariant I2).</li>
+          <li><b>NFR5</b> Host pods: 100 awake agents per host pod on a 64 GB node without node pressure.</li>
+          <li><b>NFR6</b> Everything works without Kubernetes and without containers.</li>
+          <li><b>NFR7</b> No inbound ports on hosts; laptops work behind NAT.</li>
+          <li><b>NFR8</b> Each gate is reproducible from a clean checkout with one command.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10 -->
+  <section class="chapter" id="open">
+    <span class="eyebrow"><span class="chapter-num">10</span> · Open questions</span>
+    <h2>Open questions</h2>
+    <p class="note">Resolved since the first draft: offline local attach (FR11), isolation inside host pods (ADR-0001), controller HA (ADR-0002), and the Postgres operator (Zalando postgres-operator).</p>
+    <ul class="rules">
+      <li><b>Pod granularity</b><span>Host pods by default, Sandbox as opt-in. Decided at G4 from S13 numbers with real CLIs.</span></li>
+      <li><b>Provider logins on host pods</b><span>The login wallet is shared files today. On host pods it lives on the pod's volume. With Sandbox, every pod needs a mounted copy or a broker.</span></li>
+      <li><b>Storage on k3s</b><span>Ship with Longhorn as the recommended class, or rely on K2's home sync and keep local-path?</span></li>
+    </ul>
+    <p class="note">Lab evidence so far: agent-sandbox v1.0.8 on kind (Kubernetes 1.37). A Sandbox with a 1 GiB volume became ready in 6 s. Suspend and resume kept the volume, the data and the DNS name <code>agent-alice.k2.svc.cluster.local</code>. A deleted pod came back in 34 s. A node drain left it Pending because of local-path node affinity. Sources: <a href="https://github.com/kubernetes-sigs/agent-sandbox">agent-sandbox</a>, <a href="https://gvisor.dev/docs/architecture_guide/performance/">gVisor performance</a>, <a href="https://kubernetes.io/docs/concepts/configuration/pod-overhead/">Pod overhead</a>, <a href="https://www.infoq.com/news/2024/12/gitpod-kubernetes-flex">Gitpod leaves Kubernetes</a>, <a href="https://coder.com/docs/admin/templates/managing-templates/external-workspaces">Coder external workspaces</a>, <a href="https://buildkite.com/docs/agent/lifecycle">Buildkite agent lifecycle</a>.</p>
+  </section>
+</main>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const LEVEL_COLOR = ["var(--l0)", "var(--l1)", "var(--l2)", "var(--l3)"];
+
+/* ---------- Flows (sequence diagrams). kind: call | reply | self | fail ---------- */
+const FLOWS = {
+  spawn: {
+    name: "Spawn on a remote host", note: "The client asks for an agent; the controller picks the host that holds its home.",
+    proof: "S1, S2",
+    parts: [["client", "Client", "app, web, k2 CLI"], ["ctl", "Controller", "k2-daemon"], ["host", "Agent host", "k2-host"], ["ptyd", "PTY host", "k2-ptyd"], ["cli", "claude CLI", "unchanged"]],
+    steps: [
+      { f: "client", t: "ctl", x: "POST /cli/sessions/v2/spawn", say: "The same route the client uses today. It doesn't know or care where the agent will run." },
+      { f: "ctl", t: "ctl", k: "self", x: "placement.choose(agent)", say: "Placement picks the host that holds the agent's home. A laptop-pinned agent only ever goes to that laptop." },
+      { f: "ctl", t: "host", x: "Spawn{agent, harness, resume_id, epoch}", say: "Sent over the WebSocket the host opened when it enrolled. The envelope is signed and sequenced, like k2-node compute frames today. The epoch enforces invariant I1." },
+      { f: "host", t: "ptyd", x: "open_session(cols, rows)", say: "The host asks its local PTY host for a terminal. The PTY host owns the output ring, so output survives the host link dropping." },
+      { f: "ptyd", t: "cli", x: "exec claude --resume <id>", say: "The CLI starts exactly as it does today, with K2_CELL, K2_HOOK_SOCK and K2_HOOK_TOKEN set." },
+      { f: "cli", t: "host", x: "hook SessionStart (cell socket)", say: "Hooks reach the host's per-cell socket. The /proc ancestry owner check runs here, on the same kernel as the CLI." },
+      { f: "host", t: "ctl", k: "reply", x: "AgentEvent{SessionStart, attested}", say: "The controller only accepts events the host has already attributed to the right agent." },
+      { f: "ctl", t: "client", k: "reply", x: "activity + PTY stream", say: "The client sees the agent start and can attach to its terminal through the controller." }
+    ]
+  },
+  msg: {
+    name: "Message wakes a sleeping agent", note: "Agent A on host 1 messages agent B, who is asleep and will wake on host 2.",
+    proof: "S3, S4, S8",
+    parts: [["a", "Agent A", "on host 1"], ["h1", "Host 1", "k2-host"], ["ctl", "Controller", "outbox"], ["h2", "Host 2", "k2-host"], ["b", "Agent B", "asleep"]],
+    steps: [
+      { f: "a", t: "h1", x: "k2 talk B \"review PR 42\"", say: "Agent A runs the CLI verb exactly as today. It talks to its host's cell socket, not to the controller directly." },
+      { f: "h1", t: "ctl", x: "Deliver{msg_id, to: B}", say: "The host forwards the message with a fresh id." },
+      { f: "ctl", t: "ctl", k: "self", x: "outbox.append(msg_id)", say: "New: the message is written down before anything else happens. Today k2 msg has no queue; with more moving parts, failures get more common, so delivery becomes durable." },
+      { f: "ctl", t: "ctl", k: "self", x: "wake(B): make sure host 2 is up", say: "B is asleep. On one machine, host 2 is the same process and is always up. On Kubernetes, the controller starts B's host pod first if it is stopped (see the Provisioner inside the controller)." },
+      { f: "ctl", t: "h2", x: "Spawn{B, resume}", say: "Same spawn as the previous flow, with B's saved session id." },
+      { f: "h2", t: "ctl", k: "reply", x: "Ready{B}", say: "The host reports ready once the CLI accepts input, using today's readiness wait (20 s ceiling)." },
+      { f: "ctl", t: "h2", x: "Inject{msg_id, text}", say: "The controller asks host 2 to type the message." },
+      { f: "h2", t: "b", x: "paste, wait 150 ms, Enter", say: "Exactly today's injection pattern, now run on the host." },
+      { f: "h2", t: "ctl", k: "reply", x: "Delivered{msg_id}", say: "The outbox entry closes. If host 2 died before this, the entry would still be open and the controller would retry on the next placement, and B would dedupe on the id." },
+      { f: "ctl", t: "a", k: "reply", x: "delivered", say: "A sees the same success it sees today." }
+    ]
+  },
+  sleep: {
+    name: "Sleep, then scheduled wake", note: "An agent leaves the active set, sleeps with no process, and wakes for its 09:00 heartbeat.",
+    proof: "S5",
+    parts: [["life", "Lifecycle", "active set"], ["store", "Store", "SQLite"], ["host", "Agent host", "k2-host"], ["prov", "Provisioner", ""], ["sched", "Scheduler", "heartbeats"]],
+    steps: [
+      { f: "life", t: "store", x: "who left the active set?", say: "Today's rule, unchanged: not pinned and untouched for 24 hours (active_window_hours)." },
+      { f: "life", t: "host", x: "Release{agent}", say: "The host saves the session id so --resume works later, then ends the CLI." },
+      { f: "host", t: "life", k: "reply", x: "Released{session_id}", say: "The agent now costs no process anywhere. NFR2." },
+      { f: "life", t: "prov", x: "host idle? scale down", say: "If a host pod has had no awake agents for a while, the provisioner may stop it. On the Sandbox tier the agent's Sandbox is suspended." },
+      { f: "sched", t: "sched", k: "self", x: "heartbeat due 09:00", say: "The heartbeat monitor checks every 60 s, as today." },
+      { f: "sched", t: "life", x: "need(agent, heartbeat)", say: "A heartbeat fire counts as a need, which also resets the 24-hour clock." },
+      { f: "life", t: "prov", x: "ensure host", say: "Start a host if none is running for this agent." },
+      { f: "life", t: "host", x: "Spawn{resume, --append-system-prompt}", say: "Today's heartbeat launch, sent to a host." },
+      { f: "host", t: "life", k: "reply", x: "Ready", say: "Wake latency is measured here and reported in metrics.csv for NFR3." }
+    ]
+  },
+  ctlrestart: {
+    name: "Controller restarts", note: "A controller upgrade with agents mid-conversation.",
+    proof: "S9",
+    parts: [["sup", "Supervisor", "systemd or kubelet"], ["ctl", "Controller", "k2-daemon"], ["host", "Agent host", "k2-host"], ["cli", "claude CLI", "mid-turn"], ["client", "Client", ""]],
+    steps: [
+      { f: "sup", t: "ctl", x: "SIGTERM (upgrade to 0.47)", say: "A rollout on Kubernetes, or the handoff on systemd." },
+      { f: "ctl", t: "host", k: "fail", x: "link closes", say: "The host notices the link drop. Today this is the moment every agent PTY is killed." },
+      { f: "cli", t: "host", x: "output and hooks keep flowing", say: "The agent doesn't notice. The host buffers output in the PTY ring and queues hook events." },
+      { f: "sup", t: "ctl", x: "start new controller", say: "The new controller loads its database and opens its listener." },
+      { f: "host", t: "ctl", x: "reconnect, Resume{sessions, offsets}", say: "The host re-sends its session list and ring offsets. The controller checks epochs (I1)." },
+      { f: "ctl", t: "client", k: "reply", x: "replay from offset", say: "The client catches up on output it missed. Nothing was lost." }
+    ]
+  },
+  hostdrain: {
+    name: "Host pod is stopped", note: "A node drain or rollout stops a host pod running many agents.",
+    proof: "S8",
+    parts: [["kube", "Kubernetes", "kubelet"], ["host", "k2-host", "host pod"], ["cli", "Agent CLIs", "on this host"], ["ctl", "Controller", ""]],
+    steps: [
+      { f: "kube", t: "host", x: "SIGTERM, grace 600 s", say: "Host pods set a long termination grace period and a PodDisruptionBudget, which StatefulSets support." },
+      { f: "host", t: "ctl", x: "Draining{agents}", say: "The controller stops sending new work here and holds messages in the outbox." },
+      { f: "host", t: "cli", x: "wait for each turn to end", say: "Agents finish their current turn instead of being cut off mid-edit." },
+      { f: "cli", t: "host", k: "reply", x: "Stop hook", say: "The Stop hook marks a turn boundary, a safe point to end the CLI." },
+      { f: "host", t: "ctl", x: "Released{agent → session_id}", say: "Each agent's session id is saved for resume." },
+      { f: "kube", t: "host", x: "replacement pod, same volume", say: "The StatefulSet brings the pod back with the same identity and volume." },
+      { f: "host", t: "ctl", x: "enroll (same key)", say: "The host reconnects as itself." },
+      { f: "ctl", t: "host", x: "Spawn{resume} for agents that were awake", say: "Agents that were awake before come back. Sleeping agents stay asleep." }
+    ]
+  },
+  hook: {
+    name: "A hook event", note: "How the owner check works once the controller is on another machine.",
+    proof: "S2",
+    parts: [["cli", "claude CLI", "or a child"], ["sock", "Cell socket", "per agent"], ["owner", "Owner check", "/proc ancestry"], ["host", "k2-host", ""], ["ctl", "Controller", ""]],
+    steps: [
+      { f: "cli", t: "sock", x: "POST /hook/event, X-K2-Agent-Pid", say: "Unchanged for the CLI: it posts to K2_HOOK_SOCK with its scoped token." },
+      { f: "sock", t: "owner", x: "walk parents to the PTY child", say: "Today's owner.rs rules, run on the host where the process table is real." },
+      { f: "owner", t: "sock", k: "reply", x: "verdict: Owner", say: "Stale env in a detached process is refused here, as today." },
+      { f: "sock", t: "host", x: "event + verdict", say: "Only attributed events leave the machine." },
+      { f: "host", t: "ctl", x: "AgentEvent (signed frame)", say: "The controller trusts the host's attribution because the frame is signed with the host's enrolled key." }
+    ]
+  },
+  move: {
+    name: "Move an agent to another host", note: "For portable agents on plain machines, or Kubernetes without replicated storage.",
+    proof: "S10",
+    parts: [["ctl", "Controller", ""], ["h1", "Old host", ""], ["blob", "Home store", "controller or S3"], ["h2", "New host", ""]],
+    steps: [
+      { f: "ctl", t: "h1", x: "Release{agent}", say: "The same release used for sleeping." },
+      { f: "h1", t: "ctl", k: "reply", x: "Released{session_id}", say: "The CLI has ended; the home is quiet." },
+      { f: "h1", t: "blob", x: "push home (git bundle, .k2/, provider dir)", say: "Content-addressed, so unchanged files cost nothing. The provider dir holds MEMORY.md and the transcripts." },
+      { f: "ctl", t: "ctl", k: "self", x: "placement.epoch += 1", say: "The old host's claim is now stale (I1 and I4)." },
+      { f: "ctl", t: "h2", x: "Spawn{agent, home_ref, epoch}", say: "The new host gets a pointer to the home." },
+      { f: "h2", t: "blob", x: "fetch home", say: "On Kubernetes with replicated storage, steps 3 and 6 become a volume reattach instead." },
+      { f: "h2", t: "ctl", k: "reply", x: "Ready", say: "The runner then checks memory files and the session id byte for byte (I3)." }
+    ]
+  },
+  install: {
+    name: "Install on k3s", note: "From an empty cluster to a running agent.",
+    proof: "G0, G4",
+    parts: [["you", "Owner", ""], ["helm", "kubectl", "kustomize"], ["kube", "Kubernetes", ""], ["ctl", "Controller", "StatefulSet"], ["hp", "Host pods", "StatefulSet"]],
+    steps: [
+      { f: "you", t: "helm", x: "kubectl apply -k deploy/kubernetes", say: "The manifests in deploy/kubernetes, already checked against the real APIs. A Helm chart later wraps the same objects with values for capabilities and storage class." },
+      { f: "helm", t: "kube", x: "apply StatefulSets, postgresql k2-pg, Gateway", say: "Standard objects plus the Zalando postgres-operator's postgresql object. agent-sandbox CRDs are needed only for the opt-in Sandbox tier." },
+      { f: "kube", t: "ctl", x: "start controller", say: "The controller finds Postgres through a Secret and reports its capabilities." },
+      { f: "kube", t: "hp", x: "start host pods", say: "Host pods carry a bootstrap enrollment token from a Secret." },
+      { f: "hp", t: "ctl", x: "enroll", say: "Hosts dial in. No Service needs to point at host pods." },
+      { f: "you", t: "ctl", x: "k2 users add, k2 connect login", say: "The same first-run steps as a Linux box today." }
+    ]
+  },
+  drain: {
+    name: "Node drain on local storage", note: "What we saw in the lab, and what K2 does about it.",
+    proof: "S10",
+    parts: [["kube", "Kubernetes", ""], ["pod", "Agent pod", "local-path volume"], ["sch", "Scheduler", ""], ["ctl", "Controller", ""]],
+    steps: [
+      { f: "kube", t: "pod", x: "evict (kubectl drain)", say: "Run on kind: the Sandbox pod was evicted from its node." },
+      { f: "kube", t: "sch", x: "schedule replacement", say: "The controller for the pod tries to place it again." },
+      { f: "sch", t: "kube", k: "fail", x: "Pending: volume node affinity", say: "Seen live: local-path volumes belong to one node, so the pod can only return to the drained node." },
+      { f: "ctl", t: "ctl", k: "self", x: "host away > 5 min", say: "K2 notices through its own host link, not through Kubernetes status." },
+      { f: "ctl", t: "ctl", k: "self", x: "portable? move via home sync", say: "A portable agent is moved with the previous flow. A pinned agent waits for its node. With Longhorn, the volume follows the pod instead." }
+    ]
+  },
+  laptop: {
+    name: "Laptop goes to sleep", note: "A laptop enrolled as a host closes its lid while a cloud agent messages it.",
+    proof: "S11",
+    parts: [["lap", "Laptop host", "k2-host"], ["ctl", "Controller", "cloud"], ["cloud", "Cloud agent", "host pod"]],
+    steps: [
+      { f: "lap", t: "ctl", k: "fail", x: "heartbeats stop (lid closed)", say: "No goodbye; the link just goes quiet." },
+      { f: "ctl", t: "ctl", k: "self", x: "host away after 90 s", say: "Laptop agents show as paused. They are pinned, so nothing is rescheduled." },
+      { f: "cloud", t: "ctl", x: "k2 msg laptop-agent", say: "A cloud agent sends work to the laptop agent." },
+      { f: "ctl", t: "cloud", k: "reply", x: "Queued{msg_id}", say: "The sender is told the truth: queued, not delivered." },
+      { f: "lap", t: "ctl", x: "reconnect (new IP, same key)", say: "The lid opens on a different network. Identity is the key." },
+      { f: "ctl", t: "lap", x: "drain outbox", say: "The message is delivered with its original id." },
+      { f: "lap", t: "ctl", k: "reply", x: "Delivered{msg_id}", say: "The cloud agent's message reaches its final state (I2)." }
+    ]
+  },
+  localattach: {
+    name: "Controller unreachable", note: "The laptop is offline from the cloud controller, but its own agents keep running and stay usable.",
+    proof: "S14",
+    parts: [["app", "K2 app", "on the laptop"], ["ctl", "Controller", "cloud"], ["lap", "Laptop host", "k2-host"], ["cli", "claude CLI", "pinned agent"]],
+    steps: [
+      { f: "app", t: "ctl", k: "fail", x: "connect: unreachable", say: "No network, or the controller is down. Today's desktop app would show nothing useful." },
+      { f: "app", t: "lap", x: "attach via K2_HOST_LOCAL_ATTACH", say: "The app falls back to the laptop's own host on a loopback port, authenticated with a token only this machine holds." },
+      { f: "lap", t: "app", k: "reply", x: "local agents + scrollback", say: "The host lists the agents it runs and replays their output from the PTY rings." },
+      { f: "app", t: "lap", x: "keystrokes", say: "Typing goes straight to the agent's terminal. The agent never noticed the controller was gone." },
+      { f: "lap", t: "cli", x: "write to PTY", say: "Same terminal, same process as before." },
+      { f: "app", t: "lap", x: "k2 msg cloud-agent (queued)", say: "Anything that needs the controller is accepted and shown as pending: new agents, messages to other machines, heartbeats." },
+      { f: "lap", t: "ctl", x: "reconnect, flush queue", say: "When the link returns, the host replays queued events and the app switches back to the controller." }
+    ]
+  },
+  prove: {
+    name: "A gate run", note: "What prove.sh does. Every step writes into the evidence bundle.",
+    proof: "every gate",
+    parts: [["dev", "Author", ""], ["run", "prove.sh", "runner"], ["topo", "Topology", "solo to k3s"], ["sut", "K2 under test", "fake agents"], ["rep", "Bundle", "lab-runs/"]],
+    steps: [
+      { f: "dev", t: "run", x: "prove.sh G2 --topology fleet --chaos", say: "One command from a clean checkout (NFR8)." },
+      { f: "run", t: "topo", x: "up: compose / kind / k3s", say: "The runner builds the binaries and brings up the topology." },
+      { f: "run", t: "sut", x: "parity suites", say: "Existing suites first. If they fail, the gate stops here." },
+      { f: "run", t: "sut", x: "scenarios S1…S13, chaos seed", say: "Scenarios use k2-fake-agent; chaos kills processes on a fixed seed." },
+      { f: "sut", t: "run", k: "reply", x: "trace events", say: "Every hop emits an event tagged with agent and message ids." },
+      { f: "run", t: "run", k: "self", x: "match traces to PRD flows", say: "The flows on this page, stored as JSON, are the expected traces." },
+      { f: "run", t: "rep", x: "report.html, diffs, metrics, demo.cast", say: "The author opens report.html, or reruns the same command." }
+    ]
+  }
+};
+
+/* ---------- Levels ---------- */
+const VIEWS = {
+  system: {
+    title: "The whole system", level: 0, parent: null, height: 340,
+    summary: "A client talks to the one controller, as it talks to the daemon today. The controller tells agent hosts to start, stop and message agents. Agents run on hosts; their identity and history stay with the controller.",
+    today: ["crates/k2-daemon", "crates/k2-node", "crates/k2-ptyd", "src-tauri (connection only)"],
+    entities: [
+      { id: "client", name: "Client", role: "Desktop app, web, mobile, k2 CLI. Unchanged.", runs: "an app or CLI on your computer", x: 15, y: 50, holds: ["daemon URL", "token"], does: ["spawn", "attach", "stream"], code: ["src-tauri/", "cli/k2"] },
+      { id: "controller", name: "Controller", role: "Today's daemon, minus agent processes. Exactly one.", runs: "k2-daemon: a background service, or the one process in a pod", x: 50, y: 50, drill: "controller", holds: ["database", "agents and their history", "message outbox"], does: ["decide where agents run", "wake", "deliver messages"], code: ["crates/k2-daemon"] },
+      { id: "host", name: "Agent host", role: "Runs agents' terminals and CLIs.", runs: "inside k2-daemon (one machine), or k2-host: a service on a VM or laptop, or a pod", x: 85, y: 50, drill: "host", holds: ["running agents", "agent homes"], does: ["spawn", "drain", "check hooks"], code: ["crates/k2-node", "crates/k2-ptyd"] }
+    ],
+    edges: [
+      { from: "client", to: "controller", label: "talks to" },
+      { from: "controller", to: "host", label: "runs agents on", offset: -16 },
+      { from: "host", to: "controller", label: "dials out to", offset: -16 }
+    ],
+    flows: ["spawn", "msg"]
+  },
+  controller: {
+    title: "Inside the controller", level: 1, parent: "system", height: 520,
+    summary: "Most of today's daemon stays here. What leaves is the agent process itself. Lifecycle, scheduling and delivery stop calling into local PTYs and start sending frames to hosts.",
+    today: ["active_reaper.rs", "heartbeat_monitor.rs", "workspace_msg.rs", "compute_place.rs", "k2-core/src/db/mod.rs"],
+    entities: [
+      { id: "api", name: "API", role: "Routes for clients and CLIs: /cli, /v1, WebSocket.", x: 16, y: 14, holds: ["routes"], does: ["auth", "route"], code: ["crates/k2-daemon/src/*_routes.rs"] },
+      { id: "store", name: "Store", role: "SQLite today; optional Postgres later.", x: 50, y: 14, holds: ["agents", "sessions", "heartbeats", "outbox"], does: ["persist"], code: ["k2-core/src/db/mod.rs:95"] },
+      { id: "caps", name: "Capabilities", role: "Postgres, Apps, mail, Sew, front door, key storage.", x: 84, y: 14, holds: ["mode per feature"], does: ["drive helper or Kubernetes"], code: ["crates/k2-root-proto/src/verbs.rs"] },
+      { id: "sched", name: "Scheduler", role: "Heartbeats and cron-style wakes.", x: 16, y: 50, holds: ["due times"], does: ["fire needs"], code: ["heartbeat_monitor.rs"] },
+      { id: "life", name: "Lifecycle", role: "The active set: who is awake, who sleeps.", x: 50, y: 50, holds: ["24 h window", "pins"], does: ["release", "wake"], code: ["active_reaper.rs"] },
+      { id: "deliv", name: "Delivery", role: "Messages, inbox and the new durable outbox.", x: 84, y: 50, holds: ["msg ids", "state"], does: ["inject", "retry", "dedupe"], code: ["workspace_msg.rs", "inbox.rs", "federation_drain.rs"] },
+      { id: "place", name: "Placement", role: "Host inventory, pinning, epochs.", x: 50, y: 86, holds: ["hosts", "epoch per agent"], does: ["choose", "fence"], code: ["compute_place.rs"] },
+      { id: "prov", name: "Provisioner", role: "How to get or wake a host: local, enrolled machine or Kubernetes.", x: 84, y: 86, drill: "k8s", holds: ["host pool"], does: ["ensure host", "scale down"], code: ["new"] },
+      { id: "agentdata", name: "Agent records", role: "Identity, memory pointers, sessions, messages.", x: 16, y: 86, drill: "agent", holds: ["one row set per agent"], does: [], code: ["k2-core/src/db/schema.rs"] }
+    ],
+    edges: [
+      { from: "place", to: "prov", label: "get a host" },
+      { from: "agentdata", to: "store", label: "kept in", offset: 30 },
+      { from: "api", to: "store", label: "reads, writes" },
+      { from: "api", to: "caps", label: "uses", offset: -40 },
+      { from: "sched", to: "life", label: "need" },
+      { from: "deliv", to: "life", label: "wake recipient" },
+      { from: "life", to: "store", label: "active set" },
+      { from: "deliv", to: "store", label: "outbox" },
+      { from: "life", to: "place", label: "where?" }
+    ],
+    flows: ["sleep", "ctlrestart"]
+  },
+  host: {
+    title: "Inside an agent host", level: 1, parent: "system", height: 520,
+    summary: "One supervisor per machine, VM or pod, built from k2-node and k2-ptyd. Everything that needs the real process table or the real terminal happens here.",
+    today: ["crates/k2-node", "crates/k2-ptyd", "cell_uds.rs", "agent_hooks/owner.rs", "terminal/daemon_pty.rs"],
+    entities: [
+      { id: "sup", name: "k2-host", role: "Supervisor for one machine, VM or pod.", runs: "a service (launchd, systemd) or a pod's main process", x: 50, y: 12, holds: ["host key", "epochs"], does: ["enroll", "drain", "spawn"], code: ["crates/k2-node (grows into this)"] },
+      { id: "link", name: "Host link", role: "Outbound signed WebSocket. Reconnects.", x: 16, y: 46, holds: ["sequence numbers"], does: ["send", "replay"], code: ["k2-node-proto/src/frames.rs", "compute_ws.rs"] },
+      { id: "ptyd", name: "PTY host", role: "Owns terminals and output rings.", runs: "k2-ptyd, a child process of k2-host", x: 50, y: 46, holds: ["rings, 4 MiB each"], does: ["open", "resize", "replay"], code: ["crates/k2-ptyd/src/ring.rs"] },
+      { id: "sock", name: "Cell socket", role: "Per-agent hook socket and owner check.", x: 84, y: 46, holds: ["scoped token"], does: ["attribute hooks"], code: ["cell_uds.rs", "owner.rs"] },
+      { id: "cli", name: "Agent CLI", role: "claude, codex, gemini. Unchanged.", runs: "a child process in a PTY, one per awake agent", x: 50, y: 82, holds: ["conversation"], does: ["work"], code: ["ensure_cli.rs"] },
+      { id: "home", name: "Agent home", role: "Workspace, .k2/, provider memory and transcripts.", x: 84, y: 82, holds: ["AGENT.md, MEMORY.md", "*.jsonl"], does: ["persist"], code: ["clone/mod.rs:13"] }
+    ],
+    edges: [
+      { from: "sup", to: "link", label: "keeps open" },
+      { from: "sup", to: "ptyd", label: "drives" },
+      { from: "ptyd", to: "cli", label: "spawns" },
+      { from: "cli", to: "sock", label: "sends hooks" },
+      { from: "sock", to: "sup", label: "attested events" },
+      { from: "cli", to: "home", label: "reads, writes" }
+    ],
+    flows: ["hostdrain", "hook"]
+  },
+  agent: {
+    title: "What an agent is", level: 2, parent: "controller", height: 520,
+    summary: "The data that makes an agent the same agent after any restart or move. If all of this survives, the process can die freely.",
+    today: ["clone/mod.rs:13-28", "db/schema.rs (workspace_sessions)", "inbox.rs", "resume_chat.rs"],
+    entities: [
+      { id: "agent", name: "Agent", role: "Identity. Owned by the controller.", x: 50, y: 12, holds: ["id", "name, handle", "harness", "pinned | portable"], does: [], code: ["projects table"] },
+      { id: "place", name: "Placement", role: "Where it runs right now.", x: 16, y: 46, holds: ["host_id", "awake | asleep | away | moving", "epoch"], does: [], code: ["new"] },
+      { id: "home", name: "Home", role: "Files that carry its memory.", x: 84, y: 46, holds: [".k2/ AGENT.md, skills, inbox", "~/.claude/projects/<slug>/memory", "repo working tree"], does: [], code: ["clone/mod.rs"] },
+      { id: "sess", name: "Session", role: "The provider conversation to resume.", x: 84, y: 84, holds: ["session id", "transcript .jsonl"], does: [], code: ["workspace_sessions"] },
+      { id: "msg", name: "Message", role: "Work sent from another agent.", x: 16, y: 84, holds: ["msg_id", "queued | delivered | failed"], does: [], code: ["workspace_msg.rs", "new outbox"] },
+      { id: "hb", name: "Heartbeat", role: "Scheduled wake with a prompt.", x: 50, y: 84, holds: ["schedule", "last fire"], does: [], code: ["heartbeat_launch.rs"] }
+    ],
+    edges: [
+      { from: "agent", to: "place", label: "has one" },
+      { from: "agent", to: "home", label: "has one" },
+      { from: "agent", to: "sess", label: "resumes" },
+      { from: "sess", to: "home", label: "stored in" },
+      { from: "agent", to: "hb", label: "has many" },
+      { from: "msg", to: "agent", label: "addressed to" }
+    ],
+    flows: ["move"]
+  },
+  k8s: {
+    title: "Kubernetes as a provisioner", level: 2, parent: "controller", height: 520,
+    summary: "On Kubernetes, the controller and host pool are StatefulSets and each root-helper feature becomes Kubernetes objects. Nothing above this level changes.",
+    today: ["no manifests yet", "tests/linux/Containerfile.*"],
+    groups: [
+      { label: "Core", x1: 2, x2: 63, y1: 3, y2: 97 },
+      { label: "Capabilities", x1: 66, x2: 98, y1: 3, y2: 97 }
+    ],
+    entities: [
+      { id: "ctl", name: "Controller", role: "StatefulSet, 1 replica, PVC for SQLite and vault.", x: 18, y: 20, holds: ["PVC"], does: ["provision hosts"], code: ["charts/k2 (new)"] },
+      { id: "hp", name: "Host pods", role: "StatefulSet; each pod runs many agents.", x: 47, y: 20, holds: ["PVC per pod"], does: ["drain on SIGTERM"], code: ["default tier"] },
+      { id: "sbx", name: "Sandbox tier", role: "Optional: one agent-sandbox Sandbox per agent.", x: 47, y: 66, holds: ["PVC per agent"], does: ["suspend, resume"], code: ["agents.x-k8s.io/v1beta1"] },
+      { id: "net", name: "Network", role: "Gateway API, cert-manager, external-dns, NetworkPolicy.", x: 18, y: 66, holds: ["routes", "policies"], does: ["front door", "egress rules"], code: ["replaces front443, cell_egress"] },
+      { id: "pg", name: "Postgres", role: "Zalando postgres-operator, or an external URL.", x: 82, y: 17, holds: ["App databases"], does: ["/cli/db"], code: ["replaces helper pg verbs"] },
+      { id: "apps", name: "Apps", role: "A Deployment and NetworkPolicy per App.", x: 82, y: 50, holds: ["App images"], does: ["deploy", "gateway"], code: ["k2-app-engine driver"] },
+      { id: "mail", name: "Mail and Sew", role: "Stalwart StatefulSet; Sew on UDP.", x: 82, y: 83, holds: ["mailboxes"], does: ["25, 465, 993"], code: ["replaces helper mail, sew"] }
+    ],
+    edges: [
+      { from: "ctl", to: "hp", label: "provisions" },
+      { from: "ctl", to: "sbx", label: "opt-in" },
+      { from: "net", to: "ctl", label: "routes to" },
+      { from: "ctl", to: "pg", label: "uses", offset: -14 },
+      { from: "hp", to: "apps", label: "agents deploy", offset: 10 }
+    ],
+    flows: ["install", "drain"]
+  },
+  fleet: {
+    title: "VM fleets and laptops", level: 2, parent: "controller", height: 460,
+    summary: "Without Kubernetes, hosts are machines that enroll themselves. The controller VM keeps today's systemd and root helper, so every capability works as it does now.",
+    today: ["scripts/provision-k2-server.sh", "k2-node enroll"],
+    entities: [
+      { id: "cvm", name: "Controller VM", role: "Today's daemon under systemd, with the root helper.", x: 50, y: 14, holds: ["SQLite", "Postgres", "mail"], does: ["everything but agent processes"], code: ["provision-k2-server.sh"] },
+      { id: "hvm", name: "Host VM", role: "k2-host under systemd. Durable.", x: 16, y: 54, holds: ["agent homes"], does: ["run agents"], code: ["k2-node install"] },
+      { id: "lap", name: "Laptop host", role: "k2-host under launchd. Sometimes away.", x: 84, y: 54, holds: ["pinned agents", "own logins"], does: ["run agents"], code: ["new"] },
+      { id: "netw", name: "Reachability", role: "K2 Connect tunnel or a tailnet. Hosts dial out.", x: 50, y: 88, holds: ["no inbound ports"], does: ["carry the link"], code: ["k2-core/src/tunnel"] }
+    ],
+    edges: [
+      { from: "hvm", to: "cvm", label: "dials out" },
+      { from: "lap", to: "cvm", label: "dials out, may be away" },
+      { from: "cvm", to: "netw", label: "reachable through" }
+    ],
+    flows: ["laptop", "localattach"]
+  }
+};
+
+/* ---------- Sequence diagram widget ---------- */
+let seqCount = 0;
+function wrap(text, max) {
+  const words = text.split(" "); const lines = []; let cur = "";
+  for (const w of words) {
+    if ((cur + " " + w).trim().length > max && cur) { lines.push(cur); cur = w; } else cur = (cur + " " + w).trim();
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+function mountSeq(root, flow) {
+  const id = "sq" + (++seqCount);
+  const P = flow.parts, colW = 168, pad = 16, W = pad * 2 + colW * P.length;
+  const xOf = {}; P.forEach((p, i) => { xOf[p[0]] = pad + colW * i + colW / 2; });
+  const lastId = P[P.length - 1][0];
+  let y = 84; const rows = [];
+  flow.steps.forEach((s, i) => {
+    const self = s.f === s.t;
+    const span = self ? 150 : Math.abs(xOf[s.t] - xOf[s.f]);
+    const max = Math.max(16, Math.floor((span - 20) / 6.6));
+    const lines = wrap(s.x, max);
+    const top = y; const ay = top + lines.length * 15 + 10;
+    const h = (self ? 26 : 14) + lines.length * 15 + 12;
+    rows.push({ s, i, lines, top, ay, self }); y += h;
+  });
+  const H = y + 16;
+  let out = `<defs>
+    <marker id="${id}-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="${id}-act" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="mk-act" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="${id}-bad" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="10" markerHeight="10" orient="auto"><path class="mk-bad" d="M1,1 L9,9 M9,1 L1,9" stroke="currentColor" style="stroke: var(--bad); stroke-width: 2"/></marker>
+  </defs>`;
+  P.forEach((p) => {
+    const x = xOf[p[0]];
+    out += `<line class="life" x1="${x}" y1="58" x2="${x}" y2="${H - 6}"/>`;
+    out += `<g class="head"><rect x="${x - colW / 2 + 10}" y="10" width="${colW - 20}" height="${p[2] ? 46 : 36}" rx="9"/><text class="hname" x="${x}" y="${p[2] ? 30 : 33}" text-anchor="middle">${esc(p[1])}</text>${p[2] ? `<text class="hsub" x="${x}" y="47" text-anchor="middle">${esc(p[2])}</text>` : ""}</g>`;
+  });
+  rows.forEach(({ s, i, lines, top, ay, self }) => {
+    const k = s.k || "call";
+    const x1 = xOf[s.f], x2 = xOf[s.t];
+    let g = `<g class="msg ${k}" data-i="${i}" tabindex="0" role="button" aria-label="Step ${i + 1}: ${esc(s.x)}">`;
+    if (self) {
+      const left = s.f === lastId;
+      const dir = left ? -1 : 1;
+      const lx = left ? x1 - 36 : x1 + 36;
+      g += `<rect class="hit" x="${Math.min(x1, lx) - (left ? 150 : 0)}" y="${top - 4}" width="${190}" height="${ay - top + 28}" rx="6"/>`;
+      lines.forEach((l, j) => { g += `<text class="lb" x="${lx}" y="${top + 11 + j * 15}" text-anchor="${left ? "end" : "start"}">${esc(l)}</text>`; });
+      g += `<path class="ln" d="M${x1},${ay} h${28 * dir} v14 h${-26 * dir}" marker-end="url(#${id}-a)"/>`;
+      g += `<text class="nb" x="${x1 - 8 * dir}" y="${ay + 4}" text-anchor="${left ? "start" : "end"}">${i + 1}</text>`;
+    } else {
+      const dir = x2 > x1 ? 1 : -1;
+      const mid = (x1 + x2) / 2;
+      g += `<rect class="hit" x="${Math.min(x1, x2)}" y="${top - 4}" width="${Math.abs(x2 - x1)}" height="${ay - top + 12}" rx="6"/>`;
+      lines.forEach((l, j) => { g += `<text class="lb" x="${mid}" y="${top + 11 + j * 15}" text-anchor="middle">${esc(l)}</text>`; });
+      const end = k === "fail" ? `url(#${id}-bad)` : `url(#${id}-a)`;
+      g += `<line class="ln" x1="${x1 + 3 * dir}" y1="${ay}" x2="${x2 - 4 * dir}" y2="${ay}" marker-end="${end}"/>`;
+      g += `<text class="nb" x="${x1 - 6 * dir}" y="${ay + 4}" text-anchor="${dir > 0 ? "end" : "start"}">${i + 1}</text>`;
+    }
+    out += g + `</g>`;
+  });
+  root.innerHTML =
+    `<p class="seq-note"><b>${esc(flow.name)}.</b> ${esc(flow.note)}</p>` +
+    `<div class="seq-scroll"><svg class="seq" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Sequence diagram: ${esc(flow.name)}">${out}</svg></div>` +
+    `<div class="controls"><button type="button" data-a="reset">Start over</button><button type="button" data-a="prev">Back</button><button type="button" data-a="next">Next step</button><button type="button" data-a="play">Play</button><span class="progress"></span></div>` +
+    `<div class="narration" aria-live="polite"></div>` +
+    `<p class="proof">Checked by scenario <code>${esc(flow.proof)}</code> · stored as <code>docs/prd/flows/${esc(Object.keys(FLOWS).find((k) => FLOWS[k] === flow))}.json</code></p>`;
+  const svg = $("svg", root), nar = $(".narration", root), prog = $(".progress", root);
+  const n = flow.steps.length; let cur = -1, timer = 0;
+  function set(i) {
+    cur = Math.max(-1, Math.min(n - 1, i));
+    svg.querySelectorAll(".msg").forEach((g) => {
+      const j = +g.dataset.i;
+      g.classList.toggle("active", j === cur);
+      g.classList.toggle("future", cur >= 0 && j > cur);
+      const ln = g.querySelector(".ln");
+      if (!g.classList.contains("fail")) ln.setAttribute("marker-end", `url(#${id}-${j === cur ? "act" : "a"})`);
+    });
+    if (cur < 0) { nar.innerHTML = `Press <b>Next step</b> or <b>Play</b>, or click any arrow.`; prog.textContent = `${n} steps`; }
+    else { nar.innerHTML = `<b>${cur + 1}. ${esc(flow.steps[cur].x)}</b><br>${esc(flow.steps[cur].say)}`; prog.textContent = `Step ${cur + 1} of ${n}`; }
+    $('[data-a="prev"]', root).disabled = cur < 0;
+    $('[data-a="next"]', root).disabled = cur >= n - 1;
+  }
+  function stop() { clearInterval(timer); timer = 0; $('[data-a="play"]', root).textContent = "Play"; }
+  root.addEventListener("click", (ev) => {
+    const b = ev.target.closest("button[data-a]");
+    if (b) {
+      const a = b.dataset.a;
+      if (a === "play") {
+        if (timer) return stop();
+        if (cur >= n - 1) set(-1);
+        b.textContent = "Pause";
+        set(cur + 1);
+        timer = setInterval(() => { if (cur >= n - 1) return stop(); set(cur + 1); }, 2600);
+        return;
+      }
+      stop();
+      if (a === "reset") set(-1); else if (a === "prev") set(cur - 1); else set(cur + 1);
+      return;
+    }
+    const g = ev.target.closest(".msg");
+    if (g) { stop(); set(+g.dataset.i); }
+  });
+  svg.addEventListener("keydown", (ev) => {
+    const g = ev.target.closest(".msg");
+    if (g && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); stop(); set(+g.dataset.i); }
+  });
+  set(-1);
+}
+
+/* ---------- Level explorer ---------- */
+function childrenOf(id) { return Object.keys(VIEWS).filter((k) => VIEWS[k].parent === id); }
+function treeHTML(id) {
+  const v = VIEWS[id], kids = childrenOf(id);
+  return `<li><button type="button" data-view="${id}" style="--c:${LEVEL_COLOR[v.level]}"><span class="lvl">L${v.level}</span>${esc(v.title)}</button>` +
+    (kids.length ? `<ul>${kids.map(treeHTML).join("")}</ul>` : "") + `</li>`;
+}
+$("#tree").innerHTML = `<ul>${treeHTML("system")}</ul>`;
+function pathTo(id) { const p = []; for (let k = id; k; k = VIEWS[k].parent) p.unshift(k); return p; }
+
+const erd = $("#erd"), edgesSvg = $("#edges");
+let current = null, currentId = null;
+function listHTML(label, items, mono) {
+  if (!items || !items.length) return "";
+  return `<div class="dgroup"><span class="dlabel">${label}</span><ul>${items.map((i) => `<li>${mono ? `<code>${esc(i)}</code>` : esc(i)}</li>`).join("")}</ul></div>`;
+}
+function cardEl(e, color, height) {
+  const el = document.createElement("div");
+  el.className = "card" + (e.drill ? " has-drill" : "");
+  el.dataset.id = e.id;
+  el.style.setProperty("--c", color);
+  el.style.left = e.x + "%";
+  el.style.top = Math.max(8, (e.y / 100) * height - 44) + "px";
+  const target = e.drill ? VIEWS[e.drill] : null;
+  el.innerHTML =
+    `<div class="card-head"><span class="card-name">${esc(e.name)}</span>` +
+    `<button class="info" type="button" aria-expanded="false" aria-label="Details for ${esc(e.name)}">i</button></div>` +
+    `<p class="card-role">${esc(e.role)}</p>` +
+    (e.runs ? `<p class="card-runs"><span>Runs as</span> ${esc(e.runs)}</p>` : "") +
+    (target ? `<button class="drill" type="button" data-to="${e.drill}" style="--to:${LEVEL_COLOR[target.level]}">Look inside <span class="lvl">L${target.level}</span></button>` : "") +
+    `<div class="details" hidden>${listHTML("Holds", e.holds, true)}${listHTML("Does", e.does, true)}${listHTML("Code", e.code, true)}</div>`;
+  return el;
+}
+function renderDiagram(view) {
+  erd.querySelectorAll(".card, .group").forEach((n) => n.remove());
+  const height = view.height || 500;
+  erd.style.height = height + "px";
+  const color = LEVEL_COLOR[view.level];
+  for (const g of view.groups || []) {
+    const el = document.createElement("div");
+    el.className = "group";
+    el.style.setProperty("--c", color);
+    el.style.left = g.x1 + "%"; el.style.width = (g.x2 - g.x1) + "%";
+    el.style.top = (g.y1 / 100) * height + "px"; el.style.height = ((g.y2 - g.y1) / 100) * height + "px";
+    el.innerHTML = `<span class="group-label">${esc(g.label)}</span>`;
+    erd.appendChild(el);
+  }
+  for (const e of view.entities) erd.appendChild(cardEl(e, color, height));
+  erd.querySelectorAll(".card").forEach((c) => resizeWatch.observe(c));
+  scheduleEdges();
+}
+function boxOf(id, frame) {
+  const r = erd.querySelector(`.card[data-id="${id}"]`).getBoundingClientRect();
+  return { cx: r.left - frame.left + r.width / 2, cy: r.top - frame.top + r.height / 2, hw: r.width / 2, hh: r.height / 2, bottom: r.bottom - frame.top };
+}
+function clipToBox(b, ux, uy, gap) {
+  const tx = Math.abs(ux) > 1e-6 ? b.hw / Math.abs(ux) : Infinity;
+  const ty = Math.abs(uy) > 1e-6 ? b.hh / Math.abs(uy) : Infinity;
+  return Math.min(tx, ty) + gap;
+}
+function drawEdges() {
+  if (!current) return;
+  const frame = erd.getBoundingClientRect();
+  let maxBottom = 0;
+  current.entities.forEach((e) => { maxBottom = Math.max(maxBottom, boxOf(e.id, frame).bottom); });
+  const wanted = Math.max(current.height || 500, Math.ceil(maxBottom + 24));
+  if (Math.abs(erd.offsetHeight - wanted) > 1) erd.style.height = wanted + "px";
+  const w = erd.clientWidth, h = erd.clientHeight;
+  edgesSvg.setAttribute("width", w); edgesSvg.setAttribute("height", h); edgesSvg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  let out = `<defs><marker id="erd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path class="m-fill" d="M0,0 L10,5 L0,10 z"/></marker></defs>`;
+  const labels = [];
+  for (const ed of current.edges) {
+    const a = boxOf(ed.from, frame), b = boxOf(ed.to, frame);
+    const dx = b.cx - a.cx, dy = b.cy - a.cy, len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len, uy = dy / len, off = ed.offset || 0;
+    const nx = -uy * off, ny = ux * off;
+    const s = clipToBox(a, ux, uy, 4), t = clipToBox(b, ux, uy, 6);
+    const x1 = a.cx + nx + ux * s, y1 = a.cy + ny + uy * s, x2 = b.cx + nx - ux * t, y2 = b.cy + ny - uy * t;
+    out += `<line class="edge" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#erd-arrow)"/>`;
+    if (ed.label) labels.push(`<text class="elabel" x="${(x1 + x2) / 2 + nx * 0.4}" y="${(y1 + y2) / 2 + ny * 0.4}" text-anchor="middle" dominant-baseline="middle">${esc(ed.label)}</text>`);
+  }
+  edgesSvg.innerHTML = out + labels.join("");
+}
+let edgeFrame = 0;
+function scheduleEdges() { cancelAnimationFrame(edgeFrame); edgeFrame = requestAnimationFrame(drawEdges); }
+const resizeWatch = new ResizeObserver(scheduleEdges);
+resizeWatch.observe(erd);
+erd.addEventListener("click", (ev) => {
+  const info = ev.target.closest(".info");
+  if (info) {
+    const card = info.closest(".card"), open = info.getAttribute("aria-expanded") !== "true";
+    info.setAttribute("aria-expanded", String(open));
+    card.querySelector(".details").hidden = !open;
+    card.classList.toggle("open", open);
+    scheduleEdges();
+    return;
+  }
+  const drill = ev.target.closest(".drill");
+  if (drill) show(drill.dataset.to, true);
+});
+
+function renderFlows(view) {
+  const tabs = $("#tabs"), box = $("#flowbox");
+  tabs.innerHTML = view.flows.map((f, i) => `<button type="button" role="tab" aria-selected="${i === 0}" data-flow="${f}">${esc(FLOWS[f].name)}</button>`).join("");
+  const pick = (f) => {
+    tabs.querySelectorAll("button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.flow === f)));
+    box.className = "seqbox";
+    mountSeq(box, FLOWS[f]);
+  };
+  tabs.onclick = (ev) => { const b = ev.target.closest("button[data-flow]"); if (b) pick(b.dataset.flow); };
+  pick(view.flows[0]);
+}
+
+function show(id, scroll) {
+  currentId = id; current = VIEWS[id];
+  const color = LEVEL_COLOR[current.level];
+  const frame = $("#level-frame");
+  frame.style.setProperty("--c", color);
+  $("#banner-title").textContent = `Level L${current.level} · ${current.title}`;
+  $("#view-title").textContent = current.title;
+  $("#view-summary").textContent = current.summary;
+  $("#view-today").innerHTML = `<span>Today in code:</span>` + current.today.map((t) => `<code>${esc(t)}</code>`).join("");
+  const path = pathTo(id);
+  $("#crumbs").innerHTML = path.map((k, i) => i === path.length - 1 ? `<span class="here">${esc(VIEWS[k].title)}</span>` : `<button type="button" data-view="${k}">${esc(VIEWS[k].title)}</button><span aria-hidden="true">›</span>`).join("");
+  document.querySelectorAll("#tree button").forEach((b) => b.setAttribute("aria-current", String(b.dataset.view === id)));
+  renderDiagram(current);
+  renderFlows(current);
+  if (scroll) frame.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+}
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("#tree button[data-view], #crumbs button[data-view]");
+  if (b) show(b.dataset.view, false);
+});
+show("system", false);
+
+const proveBox = $("#prove-flow");
+mountSeq(proveBox, FLOWS.prove);
+</script>
+
+</body></html>

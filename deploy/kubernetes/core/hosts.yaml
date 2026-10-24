@@ -1,0 +1,104 @@
+# Agent hosts: k2-host pods, each running many agents as processes
+# (k2-ptyd plus one claude/codex CLI per awake agent). This is the default
+# tier; one pod per agent is the optional Sandbox tier (examples/).
+#
+# Hosts open no ports and have no Kubernetes API access. They dial out to
+# the controller, enroll with the bootstrap token, and are known by their key.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k2-host
+spec:
+  serviceName: k2-host
+  replicas: 2                              # the controller scales this (K2_PROVISIONER=kubernetes)
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-host
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k2-host
+        k2.dev/role: host
+      annotations:
+        # On clusters with Karpenter: never consolidate a node out from under awake agents.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: k2-host
+      automountServiceAccountToken: false
+      # SIGTERM starts a drain: stop taking work, wait for each agent's turn
+      # to end (Stop hook), save session ids, exit. See PRD section 6.
+      terminationGracePeriodSeconds: 600
+      # ADR-0001: process isolation between agents inside a pod. No added
+      # capabilities, so the pod would pass the "restricted" Pod Security level.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: k2-host
+          image: ghcr.io/alakazam-211/k2-host:0.47.0
+          env:
+            - {name: K2_HOME, value: /var/lib/k2-host}
+            - {name: K2_CONTROLLER_URL, value: "ws://k2-controller:7420"}   # new
+            - name: K2_HOST_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}           # k2-host-0, k2-host-1, ...
+            - {name: K2_HOST_ENROLL_TOKEN_FILE, value: /run/secrets/k2/host-enroll-token}
+            - {name: K2_HOST_LABELS, value: "pool=default"}
+            - {name: K2_HOST_MAX_AWAKE, value: "100"}                     # new
+          readinessProbe:
+            exec: {command: [k2-host, health]}                            # new: 0 when linked to the controller
+            periodSeconds: 15
+          resources:
+            # About 400 MB per awake claude CLI (measured), 100 awake per pod.
+            requests: {cpu: "4", memory: 24Gi}
+            limits: {memory: 48Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            # ADR-0001, opt-in "isolated cells" profile instead: run k2-host
+            # as root with only SETUID, SETGID and CHOWN so it can drop each
+            # agent to its own UID from the 60000-60127 pool.
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/k2-host}   # agent homes, ~/.claude, ~/.codex, login wallet
+            - {name: tmp, mountPath: /tmp}
+            - {name: k2-secrets, mountPath: /run/secrets/k2, readOnly: true}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: k2-secrets
+          secret:
+            secretName: k2-secrets
+            items: [{key: host-enroll-token, path: host-enroll-token}]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        # On k3s the default class is local-path, which pins each host pod to
+        # one node (seen in the lab). Use a replicated class such as Longhorn
+        # if hosts must move between nodes; otherwise K2's home sync (P3) moves agents.
+        resources:
+          requests: {storage: 100Gi}
+---
+# Drains and upgrades take one host at a time, so most agents stay awake.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: k2-host
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-host
+---
+# Required by the StatefulSet for stable pod names. Nothing connects to hosts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-host
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: k2-host

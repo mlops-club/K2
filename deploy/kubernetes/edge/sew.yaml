@@ -1,0 +1,47 @@
+# Sew, K2's TURN and media server. TURN relays need real UDP ports on a
+# public address, so Sew uses the node's network on one labelled node.
+# Replaces the root helper's `sew` verbs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k2-sew
+spec:
+  replicas: 1
+  strategy: {type: Recreate}          # host ports can't be shared during a rollout
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-sew
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k2-sew
+        k2.dev/role: sew
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        k2.dev/sew: "true"            # kubectl label node <public-node> k2.dev/sew=true
+      containers:
+        - name: sew
+          image: ghcr.io/alakazam-211/sew:0.3.0          # new image; K2 0.46.3 pins Sew 0.3.0
+          ports:
+            - {name: turns, containerPort: 5349}
+            - {name: mgmt, containerPort: 9090}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/sew}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-sew
+spec:
+  selector:
+    app.kubernetes.io/name: k2-sew
+  ports:
+    - {name: mgmt, port: 9090, targetPort: mgmt}

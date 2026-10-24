@@ -1,0 +1,69 @@
+# Stalwart, K2's mail server, driven by the controller over its management
+# API exactly as the daemon's mail supervisor does today. Replaces the root
+# helper's `mail` verbs (useradd, unit files, binary install).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k2-mail
+spec:
+  serviceName: k2-mail
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-mail
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k2-mail
+        k2.dev/role: mail
+    spec:
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: stalwart
+          image: stalwartlabs/stalwart:v0.16.25          # K2's pinned version
+          ports:
+            - {name: smtp, containerPort: 25}
+            - {name: submissions, containerPort: 465}
+            - {name: imaps, containerPort: 993}
+            - {name: mgmt, containerPort: 8080}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - {name: data, mountPath: /opt/stalwart}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 20Gi}
+---
+# Mail ports need a public IP. k3s provides LoadBalancer IPs with its
+# built-in ServiceLB; other clusters use MetalLB or the cloud's load balancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-mail-public
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local       # keep the sender's IP for spam checks
+  selector:
+    app.kubernetes.io/name: k2-mail
+  ports:
+    - {name: smtp, port: 25, targetPort: smtp}
+    - {name: submissions, port: 465, targetPort: submissions}
+    - {name: imaps, port: 993, targetPort: imaps}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-mail
+spec:
+  selector:
+    app.kubernetes.io/name: k2-mail
+  ports:
+    - {name: mgmt, port: 8080, targetPort: mgmt}

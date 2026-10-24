@@ -1,0 +1,22 @@
+# Two namespaces, split by how much the pods in them may do.
+#
+# k2: the controller, agent hosts, Postgres and mail. "baseline" forbids
+# host networking, host paths and privileged containers. Host pods add no
+# capabilities (ADR-0001), so they would also pass "restricted"; Stalwart
+# runs as root, which is why enforcement stops at baseline.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k2
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+---
+# k2-edge: Sew only. TURN relays need the node's own network, which no
+# Pod Security level short of "privileged" allows.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k2-edge
+  labels:
+    pod-security.kubernetes.io/enforce: privileged

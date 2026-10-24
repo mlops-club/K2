@@ -1,0 +1,28 @@
+# K2 on Kubernetes: the declared end state (PRD "K2 Distributed Runtime", gate G4).
+#
+# NOT RUNNABLE YET: the k2-* images and the sew image don't exist. Every
+# object here is checked against the real APIs with a server-side dry run
+# (see deploy/README.md), so this is the shape the work builds toward.
+#
+# Needs in the cluster: Gateway API v1.6+ CRDs and a Gateway implementation
+# (k3s ships Traefik), the Zalando postgres-operator v2, and a storage class.
+# agent-sandbox is only needed for the optional per-agent tier (examples/).
+#
+#   kubectl apply -f deploy/kubernetes/namespaces.yaml
+#   kubectl -n k2 create secret generic k2-secrets \
+#     --from-file=host-enroll-token --from-file=vault-kek --from-file=stalwart-admin
+#   kubectl apply -k deploy/kubernetes
+#
+# Layout:
+#   core/      namespace k2: controller, agent hosts, Postgres, mail, front door, network rules
+#   edge/      namespace k2-edge: Sew (needs the node's network)
+#   examples/  objects the controller creates at runtime; not applied by hand
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: k2
+resources:
+  - namespaces.yaml
+  - core
+  - edge

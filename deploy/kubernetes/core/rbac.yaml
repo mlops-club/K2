@@ -1,0 +1,70 @@
+# What the controller may change in its own namespace. This replaces the
+# root helper's verbs on Kubernetes: instead of systemctl, useradd and nft,
+# the controller creates and scales Kubernetes objects. Nothing cluster-wide.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k2-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k2-controller
+rules:
+  # Host pool: scale the host StatefulSet up when agents wake, down when idle.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: ["k2-host"]
+    verbs: ["get", "watch", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    resourceNames: ["k2-host"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Optional per-agent tier: one agent-sandbox Sandbox per isolated agent.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # K2 Apps: a Deployment, Service and NetworkPolicy per App (replaces Podman and Quadlet).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # App subdomains need no Gateway objects: the controller's front door
+  # (Caddy behind the TLS passthrough) routes them, as it does today.
+  # App databases (replaces the root helper's `pg` verbs): add each App's
+  # user and database to the Zalando postgresql object's spec.users and spec.databases.
+  - apiGroups: ["acid.zalan.do"]
+    resources: ["postgresqls"]
+    resourceNames: ["k2-pg"]
+    verbs: ["get", "watch", "patch"]
+  # Read the operator's per-App credential Secrets to wire them into each App.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k2-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k2-controller
+subjects:
+  - kind: ServiceAccount
+    name: k2-controller
+---
+# Host pods get no Kubernetes API access at all: they only talk to the controller.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k2-host
+automountServiceAccountToken: false

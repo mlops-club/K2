@@ -1,0 +1,65 @@
+# EXAMPLE, created by the controller at runtime: the optional per-agent tier.
+# One agent-sandbox Sandbox per isolated agent, for untrusted work or shared
+# clusters. The default tier is many agents per host pod (core/hosts.yaml).
+# The PRD decides at gate G4 how far this tier goes.
+#
+# The pod runs k2-host in single-agent mode: same binary, same dial-out
+# link, same drain on SIGTERM. The controller sets operatingMode to
+# Suspended when the agent sleeps and back to Running when it wakes.
+# It never trusts this object's Ready condition alone: in the lab, Ready
+# read True during a resume while the old pod was still terminating.
+apiVersion: agents.x-k8s.io/v1beta1
+kind: Sandbox
+metadata:
+  name: agent-docs-bot
+  namespace: k2
+  labels:
+    k2.dev/agent: docs-bot
+spec:
+  operatingMode: Running
+  failedPodPolicy: Recreate
+  service: false                     # hosts dial out; nothing connects in
+  volumeClaimTemplates:
+    - metadata:
+        name: home
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 10Gi}
+  podTemplate:
+    metadata:
+      labels:
+        k2.dev/role: host            # gets the host network rules
+        k2.dev/agent: docs-bot
+    spec:
+      runtimeClassName: gvisor       # or kata; omit for plain runc
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: k2-host
+          image: ghcr.io/alakazam-211/k2-host:0.47.0
+          env:
+            - {name: K2_HOME, value: /var/lib/k2-host}
+            - {name: K2_CONTROLLER_URL, value: "ws://k2-controller:7420"}
+            - {name: K2_HOST_NAME, value: agent-docs-bot}
+            - {name: K2_HOST_SINGLE_AGENT, value: docs-bot}     # new: accept only this agent
+            - {name: K2_HOST_ENROLL_TOKEN_FILE, value: /run/secrets/k2/host-enroll-token}
+          resources:
+            requests: {cpu: 250m, memory: 768Mi}
+            limits: {memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: home, mountPath: /var/lib/k2-host}
+            - {name: k2-secrets, mountPath: /run/secrets/k2, readOnly: true}
+      volumes:
+        - name: k2-secrets
+          secret:
+            secretName: k2-secrets
+            items: [{key: host-enroll-token, path: host-enroll-token}]

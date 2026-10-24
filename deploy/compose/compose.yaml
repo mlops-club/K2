@@ -1,0 +1,200 @@
+# K2 on Docker Compose: the declared end state (PRD "K2 Distributed Runtime", gate G4).
+#
+# NOT RUNNABLE YET. The k2-* images don't exist and every interface marked
+# "new" below is a target the stages P0–P4 build. This file exists to show
+# the architecture and its interfaces before the work starts.
+#
+# What runs here (see deploy/README.md for the interface table):
+#   controller   k2-daemon as the controller only: database, scheduler,
+#                messaging outbox, vault, K2 Connect tunnel, front door.
+#                Runs no agent processes itself.
+#   host-1/2     k2-host: agent terminals (k2-ptyd) and agent CLIs
+#                (claude, codex, ...) as processes inside the container.
+#                Each dials out to the controller; neither opens a port
+#                except the optional local attach port.
+#   postgres     the App databases and /cli/db (today: root helper `pg`).
+#   mail         Stalwart, driven over its management API (today: root helper `mail`).
+#   sew          TURN and media (today: root helper `sew`).
+#   apps         k2-app-engine running each K2 App as a nested rootless
+#                Podman container, as on a Linux box today.
+#
+# A laptop joins from outside this file:
+#   k2-host enroll --controller https://<you>.k2.dev --enroll <code> --name my-mac
+#
+# Validate the syntax with: docker compose -f deploy/compose/compose.yaml config -q
+
+name: k2
+
+x-k2-host: &k2-host
+  image: ghcr.io/alakazam-211/k2-host:${K2_VERSION:-0.47.0}  # new image
+  restart: unless-stopped
+  depends_on:
+    controller:
+      condition: service_healthy
+  # SIGTERM starts a drain: no new deliveries, wait for each agent's turn to
+  # end (Stop hook), save session ids, exit. Long turns get ten minutes.
+  stop_grace_period: 10m
+  init: true
+  secrets:
+    - host-enroll-token
+  networks: [k2]
+  healthcheck:
+    test: ["CMD", "k2-host", "health"]                  # new: exits 0 when linked to the controller
+    interval: 15s
+    timeout: 5s
+    retries: 4
+
+services:
+  controller:
+    image: ghcr.io/alakazam-211/k2-daemon:${K2_VERSION:-0.47.0}  # new image; binary at /usr/bin => install_kind="package", no self-update
+    restart: unless-stopped
+    init: true
+    environment:
+      K2_HOME: /var/lib/k2                       # new: every ~/.k2 path honours it (P0)
+      K2_ROLE: controller                        # new: "all" (default, today) | "controller" (no in-process host)
+      K2_LISTEN: lan                             # existing: bind 0.0.0.0 instead of loopback
+      K2_DAEMON_PORT: "7420"                     # new: fixed port instead of the sticky random one in daemon.port
+      K2_HOSTS: "1"                              # new: turns on /cli/hosts/enroll and /cli/hosts/attach (like K2_COMPUTE=1)
+      K2_HOST_BOOTSTRAP_TOKEN_FILE: /run/secrets/host-enroll-token  # new: hosts in this file enroll without the SAS step
+      K2_PROVISIONER: static                     # new: static | kubernetes. Static = hosts enroll themselves
+      K2_KEK_FILE: /run/secrets/vault-kek        # new: vault key from a secret instead of keychain or root helper `keep`
+      K2_CAP_POSTGRES: external                  # new capability switches: host | external | kubernetes | off
+      K2_POSTGRES_URL_FILE: /run/secrets/postgres-url
+      K2_CAP_MAIL: external
+      K2_STALWART_URL: http://mail:8080
+      K2_STALWART_ADMIN_FILE: /run/secrets/stalwart-admin
+      K2_CAP_SEW: external
+      K2_SEW_MGMT_URL: http://sew:9090
+      K2_CAP_APPS: engine                        # engine = talk to k2-app-engine over its socket, as today
+      K2_APP_ENGINE_SOCK: /run/k2app/engine.sock # existing path, now a shared volume
+      K2_CAP_FRONT: listen                       # new: bind :443 directly instead of the systemd socket unit
+    ports:
+      - "443:443"            # front door: SNI routing to Caddy, Stalwart and Sew, as front443 does today
+      - "127.0.0.1:7420:7420" # API for a client on this machine; remote clients use the K2 Connect tunnel
+    volumes:
+      - controller-data:/var/lib/k2              # k2.db, vault.db, tunnel.json, federation identity
+      - app-engine-sock:/run/k2app
+    secrets:
+      - host-enroll-token
+      - vault-kek
+      - postgres-url
+      - stalwart-admin
+    networks: [k2]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7420/boot-status"]  # existing route; ready when phase=ready
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  host-1:
+    <<: *k2-host
+    hostname: host-1
+    environment:
+      K2_HOME: /var/lib/k2-host
+      K2_CONTROLLER_URL: ws://controller:7420     # new: wss:// when the controller is remote
+      K2_HOST_NAME: host-1
+      K2_HOST_ENROLL_TOKEN_FILE: /run/secrets/host-enroll-token
+      K2_HOST_LABELS: pool=default
+      K2_HOST_MAX_AWAKE: "100"                    # new: awake agents this host accepts before placement goes elsewhere
+      K2_HOST_LOCAL_ATTACH: 0.0.0.0:7421          # new: the local app attaches here directly when the controller is unreachable
+    ports:
+      - "127.0.0.1:7421:7421"
+    volumes:
+      - host-1-data:/var/lib/k2-host             # agent homes, ~/.claude, ~/.codex, login wallet, ptyd rings
+
+  host-2:
+    <<: *k2-host
+    hostname: host-2
+    environment:
+      K2_HOME: /var/lib/k2-host
+      K2_CONTROLLER_URL: ws://controller:7420
+      K2_HOST_NAME: host-2
+      K2_HOST_ENROLL_TOKEN_FILE: /run/secrets/host-enroll-token
+      K2_HOST_LABELS: pool=default
+      K2_HOST_MAX_AWAKE: "100"
+      K2_HOST_LOCAL_ATTACH: 0.0.0.0:7421
+    ports:
+      - "127.0.0.1:7422:7421"
+    volumes:
+      - host-2-data:/var/lib/k2-host
+
+  postgres:
+    image: postgres:17                            # K2 supports majors 16 and 17 (k2-root-proto pg_major.rs)
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: k2
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      POSTGRES_DB: k2
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    secrets:
+      - postgres-password
+    networks: [k2]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "k2"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  mail:
+    image: stalwartlabs/stalwart:v0.16.25         # K2's pinned Stalwart (k2-root-proto stalwart.rs)
+    restart: unless-stopped
+    ports:
+      - "25:25"
+      - "465:465"
+      - "993:993"
+    volumes:
+      - mail-data:/opt/stalwart
+    networks: [k2]
+
+  sew:
+    image: ghcr.io/alakazam-211/sew:0.3.0         # new image; K2 0.46.3 pins Sew 0.3.0
+    restart: unless-stopped
+    network_mode: host                            # TURN needs real UDP ports; a relay range on the bridge is impractical
+    volumes:
+      - sew-data:/var/lib/sew
+
+  apps:
+    image: ghcr.io/alakazam-211/k2-app-engine:${K2_VERSION:-0.47.0}  # new image
+    restart: unless-stopped
+    # Nested rootless Podman needs a user namespace, /dev/fuse and an
+    # unconfined seccomp profile. This is the one service with raised
+    # privileges; on Kubernetes, Apps become Deployments instead.
+    devices:
+      - /dev/fuse
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    cap_add: [SYS_ADMIN]
+    volumes:
+      - app-engine-sock:/run/k2app
+      - apps-data:/var/lib/k2app
+    networks: [k2]
+
+networks:
+  k2: {}
+
+volumes:
+  controller-data: {}
+  host-1-data: {}
+  host-2-data: {}
+  postgres-data: {}
+  mail-data: {}
+  sew-data: {}
+  apps-data: {}
+  app-engine-sock: {}
+
+secrets:
+  host-enroll-token:
+    file: ./secrets/host-enroll-token
+  vault-kek:
+    file: ./secrets/vault-kek
+  postgres-url:
+    file: ./secrets/postgres-url        # postgres://k2:<password>@postgres:5432/k2
+  postgres-password:
+    file: ./secrets/postgres-password
+  stalwart-admin:
+    file: ./secrets/stalwart-admin

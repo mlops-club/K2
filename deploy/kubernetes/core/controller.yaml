@@ -1,0 +1,108 @@
+# The controller: k2-daemon with K2_ROLE=controller. Exactly one replica
+# (ADR-0002). It runs no agent processes, so restarting it does not stop
+# agents; hosts buffer output and reconnect.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k2-controller
+data:
+  K2_HOME: /var/lib/k2                    # new: every ~/.k2 path honours it (P0)
+  K2_ROLE: controller                     # new: "all" (default, today) | "controller"
+  K2_LISTEN: lan                          # existing: bind 0.0.0.0
+  K2_DAEMON_PORT: "7420"                  # new: fixed port
+  K2_HOSTS: "1"                           # new: /cli/hosts/enroll and /cli/hosts/attach
+  K2_HOST_BOOTSTRAP_TOKEN_FILE: /run/secrets/k2/host-enroll-token
+  K2_PROVISIONER: kubernetes              # new: scales StatefulSet/k2-host, creates Sandboxes
+  K2_PROVISIONER_HOST_STATEFULSET: k2-host
+  K2_KEK_FILE: /run/secrets/k2/vault-kek  # new: vault key from a Secret (replaces keychain / root helper `keep`)
+  K2_CAP_POSTGRES: kubernetes             # App databases: patch postgresql/k2-pg (Zalando operator)
+  K2_POSTGRES_CLUSTER: k2-pg
+  K2_POSTGRES_HOST: k2-pg                 # the operator's Service for the primary
+  K2_POSTGRES_DB: k2
+  K2_POSTGRES_USER_FILE: /run/secrets/pg/username        # from the operator's Secret for user k2
+  K2_POSTGRES_PASSWORD_FILE: /run/secrets/pg/password
+  K2_CAP_MAIL: external
+  K2_STALWART_URL: http://k2-mail:8080
+  K2_STALWART_ADMIN_FILE: /run/secrets/k2/stalwart-admin
+  K2_CAP_SEW: external
+  K2_SEW_MGMT_URL: http://k2-sew.k2-edge:9090   # Sew lives in namespace k2-edge (host network)
+  K2_CAP_APPS: kubernetes                 # Apps become Deployments (see examples/app.yaml)
+  K2_CAP_FRONT: listen                    # front door on :443 behind the Gateway's TLS passthrough
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-controller
+spec:
+  selector:
+    app.kubernetes.io/name: k2-controller
+  ports:
+    - name: api            # hosts dial in here; in-cluster clients too
+      port: 7420
+      targetPort: api
+    - name: front          # TLS passthrough target for the Gateway (gateway.yaml)
+      port: 443
+      targetPort: front
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k2-controller
+spec:
+  serviceName: k2-controller
+  replicas: 1                              # ADR-0002: one controller, no HA
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k2-controller
+        k2.dev/role: controller
+    spec:
+      serviceAccountName: k2-controller
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: k2-daemon
+          image: ghcr.io/alakazam-211/k2-daemon:0.47.0   # binary at /usr/bin: install_kind="package", no self-update
+          envFrom:
+            - configMapRef: {name: k2-controller}
+          ports:
+            - {name: api, containerPort: 7420}
+            - {name: front, containerPort: 443}
+          readinessProbe:
+            httpGet: {path: /boot-status, port: api}     # existing route
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /boot-status, port: api}
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]                   # :443 for the front door
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/k2}        # k2.db, vault.db, tunnel.json, federation identity
+            - {name: k2-secrets, mountPath: /run/secrets/k2, readOnly: true}
+            - {name: pg-app, mountPath: /run/secrets/pg, readOnly: true}
+      volumes:
+        - name: k2-secrets
+          secret: {secretName: k2-secrets}
+        - name: pg-app
+          secret: {secretName: k2.k2-pg.credentials.postgresql.acid.zalan.do}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 10Gi}

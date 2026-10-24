@@ -1,0 +1,37 @@
+# The front door. Today a systemd socket on :443 hands connections to the
+# daemon, which routes by SNI to Caddy, Stalwart and Sew without
+# terminating TLS. Here the Gateway does the same passthrough, and the
+# controller's front door keeps doing the SNI routing and certificates.
+#
+# Clients outside the network can still use the K2 Connect tunnel instead;
+# it runs inside the controller pod unchanged.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: k2
+spec:
+  gatewayClassName: traefik          # k3s ships Traefik; use your cluster's class
+  listeners:
+    - name: k2-tls
+      protocol: TLS
+      port: 443
+      hostname: "*.k2.example.com"   # your domain: the controller plus each App's subdomain
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        kinds: [{kind: TLSRoute}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: k2-front
+spec:
+  parentRefs:
+    - name: k2
+      sectionName: k2-tls
+  hostnames:
+    - "*.k2.example.com"
+  rules:
+    - backendRefs:
+        - name: k2-controller
+          port: 443

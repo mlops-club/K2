@@ -1,0 +1,100 @@
+# Network rules. These replace two things K2 does with nft today: the
+# per-agent egress table (agents may reach only 443 and 53) and the
+# per-App rules matched on cgroup.
+
+# Nothing reaches a pod in this namespace unless a rule below allows it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# Controller: hosts dial in on 7420; anyone may reach the front door on 443
+# (the Gateway forwards it).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: controller-ingress
+spec:
+  podSelector:
+    matchLabels: {k2.dev/role: controller}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {k2.dev/role: host}
+      ports: [{port: 7420}]
+    - ports: [{port: 443}]
+---
+# Agent hosts: no inbound traffic. Outbound only to the controller, DNS,
+# and HTTPS on the internet (model APIs, git hosts, package registries),
+# never to private ranges. Same rule as today's cell egress table.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: host-egress
+spec:
+  podSelector:
+    matchLabels: {k2.dev/role: host}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {k2.dev/role: controller}
+      ports: [{port: 7420}]
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports: [{port: 443}]
+---
+# Postgres (Zalando operator, Spilo pods labelled cluster-name=k2-pg): the
+# controller and K2 Apps on 5432; Patroni replicas talk to each other on
+# 5432 and 8008; the operator reaches the Patroni API on 8008.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+spec:
+  podSelector:
+    matchLabels: {cluster-name: k2-pg}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {k2.dev/role: controller}
+        - podSelector:
+            matchLabels: {k2.dev/role: app}
+      ports: [{port: 5432}]
+    - from:
+        - podSelector:
+            matchLabels: {cluster-name: k2-pg}
+      ports: [{port: 5432}, {port: 8008}]
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: {name: postgres-operator}
+      ports: [{port: 8008}]
+---
+# Mail: the public mail ports from anywhere; management from the controller only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mail-ingress
+spec:
+  podSelector:
+    matchLabels: {k2.dev/role: mail}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{port: 25}, {port: 465}, {port: 993}]
+    - from:
+        - podSelector:
+            matchLabels: {k2.dev/role: controller}
+      ports: [{port: 8080}]

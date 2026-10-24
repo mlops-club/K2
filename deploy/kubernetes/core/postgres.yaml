@@ -1,0 +1,27 @@
+# Postgres for K2 Apps and /cli/db, run by the Zalando postgres-operator
+# (v2.0+, Patroni and Spilo). Replaces the root helper's `pg` verbs (apt
+# install, pg_createcluster, pg_hba edits).
+#
+# The operator creates one Secret per user, named
+#   <username, "_" → "-">.k2-pg.credentials.postgresql.acid.zalan.do
+# with keys "username" and "password". The controller mounts the one for
+# user "k2". Each App's database is added by the controller patching
+# spec.users and spec.databases below (see examples/app.yaml).
+apiVersion: acid.zalan.do/v1
+kind: postgresql
+metadata:
+  name: k2-pg                       # must start with the teamId
+spec:
+  teamId: k2
+  numberOfInstances: 1              # 2 or 3 for a Patroni standby; independent of ADR-0002
+  postgresql:
+    version: "17"                   # K2 supports majors 16 and 17 (k2-root-proto pg_major.rs)
+  users:
+    k2: [createdb, createrole]      # the controller's own login; creates App roles at runtime
+  databases:
+    k2: k2                          # database: owner
+  volume:
+    size: 20Gi
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {cpu: "2", memory: 2Gi}

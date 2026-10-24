@@ -1,0 +1,102 @@
+# EXAMPLE, created by the controller at runtime: one K2 App on Kubernetes.
+# On a Linux box today, k2-app-engine runs each App as a rootless Podman
+# container under Quadlet, with nft rules matched on its cgroup and a
+# Postgres database named app_<id>. Here the same App is a patch to the
+# shared Postgres plus three objects. The App's subdomain keeps working
+# through the controller's front door.
+#
+# The database: the controller patches postgresql/k2-pg (core/postgres.yaml):
+#
+#   kubectl -n k2 patch postgresql k2-pg --type merge -p \
+#     '{"spec":{"users":{"app_notes":[]},"databases":{"app_notes":"app_notes"}}}'
+#
+# and the Zalando operator creates the role, the database and the Secret
+# app-notes.k2-pg.credentials.postgresql.acid.zalan.do (username, password).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-notes
+  namespace: k2
+  labels:
+    k2.dev/role: app
+    k2.dev/app: notes
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {k2.dev/app: notes}
+  template:
+    metadata:
+      labels:
+        k2.dev/role: app
+        k2.dev/app: notes
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 20001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: app
+          image: ghcr.io/example/notes:1.4.2           # the App's own image
+          env:
+            - {name: PORT, value: "8080"}
+            - {name: K2_APP_ID, value: notes}          # existing App identity variables
+            - {name: K2_GATEWAY_URL, value: "http://k2-controller:7420"}
+            - {name: PGHOST, value: k2-pg}
+            - {name: PGDATABASE, value: app_notes}
+            - name: PGUSER
+              valueFrom: {secretKeyRef: {name: app-notes.k2-pg.credentials.postgresql.acid.zalan.do, key: username}}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: app-notes.k2-pg.credentials.postgresql.acid.zalan.do, key: password}}
+          ports: [{name: http, containerPort: 8080}]
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-notes
+  namespace: k2
+spec:
+  selector: {k2.dev/app: notes}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+# Only the controller's front door reaches the App; the App reaches only
+# its database, the controller's gateway, DNS and HTTPS on the internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app-notes
+  namespace: k2
+spec:
+  podSelector:
+    matchLabels: {k2.dev/app: notes}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {k2.dev/role: controller}
+      ports: [{port: 8080}]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {cluster-name: k2-pg}
+      ports: [{port: 5432}]
+    - to:
+        - podSelector:
+            matchLabels: {k2.dev/role: controller}
+      ports: [{port: 7420}]
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports: [{port: 443}]
