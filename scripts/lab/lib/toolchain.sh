@@ -19,6 +19,9 @@ lab_toolchain() {
     # workers; four build jobs per cargo command unless the caller set one.
     export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
     if command -v cargo >/dev/null 2>&1; then
+        # Pin the toolchain dirs to the caller's HOME now, so lab_cargo can
+        # run cargo under a throwaway HOME and keep the build cache.
+        export CARGO_HOME=${CARGO_HOME:-$HOME/.cargo} RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}
         LAB_RUST_SOURCE=path
         export LAB_RUST_SOURCE
         return 0
@@ -66,4 +69,25 @@ lab_native_env() {
         && [ -d /opt/homebrew/opt/openssl@3 ]; then
         export OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
     fi
+}
+
+# lab_cargo <args...>: cargo under a clean environment, as the Linux gate's
+# clean_cargo does: env -i, a FRESH HOME and TMPDIR (mktemp -d, removed
+# after), no K2_* / K2SO_* / SHELL, only the toolchain's variables. Some
+# pre-existing tests write under $HOME (seen 2026-10-24: ~/.k2/auth-audit.jsonl,
+# ~/.k2/wiki), so no lab cargo command ever runs with the real HOME.
+# Call lab_toolchain first.
+lab_cargo() {
+    local h t rc
+    h=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-cargo-home-XXXXXX") || return 1
+    t=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-cargo-tmp-XXXXXX") || return 1
+    env -i HOME="$h" TMPDIR="$t" PATH="$PATH" USER="$(id -un)" LANG=en_US.UTF-8 \
+        CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" \
+        ${CARGO_TARGET_DIR:+CARGO_TARGET_DIR="$CARGO_TARGET_DIR"} \
+        ${OPENSSL_ROOT_DIR:+OPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"} \
+        ${MACOSX_DEPLOYMENT_TARGET:+MACOSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"} \
+        cargo "$@"
+    rc=$?
+    rm -rf "$h" "$t"
+    return $rc
 }
