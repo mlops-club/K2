@@ -97,8 +97,38 @@ sequenceDiagram
 
 ## Boot measurement (before the change)
 
-To be filled: a fresh `k2-daemon` with `HOME=<empty sentinel>` and
-`K2_HOME` unset, every path it created.
+`k2-daemon` built from `2a2b9e0ef` on macOS, run with `env -i`,
+`HOME=<empty sentinel>`, `K2_HOME` unset, private `TMPDIR` and
+`XDG_RUNTIME_DIR`, the keychain kill switches (`K2_TUNNEL_LEASE=off`,
+`K2_LLM_ACCOUNTS_KEYCHAIN=0`, `K2_SUBSCRIPTION_PROBE=deny`) and logging
+`launchctl`/`security`/`crontab`/`systemctl` shims first on `PATH`. It
+reached `phase: ready` in about 3 s, ran 20 s more, then got SIGTERM.
+
+Under `$HOME/.k2` (moves behind `K2_HOME`):
+
+```text
+auth-audit.jsonl   bin/k2-open        daemon.lock        daemon.port
+daemon.token       federation/identity.pem               garden-access-on
+heartbeat.port     heartbeat.token    hooks/notify.sh    k2-threads.redb
+k2so.db(-shm,-wal) llm-accounts/{claude,codex,gemini,grok}/.lock
+publish-env.json   settings.json      skin.db(-shm,-wal) tunnel-ingress.sticky-port
+usage/{prices.json,subscriptions.json,tokens.sqlite}
+vault/{vault.db(-shm,-wal),key/kek,key/CACHEDIR.TAG}     vault.sock
+```
+
+Outside `$HOME/.k2`, written on boot:
+
+| Path | Who | Notes |
+|---|---|---|
+| `$HOME/.k2so` → `$HOME/.k2` | `k2_client::migration_home` | 0.40 compat symlink |
+| `$TMPDIR/k2-runtime/` (Linux: `$XDG_RUNTIME_DIR/k2`) | `k2_core::runtime_dir` | already has its own `K2_RUNTIME_DIR` |
+
+No `launchctl`, `security`, `crontab` or `systemctl` call, and nothing
+under `~/.claude`, `~/.codex`, `~/.config` or `~/Library` on a fresh
+boot. Provider homes are written later, on demand: hook config when an
+agent spawns (`agent_hooks/install.rs`: `~/.claude`, `~/.cursor`,
+`~/.codex`, `~/.grok`, `~/.hermes`), the claude-auth LaunchAgent when
+that scheduler is installed. Note the DB file is `k2so.db`, not `k2.db`.
 
 ## How to try it
 
