@@ -64,12 +64,10 @@ up() {
 kit() {
     local dir=$1
     shift
-    local flows=(--flows-dir "$LAB_REPO/docs/prd/flows")
-    [ -d "$LAB_REPO/docs/prd/flows/extra" ] && flows+=(--flows-dir "$LAB_REPO/docs/prd/flows/extra")
     python3 -I "$LAB_REPO/tests/lab/scenarios/g1_solo.py" --port "$LAB_PORT" --token-file "$dir/token" \
         --home "$LAB_HOME" --cwd "$LAB_WORKSPACE" --crash-cwd "$LAB_CRASH_CWD" \
         --daemon-trace "$dir/daemon.trace.jsonl" --fake-trace "$LAB_FAKE_TRACE" \
-        "${flows[@]}" --out "$dir/out" "$@"
+        --flows-dir "$LAB_REPO/docs/prd/flows" --out "$dir/out" "$@"
 }
 
 trap 'topo_down' EXIT
