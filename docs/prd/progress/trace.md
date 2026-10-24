@@ -169,9 +169,12 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
 
 ## Status
 
-- **Milestone:** diagrams written; sink, emission lines and the G1 runner
-  written, first build in progress.
-- **Next:** unit tests green, first solo run, latency check (NFR1).
+- **Milestone:** first working slice. `tests/lab/scenarios/g1_solo.sh`
+  on solo: S1 PASS, S7 PASS, and the checker passes `spawn` (7 of 8
+  steps; `placement.choose` is not in solo), `hook` (5 of 5) and `crash`
+  (11 of 11). Sink unit tests: 11 passed.
+- **Next:** `cargo test -p k2-core` and `-p k2-daemon` (all `K2_*` unset,
+  temp HOME), clippy on the changed files, spawn latency trace off vs on.
 - **Answered:** `crash.json` lives in `docs/prd/flows/` (coordinator,
   2026-10-24); the lab's `3105385e6` (cherry-picked here, drops out at
   rebase) lets `test_flows.py` accept flow files beyond the 11 PRD ones.
@@ -222,8 +225,14 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
 - **The crash scenario** uses a `tab-*` agent in a registered workspace,
   because that is where today's daemon resumes a dead CLI on the next need
   (`recovered_launch_ex`: harness command + provider session id in
-  `workspace_tab_sessions`). The turn is 30 s (`--turn-ms`), so the
-  `kill -9` lands mid-turn.
+  `workspace_tab_sessions`). The turn is 30 s (`--turn-ms`), and the
+  `kill -9` lands once the prompt is in the transcript: the CLI has taken
+  the prompt and is working on it. A kill before that leaves no
+  conversation to resume, for the real CLI too (seen in the first run: the
+  resumed fake agent exited 1, "No conversation found").
+- **The runner builds the daemon and the fake agent in two cargo calls**:
+  `cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent` builds only
+  the bin named `k2-daemon`, so the fake agent was never built.
 
 ### Rebase notes (lines in files other workers own)
 

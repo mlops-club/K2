@@ -159,6 +159,13 @@ class Crash:
         sock.send_text(json.dumps({"action": "input", "text": "\r"}))
         self.event("lab.typed", text=prompt)
         wait_until("cli.turn.start", lambda: self.fake("cli.turn.start"))
+        # Mid-turn means the CLI has recorded the prompt and is working on
+        # it: kill once the prompt is in the transcript (a kill before that
+        # leaves no conversation to resume, for the real CLI too).
+        transcript = os.path.join(a.home, ".claude", "projects", s1.claude_project_slug(a.crash_cwd),
+                                  self.claude_session + ".jsonl")
+        wait_until("the prompt in the transcript",
+                   lambda: os.path.isfile(transcript) and prompt in open(transcript, encoding="utf-8").read())
         pid = exec1.get("pid")
         os.kill(pid, signal.SIGKILL)
         self.event("lab.killed", pid=pid, signal="SIGKILL")

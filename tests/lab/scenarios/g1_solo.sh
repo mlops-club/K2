@@ -33,7 +33,7 @@ source "$LAB_REPO/scripts/lab/topology/solo.sh"
 
 say "building k2-daemon and k2-fake-agent (build.log)"
 if ! lab_toolchain "$LAB_REPO" >>"$RUN/build.log" 2>&1 \
-    || ! (cd "$LAB_REPO" && cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent) >>"$RUN/build.log" 2>&1; then
+    || ! (cd "$LAB_REPO" && cargo build -p k2-daemon --bin k2-daemon && cargo build -p k2-fake-agent) >>"$RUN/build.log" 2>&1; then
     say "build failed: $RUN/build.log"
     exit 1
 fi
