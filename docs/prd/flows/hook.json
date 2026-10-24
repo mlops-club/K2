@@ -1,0 +1,85 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "hook",
+  "name": "A hook event",
+  "note": "How the owner check works once the controller is on another machine.",
+  "proof": [
+    "S2"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.hook",
+  "correlate": "agent_id",
+  "participants": [
+    {
+      "id": "cli",
+      "name": "claude CLI",
+      "role": "or a child"
+    },
+    {
+      "id": "sock",
+      "name": "Cell socket",
+      "role": "per agent"
+    },
+    {
+      "id": "owner",
+      "name": "Owner check",
+      "role": "/proc ancestry"
+    },
+    {
+      "id": "host",
+      "name": "k2-host",
+      "role": ""
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": ""
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "cli",
+      "to": "sock",
+      "kind": "call",
+      "label": "POST /hook/event, X-K2-Agent-Pid",
+      "event": "cli.hook",
+      "say": "Unchanged for the CLI: it posts to K2_HOOK_SOCK with its scoped token."
+    },
+    {
+      "n": 2,
+      "from": "sock",
+      "to": "owner",
+      "kind": "call",
+      "label": "walk parents to the PTY child",
+      "event": "cell.owner_walk",
+      "say": "Today's owner.rs rules, run on the host where the process table is real."
+    },
+    {
+      "n": 3,
+      "from": "owner",
+      "to": "sock",
+      "kind": "reply",
+      "label": "verdict: Owner",
+      "event": "cell.owner_verdict",
+      "say": "Stale env in a detached process is refused here, as today."
+    },
+    {
+      "n": 4,
+      "from": "sock",
+      "to": "host",
+      "kind": "call",
+      "label": "event + verdict",
+      "event": "cell.event",
+      "say": "Only attributed events leave the machine."
+    },
+    {
+      "n": 5,
+      "from": "host",
+      "to": "ctl",
+      "kind": "call",
+      "label": "AgentEvent (signed frame)",
+      "event": "host.agent_event",
+      "say": "The controller trusts the host's attribution because the frame is signed with the host's enrolled key."
+    }
+  ]
+}

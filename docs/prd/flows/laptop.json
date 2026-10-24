@@ -1,0 +1,93 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "laptop",
+  "name": "Laptop goes to sleep",
+  "note": "A laptop enrolled as a host closes its lid while a cloud agent messages it.",
+  "proof": [
+    "S11"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.laptop",
+  "correlate": "msg_id",
+  "participants": [
+    {
+      "id": "lap",
+      "name": "Laptop host",
+      "role": "k2-host"
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "cloud"
+    },
+    {
+      "id": "cloud",
+      "name": "Cloud agent",
+      "role": "host pod"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "lap",
+      "to": "ctl",
+      "kind": "fail",
+      "label": "heartbeats stop (lid closed)",
+      "event": "host.heartbeat_stop",
+      "say": "No goodbye; the link just goes quiet."
+    },
+    {
+      "n": 2,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "host away after 90 s",
+      "event": "ctl.host_away",
+      "say": "Laptop agents show as paused. They are pinned, so nothing is rescheduled."
+    },
+    {
+      "n": 3,
+      "from": "cloud",
+      "to": "ctl",
+      "kind": "call",
+      "label": "k2 msg laptop-agent",
+      "event": "ctl.deliver",
+      "say": "A cloud agent sends work to the laptop agent."
+    },
+    {
+      "n": 4,
+      "from": "ctl",
+      "to": "cloud",
+      "kind": "reply",
+      "label": "Queued{msg_id}",
+      "event": "outbox.queued",
+      "say": "The sender is told the truth: queued, not delivered."
+    },
+    {
+      "n": 5,
+      "from": "lap",
+      "to": "ctl",
+      "kind": "call",
+      "label": "reconnect (new IP, same key)",
+      "event": "host.reconnect",
+      "say": "The lid opens on a different network. Identity is the key."
+    },
+    {
+      "n": 6,
+      "from": "ctl",
+      "to": "lap",
+      "kind": "call",
+      "label": "drain outbox",
+      "event": "outbox.drain",
+      "say": "The message is delivered with its original id."
+    },
+    {
+      "n": 7,
+      "from": "lap",
+      "to": "ctl",
+      "kind": "reply",
+      "label": "Delivered{msg_id}",
+      "event": "outbox.delivered",
+      "say": "The cloud agent's message reaches its final state (I2)."
+    }
+  ]
+}

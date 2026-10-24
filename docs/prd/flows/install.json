@@ -1,0 +1,95 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "install",
+  "name": "Install on k3s",
+  "note": "From an empty cluster to a running agent.",
+  "proof": [
+    "G0",
+    "G4"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.install",
+  "correlate": null,
+  "participants": [
+    {
+      "id": "you",
+      "name": "Owner",
+      "role": ""
+    },
+    {
+      "id": "helm",
+      "name": "kubectl",
+      "role": "kustomize"
+    },
+    {
+      "id": "kube",
+      "name": "Kubernetes",
+      "role": ""
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "StatefulSet"
+    },
+    {
+      "id": "hp",
+      "name": "Host pods",
+      "role": "StatefulSet"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "you",
+      "to": "helm",
+      "kind": "call",
+      "label": "kubectl apply -k deploy/kubernetes",
+      "event": "owner.apply",
+      "say": "The manifests in deploy/kubernetes, already checked against the real APIs. A Helm chart later wraps the same objects with values for capabilities and storage class."
+    },
+    {
+      "n": 2,
+      "from": "helm",
+      "to": "kube",
+      "kind": "call",
+      "label": "apply StatefulSets, postgresql k2-pg, Gateway",
+      "event": "kube.apply",
+      "say": "Standard objects plus the Zalando postgres-operator's postgresql object. agent-sandbox CRDs are needed only for the opt-in Sandbox tier."
+    },
+    {
+      "n": 3,
+      "from": "kube",
+      "to": "ctl",
+      "kind": "call",
+      "label": "start controller",
+      "event": "kube.start_controller",
+      "say": "The controller finds Postgres through a Secret and reports its capabilities."
+    },
+    {
+      "n": 4,
+      "from": "kube",
+      "to": "hp",
+      "kind": "call",
+      "label": "start host pods",
+      "event": "kube.start_hosts",
+      "say": "Host pods carry a bootstrap enrollment token from a Secret."
+    },
+    {
+      "n": 5,
+      "from": "hp",
+      "to": "ctl",
+      "kind": "call",
+      "label": "enroll",
+      "event": "host.enroll",
+      "say": "Hosts dial in. No Service needs to point at host pods."
+    },
+    {
+      "n": 6,
+      "from": "you",
+      "to": "ctl",
+      "kind": "call",
+      "label": "k2 users add, k2 connect login",
+      "event": "owner.first_run",
+      "say": "The same first-run steps as a Linux box today."
+    }
+  ]
+}

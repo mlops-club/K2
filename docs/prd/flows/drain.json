@@ -1,0 +1,80 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "drain",
+  "name": "Node drain on local storage",
+  "note": "What we saw in the lab, and what K2 does about it.",
+  "proof": [
+    "S10"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.drain",
+  "correlate": null,
+  "participants": [
+    {
+      "id": "kube",
+      "name": "Kubernetes",
+      "role": ""
+    },
+    {
+      "id": "pod",
+      "name": "Agent pod",
+      "role": "local-path volume"
+    },
+    {
+      "id": "sch",
+      "name": "Scheduler",
+      "role": ""
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": ""
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "kube",
+      "to": "pod",
+      "kind": "call",
+      "label": "evict (kubectl drain)",
+      "event": "kube.evict",
+      "say": "Run on kind: the Sandbox pod was evicted from its node."
+    },
+    {
+      "n": 2,
+      "from": "kube",
+      "to": "sch",
+      "kind": "call",
+      "label": "schedule replacement",
+      "event": "kube.schedule",
+      "say": "The controller for the pod tries to place it again."
+    },
+    {
+      "n": 3,
+      "from": "sch",
+      "to": "kube",
+      "kind": "fail",
+      "label": "Pending: volume node affinity",
+      "event": "kube.pending",
+      "say": "Seen live: local-path volumes belong to one node, so the pod can only return to the drained node."
+    },
+    {
+      "n": 4,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "host away > 5 min",
+      "event": "ctl.host_away",
+      "say": "K2 notices through its own host link, not through Kubernetes status."
+    },
+    {
+      "n": 5,
+      "from": "ctl",
+      "to": "ctl",
+      "kind": "self",
+      "label": "portable? move via home sync",
+      "event": "ctl.move_decision",
+      "say": "A portable agent is moved with the previous flow. A pinned agent waits for its node. With Longhorn, the volume follows the pod instead."
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "ctlrestart",
+  "name": "Controller restarts",
+  "note": "A controller upgrade with agents mid-conversation.",
+  "proof": [
+    "S9"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.ctlrestart",
+  "correlate": "host",
+  "participants": [
+    {
+      "id": "sup",
+      "name": "Supervisor",
+      "role": "systemd or kubelet"
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "k2-daemon"
+    },
+    {
+      "id": "host",
+      "name": "Agent host",
+      "role": "k2-host"
+    },
+    {
+      "id": "cli",
+      "name": "claude CLI",
+      "role": "mid-turn"
+    },
+    {
+      "id": "client",
+      "name": "Client",
+      "role": ""
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "sup",
+      "to": "ctl",
+      "kind": "call",
+      "label": "SIGTERM (upgrade to 0.47)",
+      "event": "ctl.sigterm",
+      "say": "A rollout on Kubernetes, or the handoff on systemd."
+    },
+    {
+      "n": 2,
+      "from": "ctl",
+      "to": "host",
+      "kind": "fail",
+      "label": "link closes",
+      "event": "host.link_down",
+      "say": "The host notices the link drop. Today this is the moment every agent PTY is killed."
+    },
+    {
+      "n": 3,
+      "from": "cli",
+      "to": "host",
+      "kind": "call",
+      "label": "output and hooks keep flowing",
+      "event": "host.buffer",
+      "say": "The agent doesn't notice. The host buffers output in the PTY ring and queues hook events."
+    },
+    {
+      "n": 4,
+      "from": "sup",
+      "to": "ctl",
+      "kind": "call",
+      "label": "start new controller",
+      "event": "ctl.start",
+      "say": "The new controller loads its database and opens its listener."
+    },
+    {
+      "n": 5,
+      "from": "host",
+      "to": "ctl",
+      "kind": "call",
+      "label": "reconnect, Resume{sessions, offsets}",
+      "event": "host.resume",
+      "say": "The host re-sends its session list and ring offsets. The controller checks epochs (I1)."
+    },
+    {
+      "n": 6,
+      "from": "ctl",
+      "to": "client",
+      "kind": "reply",
+      "label": "replay from offset",
+      "event": "client.replay",
+      "say": "The client catches up on output it missed. Nothing was lost."
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "k2-lab/flows.schema.json",
+  "title": "K2 lab flow: one PRD sequence diagram as an expected trace",
+  "description": "Written by tests/lab/extract_flows.py from docs/prd/k2-distributed-runtime.html. Checked by tests/lab/labkit/flows.py (which validates this shape by hand; the lab has no jsonschema dependency).",
+  "type": "object",
+  "required": ["id", "name", "proof", "source", "correlate", "participants", "steps"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "id": {"type": "string", "pattern": "^[a-z0-9]+$"},
+    "name": {"type": "string"},
+    "note": {"type": "string"},
+    "proof": {"type": "array", "items": {"type": "string"}},
+    "source": {"type": "string"},
+    "correlate": {
+      "description": "Trace field that ties one instance's events together (agent_id, msg_id, host), or null: the whole trace is one instance.",
+      "type": ["string", "null"]
+    },
+    "participants": {
+      "type": "array", "minItems": 2,
+      "items": {
+        "type": "object", "required": ["id", "name", "role"],
+        "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "role": {"type": "string"}}
+      }
+    },
+    "steps": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "required": ["n", "from", "to", "kind", "label", "event"],
+        "properties": {
+          "n": {"type": "integer", "minimum": 1},
+          "from": {"type": "string", "description": "a participant id"},
+          "to": {"type": "string", "description": "a participant id"},
+          "kind": {"enum": ["call", "reply", "self", "fail"]},
+          "label": {"type": "string"},
+          "event": {"type": "string", "pattern": "^[a-z_]+(\\.[a-z_]+)+$", "description": "the trace event name that proves this step"},
+          "match": {"type": "object", "description": "extra fields the event must carry (top level or under attrs)"},
+          "say": {"type": "string"}
+        }
+      }
+    }
+  }
+}
