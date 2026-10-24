@@ -258,6 +258,15 @@ impl Ctx {
         self.self_exe == self.p(HELPER_PATH)
     }
 
+    /// Did a package manager (or an OCI image) install this helper? The
+    /// daemon's rule (`k2_root_proto::install_kind`), on the path below the
+    /// root. A packaged helper never replaces K2 binaries itself.
+    pub fn is_package_install(&self) -> bool {
+        let rel = self.self_exe.strip_prefix(&self.root).unwrap_or(&self.self_exe);
+        let abs = Path::new("/").join(rel);
+        k2_root_proto::install_kind::is_package_install(Some(&abs))
+    }
+
     /// Run a fixed program; non-zero exit is an `Err` with its stderr
     /// (the child's words, trimmed; never our stdin).
     pub fn run_ok(&self, prog: &str, args: &[&str], stdin: Option<&[u8]>) -> HResult<ExecOut> {

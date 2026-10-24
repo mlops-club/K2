@@ -27,7 +27,7 @@ fn main() {
             let (marker, test) = k2_app_engine::build_strings();
             println!(
                 "{}",
-                serde_json::json!({"name": "k2-app-engine", "version": env!("K2_PRODUCT_VERSION"), "protocol": k2_root_proto::engine::ENGINE_PROTOCOL, "build": marker, "testKeys": test})
+                serde_json::json!({"name": "k2-app-engine", "version": env!("K2_PRODUCT_VERSION"), "protocol": k2_root_proto::engine::ENGINE_PROTOCOL, "build": marker, "testKeys": test, "installKind": k2_app_engine::install_kind()})
             );
             0
         }

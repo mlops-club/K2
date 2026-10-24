@@ -1106,6 +1106,10 @@ const CAP_ENGINE_FILE: usize = 64 * 1024 * 1024;
 /// for each configured daemon user), then (re)start the engine as k2app.
 /// Every check runs before any write; the binary is never executed here.
 pub fn install_engine(ctx: &Ctx, payload: &[u8]) -> HResult<J> {
+    // A packaged helper means a packaged K2: its package owns the engine.
+    if ctx.is_package_install() {
+        return Err(Fail::sig("package_owned"));
+    }
     let pw = app_user(ctx)?;
     let (sig, elf) = decode_payload(payload).map_err(Fail::sig)?;
     let keys = trusted_keys(ctx.test_keys);

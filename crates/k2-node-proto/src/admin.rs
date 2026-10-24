@@ -78,6 +78,8 @@ pub mod code {
     pub const SAME_VERSION: &str = "same_version";
     pub const ROLLED_BACK_VERSION: &str = "rolled_back_version";
     pub const AUTO_UPDATE_OFF: &str = "auto_update_off";
+    /// A package manager (or an OCI image) installed this k2-node.
+    pub const PACKAGE_OWNED: &str = "package_owned";
     pub const NO_PREVIOUS: &str = "no_previous";
     pub const BUSY: &str = "busy";
 }

@@ -89,6 +89,14 @@ fn obtain(from: Option<&str>, arch: &str) -> Result<(Vec<u8>, String), String> {
     Ok((bin, sig))
 }
 
+/// Refuse when the running engine reports `installKind: "package"`.
+fn package_owned_refusal(version: Option<&J>) -> Option<super::routes::Refusal> {
+    let kind = version?.get("installKind")?.as_str()?;
+    (kind == crate::boot_status::INSTALL_KIND_PACKAGE).then(|| {
+        no("package_owned", 409, "a package manager installed this k2-app-engine: update it with that package, not k2 app engine install")
+    })
+}
+
 /// The route.
 pub(crate) fn install_route(who: &Who, body: &J) -> R<J> {
     need_credential(who)?;
@@ -110,6 +118,10 @@ pub(crate) fn install_route(who: &Who, body: &J) -> R<J> {
 pub(crate) fn install_core(from: Option<&str>) -> R<J> {
     if !cfg!(target_os = "linux") {
         return Err(no("linux_only", 409, "the App engine runs on Linux boxes only"));
+    }
+    // K2 distributed runtime P0: a package manager owns a packaged engine.
+    if let Some(refusal) = package_owned_refusal(super::guarded::engine_version().ok().as_ref()) {
+        return Err(refusal);
     }
     let st = root_helper::state();
     if !st.usable(APPS_MIN_PROTOCOL) {
@@ -146,6 +158,18 @@ mod tests {
     use super::*;
     use k2_root_proto::engine::{format_marker, trusted_comment};
     use k2_root_proto::testsign::{fake_elf, sign_with_test_key};
+
+    #[test]
+    fn a_package_installed_engine_is_never_installed_over() {
+        let r = package_owned_refusal(Some(&json!({"version": "0.46.3", "installKind": "package"}))).expect("refused");
+        assert_eq!((r.code, r.status), ("package_owned", 409));
+        assert!(r.hint.contains("package manager"), "{}", r.hint);
+        for v in [json!({"installKind": "standalone"}), json!({"installKind": "unknown"}), json!({"version": "0.46.2"})] {
+            assert!(package_owned_refusal(Some(&v)).is_none(), "{v}");
+        }
+        // No engine answering (not installed yet): nothing to protect.
+        assert!(package_owned_refusal(None).is_none());
+    }
 
     #[test]
     fn only_this_versions_signed_build_passes() {
