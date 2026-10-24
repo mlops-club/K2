@@ -159,8 +159,12 @@ kernel as the CLI). All crash steps exist in solo.
 # K2_TRACE_FILE, runs S1 and the CLI crash, prints the verdict per flow.
 tests/lab/scenarios/g1_solo.sh
 
-# The sink's unit tests
-cargo test -p k2-core --lib -- trace::
+# The sink's unit tests, under a throwaway HOME as the Linux gate does
+# (some pre-existing tests write to $HOME/.k2)
+HOME=$(mktemp -d) cargo test -p k2-core --lib -- trace::
+
+# The runner's flow logic on hand-written traces (no daemon)
+python3 -I -B tests/lab/scenarios/test_g1_solo.py
 ```
 
 ## Status
