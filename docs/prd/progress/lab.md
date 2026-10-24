@@ -267,8 +267,9 @@ FAIL; the suite is then NOT RUN, never green:
 - `node_admin_linux_container`: a build-box script that needs an output dir
   argument and podman.
 - `sign_app_engine`, `sign_k2_node`: need `minisign`, which this Mac does not
-  have. Not installed (coordinator, 2026-10-24); they stay NOT RUN with that
-  reason while the coordinator raises it with the owner.
+  have. The owner approved it and the coordinator installed
+  `/opt/homebrew/bin/minisign` 0.12 (2026-10-24); the suites' clean PATH
+  includes `/opt/homebrew/bin`, so both run from the next full run on.
 
 Real failures (pre-existing): `app_runtime_cli_smoke` (expects the Linux App
 box doctor), `permission_off_golden` (its schema golden is stale against
