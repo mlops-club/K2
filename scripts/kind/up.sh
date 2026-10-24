@@ -105,26 +105,9 @@ for pair in $KIND_ROLLOUT; do
 done
 
 # ── 3. port-forward ─────────────────────────────────────────────────────
-kind_stop_forward
-if lsof -nP -iTCP:"$KIND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "up.sh: 127.0.0.1:$KIND_PORT is already in use; set K2_KIND_PORT to a free port" >&2
-    exit 1
-fi
-nohup "$KIND_REPO/scripts/kind/port-forward.sh" "$KIND_VARIANT" >"$KIND_STATE/port-forward.log" 2>&1 &
-echo $! > "$KIND_STATE/port-forward.pid"
-echo "$KIND_PORT" > "$KIND_STATE/port"
+kind_start_forward || exit 1
 base="http://127.0.0.1:$KIND_PORT"
-phase=""
-for _ in $(seq 1 120); do
-    phase=$(curl -s --connect-timeout 1 "$base/boot-status" 2>/dev/null \
-        | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("phase",""))' 2>/dev/null || true)
-    [ "$phase" = ready ] && break
-    sleep 0.5
-done
-if [ "$phase" != ready ]; then
-    echo "up.sh: $base/boot-status never said phase=ready (last: '$phase'); see $KIND_STATE/port-forward.log" >&2
-    exit 1
-fi
+kind_wait_ready || exit 1
 say "daemon ready at $base"
 
 # ── 4. the app's login ──────────────────────────────────────────────────
@@ -197,5 +180,6 @@ K2 is up on kind $KIND_CLUSTER (namespace $KIND_NS, agents on $KIND_IMAGE in $KI
 
 In the K2 app: Settings → Connected Servers → + Add a server
 (deploy/kind/README.md). The port-forward runs in the background
-(log: $KIND_STATE/port-forward.log). Stop everything: scripts/kind/down.sh$flag
+(log: $KIND_STATE/port-forward.log); scripts/kind/forward.sh$flag restarts
+just that. Stop everything: scripts/kind/down.sh$flag
 EOF

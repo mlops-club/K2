@@ -87,3 +87,34 @@ kind_stop_forward() {
         sleep 0.1
     done
 }
+
+# Start the port-forward loop (port-forward.sh) for this variant, after
+# stopping any old one. It runs in its own session (setsid), so a signal to
+# whatever started it (a terminal closing, a tool cleaning up its process
+# group) never reaches it; only kind_stop_forward stops it. The log is
+# appended, never overwritten.
+kind_start_forward() {
+    kind_stop_forward
+    if lsof -nP -iTCP:"$KIND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "127.0.0.1:$KIND_PORT is already in use; set K2_KIND_PORT to a free port" >&2
+        return 1
+    fi
+    python3 -I -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+        "$KIND_REPO/scripts/kind/port-forward.sh" "$KIND_VARIANT" \
+        </dev/null >>"$KIND_STATE/port-forward.log" 2>&1 &
+    echo $! > "$KIND_STATE/port-forward.pid"     # execv keeps the pid
+    echo "$KIND_PORT" > "$KIND_STATE/port"
+}
+
+# Wait until /boot-status through the forward says phase=ready.
+kind_wait_ready() {
+    local phase="" _
+    for _ in $(seq 1 120); do
+        phase=$(curl -s --connect-timeout 1 "http://127.0.0.1:$KIND_PORT/boot-status" 2>/dev/null \
+            | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("phase",""))' 2>/dev/null || true)
+        [ "$phase" = ready ] && return 0
+        sleep 0.5
+    done
+    echo "http://127.0.0.1:$KIND_PORT/boot-status never said phase=ready (last: '$phase'); see $KIND_STATE/port-forward.log" >&2
+    return 1
+}

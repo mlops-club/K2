@@ -25,7 +25,7 @@ The script does the following:
 
 - builds `k2-daemon:dev` if it is missing, or always with `--rebuild-daemon`;
 - builds `k2-agents:dev`, runs `kind load` and applies `deploy/kind/agents`;
-- waits for the pod and keeps a port-forward to `127.0.0.1:7440` running in the background. It reconnects after a pod restart.
+- waits for the pod and keeps a port-forward to `127.0.0.1:7440` running in the background. It runs in its own session, reconnects after a pod restart, and restarts kubectl if `/boot-status` stops answering. Every start, restart and stop is appended to `$TMPDIR/k2-kind/agents/port-forward.log`.
 - creates a K2 login for the app, user `owner` with the Owner role, and a random password;
 - creates a git folder `/var/lib/k2/work/demo` for your first workspace.
 
@@ -40,6 +40,10 @@ It ends with:
 The password is shown only on the run that creates it. Re-running `up.sh` is
 safe and keeps the login. `scripts/kind/up.sh --reset-password` sets and
 shows a new password.
+
+If the app ever can't reach `http://127.0.0.1:7440`, check the forward
+with `scripts/kind/forward.sh --status`, and restart just the forward with
+`scripts/kind/forward.sh`. Neither builds nor applies anything.
 
 Port 7440 must be free on the Mac. Use `K2_KIND_PORT=7450 scripts/kind/up.sh`
 otherwise, and also if your own local K2 daemon happens to use 7440.

@@ -236,4 +236,34 @@ agent never calls `xdg-open`.
     default anyway.
   - Owner decision 2026-10-24: no credential Secret; login is `/login` in a
     claude session opened from the app.
+- **Port-forward hardening (2026-10-24, after the owner's forward died):**
+  - What happened: at 16:26 the pod was OOM-killed and kubectl exited
+    (`lost connection to pod`), but nothing reconnected. Its loop had died
+    some time after 12:55, when it last logged a reconnect, leaving kubectl
+    (pid 61505) orphaned and serving.
+  - Two causes in my code:
+    1. The loop ran `kc … &`, which backgrounds a function, i.e. a
+       subshell. `$!` was that subshell, so every `kill "$child"` orphaned
+       kubectl. This also explains the orphan found at 12:28.
+    2. The loop lived in its launcher's process group and session, so an
+       untrappable signal to that group (a tool or terminal cleanup) could
+       kill it silently. Who sent that signal can't be proven: the old loop
+       logged nothing on exit.
+  - Fixes:
+    - The loop backgrounds `kubectl` itself.
+    - The loop starts under `setsid` (`kind_start_forward`).
+    - It logs every start, signal and exit, and the log is appended, not
+      overwritten.
+    - A watcher restarts kubectl after 3 failed `/boot-status` probes.
+    - New `scripts/kind/forward.sh [--dist] [--fake] [--status]` restarts
+      or inspects just the forward.
+  - Tested with a stub kubectl under a throwaway TMPDIR on port 7499, no
+    cluster involved:
+    - kubectl exits: restarted after 2 s;
+    - kubectl alive but silent: restarted after 3 probes;
+    - the launcher's process group is SIGKILLed: the loop survives;
+    - normal stop: the loop logs SIGTERM; no orphan, port freed.
+  - The owner's running forward (pid 23886, started by the coordinator) is
+    still the old code. A `scripts/kind/forward.sh` swaps it with a blip of
+    about a second.
 - **Open questions:** none.
