@@ -1,7 +1,8 @@
 # OPT-IN: deploy/kind/agents plus a NetworkPolicy that denies the pod all
-# egress except DNS and TCP 443, to show K2 on kind depends on nothing else
-# (no k2.dev tunnel or relay ports). Claude's sign-in and API calls are
-# HTTPS (443), so /login and agent work still run.
+# egress except DNS and TCP 443. Claude's sign-in and API calls are HTTPS
+# (443), so /login and agent work still run. This blocks frp and every other
+# non-443 port. It does NOT prove independence from k2.dev: k2.dev is 443
+# too, and a plain NetworkPolicy matches IPs and ports, not hostnames.
 #
 #   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egress-locked \
 #     | kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f -

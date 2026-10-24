@@ -12,7 +12,7 @@ Lab only: `deploy/kubernetes/` is the end state.
 | `agents/kustomization.yaml` | Overlay over `packaging/oci/kind/solo.yaml`: namespace `k2-kind`, image `k2-agents:dev` |
 | `Dockerfile.fake`, `fake/` | TEST ONLY: `k2-agents:fake` with the lab's `k2-fake-agent` as every agent CLI, in namespace `k2-kind-fake`, for `scripts/kind/s1.sh` |
 | `components/no-k2dev` | Shared by both overlays: `K2_TUNNEL_LEASE=off`, `K2_FEDERATION=off`, relay list and DNS API pointed at a closed local port. Nothing here talks to k2.dev |
-| `agents-egress-locked/` | Opt-in: `agents` plus a NetworkPolicy allowing only DNS and TCP 443 out |
+| `agents-egress-locked/` | Opt-in: `agents` plus a NetworkPolicy allowing only DNS and TCP 443 out. Blocks frp and other non-443 ports; it can't block k2.dev, which is also 443 |
 | `scripts/kind/up.sh`, `down.sh` | One command up, one command down |
 
 ## 1. Bring it up
@@ -158,7 +158,7 @@ scripts/kind/down.sh --keep-data  # stops the port-forward, scales to 0, keeps t
 
 Then remove **kind k2lab** in **Settings → Connected Servers**.
 
-## Optional: prove it needs nothing but HTTPS
+## Optional: close every port but DNS and 443
 
 ```sh
 kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egress-locked \
@@ -167,8 +167,14 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egre
 
 This adds a NetworkPolicy that denies the pod every egress except DNS and
 TCP 443. The port-forward goes through the kubelet, so the app's connection
-is unaffected. Verified on the fake variant: port 80 out times out, 443
-out answers, the daemon boots and S1 passes. Remove it with
+is unaffected. Verified on the fake variant: port 80 out times out, 443 out
+answers, the daemon boots and S1 passes.
+
+What it shows: K2 on kind runs with frp and every other non-443 port closed.
+What it does not show: independence from k2.dev. k2.dev is also served on
+443, and a plain NetworkPolicy matches IPs and ports, not hostnames.
+
+Remove it with
 `kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind delete networkpolicy k2-solo-egress`.
 
 ## Proof without a real agent (S1)

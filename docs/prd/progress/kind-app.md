@@ -172,7 +172,7 @@ Other checks:
 | Survives a restart | fake pod: write `~/.claude/persist-probe`, `kubectl delete pod`, wait | file still there; port-forward reconnected by itself (ready after 4 s); app login still works |
 | `down.sh --fake` | then `kubectl get ns`, `lsof :7441` | namespace gone, port free |
 | no-k2.dev settings | `up.sh --fake` after RESUME; env and log in the pod | `K2_TUNNEL_LEASE=off`, `K2_FEDERATION=off`, relay list and DNS API at `127.0.0.1:9`, no `K2_AIRGAP`; no `tunnel.json`, no frpc; log: "tunnel/relays boot refresh skipped: no tunnel token"; S1 PASS (`lab-runs/kind/2026-10-24T22-04-40Z/`) |
-| Egress lock | the opt-in NetworkPolicy applied to `k2-kind-fake`, pod restarted | `http://example.com` (80) times out, `https://api.anthropic.com` (443) answers 404; boot ready in 4 s; S1 PASS (`…T22-05-22Z/`) |
+| Egress lock | the opt-in NetworkPolicy applied to `k2-kind-fake`, pod restarted | `http://example.com` (80) times out, `https://api.anthropic.com` (443) answers 404; boot ready in 4 s; S1 PASS (`…T22-05-22Z/`). This shows only that K2 on kind runs with frp and every non-443 port closed. It is not proof of k2.dev independence: k2.dev is also 443, and a plain NetworkPolicy can't filter by hostname |
 
 The agent's PTY gets `~/.k2/bin` first on its PATH, so Claude's `xdg-open` is
 the shim. That comes from reading `open_shim.rs` and `daemon_pty`; the fake
