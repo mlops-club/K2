@@ -132,7 +132,7 @@ that scheduler is installed. Note the DB file is `k2so.db`, not `k2.db`.
 
 ## How to try it
 
-From the worktree. Builds `k2-daemon` with the worker's toolchain (4
+From the worktree. Builds `k2-daemon` with the worker's toolchain (3
 jobs), boots it with `K2_HOME=/tmp/k2demo` and a cleared env whose `HOME`,
 `TMPDIR` and runtime dir are all inside `/tmp/k2demo`, waits for
 `/boot-status` to say `ready`, stops it (SIGTERM), lists every file under
@@ -144,7 +144,7 @@ It never reads or writes the real `~/.k2`.
 cd /Users/eric/.superset/worktrees/8af91ef4-b71b-4734-b52d-5d40840fbde7/k2-dist/home && bash <<'EOF'
 set -u
 R=$HOME/.cache/k2-dist-rust
-env CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup CARGO_BUILD_JOBS=4 CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON \
+env CARGO_HOME=$R/cargo RUSTUP_HOME=$R/rustup CARGO_BUILD_JOBS=3 CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON \
   PATH=$R/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin $R/cargo/bin/cargo build -q -p k2-daemon --bin k2-daemon || exit 1
 D=/tmp/k2demo; rm -rf $D; mkdir -p $D/sentinel-home $D/tmp $D/run; chmod 700 $D/run
 env -i HOME=$D/sentinel-home TMPDIR=$D/tmp/ XDG_RUNTIME_DIR=$D/run K2_RUNTIME_DIR=$D/run \
@@ -224,29 +224,34 @@ EOF
   saw. From now on every cargo test runs with a fresh `mktemp -d` `HOME`
   and `TMPDIR`. Follow-up owned by the coordinator.
 
-## Checks so far
+## Checks
 
-| Command (all run before the fresh-HOME rule, so with the real `HOME`; to be rerun under a temp `HOME`) | Result |
+Final runs: every `K2_*`/`K2SO_*` unset, `HOME` and `TMPDIR` a fresh
+`mktemp -d`, `CARGO_BUILD_JOBS` 3–4, `--test-threads` 3–4.
+
+| Command | Result |
 |---|---|
-| `cargo check -p k2-client -p k2-core -p k2-daemon --all-targets` | clean, no warnings in these crates |
-| `cargo test -p k2-client --lib` | 99 passed |
-| `cargo test -p k2-core --lib -- k2_home` (7 env tests, lint, both ratchets) | 12 passed |
-| `cargo test -p k2-daemon --test k2_home_integration` | 2 passed |
-| `cargo test -p k2-daemon --lib -- no_new_k2_home_paths no_new_raw_env` | 2 passed |
+| `cargo test -p k2-core --no-fail-fast` | lib 3677 passed, 1 ignored; every integration binary passed except `ptyd_backend` (8 failed: "k2-ptyd binary not found", the file's documented prerequisite) |
+| `cargo build -p k2-ptyd --bin k2-ptyd && cargo test -p k2-core --test ptyd_backend` | 8 passed |
+| `cargo test -p k2-daemon --no-fail-fast` | lib 4344 passed, 1 failed, 5 ignored; all 160 other test binaries passed (incl. `k2_home_integration`, 2 passed) |
+| the 1 failure, `publish_runtime::tests::local_late_bind_within_grace_ends_running_with_event` | "bind clash: 127.0.0.1:29359 is already accepting connections": another process took the `loopback_test_port` port on this loaded Mac. File not changed by this task. Alone: 3 of 3 passed; whole `publish_runtime::` module: 20 passed |
+| ratchet probe: `dirs::home_dir().unwrap_or_default().join(".k2")` appended to `k2-daemon/src/agent_retire.rs`, then `cargo test -p k2-daemon --lib -- no_new_k2_home_paths` | FAILED with `agent_retire.rs:929: … (1 found, 0 allowed)`; probe reverted (`git checkout`) |
+| `cargo clippy -p k2-core -p k2-daemon -p k2-client --all-targets -- --cap-lints warn`, here and on a `k2-dist/wave1` worktree, compared per changed file by (file, lint, source line) | 56 changed files: 86 findings on both sides, **0 new** |
+| `cargo test -p k2-client --lib` | 99 passed (real `HOME`, before the rule; touches no home) |
+| try-it (below), run verbatim | `"phase":"ready"`; every boot file under `/tmp/k2demo`; sentinel `HOME` empty; `/tmp/k2demo` removed; real `~/.k2/daemon.{port,token,lock}` unchanged (mtime 12:16, the production daemon's own boot) |
 
 ## Status
 
-- **Milestone:** first working slice. The resolver and every converted call
-  site compile (`cargo check -p k2-client -p k2-core -p k2-daemon
-  --all-targets`); ratchet tests written.
-- **Next (paused):** heavy builds wait for the coordinator (the image
-  worker's kind build is the critical path). Then: the ratchet probe, the
-  full `k2-core`/`k2-daemon` suites with every `K2_*` unset, the clippy
-  diff against `k2-dist/wave1`, and the try-it run.
+- **Milestone:** done. `K2_HOME` is honoured by every K2-home path in
+  `k2-client`, `k2-core` and `k2-daemon`; unset keeps `$HOME/.k2`.
+- **Next:** none for this task. Hand-off to `image`: drop `HOME=/var/lib/k2`,
+  set `K2_HOME=/var/lib/k2` (absolute; it *is* the K2 home, no `.k2` under
+  it). Set `HOME` to the volume as well if agent CLIs run in that
+  container (provider homes stay under `$HOME`), and `K2_TUNNEL_LEASE=off`.
 - **Open questions:** none.
 - **Toolchain note:** this Mac had no Rust toolchain. The worker installed
   rustup into `~/.cache/k2-dist-rust` (`RUSTUP_HOME`/`CARGO_HOME` there,
   nothing in `~/.cargo` or `~/.rustup`, no shell profile edits). Building
   `llama-cpp-sys-2` needs `CMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON` here
   (Homebrew OpenSSL 3.6 headers break cpp-httplib). Builds use
-  `CARGO_BUILD_JOBS=4`, tests `--test-threads=4`.
+  `CARGO_BUILD_JOBS=3`, tests `--test-threads=3` (coordinator rule).
