@@ -286,9 +286,11 @@ impl WeakAgentSession {
 /// Every way the controller drives an agent session. Object safe, so the
 /// daemon holds one `&'static dyn AgentHost` ([`host`]).
 pub(crate) trait AgentHost: Send + Sync {
+    #[allow(dead_code)] // interface surface: tests today, the remote host and placement checks in P2
     /// Short name for logs and the progress page (`in-process`).
     fn kind(&self) -> &'static str;
 
+    #[allow(dead_code)] // interface surface: tests today, the remote host and placement checks in P2
     /// The epoch new placements on this host get.
     fn epoch(&self) -> PlacementEpoch;
 
@@ -376,14 +378,17 @@ pub(crate) trait AgentHost: Send + Sync {
 
     // ── hook events ────────────────────────────────────────────────────
 
+    #[allow(dead_code)] // interface surface: tests today, the remote host and placement checks in P2
     /// Hook envelopes that passed the owner check, for every session on
     /// this host.
     fn hook_events(&self) -> broadcast::Receiver<crate::hook_ingest::IngestEvent>;
 
     // ── the agent's home ───────────────────────────────────────────────
 
+    #[allow(dead_code)] // interface surface: tests today, the remote host and placement checks in P2
     fn read_home(&self, home: &AgentHome, rel: &Path) -> io::Result<Vec<u8>>;
 
+    #[allow(dead_code)] // interface surface: tests today, the remote host and placement checks in P2
     /// Write a file in the home, creating parent directories; readers see
     /// the old or the new content, never a torn one.
     fn write_home(&self, home: &AgentHome, rel: &Path, bytes: &[u8]) -> io::Result<()>;
