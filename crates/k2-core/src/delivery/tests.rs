@@ -57,6 +57,11 @@ fn seen_answers_a_redelivery_and_is_bounded() {
     seen::record(&c, "m1", "delivered", 1, POLICY.seen_cap).unwrap();
     seen::record(&c, "m1", "delivered", 2, POLICY.seen_cap).unwrap();
     assert_eq!(seen::status(&c, "m1").unwrap().as_deref(), Some("delivered"));
+    // A later answer replaces an earlier one (the controller's `handling`).
+    seen::record(&c, "h1", "handling", 1, POLICY.seen_cap).unwrap();
+    seen::record(&c, "h1", "rejected: dormant_no_wake", 1, POLICY.seen_cap).unwrap();
+    assert_eq!(seen::status(&c, "h1").unwrap().as_deref(), Some("rejected: dormant_no_wake"));
+    seen::record(&c, "h1", "delivered", 1, POLICY.seen_cap).unwrap();
     for i in 2..=5 {
         seen::record(&c, &format!("m{i}"), "delivered", i, POLICY.seen_cap).unwrap();
     }

@@ -18,6 +18,14 @@
 //!   the TTL. The host ([`HostSide::receive`]) checks its `delivery_seen`
 //!   table, injects into the local agent, records the id, then acks.
 //!
+//! A `k2 msg` whose recipient isn't placed but which the controller
+//! resolves itself (a workspace path or name, a sidecar, a session id)
+//! skips the outbox: the controller runs today's `K2_ROLE=all` cascade
+//! ([`Direct`]), so a sleeping agent answers `dormant_no_wake`, or with
+//! `--wake` is woken on a host through `host()` and gets the message. A
+//! host's resend of such a message is answered from `delivery_seen`, so
+//! the cascade runs once per `msg_id`.
+//!
 //! Under `K2_ROLE=all` none of this runs: `k2 msg` is today's direct
 //! delivery. The store is `k2_core::delivery`; the protocol and state
 //! machine are in `docs/prd/progress/outbox.md`.
@@ -140,7 +148,47 @@ pub struct Controller {
     db: Db,
     policy: Policy,
     nudge: Notify,
+    direct: Direct,
 }
+
+/// `k2 msg` recipients the controller resolves itself instead of queueing
+/// for a placement: today's cascade (live inject, `dormant_no_wake`,
+/// `--wake` through `host()`).
+pub struct Direct {
+    /// Does this controller know `recipient` as a workspace, sidecar or session?
+    pub resolves: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Deliver a `kind=msg` body to `recipient` now (blocking: it may wake
+    /// the agent). `Err` is the reason it wasn't delivered.
+    pub deliver: Box<dyn Fn(&str, &str, &Value) -> Result<(), String> + Send + Sync>,
+}
+
+impl Direct {
+    /// Every recipient goes through the outbox.
+    pub fn none() -> Self {
+        Direct { resolves: Box::new(|_| false), deliver: Box::new(|_, _, _| Err("no direct delivery".into())) }
+    }
+
+    /// The daemon's own resolver and cascade (`workspace_msg`).
+    pub fn production() -> Self {
+        Direct {
+            resolves: Box::new(|r| crate::workspace_msg::resolve_msg_target(r).is_some()),
+            deliver: Box::new(crate::workspace_msg::deliver_for_controller),
+        }
+    }
+}
+
+/// What the controller does with a `deliver` from a host.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// Ack now.
+    Ack(DeliverStatus, Option<String>),
+    /// Run [`Controller::deliver_direct`] off the link's task, then ack.
+    Direct,
+    /// The first copy is still being delivered directly: no ack; the host resends.
+    InFlight,
+}
+
+const HANDLING: &str = "handling";
 
 fn controllers() -> &'static Mutex<Vec<Arc<Controller>>> {
     static C: OnceLock<Mutex<Vec<Arc<Controller>>>> = OnceLock::new();
@@ -153,12 +201,12 @@ fn controller_for(remote: &RemoteHost) -> Option<Arc<Controller>> {
 }
 
 /// Start the drain for `remote` on this runtime (once per `remote`).
-pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy) -> Arc<Controller> {
+pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy, direct: Direct) -> Arc<Controller> {
     let mut all = controllers().lock();
     if let Some(c) = all.iter().find(|c| std::ptr::eq(c.remote, remote)) {
         return Arc::clone(c);
     }
-    let c = Arc::new(Controller { remote, db: ready(db), policy, nudge: Notify::new() });
+    let c = Arc::new(Controller { remote, db: ready(db), policy, nudge: Notify::new(), direct });
     all.push(Arc::clone(&c));
     tokio::spawn(Arc::clone(&c).run());
     log_debug!("[delivery] controller drain started");
@@ -169,7 +217,7 @@ pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy) -> 
 /// `RemoteHost`), started on first use. The gate calls it when a host
 /// links, so a restarted controller drains what it had queued.
 pub fn ensure_controller_drain() -> Arc<Controller> {
-    start_controller(crate::agent_host::remote::global(), k2_core::db::shared(), Policy::PRODUCTION)
+    start_controller(crate::agent_host::remote::global(), k2_core::db::shared(), Policy::PRODUCTION, Direct::production())
 }
 
 /// `RemoteHost::on_frame`'s hook for `deliver` and `deliver.ack` from a host.
@@ -180,17 +228,30 @@ pub fn on_host_frame(remote: &RemoteHost, host_id: &str, frame: Frame) {
     };
     match frame {
         Frame::Deliver { msg_id, agent_id, from, body, attempt, .. } => {
-            let (status, reason) = c.accept(&msg_id, &from, &agent_id, &body, delivery::now_ms());
-            k2_core::trace::emit(|| {
-                k2_core::trace::Event::new(events::CTL_MSG_ACCEPT)
-                    .msg(msg_id.as_str())
-                    .agent(agent_id.as_str())
-                    .attr("host", host_id)
-                    .attr("attempt", attempt)
-                    .attr("status", format!("{status:?}").to_lowercase())
-            });
-            if let Err(e) = c.remote.send_frame(host_id, Frame::DeliverAck { msg_id, status, reason }) {
-                log_debug!("[delivery] ack to host {host_id}: {e} (the host resends)");
+            let (id, to) = (msg_id.clone(), agent_id.clone());
+            let ack = move |c: &Controller, status: DeliverStatus, reason: Option<String>, host_id: &str| {
+                k2_core::trace::emit(|| {
+                    k2_core::trace::Event::new(events::CTL_MSG_ACCEPT)
+                        .msg(msg_id.as_str())
+                        .agent(agent_id.as_str())
+                        .attr("host", host_id)
+                        .attr("attempt", attempt)
+                        .attr("status", format!("{status:?}").to_lowercase())
+                });
+                if let Err(e) = c.remote.send_frame(host_id, Frame::DeliverAck { msg_id, status, reason }) {
+                    log_debug!("[delivery] ack to host {host_id}: {e} (the host resends)");
+                }
+            };
+            match c.take(&id, &from, &to, &body, delivery::now_ms()) {
+                Taken::Ack(status, reason) => ack(&c, status, reason, host_id),
+                Taken::InFlight => {}
+                Taken::Direct => {
+                    let host_id = host_id.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        let (status, reason) = c.deliver_direct(&id, &from, &to, &body, delivery::now_ms());
+                        ack(&c, status, reason, &host_id);
+                    });
+                }
             }
         }
         Frame::DeliverAck { msg_id, status, reason } => {
@@ -221,6 +282,58 @@ impl Controller {
                 (DeliverStatus::Rejected, Some(format!("controller database: {e}")))
             }
         }
+    }
+
+    /// Does `recipient` skip the outbox? A `kind=msg` body for a recipient
+    /// with no placement that this controller resolves itself.
+    pub fn is_direct(&self, recipient: &str, body: &Value) -> bool {
+        matches!(body.get("kind").and_then(Value::as_str), Some("msg") | None)
+            && self.remote.placement(recipient).is_none()
+            && (self.direct.resolves)(recipient)
+    }
+
+    /// A `deliver` from a host: answered from `delivery_seen` when this
+    /// controller handled it directly before, handed to
+    /// [`Self::deliver_direct`] when [`Self::is_direct`], else [`Self::accept`].
+    pub fn take(&self, msg_id: &str, from: &str, agent_id: &str, body: &Value, now: i64) -> Taken {
+        if !msg_id.is_empty() {
+            let conn = self.db.lock();
+            match seen::status(&conn, msg_id) {
+                Ok(Some(s)) if s == HANDLING => return Taken::InFlight,
+                Ok(Some(s)) => {
+                    return match s.strip_prefix("rejected: ") {
+                        Some(why) => Taken::Ack(DeliverStatus::Rejected, Some(why.to_string())),
+                        None => Taken::Ack(DeliverStatus::Duplicate, None),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return Taken::Ack(DeliverStatus::Rejected, Some(format!("controller database: {e}"))),
+            }
+            let queued = outbox::get(&conn, Hop::Down, msg_id).ok().flatten().is_some();
+            if !queued && !agent_id.is_empty() && self.is_direct(agent_id, body) {
+                return match seen::record(&conn, msg_id, HANDLING, now, self.policy.seen_cap) {
+                    Ok(()) => Taken::Direct,
+                    Err(e) => Taken::Ack(DeliverStatus::Rejected, Some(format!("controller database: {e}"))),
+                };
+            }
+        }
+        let (status, reason) = self.accept(msg_id, from, agent_id, body, now);
+        Taken::Ack(status, reason)
+    }
+
+    /// Deliver a host's message through [`Direct::deliver`] and remember
+    /// the answer for its resends.
+    pub fn deliver_direct(&self, msg_id: &str, from: &str, agent_id: &str, body: &Value, now: i64) -> (DeliverStatus, Option<String>) {
+        let r = (self.direct.deliver)(agent_id, from, body);
+        let (status, reason, seen_as) = match r {
+            Ok(()) => (DeliverStatus::Delivered, None, "delivered".to_string()),
+            Err(why) => (DeliverStatus::Rejected, Some(why.clone()), format!("rejected: {why}")),
+        };
+        log_debug!("[delivery] {msg_id} {from} → {agent_id}: delivered directly: {seen_as}");
+        if let Err(e) = seen::record(&self.db.lock(), msg_id, &seen_as, now, self.policy.seen_cap) {
+            log_debug!("[delivery] ERROR: can't record {msg_id}: {e}");
+        }
+        (status, reason)
     }
 
     /// A message that starts on the controller (`k2 msg` sent to it).
@@ -597,18 +710,34 @@ pub struct Sent {
 
 /// `k2 msg` / inbox compose on a host or a controller: hand the message
 /// to the controller's outbox. On a host this waits up to [`ACCEPT_WAIT`]
-/// for the controller's ack. `None` under `K2_ROLE=all`.
+/// (plus the wake timeout when the body asks for a wake) for the
+/// controller's ack. `None` under `K2_ROLE=all`, and on a controller for a
+/// message it delivers directly ([`Controller::is_direct`]): the caller
+/// runs today's cascade.
 pub fn send(from: &str, agent_id: &str, body: Value) -> Option<Result<Sent, String>> {
     let sender = sender_address(from);
     match crate::runtime_role::current() {
         crate::runtime_role::Role::All => None,
-        crate::runtime_role::Role::Controller => Some(
-            ensure_controller_drain()
-                .send(&sender, agent_id, body)
-                .map(|msg_id| Sent { msg_id, state: "accepted", reason: None }),
-        ),
-        crate::runtime_role::Role::Host => Some(host_send(host_side(), &sender, agent_id, body, ACCEPT_WAIT)),
+        crate::runtime_role::Role::Controller => {
+            let c = ensure_controller_drain();
+            if c.is_direct(agent_id, &body) {
+                return None;
+            }
+            Some(c.send(&sender, agent_id, body).map(|msg_id| Sent { msg_id, state: "accepted", reason: None }))
+        }
+        crate::runtime_role::Role::Host => {
+            let wait = ACCEPT_WAIT + wake_wait(&body);
+            Some(host_send(host_side(), &sender, agent_id, body, wait))
+        }
     }
+}
+
+/// The wake timeout a `kind=msg` body asks for (zero without a wake).
+fn wake_wait(body: &Value) -> Duration {
+    if body.get("wake").and_then(Value::as_bool) != Some(true) {
+        return Duration::ZERO;
+    }
+    body.get("wake_timeout_ms").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(Duration::ZERO)
 }
 
 fn host_send(h: &HostSide, sender: &str, agent_id: &str, body: Value, wait: Duration) -> Result<Sent, String> {
