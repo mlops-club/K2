@@ -143,8 +143,8 @@ kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
 kind load docker-image k2-daemon:dev --name k2lab
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f packaging/oci/kind/solo.yaml
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo rollout status sts/k2-solo
-kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward svc/k2-solo 7440:7420 &
-curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilities}'   # full view: port-forward arrives on loopback
+kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward --address 127.0.0.1 svc/k2-solo 7461:7420 &
+curl -fsS http://127.0.0.1:7461/boot-status | jq '{phase, installKind, capabilities}'   # full view: port-forward arrives on loopback
 ```
 
 ## Status
@@ -178,6 +178,12 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilit
   completed (rc 0) before it. After the restart, check
   that the Compose service (`restart: unless-stopped`) and `sts/k2-solo` on
   k2lab came back Ready; nothing was re-run yet.
+- **After DOCKER-OK (2026-10-25):** Compose `k2-solo` healthy, recreated
+  with `cpus: 3`/3 GB; full view `ready`, `package`. k2lab `k2-solo-0` 1/1
+  Running (2 restarts during the Docker restart); through the port-forward:
+  full view `ready`, `package`, capabilities. Local port 7440 is now taken by
+  another worker's container, so the try commands use 7461 bound to
+  127.0.0.1.
 - **Not run here:** `cargo test -p k2-core` and `-p k2-daemon` in full (the
   k2-daemon lib needs about 4.8 GB to compile; the Docker cap is 3 GB). The
   integrator's `scripts/test-gate-linux.sh` runs them after the wave-1 merge.

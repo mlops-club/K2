@@ -391,3 +391,49 @@ fn cli_hook_is_traced_before_the_hook_runs_and_done_after() {
         ]
     );
 }
+
+/// Many agents share one trace file (every agent of a host): each line is
+/// one O_APPEND write, so concurrent writers never tear or interleave lines.
+/// 24 fake agents, each with a long prompt (lines well over a page), all
+/// writing the same trace at once; every line must parse and every agent's
+/// events must all be there.
+#[test]
+fn concurrent_agents_never_tear_trace_lines() {
+    let b = Box_::new();
+    let trace = b.home().join("shared-trace.jsonl");
+    // A long flag the fake ignores lands in cli.exec's argv: lines of ~12 KB,
+    // several pages, so a line written in pieces would tear.
+    let long = "y".repeat(12_000);
+    let prompt = "hello\n";
+    let n = 24;
+    let children: Vec<_> = (0..n)
+        .map(|i| {
+            let sid = format!("11111111-2222-4333-8444-{:012}", i);
+            let mut c = b.cmd(
+                BIN,
+                &["--session-id", &sid, "--append-system-prompt", &long],
+                &[("K2_FAKE_AGENT_TRACE", trace.to_str().unwrap())],
+            );
+            // Each in its own cwd, so the transcripts don't collide.
+            let cwd = b.home().join(format!("w{i}"));
+            fs::create_dir_all(&cwd).unwrap();
+            c.current_dir(&cwd).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+            let mut child = c.spawn().expect("spawn k2-fake-agent");
+            child.stdin.take().unwrap().write_all(prompt.as_bytes()).unwrap();
+            child
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let text = fs::read_to_string(&trace).unwrap();
+    let mut per_session = std::collections::BTreeMap::<String, usize>::new();
+    for (i, line) in text.lines().enumerate() {
+        let v: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i} is torn ({e}): {:.120}", line));
+        *per_session.entry(v["session_id"].as_str().unwrap().to_string()).or_default() += 1;
+    }
+    assert_eq!(per_session.len(), n, "every agent wrote its events");
+    // cli.exec, cli.hook (SessionStart), cli.turn.start, cli.hook (UserPromptSubmit),
+    // cli.turn.end, cli.hook (Stop), cli.hook (SessionEnd), cli.exit
+    assert!(per_session.values().all(|&k| k == 8), "{per_session:?}");
+}
