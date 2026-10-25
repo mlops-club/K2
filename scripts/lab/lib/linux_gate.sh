@@ -62,6 +62,9 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
 } >"$run/topology/linux-gate.txt"
 
+# The gate writes its per-package logs to <workdir>/logs; a symlink into
+# this bind mount keeps them in the bundle (the container is --rm).
+mkdir -p "$run/parity/linux-gate-logs"
 cargo_cfg="$run/topology/linux-gate.cargo-config.toml"
 printf '[build]\njobs = 1\n' >"$cargo_cfg"
 
@@ -73,6 +76,8 @@ docker run --rm --name "$name" \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
     -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \
     -v "$target_vol:/cache/target" -v "$registry_vol:/usr/local/cargo/registry" \
+    -v "$run/parity/linux-gate-logs:/out/logs" \
     "$image" \
     bash -c 'rm -rf /gate/work && mkdir -p /gate/work && ln -s /cache/target /gate/work/target \
+             && ln -s /out/logs /gate/work/logs \
              && exec bash /src/wt/scripts/test-gate-linux.sh "$0" /gate/work' "$sha"
