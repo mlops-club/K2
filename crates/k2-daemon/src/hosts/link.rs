@@ -23,9 +23,52 @@ use super::proto::{Frame, PROTOCOL};
 use super::HostConfig;
 use crate::session_events::SessionEvent;
 
-const WELCOME_DEADLINE: Duration = Duration::from_secs(10);
-const BACKOFF_MIN: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Every wait on the link has a deadline, so a dead or silent controller
+/// always ends in a logged failure and a retry, never a silent stall.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timings {
+    /// TCP connect plus the WebSocket upgrade. A SYN to a vanished pod IP
+    /// would otherwise wait out the kernel's SYN retries (~127 s on Linux),
+    /// and a peer that accepts but never upgrades, forever.
+    pub connect: Duration,
+    /// `hello` → `welcome`.
+    pub welcome: Duration,
+    /// Nothing at all from the controller (it pings every 15 s,
+    /// `hub::PING_EVERY`) for this long: the link is dead.
+    pub idle: Duration,
+    /// Sending our close on a link that already failed.
+    pub close: Duration,
+    pub backoff_min: Duration,
+    pub backoff_max: Duration,
+}
+
+impl Timings {
+    pub const PRODUCTION: Timings = Timings {
+        connect: Duration::from_secs(10),
+        welcome: Duration::from_secs(10),
+        idle: Duration::from_secs(45),
+        close: Duration::from_secs(2),
+        backoff_min: Duration::from_secs(1),
+        backoff_max: Duration::from_secs(30),
+    };
+}
+
+/// The reconnect policy: after a link that was up, retry after
+/// `backoff_min`; after a failed attempt, after `prev`. Returns (this
+/// sleep, the next attempt's `prev`), doubling up to `backoff_max`.
+pub(crate) fn next_backoff(prev: Duration, was_linked: bool, t: &Timings) -> (Duration, Duration) {
+    let sleep = if was_linked { t.backoff_min } else { prev.clamp(t.backoff_min, t.backoff_max) };
+    (sleep, (sleep * 2).min(t.backoff_max))
+}
+
+/// What the link loop did, for tests ([`run_with`]'s observer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkEvent {
+    Attempt(u64),
+    Linked,
+    Ended { was_linked: bool, error: Option<String> },
+    Sleep(Duration),
+}
 
 #[derive(Default)]
 struct LinkState {
@@ -34,6 +77,8 @@ struct LinkState {
     host_name: String,
     controller: String,
     last_error: Option<String>,
+    attempts: u64,
+    links: u64,
 }
 
 fn state() -> &'static Mutex<LinkState> {
@@ -51,36 +96,58 @@ pub fn status_json() -> serde_json::Value {
         "host_name": s.host_name,
         "controller": s.controller,
         "last_error": s.last_error,
+        "attempts": s.attempts,
+        "links": s.links,
     })
 }
 
-/// The link, forever: connect, serve, and on any drop reconnect with
-/// backoff (1 s doubling to 30 s). Agents keep running while it is down.
+/// The link, forever: connect, serve, and on any end (connect error, read
+/// error, close, silence) reconnect: 1 s after a link that was up, then
+/// doubling to 30 s while attempts fail. Agents keep running while it is
+/// down.
 pub async fn run(cfg: HostConfig) {
+    run_with(cfg, Timings::PRODUCTION, None).await
+}
+
+pub(crate) async fn run_with(cfg: HostConfig, t: Timings, observe: Option<mpsc::UnboundedSender<LinkEvent>>) {
+    let note = |e: LinkEvent| {
+        if let Some(o) = &observe {
+            let _ = o.send(e);
+        }
+    };
     {
         let mut s = state().lock();
         s.host_name = cfg.host_name.clone();
         s.controller = cfg.attach_url.clone();
     }
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = t.backoff_min;
+    let mut attempt = 0u64;
     loop {
-        let result = serve_once(&cfg).await;
-        let was_linked = {
+        attempt += 1;
+        state().lock().attempts += 1;
+        log_debug!("[hosts/link] connecting to {} (attempt {attempt})", cfg.attach_url);
+        note(LinkEvent::Attempt(attempt));
+        // This attempt's own outcome, not the process-wide status.
+        let mut was_linked = false;
+        let result = serve_once(&cfg, &t, || {
+            was_linked = true;
+            note(LinkEvent::Linked);
+        })
+        .await;
+        {
             let mut s = state().lock();
-            let was = s.linked;
             s.linked = false;
             s.last_error = result.as_ref().err().cloned();
-            was
-        };
+        }
+        let (sleep, next) = next_backoff(backoff, was_linked, &t);
         match &result {
-            Ok(()) => log_debug!("[hosts/link] link to {} closed", cfg.attach_url),
-            Err(e) => log_debug!("[hosts/link] link to {}: {e}", cfg.attach_url),
+            Ok(()) => log_debug!("[hosts/link] link to {} closed; retrying in {sleep:?}", cfg.attach_url),
+            Err(e) => log_debug!("[hosts/link] link to {}: {e}; retrying in {sleep:?}", cfg.attach_url),
         }
-        if was_linked {
-            backoff = BACKOFF_MIN;
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        note(LinkEvent::Ended { was_linked, error: result.err() });
+        note(LinkEvent::Sleep(sleep));
+        tokio::time::sleep(sleep).await;
+        backoff = next;
     }
 }
 
@@ -92,16 +159,18 @@ struct Placed {
     sessions: HashMap<String, String>,
 }
 
-/// One connection: handshake, then serve until it closes.
-pub(crate) async fn serve_once(cfg: &HostConfig) -> Result<(), String> {
+/// One connection: handshake, then serve until it closes, fails or goes
+/// silent for `t.idle`. `linked` runs once the controller welcomed us.
+pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnce()) -> Result<(), String> {
     // Subscribe before the handshake, so nothing between welcome and the
     // loop is missed.
     let mut hooks = crate::hook_ingest::subscribe();
     let mut events = crate::session_events::subscribe();
 
-    let (ws, _) = tokio_tungstenite::connect_async(cfg.attach_url.as_str())
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+    let (ws, _) = match tokio::time::timeout(t.connect, tokio_tungstenite::connect_async(cfg.attach_url.as_str())).await {
+        Ok(r) => r.map_err(|e| format!("connect: {e}"))?,
+        Err(_) => return Err(format!("connect: no answer within {:?}", t.connect)),
+    };
     let (mut write, mut read) = ws.split();
     let hello = Frame::Hello {
         protocol: PROTOCOL,
@@ -110,7 +179,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig) -> Result<(), String> {
         labels: cfg.labels.clone(),
     };
     write.send(Message::Text(hello.encode())).await.map_err(|e| format!("send hello: {e}"))?;
-    let host_id = match tokio::time::timeout(WELCOME_DEADLINE, read.next()).await {
+    let host_id = match tokio::time::timeout(t.welcome, read.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => match Frame::decode(&t)? {
             Frame::Welcome { host_id, protocol, controller } => {
                 log_debug!("[hosts/link] linked as {host_id} to {controller} (protocol {protocol})");
@@ -125,17 +194,24 @@ pub(crate) async fn serve_once(cfg: &HostConfig) -> Result<(), String> {
     {
         let mut s = state().lock();
         s.linked = true;
+        s.links += 1;
         s.host_id = Some(host_id.clone());
         s.last_error = None;
     }
+    linked();
     k2_core::trace::emit(|| k2_core::trace::Event::new("host.linked").attr("host", host_id.as_str()));
 
     let (tx, mut out) = mpsc::unbounded_channel::<Frame>();
     let streams: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>> = Arc::default();
     let placed: Arc<Mutex<Placed>> = Arc::default();
 
+    // Any message from the controller (its pings included) moves this on.
+    let mut heard = tokio::time::Instant::now();
     let result = loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(heard + t.idle) => {
+                break Err(format!("nothing from the controller for {:?}", t.idle));
+            }
             f = out.recv() => {
                 // `tx` lives in this loop, so the channel never closes here.
                 let Some(f) = f else { break Ok(()) };
@@ -144,7 +220,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig) -> Result<(), String> {
                 }
             }
             m = read.next() => match m {
-                Some(Ok(Message::Text(t))) => match Frame::decode(&t) {
+                Some(Ok(Message::Text(text))) => match { heard = tokio::time::Instant::now(); Frame::decode(&text) } {
                     Ok(f) => {
                         if let Err(e) = handle(f, &tx, &streams, &placed) {
                             break Err(e);
@@ -154,7 +230,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig) -> Result<(), String> {
                 },
                 Some(Ok(Message::Close(_))) | None => break Ok(()),
                 Some(Err(e)) => break Err(format!("read: {e}")),
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => heard = tokio::time::Instant::now(),
             },
             h = hooks.recv() => match h {
                 Ok(crate::hook_ingest::IngestEvent::Envelope { envelope, received_at_ms, .. }) => {
@@ -197,7 +273,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig) -> Result<(), String> {
     };
     // Ends every local grid stream (their senders drop).
     streams.lock().clear();
-    let _ = write.close().await;
+    let _ = tokio::time::timeout(t.close, write.close()).await;
     result
 }
 
@@ -243,7 +319,11 @@ fn handle(
                 let _ = tx.send(Frame::Reply { req, status, body });
             });
         }
-        Frame::GridOpen { stream, session_id, .. } => {
+        Frame::GridOpen { stream, session_id, as_user, .. } => {
+            log_debug!(
+                "[hosts/link] grid stream {stream} session {session_id} for {}",
+                as_user.as_deref().unwrap_or("the owner")
+            );
             let (ctx, crx) = mpsc::unbounded_channel();
             streams.lock().insert(stream, ctx);
             let tx = tx.clone();
