@@ -333,3 +333,20 @@ top of `prove.sh`, and a scenario loop in `prove.sh` instead of the S1
 block. Note for **trace**: commit 3105385e6 (on top of 66f48678a) lets
 `docs/prd/flows/` hold flow files beyond the 11 PRD flows; before it,
 `test_flows.py` failed on any extra file such as `crash.json`.
+
+## The Linux gate on this Mac (first real runs, 2026-10-25)
+
+`test-gate-linux.sh` ran in Docker (rust 1.99.1, slot then Docker lock,
+`--memory=6g`, one cargo build job, 3 test threads). The first two runs were
+GATE RED. Each failure, classified (coordinator's scheme: (a) this Mac or
+VM, (b) pre-existing on the base, (c) caused by wave 1):
+
+| Failure | Class | What was done |
+|---|---|---|
+| `ptyd_backend` (7 tests): "k2-ptyd binary not found" | gap in the gate itself: `cargo test -p k2-core` builds `k2-ptyd` only as a library, so any fresh gate box fails these | **Fixed** in `scripts/test-gate-linux.sh` (now owned by this task, coordinator 2026-10-25): build `k2-ptyd --bin k2-ptyd` first into the same target dir, as CI does. Commit a02c8a719 |
+| `terminal::daemon_pty::tests::child_self_exit_releases_pty_master_fd`, `kill_releases_pty_master_fd_with_arc_retained`: "lsof must be runnable: NotFound" | (a) the lab's gate image had no `lsof` | **Fixed**: `gate.Dockerfile` installs `lsof` (image `k2-lab-gate:2`). Commit b6d5e22fa |
+| `could not compile k2-daemon (lib test)`: rustc `signal: 9, SIGKILL` | (a) the 6 GB container cap: with ONE build job, the single rustc for the k2-daemon lib-test crate needs more than 6 GB | **Not fixable here under the rules** (no parallelism left to lower; the cap may not be raised). Reported to the coordinator. The report shows it as "OOM-killed under the 6 GB cap" |
+
+The gate's per-package logs now stay in the bundle
+(`parity/linux-gate-logs/`, a symlink from the gate's workdir to a bind mount).
+No class (b) or (c) failure was found in the gate's k2-core results.
