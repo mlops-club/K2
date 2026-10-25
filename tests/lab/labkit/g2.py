@@ -95,6 +95,39 @@ class Scenario:
         return doc
 
 
+DAEMON_BACK_S = 90  # how long a client waits for a restarting daemon, as the app does
+
+
+def daemon_down(status, text):
+    """The daemon is not there to answer yet: connection refused (it is
+    down: the request never reached it, so sending again cannot duplicate
+    it) or 503 while it boots (`"state":"migrating"`)."""
+    return (status == 0 and "refused" in text) or (status == 503 and '"migrating"' in text)
+
+
+def send_waiting_for_daemon(req, log=None):
+    """urlopen that waits (up to DAEMON_BACK_S) while the daemon is down or
+    booting, like the app reconnecting; anything else is returned as is."""
+    end = time.monotonic() + DAEMON_BACK_S
+    waited = False
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
+                status, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            status, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            status, text = 0, "request failed: %s" % e
+        if not daemon_down(status, text) or time.monotonic() >= end:
+            if waited and log:
+                log("the daemon answered again (HTTP %s)" % status)
+            return status, text
+        if not waited and log:
+            log("the daemon is down or booting (%s); waiting for it, as the app does" % text[:80])
+        waited = True
+        time.sleep(0.5)
+
+
 class Client:
     """HTTP and WS to the topology, and its evidence."""
 
@@ -122,14 +155,8 @@ class Client:
             headers["Content-Type"] = "application/json"
         else:
             data = b"" if method == "POST" else None
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
-                status, text = r.status, r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            status, text = e.code, e.read().decode("utf-8", "replace")
-        except OSError as e:
-            status, text = 0, "request failed: %s" % e
+        status, text = send_waiting_for_daemon(urllib.request.Request(url, data=data, method=method, headers=headers),
+                                               self.log)
         self.log("%s :%s%s %s -> %s %s" % (method, port or self.fleet.port, path,
                                           json.dumps(form if form is not None else body), status, text[:500]))
         try:
@@ -241,6 +268,16 @@ class Client:
 
     # ── grid ────────────────────────────────────────────────────────────
     def attach(self, session):
+        end = time.monotonic() + DAEMON_BACK_S
+        while True:
+            try:
+                return self._attach(session)
+            except ConnectionRefusedError:
+                if time.monotonic() >= end:
+                    raise
+                time.sleep(0.5)
+
+    def _attach(self, session):
         sock = wslib.WebSocket("127.0.0.1", self.fleet.port, "/cli/sessions/grid?" + urllib.parse.urlencode(
             {"session": session, "token": self.fleet.token()}), timeout=DEADLINE_S)
         return sock, s1.Grid()

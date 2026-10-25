@@ -51,9 +51,11 @@ import uuid
 if __package__ in (None, ""):
     # Run as a script: make `labkit` importable from tests/lab.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from labkit import g2  # noqa: E402
     from labkit import s1  # noqa: E402
     from labkit import ws as wslib  # noqa: E402
 else:
+    from . import g2  # noqa: E402
     from . import s1  # noqa: E402
     from . import ws as wslib  # noqa: E402
 
@@ -76,9 +78,11 @@ def read_jsonl(path):
                 line = line.strip()
                 if line:
                     try:
-                        out.append(json.loads(line))
+                        v = json.loads(line)
                     except ValueError:
-                        pass
+                        continue
+                    if isinstance(v, dict):  # a CLI killed mid-write leaves a torn line
+                        out.append(v)
     return out
 
 
@@ -140,13 +144,8 @@ class W1:
             data = b"" if method == "POST" else None
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         shown = form if form is not None else body
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
-                status, text = r.status, r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            status, text = e.code, e.read().decode("utf-8", "replace")
-        except OSError as e:
-            status, text = 0, "request failed: %s" % e
+        # Waits while the daemon is down or booting (--chaos), as the app does.
+        status, text = g2.send_waiting_for_daemon(req, self.log)
         self.log("%s %s %s -> %s %s" % (method, path, json.dumps(shown), status, text[:600]))
         try:
             parsed = json.loads(text)
