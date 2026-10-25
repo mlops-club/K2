@@ -167,6 +167,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
     let mut hooks = crate::hook_ingest::subscribe();
     let mut events = crate::session_events::subscribe();
 
+    let token = super::enroll::hello_token(cfg).await?;
     let (ws, _) = match tokio::time::timeout(t.connect, tokio_tungstenite::connect_async(cfg.attach_url.as_str())).await {
         Ok(r) => r.map_err(|e| format!("connect: {e}"))?,
         Err(_) => return Err(format!("connect: no answer within {:?}", t.connect)),
@@ -175,7 +176,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
     let hello = Frame::Hello {
         protocol: PROTOCOL,
         host_name: cfg.host_name.clone(),
-        token: cfg.token.clone(),
+        token,
         labels: cfg.labels.clone(),
         // S9 fills this with the placements this host still runs.
         resume: vec![],

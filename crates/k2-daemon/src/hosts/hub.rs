@@ -58,8 +58,8 @@ where
                 )
                 .await;
             };
-            if token.is_empty() || !crate::routes::http::ct_eq_token(&presented, token) {
-                return refuse(&mut ws, "bad_token", "the host token doesn't match this controller's").await;
+            if let Err(r) = super::enroll::admit_hello(remote, token, &presented, &host_name) {
+                return refuse(&mut ws, r.code, &r.message).await;
             }
             if host_name.trim().is_empty() {
                 return refuse(&mut ws, "protocol", "host_name is empty").await;
