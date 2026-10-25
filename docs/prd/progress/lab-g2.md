@@ -182,8 +182,75 @@ tests/lab/run_tests.sh                                            # the lab's ow
 ## Status
 
 - Milestones: diagrams written; first working slice (fleet procs: S1, S2,
-  S3, S5 green; S4 red on a daemon gap, below).
-- Next: chaos runs; solo G2; compose backend and one compose run.
+  S3, S5 green; S4 red on a daemon gap); chaos runs classified; G2 on solo.
+- Next: the compose run (Docker lock), then a Linux gate run to prove the
+  gate fixes below.
+
+### Daemon gaps the lab found (for the owners)
+
+| Gap | Scenario | Evidence |
+|---|---|---|
+| On a host or controller, `k2 msg` hands every message to the outbox and ignores `wake` (`workspace_msg.rs:951`, `delivery_drain::send`); the outbox only delivers to a placed agent, so a sleeping agent is never woken and the message waits for the 7-day TTL | S4 on fleet; I2 | being fixed by the outbox worker |
+| The controller's outbox matches the recipient only against placement ids (`delivery_drain.rs:282`): a workspace agent (placed under its project id) addressed by its workspace name, as agents address each other today (`k2 connections list`), never matches, so the message waits for the TTL. On solo the same `k2 msg <workspace>` and inbox compose deliver. The outbox's own test used bare v2 agent names, which solo's `k2 msg` does not accept (`workspace_not_found`) | S3, S6 on fleet; I2 | `lab-runs/dev/r4` (solo: PASS), `r5` (fleet: queued) |
+| A host exits at once on SIGTERM: no drain, the turn in progress never ends, nothing resumes the agent | S8 | W3 |
+| A restarted controller does not re-adopt running agents (no `ctl.adopt`, placements 0) | S9 | W3 |
+
+### Chaos runs and how each red was classified
+
+`--chaos seed=N`: under chaos the scenario set repeats in rounds for at
+least 180 s (`LAB_CHAOS_MIN_S`), so chaos acts even on solo, where S3 to S9
+take ~10 s; a scenario passes only if it passed in every round. Every red
+was matched to `chaos.log` by time. Classes: **K2** (a daemon gap, table
+above), **allowed** (a loss the PRD failure table allows: the turn in
+progress when the CLI, or on solo the daemon, dies), **lab** (the lab
+client or manager; fixed, commit given).
+
+| Run | Result | Reds and class |
+|---|---|---|
+| fleet 4117 (`22-04-38Z`, 29 steps: 10 host, 6 controller, 2 CLI kills) | S1-S3, S5-S7 PASS | S4, S8, S9, I2: K2 |
+| fleet 7 (`22-12-42Z`) | as 4117, plus S7 | S7: lab: chaos killed S7's CLI 0.1 s after its banner and S7 gave up; it now reopens the agent (the next need) and counts it (3beb44399) |
+| fleet 2026 (`22-21-26Z`) | as 4117, plus S6 | S6: lab: its last read of the sender host's outbox raced a chaos restart of that host; it now waits for the host (3beb44399) |
+| fleet 4117, first try (`21-55-47Z`) | — | lab: two lab processes wrote back each other's stale pids (chaos "killed" a gone pid, then started a second host-1), and chaos counted host helper CLIs as agents. Fixed: per-process state updates under a file lock, no signal unless the pid runs this run's daemon, agents only (3beb44399) |
+| solo, first tries (`22-42-41Z`, `22-46-34Z`) | most rounds red | lab: the client gave up on "connection refused" and 503 `migrating` while chaos restarted the daemon, kept the old token after a restart (a daemon issues a new one each boot, `daemon_main.rs:811`), and retried nothing a dying daemon dropped. Fixed: wait for the daemon as the app does, rebuild each retry with the current token, resend only idempotent requests, never `k2 msg` or inbox compose (cb8ec65e7, 08bfdc7a9) |
+| solo 7 (`23-03-46Z`, 2 rounds) | all PASS; I1-I4 PASS | none |
+| solo 4117 (`23-07-16Z`, 8 rounds) | S4 red in round 8 | allowed: the solo daemon was killed 7 times in that round; the second wake's CLI died mid-turn. The client now does every w1 turn again when its CLI died first, counted (3a97361e3, 97145c43d) |
+| solo 2026 (`23-13-22Z`, 6 rounds) | S5 red in rounds 5, 6; S7 in round 4 | S5: allowed (daemon or CLI killed mid-turn), same fix. S7: lab: chaos killed S7's CLI 0.16 s before S7 did; S7 now accepts a CLI already gone (97145c43d) |
+| fleet 7, after those fixes (`23-17-20Z`) | S1, S2, S7 PASS; I1, I3, I4 PASS | S3, S4, S8, S9, I2: K2. S5: allowed (the heartbeat's CLI killed at 23:22:17; this run loaded w1 before the redo fix). S6: lab: chaos killed host-2 0.5 s before placement, so alice and bob both went to host-1 (correct placement); S6 now sends from any other host (6c9e62056) |
+
+I1 (never two live CLIs for one agent; epochs strictly increasing across 6
+to 7 controller kills per run), I3 and I4 passed in every chaos run.
+
+### G2 on solo
+
+`prove.sh G2 --topology solo --parity none` (`lab-runs/G2/2026-10-25T22-41-34Z`):
+S1 to S7 PASS, S8 and S9 n/a (not on solo in the PRD matrix), I1 to I4
+PASS. S12 is NOT RUN (no client yet), so the gate stays red.
+
+### Linux gate fixes (wave-1 gate: k2-daemon 5179 passed, 2 failed)
+
+Both failures were the gate container, not the code (20dfc130d):
+
+- `root_helper::cli_refresh::tests::inspect_names_a_linked_or_writable_directory`
+  expects a temp dir root does not own; the gate ran every test as root.
+  `test-gate-linux.sh` takes `K2_GATE_TEST_USER=<user>` (root only): the
+  workdir is handed to that user and the k2-ptyd build and package tests run
+  as it (`runuser`); the root-only allowlisted `cell_egress` run stays root.
+  Unset, the script runs as before. `linux_gate.sh` creates `k2gate` (uid
+  10001) in the container and sets it.
+- `sidecar_cli_integration` `resume_after_restart_cursor_agent`: its fake CLI
+  calls `/usr/bin/uuidgen`; `gate.Dockerfile` adds `uuid-runtime`
+  (`k2-lab-gate:3`).
+- Not yet proven by a gate run (next, under the Docker lock).
+
+Class (b), pre-existing, for the owner: ignored tests that are not on the
+gate's allowlist (each is ignored on base; the allowlist is unchanged since
+base). The gate fails on them until each is allowlisted or run:
+
+- `compute_tenant_guard::tests::a_headless_daemons_cell_socket_is_closed_to_tenants`
+- `compute_tenant_guard::tests::a_tenant_users_loopback_client_is_found`
+- `crates/k2-daemon/src/apps/mod.rs - apps::admission (line 42)` (doctest)
+- `sql::pgmove::real_move::real_move_16_to_17_rollback_forget_and_refusals`
+- `sql::tests::real_pg_majors::real_pg_majors_side_by_side`
 
 ### First working slice: `prove.sh G2 --topology fleet --parity none`
 
