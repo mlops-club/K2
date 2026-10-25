@@ -247,9 +247,14 @@ set.
   removes another holder's lock. The gate container runs on 3 CPUs with the
   gate's own `K2_GATE_THREADS=3`, last in the run, never alongside another
   heavy build. The lab never uses kind (namespace `k2-kind` is the owner's).
-  Memory: the gate container runs with `--memory=3g --memory-swap=3g` (the
-  8 GB Docker VM is shared with kind; the owner's pod was OOM-killed at
-  16:26 while another worker's container ran). An OOM kill is reported as
+  Memory: every container is capped (the 8 GB Docker VM is shared with
+  kind; the owner's pod was OOM-killed at 16:26 while another worker's
+  container ran). The gate compiles k2-core and k2-daemon for Linux (about
+  5 GB), so per the coordinator it alone gets `--memory=6g --memory-swap=6g`
+  with ONE cargo build job (a mounted `config.toml`; the gate's `env -i`
+  drops `CARGO_BUILD_JOBS`), 3 CPUs and 3 test threads, with nothing else in
+  Docker (the lock). The lab never touches `k2-kind`, `k2-kind-proxy` or
+  `k2-kind-dist-fake`. An OOM kill is reported as
   such, and the fix is lower parallelism, never a larger cap.
   Cargo queue: every lab cargo command runs in a machine-wide slot
   (`~/.cache/k2-dist-cargo-slot.sh`, at most 2 at once): `lab_cargo` wraps

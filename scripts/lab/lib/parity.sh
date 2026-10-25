@@ -242,7 +242,7 @@ parity_linux_gate_finish() {
     if grep -q '^GATE GREEN' "$log"; then
         result_json linux-gate "$title" pass "" "parity/linux-gate.log" $rc $secs
     elif [ "$rc" -eq 137 ] || grep -qiE 'out of memory|oom-?kill|signal: 9, SIGKILL' "$log"; then
-        result_json linux-gate "$title" fail "OOM-killed under the 3 GB cap (exit $rc): lower the gate's parallelism (CARGO_BUILD_JOBS / LAB_TEST_THREADS), never the cap" "parity/linux-gate.log" $rc $secs
+        result_json linux-gate "$title" fail "OOM-killed under the 6 GB cap (exit $rc): lower the gate's parallelism (LAB_TEST_THREADS; build jobs are already 1), never the cap" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run (held by the lab' "$log"; then
         result_json linux-gate "$title" not_run "$(grep -m1 '^refusing to run (held by the lab' "$log" | sed 's/^refusing to run //')" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run' "$log"; then
