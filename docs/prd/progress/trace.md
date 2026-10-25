@@ -165,16 +165,54 @@ HOME=$(mktemp -d) cargo test -p k2-core --lib -- trace::
 
 # The runner's flow logic on hand-written traces (no daemon)
 python3 -I -B tests/lab/scenarios/test_g1_solo.py
+
+# Spawn latency (NFR1): S1 x9 with the trace off and on, and against a
+# k2-daemon built from the base commit when G1_BASE_DAEMON names one
+G1_BASE_DAEMON=/path/to/base/k2-daemon tests/lab/scenarios/g1_solo.sh --bench 9
 ```
+
+Output lands in `lab-runs/G1-trace/<ts>/` (gitignored): `solo/out/trace.jsonl`
+(daemon, fake agent and lab events merged), `solo/out/flows.json` (the G1
+verdicts and every flow on the whole trace), `S1/`, `S7.json`,
+`solo/daemon.trace.jsonl` (the daemon's own trace).
 
 ## Status
 
-- **Milestone:** first working slice. `tests/lab/scenarios/g1_solo.sh`
-  on solo: S1 PASS, S7 PASS, and the checker passes `spawn` (7 of 8
-  steps; `placement.choose` is not in solo), `hook` (5 of 5) and `crash`
-  (11 of 11). Sink unit tests: 11 passed.
-- **Next:** `cargo test -p k2-core` and `-p k2-daemon` (all `K2_*` unset,
-  temp HOME), clippy on the changed files, spawn latency trace off vs on.
+- **Milestone:** done (2026-10-25).
+- **Checks (all on this Mac, temp HOME, every `K2_*` unset, 3 jobs, 3
+  threads):**
+  - `tests/lab/scenarios/g1_solo.sh`: S1 PASS, S7 PASS; `spawn` PASS
+    (7 of 8 steps, `placement.choose` not in solo), `hook` PASS (5 of 5),
+    `crash` PASS (11 of 11). Bundle `lab-runs/G1-trace/2026-10-25T15-06-24Z`.
+  - Sink unit tests (`trace::`): 11 passed.
+  - `cargo test -p k2-core`: all pass (lib 3676 + 1 ignored, every
+    integration binary). Two environment notes: `tests/ptyd_backend.rs`
+    needs `cargo build -p k2-ptyd --bin k2-ptyd` first (8/8 then), and
+    `macos_keychain_tests` needs a short `$HOME` (the `security -i` line
+    carries the keychain path; 18/18 under `/tmp`). The keychain test is
+    macOS-only; neither touches trace code.
+  - `cargo test -p k2-daemon`: lib 4344 passed, 0 failed (5 ignored);
+    162 binaries, 5143 passed. Two failed in that run, which a
+    coordinator SIGSTOP froze for 3 h and which ran at load 140 to 170:
+    `heartbeat_daemon_tick::headless_daemon_fires_with_no_external_ticker_within_150s`
+    passes alone; `connect_login_edge::anonymous_app_spray_closes_only_anonymous_app_logins`
+    failed alone at load 165 (65 of 65 anonymous app logins got 401, the
+    60-failure ceiling never refused one) and passes on this branch 3 of 3
+    at low load and on the base commit at low load. Not reproducible since;
+    no trace line is on the login path, and with `K2_TRACE_FILE` unset none
+    runs. Worth a soak under load by whoever owns login throttling.
+  - Clippy (`-p k2-core -p k2-daemon --all-targets`): 0 findings on any
+    added line, 0 in `trace/`. Pre-existing: 6 deny-level errors in
+    `k2-core` (`deprecated/delegate.rs`, `terminal/grid_snapshot.rs`) and 3
+    in `k2-daemon` (`compute_admin/tests.rs`, `llm_routes.rs`,
+    `mail/external_imap.rs`) fail clippy on base too; run with
+    `-A clippy::deprecated_semver -A clippy::while_immutable_condition` to
+    see the rest.
+  - NFR1, `g1_solo.sh --bench 9` (S1 `spawn_to_banner_ms` median): base
+    commit 56.1 ms, this branch trace off 54.6 ms (-2.7%), trace on
+    57.2 ms (+2.0%). Within 5%.
+  - Lab suite `tests/lab/run_tests.sh`: 28 Python + fake-agent tests OK;
+    `extract_flows.py --check`: 11 flows in sync; `test_g1_solo.py`: 6 OK.
 - **Answered:** `crash.json` lives in `docs/prd/flows/` (coordinator,
   2026-10-24); the lab's `3105385e6` (cherry-picked here, drops out at
   rebase) lets `test_flows.py` accept flow files beyond the 11 PRD ones.
@@ -234,6 +272,34 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
   `cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent` builds only
   the bin named `k2-daemon`, so the fake agent was never built.
 
+### Hand-off: `prove.sh G1 --topology solo` (lab worker)
+
+1. Start the solo daemon with `K2_TRACE_FILE=$RUN/daemon.trace.jsonl` (add
+   it to `SOLO_ENV` in `scripts/lab/topology/solo.sh`; `g1_solo.sh` does it
+   with a two-line wrapper only because it may not edit `solo.sh`).
+2. Merge `daemon.trace.jsonl`, `fake-agent.trace.jsonl` and the
+   scenarios' lab events, sorted by `ts` (the checker sorts too).
+3. Run S7 as `tests/lab/scenarios/g1_solo.py`'s `Crash` does: register the
+   workspace (`/cli/projects/add-from-path`), spawn a `tab-<uuid>` agent
+   with `--session-id X --turn-ms 30000`, type, wait for the prompt in the
+   transcript, `kill -9` the CLI pid (`cli.exec`'s `pid`), wait for
+   `host.agent_exit` on that pane, then spawn the same agent with no
+   command. Or call `Crash(...).run()` and `check_g1(...)` directly.
+4. Judge `spawn`, `hook` and `crash` on their solo steps:
+   `g1_solo.NOT_IN_SOLO` lists the step to show as "not in solo"
+   (`spawn` step 2, `placement.choose`). Check each flow on its
+   scenario's events (`g1_solo.scoped`), so another agent's events never
+   complete it.
+5. `crates/k2-daemon` must call `k2_core::trace::boot_check()` at boot
+   (integration, `daemon_main.rs`), and `deploy/README.md` gains
+   `K2_TRACE_FILE`.
+
+### Flow steps that exist only with remote hosts (P2)
+
+- `spawn` step 2, `placement.choose`. Every other step of `spawn`, `hook`
+  and `crash` has a solo emission point (table above). In P2 the `host.*`,
+  `cell.*` and `ptyd.*` events move to `src: "k2-host"` / `"k2-ptyd"`.
+
 ### Rebase notes (lines in files other workers own)
 
 - `crates/k2-daemon/src/v2_spawn.rs`: one line, first line of `spawn_session`.
@@ -241,3 +307,6 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
   `serve_session_grid_connection`.
 - `crates/k2-core/src/terminal/daemon_pty.rs`: trace lines only, plus
   `write` converts `bytes` once (to count them) and passes the `Cow` on.
+- Cherry-picked lab commits that drop out at rebase: `3105385e6`
+  (test_flows accepts extra flow files), `9cb30dde7` (fake agent
+  `cli.hook` before the hook, `cli.hook.done` after).
