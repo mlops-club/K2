@@ -185,8 +185,7 @@ impl AgentSession {
     pub fn cwd(&self) -> String {
         self.0
             .cwd
-            .as_ref()
-            .map(PathBuf::as_path)
+            .as_deref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
