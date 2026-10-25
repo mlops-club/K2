@@ -391,3 +391,39 @@ fn cli_hook_is_traced_before_the_hook_runs_and_done_after() {
         ]
     );
 }
+
+/// The evidence the G2 lab's invariant checkers read: `host` on every
+/// event, the cwd on `cli.exec`, and the memory file's sha256 on `cli.exec`,
+/// `cli.turn.end` and `cli.exit`. A `[[remember: …]]` directive (here behind
+/// a `k2 msg`-style prefix) writes memory; a resume starts with exactly the
+/// hash the previous process ended with (I3).
+#[test]
+fn trace_carries_host_cwd_and_memory_hash_across_a_resume() {
+    let b = Box_::new();
+    let trace = b.home().join("trace.jsonl");
+    let env = [("K2_FAKE_AGENT_TRACE", trace.to_str().unwrap()), ("K2_FAKE_AGENT_HOST", "host-2")];
+    let o = b.run_in(BIN, &["--session-id", SID], "[from lab] note [[remember: blue door]] [[turn-ms=5]]\n", &env);
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(fs::read_to_string(b.memory()).unwrap(), "# Memory\n\n- blue door\n");
+    let o = b.run_in(BIN, &["--resume", SID], "again\n", &env);
+    assert!(o.status.success(), "{o:?}");
+
+    let t = lines(&trace);
+    assert!(t.iter().all(|v| v["host"] == "host-2"), "{t:?}");
+    let pick = |event: &str| -> Vec<&Value> { t.iter().filter(|v| v["event"] == event).collect() };
+    let execs = pick("cli.exec");
+    let exits = pick("cli.exit");
+    let ends = pick("cli.turn.end");
+    assert_eq!((execs.len(), exits.len(), ends.len()), (2, 2, 2));
+    let cwd = fs::canonicalize(b.cwd.path()).unwrap();
+    assert_eq!(fs::canonicalize(execs[0]["attrs"]["cwd"].as_str().unwrap()).unwrap(), cwd);
+    assert_eq!(execs[0]["attrs"]["memory_sha256"], "absent");
+    assert_eq!(ends[0]["attrs"]["turn_ms"], 5);
+    let h = ends[0]["attrs"]["memory_sha256"].as_str().unwrap();
+    assert_eq!(h.len(), 64);
+    assert_eq!(exits[0]["attrs"]["memory_sha256"], h);
+    assert_eq!(execs[1]["attrs"]["resumed"], true);
+    assert_eq!(execs[1]["session_id"], SID);
+    assert_eq!(execs[1]["attrs"]["memory_sha256"], h, "I3: the resume starts with the memory the last run left");
+    assert_eq!(exits[1]["attrs"]["memory_sha256"], h);
+}
