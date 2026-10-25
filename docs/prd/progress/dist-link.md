@@ -375,6 +375,7 @@ W3 results:
 | two-process check 10, S9 (run `20261025T213031Z`) | spawn through the controller, type a prompt (the turn is running: the prompt is in the transcript), `kill -TERM` the controller, start it again: it restores 4 placements, the host relinks and all 4 are **Adopted**; the agent's pid and parent are unchanged (`12929 8664`, the host); the client re-attaches through the new controller and sees banner, prompt and reply in order (positions 0, 81, 95); the prompt is in the transcript once. 8/8 |
 | two-process check 11, S8 (same run) | `kill -9` the host mid-turn: the controller reports `lost: [host-1]`; spawning the agent → 502 "lost"; grid → "is lost" error; the host restarts and links: its dead placements are **Gone**; the agent spawns fresh on the host (`reused: false`), the interrupted prompt is in its transcript and it resumes the same conversation. 10/10 |
 | two-process, every check | **12/12 PASS** (S1, W1 25/25 and the rest unchanged) |
+| two-process on the merged tree (wave2-preview + outbox 86276d0d5 + lab's fake-agent fix 2c1bc8cb9; run `20261025T232814Z`) | **12/12 PASS**: S1, W1 25/25 (S4 wake through the outbox's controller path), S9 8/8 (same pid), S8 10/10 |
 | `K2_ROLE=all` regression after W3: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: **5204 passed, 0 failed**, 6 ignored |
 | `cargo test -p k2-core -- --test-threads=3` (W3 adds `db::shared_path`), throwaway HOME | 17 test binaries: **3866 passed, 0 failed**, 1 ignored (fork_tab_repair green since `d543108d5`) |
 
