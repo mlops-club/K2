@@ -200,7 +200,7 @@ parity_contract() {
 # this Mac's Docker. The Docker side (lock, limits, mounts, volumes) is
 # scripts/lab/lib/linux_gate.sh; here it runs inside a cargo slot, last in
 # the run, with its output in parity/linux-gate.log.
-GATE_IMAGE_TAG=k2-lab-gate:1
+GATE_IMAGE_TAG=k2-lab-gate:2
 
 # LAB_LINUX_GATE=hold (prove.sh --linux-gate hold):
 # never touch Docker; the gate is NOT RUN with LAB_LINUX_GATE_HOLD_REASON.

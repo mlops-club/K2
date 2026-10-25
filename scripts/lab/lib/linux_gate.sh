@@ -31,7 +31,7 @@
 # removes the link, not the cache). Nothing from $HOME is mounted.
 set -uo pipefail
 repo=$1 common=$2 sha=$3 run=$4 name=$5
-image=k2-lab-gate:1
+image=k2-lab-gate:2
 target_vol=k2-lab-gate-target
 registry_vol=k2-lab-gate-cargo-registry
 lock="$HOME/.cache/k2-dist-docker.lock"
