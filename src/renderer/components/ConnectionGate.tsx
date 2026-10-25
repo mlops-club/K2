@@ -61,6 +61,7 @@ import { isWebClient } from '@/lib/is-web'
 import { withCliTokenQuery, withDaemonFetch } from '@/web/session-token'
 import {
   deriveRecovery,
+  RECOVERY_RECONNECT_MAX_MS,
   recoveryPollMs,
   recoveryStatusText,
   type RemoteRecoveryState,
@@ -157,6 +158,11 @@ const REMOTE_BOOT_STATUS_TIMEOUT_MS = 4000
  *  transport error we treat the session as 'unknown' (a blip, not dead)
  *  and proceed to mount rather than nuking a good session. */
 const REMOTE_WHOAMI_TIMEOUT_MS = 4000
+/** Hard ceiling on one gate poll (tick). Every await in a tick has its own
+ *  timeout (the longest legitimate tick, a first connect, is ~31 s), but a
+ *  request that never settles, abort or not, must not end the poll loop:
+ *  past this the tick is abandoned and the next one scheduled. */
+const GATE_TICK_WATCHDOG_MS = 45_000
 
 /** Issue #4 (never-strand): on the FIRST connect with a remembered token we
  *  must POSITIVELY confirm the session is alive before mounting. A remote
@@ -588,7 +594,12 @@ function wedgeReloadFlagKey(hostKey: string): string {
 /**
  * When to ask the out-of-webview arbiter whether the host is actually up.
  *
- * Sustained 60s fail and GH#57 flap still qualify. After first accept, a
+ * Sustained 60s fail (while the probe in hand still fails) and GH#57 flap
+ * qualify. A sustained run whose latest probe SUCCEEDED is a host coming
+ * back after a long outage (a pod roll, a reboot), not a wedge: the
+ * failure clock only clears after WEDGE_CLEAR_OK_STREAK oks, and asking
+ * the arbiter then saw 'ready' and auto-reloaded a working page (the
+ * k2-kind-dist roll, 2026-10-25). After first accept, a
  * single webview `/boot-status` miss also qualifies: the 25s health poll
  * can never hit 4 reconnect banners in 45s, and "Message the agent"
  * (`POST /cli/terminal/send-message`) keeps a poisoned WKWebView pool
@@ -601,7 +612,8 @@ export function shouldConsultArbiter(opts: {
   sustainedFail: boolean
   flapFail: boolean
 }): boolean {
-  if (opts.sustainedFail || opts.flapFail) return true
+  if (opts.flapFail) return true
+  if (opts.sustainedFail) return !opts.probeOk
   return opts.acceptedOnce && !opts.probeOk
 }
 
@@ -937,6 +949,10 @@ export function ConnectionGate(): React.ReactElement {
     // (a token-sent poll answered with a stranger's view). Re-armed by the
     // next full view.
     let staleViewReviveStarted = false
+    // The current tick's generation. A newer tick (forceProbe, or the
+    // watchdog abandoning a stuck one) makes an older in-flight tick stale:
+    // it stops at its next await instead of writing late results.
+    let tickGen = 0
 
     // A host switch must re-poll from scratch: drop any prior accept so
     // the overlay shows while the new host is contacted. (The recovery
@@ -970,17 +986,53 @@ export function ConnectionGate(): React.ReactElement {
       }
       if (timeoutId !== null) clearTimeout(timeoutId)
       timeoutId = setTimeout(() => {
-        void tick()
+        void runTick()
       }, jittered(REMOTE_HEALTH_POLL_MS))
     }
 
-    const tick = async (): Promise<void> => {
+    /** The next poll's delay after a failed or abandoned tick: the soft
+     *  backoff once accepted, the tight first-connect cadence before. */
+    const failedPollDelayMs = (): number =>
+      jittered(
+        isRemote && acceptedOnce
+          ? recoveryPollMs(useConnectHostStore.getState().recovery, attemptsLocal)
+          : 500,
+      )
+
+    /** Run one tick under the watchdog. The poll loop must never end
+     *  because a tick hung or threw: either way the next one is scheduled. */
+    const runTick = async (): Promise<void> => {
+      const gen = ++tickGen
+      let watchdogId: ReturnType<typeof setTimeout> | null = null
+      const watchdog = new Promise<'timeout'>((resolve) => {
+        watchdogId = setTimeout(() => resolve('timeout'), GATE_TICK_WATCHDOG_MS)
+      })
+      try {
+        const outcome = await Promise.race([tick(gen).then(() => 'done' as const), watchdog])
+        if (outcome === 'timeout' && !cancelled && gen === tickGen) {
+          console.warn('[connection-gate] a poll did not settle in', GATE_TICK_WATCHDOG_MS, 'ms; abandoning it')
+          logRemotePath('tick-watchdog', { acceptedOnce, attempts: attemptsLocal })
+          tickGen += 1 // the stuck tick is stale from here on
+          timeoutId = setTimeout(() => { void runTick() }, failedPollDelayMs())
+        }
+      } catch (err) {
+        if (!cancelled && gen === tickGen) {
+          console.error('[connection-gate] poll failed; retrying:', err)
+          timeoutId = setTimeout(() => { void runTick() }, failedPollDelayMs())
+        }
+      } finally {
+        if (watchdogId !== null) clearTimeout(watchdogId)
+      }
+    }
+
+    const tick = async (gen: number): Promise<void> => {
+      const stale = (): boolean => cancelled || gen !== tickGen
       // Never poll toward a mount we can't authenticate: a remote host
       // with no session token must sign in first (the effect above opens
       // RemoteSignIn). Park in 'wait' until a token lands — selectHost /
       // setHostToken re-key this effect when the session is obtained.
       if (remoteNeedsAuth) {
-        if (cancelled) return
+        if (stale()) return
         setDecision({ kind: 'wait', reason: 'remote-needs-auth' })
         useConnectHostStore.getState().setConnectionStatus('connecting')
         return
@@ -990,11 +1042,15 @@ export function ConnectionGate(): React.ReactElement {
       // First-connect and recovery paths still run when visible. WS
       // onclose still detects real drops for open tabs; a hidden tab
       // re-probes once on become-visible.
+      // Not while recovering, though: the WS-drop path (forceProbe) clears
+      // the pending timer, so returning here while hidden would leave the
+      // banner up until a visibilitychange that may never come.
       if (
         isRemote &&
         acceptedOnce &&
         typeof document !== 'undefined' &&
-        document.visibilityState === 'hidden'
+        document.visibilityState === 'hidden' &&
+        useConnectHostStore.getState().recovery.kind === 'connected'
       ) {
         return
       }
@@ -1004,7 +1060,7 @@ export function ConnectionGate(): React.ReactElement {
       const probe = await fetchBootStatus(
         isRemote ? REMOTE_BOOT_STATUS_TIMEOUT_MS : 2000,
       )
-      if (cancelled) return
+      if (stale()) return
       // Policies keep their old input shape: any failed probe folds to null.
       const status = probe.kind === 'ok' ? probe.status : null
       // Wedge tracking (0.40.48 + 0.40.68): only a REMOTE host can wedge
@@ -1049,7 +1105,7 @@ export function ConnectionGate(): React.ReactElement {
         const active = useConnectHostStore.getState().activeHost
         if (active !== 'local') {
           const verdict = await arbiterBootProbe(active)
-          if (cancelled) return
+          if (stale()) return
           if (arbiterProvesHostReady(verdict)) {
             logRemotePath('arbiter-ready-webview-fail', {
               webview: probe.kind,
@@ -1078,6 +1134,8 @@ export function ConnectionGate(): React.ReactElement {
               )
               sessionStorage.setItem(flagKey, '1')
               window.location.reload()
+              // If the reload doesn't happen, the loop must not end here.
+              timeoutId = setTimeout(() => { void runTick() }, RECOVERY_RECONNECT_MAX_MS)
               return
             }
             // Step 2: the reload didn't clear it — only an app restart can.
@@ -1098,7 +1156,7 @@ export function ConnectionGate(): React.ReactElement {
       // migrations finish. Probe a real route before importing App.
       if (next.kind === 'accept' && !isRemote) {
         const cliReady = await probeCliReady()
-        if (cancelled) return
+        if (stale()) return
         next = holdAcceptIfCliNotReady(next, cliReady)
       }
       // 0.39.36: a REMOTE host's /boot-status accepting only proves the
@@ -1133,10 +1191,10 @@ export function ConnectionGate(): React.ReactElement {
             await new Promise((r) =>
               setTimeout(r, FIRST_CONNECT_PROBE_RETRY_DELAY_MS),
             )
-            if (cancelled) return
+            if (stale()) return
             probe = await probeRemoteSession()
           }
-          if (cancelled) return
+          if (stale()) return
           if (probe !== 'alive') {
             // 'dead' (401/403) OR persistent 'unknown' (the session could not
             // be confirmed after retries — a dead remembered token wiped by a
@@ -1321,7 +1379,13 @@ export function ConnectionGate(): React.ReactElement {
             // detector (thrash between connected and reconnecting).
             // D9: if R1 already stamped this episode, skip a second stamp
             // so we neither under-count nor double-count the same blip.
-            if (!wasR1FlapStampedThisEpisode()) {
+            // Only a transition from 'connected' is a flap: every failed
+            // poll of ONE long outage is not (it tripped the flap detector
+            // and the auto-reload when the host came back).
+            if (
+              !wasR1FlapStampedThisEpisode() &&
+              useConnectHostStore.getState().recovery.kind === 'connected'
+            ) {
               const t = Date.now()
               reconnectSurfacedAt = pruneFlapTimestamps([...reconnectSurfacedAt, t], t)
             }
@@ -1357,7 +1421,7 @@ export function ConnectionGate(): React.ReactElement {
           ? recoveryPollMs(useConnectHostStore.getState().recovery, attemptsLocal)
           : 500,
       )
-      timeoutId = setTimeout(() => { void tick() }, backoff)
+      timeoutId = setTimeout(() => { void runTick() }, backoff)
     }
 
     // 0.40.75: one probe when the tab becomes visible again after a
@@ -1371,7 +1435,7 @@ export function ConnectionGate(): React.ReactElement {
         clearTimeout(timeoutId)
         timeoutId = null
       }
-      void tick()
+      void runTick()
     }
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', onVisibilityChange)
@@ -1389,7 +1453,7 @@ export function ConnectionGate(): React.ReactElement {
             clearTimeout(timeoutId)
             timeoutId = null
           }
-          void tick()
+          void runTick()
         },
         stampFlap: () => {
           if (cancelled) return
@@ -1399,7 +1463,7 @@ export function ConnectionGate(): React.ReactElement {
       })
     }
 
-    void tick()
+    void runTick()
 
     return () => {
       cancelled = true

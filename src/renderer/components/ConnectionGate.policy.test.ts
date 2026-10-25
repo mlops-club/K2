@@ -355,6 +355,19 @@ describe('shouldConsultArbiter (post-accept poisoned pool)', () => {
     ).toBe(false)
   })
 
+  it('a sustained fail whose latest probe succeeded is a recovery, not a wedge', () => {
+    // A >60 s outage (a pod roll) ends with an ok probe while the failure
+    // clock still runs: asking the arbiter then reloaded a working page.
+    expect(
+      shouldConsultArbiter({
+        acceptedOnce: true,
+        probeOk: true,
+        sustainedFail: true,
+        flapFail: false,
+      }),
+    ).toBe(false)
+  })
+
   it('sustained fail or flap still consult even before first accept', () => {
     expect(
       shouldConsultArbiter({
