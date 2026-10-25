@@ -177,6 +177,8 @@ def check_i2(ev):
                 continue  # an HTTP error is a loud failure
             if r.get("success") is True:
                 continue
+            if m.get("kind") == "inbox" and m.get("http") == 200 and (r.get("id") or r.get("filename")):
+                continue  # solo inbox compose answers with the item it wrote
             if r.get("success") is False and (r.get("reason") or r.get("error")):
                 continue
             if m.get("rc") not in (None, 0) and m.get("response"):

@@ -135,6 +135,8 @@ class Invariants(unittest.TestCase):
         self.r.ledger(scenario="S3", to="bob", http=200, response={"success": True})
         self.r.ledger(scenario="S7", to="x", http=200, response={"success": False, "reason": "dormant_no_wake"})
         self.assertEqual(self.check("solo")["I2"]["status"], "pass")
+        self.r.ledger(scenario="S6", kind="inbox", to="bob", http=200, response={"id": "s6-item", "filename": "s6-item.md"})
+        self.assertEqual(self.check("solo")["I2"]["status"], "pass")
         self.r.ledger(scenario="S7", to="y", http=200, response={"success": False})
         self.assertEqual(self.check("solo")["I2"]["status"], "fail")
 
