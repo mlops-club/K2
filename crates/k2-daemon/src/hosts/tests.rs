@@ -41,6 +41,10 @@ impl Controller {
     async fn start() -> Self {
         // Leaked: each test owns its RemoteHost for the test's life.
         let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+        Self::start_on(remote).await
+    }
+
+    async fn start_on(remote: &'static RemoteHost) -> Self {
         let attach = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let attach_url = format!("ws://{}{ATTACH_PATH}", attach.local_addr().unwrap());
         tokio::spawn(async move {
@@ -317,7 +321,7 @@ async fn bad_token_and_wrong_protocol_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn link_loss_fails_waiting_requests_and_forgets_placements() {
+async fn link_loss_fails_waiting_requests_and_keeps_placements_as_lost() {
     let c = Controller::start().await;
     let mut host = fake_host(&c, "lossy").await;
     c.wait_hosts(1).await;
@@ -330,7 +334,21 @@ async fn link_loss_fails_waiting_requests_and_forgets_placements() {
     assert_eq!(status, "502 Bad Gateway", "{body}");
     assert!(body.contains("disconnected before it answered"), "{body}");
     c.wait_hosts(0).await;
-    assert!(c.remote.placements().is_empty());
+    // W3: a protocol-2 host's placement is kept, lost, not forgotten; the
+    // spawn that never got an answer reserved nothing.
+    assert_eq!(c.remote.placements().iter().map(|p| p.agent_id.as_str()).collect::<Vec<_>>(), vec!["kept"]);
+    assert_eq!(c.remote.status_json()["lost"], json!(["lossy"]));
+    // A protocol-1 host can't resume, so its placements are forgotten, as before W3.
+    let (mut v1, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
+    v1.send(Message::Text(r#"{"t":"hello","protocol":1,"host_name":"old","token":"test-bootstrap-token","labels":[]}"#.into()))
+        .await
+        .unwrap();
+    assert!(matches!(recv(&mut v1).await, Frame::Welcome { protocol: 1, .. }));
+    c.wait_hosts(1).await;
+    place(&c, &mut v1, "on-v1", "s-v1").await;
+    drop(v1);
+    c.wait_hosts(0).await;
+    assert_eq!(c.remote.placement("on-v1"), None, "a protocol-1 host's placements are forgotten");
     // A newer link with the same name replaces an older one.
     let mut old = fake_host(&c, "dup").await;
     let _new = fake_host(&c, "dup").await;
@@ -703,7 +721,10 @@ async fn protocol_1_hosts_are_still_accepted_and_resume_is_handed_to_adopt() {
         epoch: 7,
         ring: Some(super::proto::RingRange { start: 0, end: 512 }),
         child_alive: true,
+        ..Default::default()
     }];
+    let resume: Vec<super::proto::ResumePlacement> =
+        resume.into_iter().map(|r| super::proto::ResumePlacement { session_id: uuid::Uuid::new_v4().to_string(), ..r }).collect();
     let (mut v2, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
     send(&mut v2, &Frame::Hello { protocol: 2, host_name: "new-1".into(), token: TOKEN.into(), labels: vec![], resume: resume.clone() }).await;
     match recv(&mut v2).await {
@@ -712,12 +733,10 @@ async fn protocol_1_hosts_are_still_accepted_and_resume_is_handed_to_adopt() {
     }
     c.wait_hosts(2).await;
     assert_eq!(c.remote.link_protocol("new-1"), Some(2));
-    // adopt is a stub in W0: every resumed placement is deferred, none placed.
-    assert_eq!(
-        c.remote.adopt("new-1", &resume),
-        vec![("kept".to_string(), crate::agent_host::remote::AdoptDecision::Deferred)]
-    );
-    assert_eq!(c.remote.placement("kept"), None);
+    // W3: the hub reconciled the resume on link: an agent the controller
+    // didn't hold is adopted, at the host's epoch.
+    let p = c.remote.placement("kept").expect("adopted");
+    assert_eq!((p.host_id.as_str(), p.epoch.0), ("new-1", 7));
 }
 
 // ── W1: RemoteHost is the controller's AgentHost ─────────────────────────
@@ -912,4 +931,210 @@ async fn transcript_probe_asks_the_host_that_ran_the_project() {
     assert_eq!(tokio::task::block_in_place(|| remote.transcript_exists("claude", &sid, &project_s)), Some(true));
     tokio::task::block_in_place(|| crate::agent_host::AgentHost::unplace(remote, &key));
     link_task.abort();
+}
+
+// ── W3: placements survive controller restarts and host loss ────────────
+
+use crate::agent_host::remote::PlacementStore;
+
+/// A controller whose placements live in its own DB file.
+fn store_at(path: &std::path::Path) -> std::sync::Arc<PlacementStore> {
+    let conn = rusqlite::Connection::open(path).expect("open store db");
+    std::sync::Arc::new(PlacementStore::open(std::sync::Arc::new(parking_lot::ReentrantMutex::new(conn))).expect("store"))
+}
+
+impl Controller {
+    /// The same harness on a store-backed RemoteHost, restored from it.
+    async fn start_with_store(db: &std::path::Path) -> Self {
+        let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::with_store(store_at(db), None)));
+        remote.restore();
+        Self::start_on(remote).await
+    }
+}
+
+/// Spawn `agent` on a fake host through the S1 route; returns (session, epoch).
+async fn place_on(c: &Controller, host: &mut Ws, agent: &str) -> (String, u64) {
+    let session = uuid::Uuid::new_v4().to_string();
+    let epoch = place(c, host, agent, &session).await;
+    (session, epoch)
+}
+
+async fn hello_with(c: &Controller, name: &str, resume: Vec<super::proto::ResumePlacement>) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.expect("dial");
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume }).await;
+    assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
+    ws
+}
+
+fn resumed(agent: &str, session: &str, epoch: u64) -> super::proto::ResumePlacement {
+    super::proto::ResumePlacement {
+        agent_id: agent.into(),
+        session_id: session.into(),
+        epoch,
+        child_alive: true,
+        cwd: Some("/w".into()),
+        program: Some("claude".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placements_survive_a_controller_restart_and_are_adopted() {
+    let db = test_env::unique_temp_path("w3-store").with_extension("db");
+    // Controller #1 places an agent and dies.
+    let (session, epoch) = {
+        let c = Controller::start_with_store(&db).await;
+        let mut host = fake_host(&c, "h-s9").await;
+        c.wait_hosts(1).await;
+        place_on(&c, &mut host, "agent-s9").await
+    };
+    // Controller #2, same store: the placement is back, lost until h-s9 links.
+    let c = Controller::start_with_store(&db).await;
+    let p = c.remote.placement("agent-s9").expect("restored");
+    assert_eq!((p.host_id.as_str(), p.epoch.0, p.session_id.as_deref()), ("h-s9", epoch, Some(session.as_str())));
+    assert_eq!(c.remote.status_json()["lost"], json!(["h-s9"]));
+    let ctl: &'static dyn crate::agent_host::AgentHost = c.remote;
+    assert!(ctl.find_agent("agent-s9").is_some(), "still findable while lost");
+    // While lost: no grid, and a spawn of the agent is refused, not placed elsewhere (I1).
+    let mut other = fake_host(&c, "h-other").await;
+    c.wait_hosts(1).await;
+    let mut client = c.attach_grid(&session).await;
+    let v: Value = serde_json::from_str(within("error", client.next()).await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert!(v["payload"]["message"].as_str().unwrap().contains("is lost"), "{v}");
+    let (status, body) = c.remote.spawn(br#"{"agent_name":"agent-s9","command":"claude"}"#).await;
+    assert_eq!(status, "502 Bad Gateway", "{body}");
+    assert!(body.contains("lost"), "{body}");
+    // New epochs stay above the restored one.
+    let (_, e2) = place_on(&c, &mut other, "agent-new").await;
+    assert!(e2 > epoch, "{e2} > {epoch}");
+    // h-s9 comes back still running it at that epoch: adopted, grid works.
+    let mut host = hello_with(&c, "h-s9", vec![resumed("agent-s9", &session, epoch)]).await;
+    c.wait_hosts(2).await;
+    assert_eq!(c.remote.status_json()["lost"], json!([]));
+    let mut client = c.attach_grid(&session).await;
+    let stream = match recv(&mut host).await {
+        Frame::GridOpen { stream, session_id, epoch: e, .. } => {
+            assert_eq!((session_id.as_str(), e), (session.as_str(), epoch));
+            stream
+        }
+        other => panic!("expected grid.open, got {other:?}"),
+    };
+    send(&mut host, &Frame::GridData { stream, text: r#"{"event":"snapshot","payload":{"version":9}}"#.into(), ring_offset: Some(9) }).await;
+    assert!(within("snapshot", client.next()).await.unwrap().unwrap().to_text().unwrap().contains("snapshot"));
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_old_epoch_placement_is_released_and_a_missing_one_is_gone() {
+    let db = test_env::unique_temp_path("w3-epochs").with_extension("db");
+    let c = Controller::start_with_store(&db).await;
+    let mut host = fake_host(&c, "h-i1").await;
+    c.wait_hosts(1).await;
+    let (s_old, e_old) = place_on(&c, &mut host, "agent-i1").await;
+    let (_s_gone, _) = place_on(&c, &mut host, "agent-gone").await;
+    // The agent is closed and placed again: a newer epoch on the same host.
+    let remote = c.remote;
+    let close = tokio::spawn(async move { remote.close(br#"{"agent_name":"agent-i1","force":true}"#).await });
+    match recv(&mut host).await {
+        Frame::Close { req, .. } => send(&mut host, &Frame::Reply { req, status: "200 OK".into(), body: r#"{"closed":true}"#.into() }).await,
+        other => panic!("expected close, got {other:?}"),
+    }
+    within("close", close).await.unwrap();
+    let (s_new, e_new) = place_on(&c, &mut host, "agent-i1").await;
+    assert!(e_new > e_old);
+    drop(host);
+    within("lost", async {
+        while c.remote.status_json()["lost"] != json!(["h-i1"]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let ctl: &'static dyn crate::agent_host::AgentHost = c.remote;
+    let mut gone_events = ctl.events(&ctl.find_agent("agent-gone").expect("kept while lost"));
+    // h-i1 links again resuming the OLD epoch of agent-i1 and not agent-gone.
+    let mut host = hello_with(&c, "h-i1", vec![resumed("agent-i1", &s_old, e_old)]).await;
+    match recv(&mut host).await {
+        Frame::Release { agent_id, epoch, reason, .. } => {
+            assert_eq!((agent_id.as_str(), epoch), ("agent-i1", e_old));
+            assert!(reason.contains("stale"), "{reason}");
+        }
+        other => panic!("expected release, got {other:?}"),
+    }
+    // The controller's placement is untouched (the newer epoch, still lost
+    // until a resume names it); agent-gone is gone, with ChildExit.
+    let p = c.remote.placement("agent-i1").expect("kept");
+    assert_eq!((p.epoch.0, p.session_id.as_deref()), (e_new, Some(s_new.as_str())));
+    assert_eq!(c.remote.placement("agent-gone"), None);
+    assert!(matches!(within("ChildExit", gone_events.recv()).await, Ok(k2_core::terminal::AlacEvent::ChildExit(_))));
+    // And the store agrees after a restart.
+    let rows = store_at(&db).load().unwrap();
+    assert_eq!(rows.iter().map(|r| (r.agent_id.as_str(), r.epoch)).collect::<Vec<_>>(), vec![("agent-i1", e_new)]);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_host_resumes_its_agents_after_a_link_drop() {
+    let home = TempHome::new();
+    let _shim = AgentShim::install();
+    let _ = k2_core::db::init_for_tests();
+    let db = test_env::unique_temp_path("w3-real").with_extension("db");
+    let c = Controller::start_with_store(&db).await;
+    let cfg = HostConfig { attach_url: c.attach_url.clone(), token: TOKEN.into(), host_name: "w3-host".into(), labels: vec![] };
+    let link_cfg = cfg.clone();
+    let link1 = tokio::spawn(async move { link::serve_once(&link_cfg, &link::Timings::PRODUCTION, || {}).await });
+    c.wait_hosts(1).await;
+    let key = format!("w3-{}", uuid::Uuid::new_v4());
+    let cwd = home.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let req = crate::spawn::SpawnWorkspaceSessionRequest {
+        agent_name: key.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        command: Some("claude".into()),
+        args: Some(vec![]),
+        cols: 80,
+        rows: 24,
+        canonical_key: Some(key.clone()),
+        ..Default::default()
+    };
+    let remote = c.remote;
+    let (_, session) = tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req)).await.unwrap().unwrap();
+    let pid = crate::agent_host::host().find_agent(&key).unwrap().child_pid().unwrap();
+    // The link drops (the controller side of it, as on a restart).
+    link1.abort();
+    let _ = link1.await;
+    within("lost", async {
+        while c.remote.status_json()["lost"] != json!(["w3-host"]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // The agent keeps running on the host.
+    assert_eq!(crate::agent_host::host().find_agent(&key).unwrap().child_pid(), Some(pid));
+    // The host links again; its hello resumes the agent; adopted.
+    let mut adopted = c.remote.hook_events(); // keep a receiver alive; adoption is checked through the table
+    let link2 = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
+    within("adopted", async {
+        while c.remote.status_json()["lost"] != json!([]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let _ = adopted.try_recv();
+    let ctl: &'static dyn crate::agent_host::AgentHost = c.remote;
+    let again = ctl.find_agent(&key).expect("still placed");
+    assert!(again.same_session(&session), "the same handle, not a new placement");
+    // Ops reach it again: the same process.
+    let typed = format!("w3-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    ctl.write(&again, format!("{typed}\r").into_bytes()).unwrap();
+    until_sync("the write after resume", || ctl.read_screen(&again, 50).iter().any(|l| l.contains(&typed)).then_some(())).await;
+    assert_eq!(crate::agent_host::host().find_agent(&key).unwrap().child_pid(), Some(pid));
+    tokio::task::block_in_place(|| ctl.unplace(&key));
+    link2.abort();
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn grid_frames_carry_their_version_as_the_ring_offset() {
+    assert_eq!(link::frame_version(r#"{"event":"delta","payload":{"rows":24,"version":4211,"damagedRows":[]}}"#), Some(4211));
+    assert_eq!(link::frame_version(r#"{"event":"label_initial","payload":{"label":"x"}}"#), None);
 }

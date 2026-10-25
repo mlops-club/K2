@@ -164,19 +164,147 @@ fn answer(status: &str, body: Value) -> Answer {
     (status.to_string(), body.to_string())
 }
 
+/// One placement as the controller's store keeps it (W3): enough to
+/// rebuild the placement and its session handle after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPlacement {
+    pub agent_id: String,
+    pub host_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub cwd: Option<String>,
+    pub program: Option<String>,
+    pub args: Vec<String>,
+    pub label: String,
+    pub label_source: String,
+}
+
+/// The controller's placement table and epoch counter in its DB (W3: S9,
+/// I1). Two tables, created on first use (`CREATE TABLE IF NOT EXISTS`;
+/// k2-core's migrations don't know them): `host_placements` (one row per
+/// placed agent) and `host_epoch` (the last epoch issued).
+pub struct PlacementStore {
+    db: Arc<parking_lot::ReentrantMutex<rusqlite::Connection>>,
+}
+
+impl PlacementStore {
+    /// A store in `db` (the controller's `k2.db`, or a test's own file).
+    pub fn open(db: Arc<parking_lot::ReentrantMutex<rusqlite::Connection>>) -> Result<Self, String> {
+        {
+            let c = db.lock();
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS host_placements (
+                    agent_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    cwd TEXT,
+                    program TEXT,
+                    args_json TEXT NOT NULL DEFAULT '[]',
+                    label TEXT NOT NULL DEFAULT '',
+                    label_source TEXT NOT NULL DEFAULT 'pty',
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE TABLE IF NOT EXISTS host_epoch (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last INTEGER NOT NULL
+                );",
+            )
+            .map_err(|e| format!("host placement tables: {e}"))?;
+        }
+        Ok(Self { db })
+    }
+
+    pub fn load(&self) -> Result<Vec<StoredPlacement>, String> {
+        let c = self.db.lock();
+        let mut st = c
+            .prepare(
+                "SELECT agent_id, host_id, session_id, epoch, cwd, program, args_json, label, label_source
+                 FROM host_placements ORDER BY agent_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                let args: String = r.get(6)?;
+                Ok(StoredPlacement {
+                    agent_id: r.get(0)?,
+                    host_id: r.get(1)?,
+                    session_id: r.get(2)?,
+                    epoch: r.get::<_, i64>(3)? as u64,
+                    cwd: r.get(4)?,
+                    program: r.get(5)?,
+                    args: serde_json::from_str(&args).unwrap_or_default(),
+                    label: r.get(7)?,
+                    label_source: r.get(8)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn upsert(&self, p: &StoredPlacement) -> Result<(), String> {
+        let c = self.db.lock();
+        c.execute(
+            "INSERT INTO host_placements (agent_id, host_id, session_id, epoch, cwd, program, args_json, label, label_source, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
+             ON CONFLICT(agent_id) DO UPDATE SET host_id = ?2, session_id = ?3, epoch = ?4, cwd = ?5, program = ?6,
+               args_json = ?7, label = ?8, label_source = ?9, updated_at = unixepoch()",
+            rusqlite::params![
+                p.agent_id,
+                p.host_id,
+                p.session_id,
+                p.epoch as i64,
+                p.cwd,
+                p.program,
+                serde_json::to_string(&p.args).unwrap_or_else(|_| "[]".into()),
+                p.label,
+                p.label_source
+            ],
+        )
+        .map(drop)
+        .map_err(|e| format!("store placement {}: {e}", p.agent_id))
+    }
+
+    /// Forget `agent_id`'s row, only if it is still at `epoch`.
+    pub fn delete(&self, agent_id: &str, epoch: u64) -> Result<(), String> {
+        let c = self.db.lock();
+        c.execute("DELETE FROM host_placements WHERE agent_id = ?1 AND epoch = ?2", rusqlite::params![agent_id, epoch as i64])
+            .map(drop)
+            .map_err(|e| format!("forget placement {agent_id}: {e}"))
+    }
+
+    fn last_epoch(&self) -> Result<Option<u64>, String> {
+        let c = self.db.lock();
+        match c.query_row("SELECT last FROM host_epoch WHERE id = 1", [], |r| r.get::<_, i64>(0)) {
+            Ok(n) => Ok(Some(n as u64)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn set_last_epoch(&self, n: u64) -> io::Result<()> {
+        let c = self.db.lock();
+        c.execute(
+            "INSERT INTO host_epoch (id, last) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET last = max(last, ?1)",
+            rusqlite::params![n as i64],
+        )
+        .map(drop)
+        .map_err(|e| io::Error::other(format!("persist the placement epoch: {e}")))
+    }
+}
+
 /// Placement epochs (invariant I1): a monotonic counter the controller
 /// persists, so epochs only grow across controller restarts.
 ///
-/// The file holds the last epoch issued, as decimal text; each [`next`]
-/// writes the new value (temp file, fsync, rename) before returning it. A
-/// missing file starts the counter at the current Unix time in ms, once:
-/// protocol-1 controllers used ms timestamps as epochs, so this stays
-/// above any epoch a protocol-1 host may still hold. An unreadable file is
-/// treated the same way (logged), never as 0.
-///
-/// [`next`]: EpochCounter::next
+/// W3: in the controller's DB ([`PlacementStore`], `host_epoch`), written
+/// before an epoch is used. W0's file (`<K2 home>/hosts/placement-epoch`) is
+/// still read once, and the counter starts at the highest of the DB, the
+/// file and (when neither has a value) the current Unix time in ms:
+/// protocol-1 controllers used ms timestamps as epochs, so it stays above
+/// any epoch a protocol-1 host may still hold. Never restarts at 0.
 pub struct EpochCounter {
-    path: Option<std::path::PathBuf>,
+    path: Option<PathBuf>,
+    store: Option<Arc<PlacementStore>>,
     last: Mutex<u64>,
 }
 
@@ -187,45 +315,70 @@ fn now_ms() -> u64 {
         .unwrap_or(1)
 }
 
+fn read_epoch_file(path: &Path) -> Option<u64> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => match t.trim().parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                log_debug!("[hosts] placement epoch file {} unreadable ({e})", path.display());
+                None
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log_debug!("[hosts] placement epoch file {}: {e}", path.display());
+            None
+        }
+    }
+}
+
 impl EpochCounter {
     /// Not persisted (tests).
     pub fn in_memory(last: u64) -> Self {
-        Self { path: None, last: Mutex::new(last) }
+        Self { path: None, store: None, last: Mutex::new(last) }
     }
 
-    /// Persisted at `path`.
-    pub fn persisted(path: std::path::PathBuf) -> Self {
-        let last = match std::fs::read_to_string(&path) {
-            Ok(t) => match t.trim().parse::<u64>() {
-                Ok(n) => n,
-                Err(e) => {
-                    log_debug!("[hosts] placement epoch file {} unreadable ({e}); starting above the clock", path.display());
-                    now_ms()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => now_ms(),
+    /// Persisted in a file at `path` (W0).
+    pub fn persisted(path: PathBuf) -> Self {
+        let last = read_epoch_file(&path).unwrap_or_else(now_ms);
+        Self { path: Some(path), store: None, last: Mutex::new(last) }
+    }
+
+    /// Persisted in the controller's DB (W3), reading W0's file at
+    /// `legacy_file` once.
+    pub fn in_store(store: Arc<PlacementStore>, legacy_file: Option<&Path>) -> Self {
+        let db = match store.last_epoch() {
+            Ok(n) => n,
             Err(e) => {
-                log_debug!("[hosts] placement epoch file {}: {e}; starting above the clock", path.display());
-                now_ms()
+                log_debug!("[hosts] placement epoch in the DB unreadable ({e}); starting above the clock");
+                None
             }
         };
-        Self { path: Some(path), last: Mutex::new(last) }
+        let file = legacy_file.and_then(read_epoch_file);
+        let last = match (db, file) {
+            (None, None) => now_ms(),
+            (a, b) => a.unwrap_or(0).max(b.unwrap_or(0)),
+        };
+        Self { path: None, store: Some(store), last: Mutex::new(last) }
     }
 
-    /// The controller's file: `<K2 home>/hosts/placement-epoch`.
-    pub fn default_path() -> std::path::PathBuf {
+    /// W0's file: `<K2 home>/hosts/placement-epoch`.
+    pub fn default_path() -> PathBuf {
         k2_core::paths::k2_home().join("hosts").join("placement-epoch")
     }
 
     /// The next epoch, persisted before it is returned.
-    pub fn next(&self) -> std::io::Result<u64> {
+    pub fn next(&self) -> io::Result<u64> {
         let mut last = self.last.lock();
         let n = *last + 1;
+        if let Some(store) = &self.store {
+            store.set_last_epoch(n)?;
+        }
         if let Some(path) = &self.path {
-            let dir = path.parent().unwrap_or(std::path::Path::new("."));
+            let dir = path.parent().unwrap_or(Path::new("."));
             std::fs::create_dir_all(dir)?;
             let tmp = dir.join(format!(".placement-epoch.{}", uuid::Uuid::new_v4()));
-            let write = || -> std::io::Result<()> {
+            let write = || -> io::Result<()> {
                 use std::io::Write;
                 let mut f = std::fs::File::create(&tmp)?;
                 f.write_all(n.to_string().as_bytes())?;
@@ -241,19 +394,26 @@ impl EpochCounter {
         Ok(n)
     }
 
-    /// Never issue `epoch` or anything below it again (a resumed placement
-    /// reported it; S9). Persisted on the next [`Self::next`].
+    /// Never issue `epoch` or anything below it again (an adopted
+    /// placement reported it; S9). Persisted on the next [`Self::next`].
     pub fn observe(&self, epoch: u64) {
         let mut last = self.last.lock();
         *last = (*last).max(epoch);
     }
 }
 
-/// What [`RemoteHost::adopt`] decided for one resumed placement.
+/// What [`RemoteHost::adopt`] decided for one placement when a host linked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdoptDecision {
-    /// Stub (W0): re-adoption is S9 work; nothing is placed yet.
-    Deferred,
+    /// The host still runs it at the epoch the controller holds (or the
+    /// controller had no placement for the agent): live again.
+    Adopted,
+    /// The host runs it at an epoch the controller doesn't hold (older, or
+    /// placed on another host): told to release it (I1).
+    Released(String),
+    /// The controller had it on this host but the host no longer runs it:
+    /// the child is gone (`ChildExit`), the placement is dropped.
+    Gone,
 }
 
 /// The controller's remote hosts and placements.
@@ -262,6 +422,8 @@ pub struct RemoteHost {
     next_id: AtomicU64,
     epochs: EpochCounter,
     hooks: broadcast::Sender<HostHook>,
+    /// W3: where placements survive a controller restart (`None`: memory).
+    store: Option<Arc<PlacementStore>>,
 }
 
 impl Default for RemoteHost {
@@ -282,6 +444,92 @@ impl RemoteHost {
             next_id: AtomicU64::new(1),
             epochs,
             hooks: broadcast::channel(1024).0,
+            store: None,
+        }
+    }
+
+    /// Placements and epochs in `store` (W3). Call [`Self::restore`] once
+    /// the host is `'static`.
+    pub fn with_store(store: Arc<PlacementStore>, legacy_epoch_file: Option<&Path>) -> Self {
+        let epochs = EpochCounter::in_store(Arc::clone(&store), legacy_epoch_file);
+        Self { store: Some(store), ..Self::with_epochs(epochs) }
+    }
+
+    /// Reload the stored placements after a controller restart (S9). Every
+    /// one is **lost** until its host links again and [`Self::adopt`]
+    /// decides: its agent may still run there, so it is neither forgotten
+    /// nor placed elsewhere (I1). Returns how many were loaded.
+    pub fn restore(&'static self) -> usize {
+        let Some(store) = &self.store else { return 0 };
+        let rows = match store.load() {
+            Ok(r) => r,
+            Err(e) => {
+                log_debug!("[hosts] placement store unreadable: {e}");
+                return 0;
+            }
+        };
+        let mut inner = self.inner.lock();
+        let mut n = 0;
+        for r in rows {
+            let Some(sid) = SessionId::parse(&r.session_id) else { continue };
+            self.epochs.observe(r.epoch);
+            let epoch = PlacementEpoch(r.epoch);
+            inner.placements.insert(
+                r.agent_id.clone(),
+                RemotePlacement {
+                    agent_id: r.agent_id.clone(),
+                    host_id: r.host_id.clone(),
+                    session_id: Some(r.session_id.clone()),
+                    epoch,
+                    hooks: 0,
+                },
+            );
+            let meta = SpawnedMeta {
+                cwd: r.cwd.map(PathBuf::from),
+                program: r.program,
+                args: r.args,
+                label: r.label,
+                label_source: label_source_from_wire(&r.label_source),
+            };
+            if let Some(cwd) = &meta.cwd {
+                inner.last_host_for_cwd.insert(cwd.clone(), r.host_id.clone());
+            }
+            let s = Arc::new(RemoteSession::new(self, &r.agent_id, &r.host_id, epoch, sid, meta));
+            s.cached.lock().lost = true;
+            inner.sessions.insert(r.agent_id.clone(), s);
+            n += 1;
+        }
+        log_debug!("[hosts] restored {n} placement(s), lost until their hosts link");
+        n
+    }
+
+    fn persist(&self, s: &RemoteSession) {
+        let Some(store) = &self.store else { return };
+        let (label, label_source) = {
+            let c = s.cached.lock();
+            (c.label.clone(), label_source_wire(c.label_source).to_string())
+        };
+        let row = StoredPlacement {
+            agent_id: s.agent_id.clone(),
+            host_id: s.host_id.clone(),
+            session_id: s.session_id.to_string(),
+            epoch: s.epoch.0,
+            cwd: s.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            program: s.program.clone(),
+            args: s.args.clone(),
+            label,
+            label_source,
+        };
+        if let Err(e) = store.upsert(&row) {
+            log_debug!("[hosts] {e}");
+        }
+    }
+
+    fn forget(&self, agent_id: &str, epoch: PlacementEpoch) {
+        if let Some(store) = &self.store {
+            if let Err(e) = store.delete(agent_id, epoch.0) {
+                log_debug!("[hosts] {e}");
+            }
         }
     }
 
@@ -326,13 +574,27 @@ impl RemoteHost {
             if inner.links.get(host_id).map(|l| l.conn) != Some(conn) {
                 return;
             }
-            inner.placements.retain(|_, p| p.host_id != host_id);
-            let gone: Vec<String> =
-                inner.sessions.iter().filter(|(_, s)| s.host_id == host_id).map(|(a, _)| a.clone()).collect();
-            for agent in gone {
-                if let Some(s) = inner.sessions.remove(&agent) {
-                    // Unknown from here on; a re-spawn finds it on the host.
-                    s.mark_exited();
+            let protocol = inner.links.get(host_id).map(|l| l.protocol).unwrap_or(1);
+            if protocol >= 2 {
+                // W3: the host's agents may still run. Keep every placement,
+                // marked lost, until the host links again and resumes them
+                // (adopt) or doesn't (gone). Nothing is placed elsewhere.
+                for s in inner.sessions.values().filter(|s| s.host_id == host_id) {
+                    s.cached.lock().lost = true;
+                }
+                log_debug!(
+                    "[hosts] host {host_id} lost: {} placement(s) kept until it links again",
+                    inner.placements.values().filter(|p| p.host_id == host_id).count()
+                );
+            } else {
+                // A protocol-1 host can't resume: forget, as before W3.
+                inner.placements.retain(|_, p| p.host_id != host_id);
+                let gone: Vec<String> =
+                    inner.sessions.iter().filter(|(_, s)| s.host_id == host_id).map(|(a, _)| a.clone()).collect();
+                for agent in gone {
+                    if let Some(s) = inner.sessions.remove(&agent) {
+                        s.mark_exited();
+                    }
                 }
             }
             inner.links.remove(host_id)
@@ -411,12 +673,17 @@ impl RemoteHost {
                     None => true,
                 };
                 if !stale {
-                    inner.placements.remove(&agent_id);
+                    if let Some(p) = inner.placements.remove(&agent_id) {
+                        self.forget(&agent_id, p.epoch);
+                    }
                     if let Some(s) = inner.sessions.remove(&agent_id) {
                         s.exited(exit_code);
                     }
                     log_debug!("[hosts] agent {agent_id} gone on host {host_id}");
                 }
+            }
+            Frame::Released { agent_id, epoch, .. } => {
+                log_debug!("[hosts] host {host_id} released agent {agent_id} at epoch {epoch}");
             }
             other => log_debug!("[hosts] ignored frame {} from host {host_id}", other.kind()),
         }
@@ -431,7 +698,7 @@ impl RemoteHost {
         {
             let mut inner = self.inner.lock();
             let Some(link) = inner.links.get_mut(host_id) else {
-                return Err(answer("502 Bad Gateway", json!({"error": format!("agent host {host_id} is not connected")})));
+                return Err(answer("502 Bad Gateway", json!({"error": lost_or_unknown(host_id)})));
             };
             link.pending.insert(req, Waiter::Async(tx));
             if link.tx.send(make(req)).is_err() {
@@ -606,6 +873,7 @@ impl RemoteHost {
                     let mut inner = self.inner.lock();
                     if inner.placements.get(&agent_id).is_some_and(|p| p.epoch == epoch) {
                         inner.placements.remove(&agent_id);
+                        self.forget(&agent_id, epoch);
                         if let Some(s) = inner.sessions.remove(&agent_id) {
                             s.mark_exited();
                         }
@@ -640,6 +908,7 @@ impl RemoteHost {
         if let Some(old) = inner.sessions.insert(agent_id.to_string(), Arc::clone(&s)) {
             old.mark_exited();
         }
+        self.persist(&s);
         s
     }
 
@@ -747,7 +1016,7 @@ impl RemoteHost {
         let (tx, rx) = std::sync::mpsc::channel();
         {
             let mut inner = self.inner.lock();
-            let link = inner.links.get_mut(host_id).ok_or_else(|| format!("agent host {host_id} is not connected"))?;
+            let link = inner.links.get_mut(host_id).ok_or_else(|| lost_or_unknown(host_id))?;
             let frame = make(req);
             if frame.min_protocol() > link.protocol {
                 return Err(format!(
@@ -889,7 +1158,10 @@ impl RemoteHost {
             return Err(format!("session {session_id} is not placed on any agent host"));
         };
         let Some(link) = inner.links.get_mut(&p.host_id) else {
-            return Err(format!("agent host {} is not connected", p.host_id));
+            return Err(format!(
+                "agent host {} is lost (its link is down); the session stays placed there until it returns",
+                p.host_id
+            ));
         };
         let (etx, erx) = mpsc::unbounded_channel();
         link.streams.insert(stream, etx);
@@ -909,35 +1181,114 @@ impl RemoteHost {
         self.inner.lock().links.get(host_id).map(|l| l.protocol)
     }
 
-    /// Placements a host reported in `hello` (`resume`, protocol 2). STUB
-    /// (W0): logs and traces each one and returns [`AdoptDecision::Deferred`];
-    /// the table is unchanged.
-    ///
-    /// The rule S9 implements here: adopt a resumed placement when the
-    /// controller has none for the agent (or the same host at the same
-    /// epoch), refuse one whose epoch is below the agent's current
-    /// placement (I1), and call [`EpochCounter::observe`] with every
-    /// adopted epoch so new epochs stay above it.
-    pub fn adopt(&self, host_id: &str, resume: &[ResumePlacement]) -> Vec<(String, AdoptDecision)> {
-        resume
-            .iter()
-            .map(|r| {
-                log_debug!(
-                    "[hosts] host {host_id} still runs agent {} (session {}, epoch {}): adoption deferred (S9)",
-                    r.agent_id,
-                    r.session_id,
-                    r.epoch
-                );
-                k2_core::trace::emit(|| {
-                    k2_core::trace::Event::new(trace_events::CTL_ADOPT)
-                        .agent(r.agent_id.as_str())
-                        .attr("host", host_id)
-                        .attr("epoch", r.epoch)
-                        .attr("decision", "deferred")
-                });
-                (r.agent_id.clone(), AdoptDecision::Deferred)
-            })
-            .collect()
+    /// A protocol-2 host linked: reconcile its `resume` (the placements it
+    /// still runs) with the table (S9, I1). Per agent:
+    /// - same host, same epoch → [`AdoptDecision::Adopted`] (live again);
+    /// - the controller has no placement for it → adopted, and its epoch is
+    ///   observed so new epochs stay above it;
+    /// - another epoch (older), or placed on another host →
+    ///   [`AdoptDecision::Released`]: the host is told to release it;
+    /// - placed on this host but not resumed → [`AdoptDecision::Gone`]: the
+    ///   child is gone (`ChildExit`), the placement and its row dropped.
+    pub fn adopt(&'static self, host_id: &str, resume: &[ResumePlacement]) -> Vec<(String, AdoptDecision)> {
+        let mut out = Vec::new();
+        let mut releases = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            for r in resume {
+                let decision = match inner.placements.get(&r.agent_id).cloned() {
+                    Some(p) if p.host_id == host_id && p.epoch.0 == r.epoch => {
+                        if let Some(s) = inner.sessions.get(&r.agent_id) {
+                            let mut c = s.cached.lock();
+                            c.lost = false;
+                            c.alive = r.child_alive;
+                        }
+                        AdoptDecision::Adopted
+                    }
+                    Some(p) if p.host_id == host_id && r.epoch > p.epoch.0 => {
+                        // Can't be issued by this controller; a newer one's.
+                        // Take it, like an unknown placement.
+                        self.adopt_unknown(&mut inner, host_id, r);
+                        AdoptDecision::Adopted
+                    }
+                    Some(p) => AdoptDecision::Released(format!(
+                        "controller holds agent {} at epoch {} on host {}; host resumed epoch {}",
+                        r.agent_id, p.epoch.0, p.host_id, r.epoch
+                    )),
+                    None => {
+                        self.adopt_unknown(&mut inner, host_id, r);
+                        AdoptDecision::Adopted
+                    }
+                };
+                if let AdoptDecision::Released(why) = &decision {
+                    releases.push((r.agent_id.clone(), r.epoch, why.clone()));
+                }
+                out.push((r.agent_id.clone(), decision));
+            }
+            // Placed here but not resumed: gone while the host was away.
+            let gone: Vec<(String, PlacementEpoch)> = inner
+                .placements
+                .values()
+                .filter(|p| p.host_id == host_id && p.session_id.is_some() && !resume.iter().any(|r| r.agent_id == p.agent_id))
+                .map(|p| (p.agent_id.clone(), p.epoch))
+                .collect();
+            for (agent, epoch) in gone {
+                inner.placements.remove(&agent);
+                self.forget(&agent, epoch);
+                if let Some(s) = inner.sessions.remove(&agent) {
+                    s.exited(None);
+                }
+                out.push((agent, AdoptDecision::Gone));
+            }
+            // Reach the host after the table is settled.
+            if let Some(link) = inner.links.get(host_id) {
+                for (agent_id, epoch, reason) in &releases {
+                    let _ = link.tx.send(Frame::Release {
+                        req: self.id(),
+                        agent_id: agent_id.clone(),
+                        epoch: *epoch,
+                        reason: format!("stale placement: {reason}"),
+                    });
+                }
+            }
+        }
+        for (agent, d) in &out {
+            log_debug!("[hosts] host {host_id}: agent {agent} {d:?}");
+            let decision = match d {
+                AdoptDecision::Adopted => "adopted",
+                AdoptDecision::Released(_) => "released",
+                AdoptDecision::Gone => "gone",
+            };
+            k2_core::trace::emit(|| {
+                k2_core::trace::Event::new(trace_events::CTL_ADOPT).agent(agent.as_str()).attr("host", host_id).attr("decision", decision)
+            });
+        }
+        out
+    }
+
+    fn adopt_unknown(&'static self, inner: &mut Inner, host_id: &str, r: &ResumePlacement) {
+        let Some(sid) = SessionId::parse(&r.session_id) else { return };
+        self.epochs.observe(r.epoch);
+        let epoch = PlacementEpoch(r.epoch);
+        inner.placements.insert(
+            r.agent_id.clone(),
+            RemotePlacement {
+                agent_id: r.agent_id.clone(),
+                host_id: host_id.to_string(),
+                session_id: Some(r.session_id.clone()),
+                epoch,
+                hooks: 0,
+            },
+        );
+        let meta = SpawnedMeta {
+            cwd: r.cwd.clone().map(PathBuf::from),
+            program: r.program.clone(),
+            args: r.args.clone(),
+            label: r.label.clone().unwrap_or_default(),
+            label_source: LabelSource::Locked,
+        };
+        let s = self.keep_session(inner, &r.agent_id, host_id, epoch, sid, meta);
+        s.cached.lock().alive = r.child_alive;
     }
 
     // ── reads ──────────────────────────────────────────────────────────
@@ -971,8 +1322,16 @@ impl RemoteHost {
             })
             .collect();
         hosts.sort_by(|a, b| a["host_id"].as_str().cmp(&b["host_id"].as_str()));
-        json!({"role": "controller", "hosts": hosts})
+        let mut lost: Vec<&String> =
+            inner.placements.values().map(|p| &p.host_id).filter(|h| !inner.links.contains_key(*h)).collect();
+        lost.sort();
+        lost.dedup();
+        json!({"role": "controller", "hosts": hosts, "lost": lost})
     }
+}
+
+fn lost_or_unknown(host_id: &str) -> String {
+    format!("agent host {host_id} is not connected (lost: its agents keep their placement there until it links again)")
 }
 
 /// What a spawn told the controller about a session's fixed metadata.
@@ -1002,6 +1361,8 @@ pub(crate) fn label_source_from_wire(s: &str) -> LabelSource {
 
 struct Cached {
     alive: bool,
+    /// W3: its host's link is down; its agent may still run there.
+    lost: bool,
     label: String,
     label_source: LabelSource,
     ever_attached: bool,
@@ -1044,7 +1405,7 @@ impl RemoteSession {
             cwd: meta.cwd,
             program: meta.program,
             args: meta.args,
-            cached: Mutex::new(Cached { alive: true, label: meta.label, label_source: meta.label_source, ever_attached: false }),
+            cached: Mutex::new(Cached { alive: true, lost: false, label: meta.label, label_source: meta.label_source, ever_attached: false }),
             events: broadcast::channel(64).0,
             labels: broadcast::channel(16).0,
             pins: broadcast::channel(16).0,
@@ -1215,6 +1576,7 @@ impl AgentHost for RemoteHost {
             (inner.placements.remove(agent_id), inner.sessions.remove(agent_id))
         };
         let placement = placement?;
+        self.forget(agent_id, placement.epoch);
         let body = json!({"agent_name": agent_id, "force": true});
         let r = self.request_blocking(
             &placement.host_id,
@@ -1371,5 +1733,16 @@ impl AgentHost for RemoteHost {
 /// The controller's one [`RemoteHost`].
 pub fn global() -> &'static RemoteHost {
     static REMOTE: OnceLock<RemoteHost> = OnceLock::new();
-    REMOTE.get_or_init(|| RemoteHost::with_epochs(EpochCounter::persisted(EpochCounter::default_path())))
+    static RESTORED: std::sync::Once = std::sync::Once::new();
+    let r = REMOTE.get_or_init(|| match PlacementStore::open(k2_core::db::shared()) {
+        Ok(store) => RemoteHost::with_store(Arc::new(store), Some(&EpochCounter::default_path())),
+        Err(e) => {
+            log_debug!("[hosts] placement store unavailable ({e}); placements won't survive a restart");
+            RemoteHost::with_epochs(EpochCounter::persisted(EpochCounter::default_path()))
+        }
+    });
+    RESTORED.call_once(|| {
+        r.restore();
+    });
+    r
 }

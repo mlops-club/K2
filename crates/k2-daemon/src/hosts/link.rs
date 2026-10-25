@@ -152,11 +152,58 @@ pub(crate) async fn run_with(cfg: HostConfig, t: Timings, observe: Option<mpsc::
 }
 
 /// What this host placed for the controller: agent → epoch, and the
-/// session ids its spawns returned → agent.
+/// session ids its spawns returned → agent. Process-wide (W3), so it
+/// survives link drops and becomes `resume` in the next `hello`.
 #[derive(Default)]
 struct Placed {
     epochs: HashMap<String, u64>,
     sessions: HashMap<String, String>,
+}
+
+fn placed() -> Arc<Mutex<Placed>> {
+    static P: std::sync::OnceLock<Arc<Mutex<Placed>>> = std::sync::OnceLock::new();
+    Arc::clone(P.get_or_init(Arc::default))
+}
+
+/// `hello.resume`: every placement this host still runs (S9). Entries
+/// whose session is gone are dropped from `placed` here.
+fn resume_list() -> Vec<super::proto::ResumePlacement> {
+    let placed = placed();
+    let mut p = placed.lock();
+    let mut out = Vec::new();
+    let mut dead = Vec::new();
+    for (agent, epoch) in p.epochs.iter() {
+        match crate::agent_host::host().find_agent(agent) {
+            Some(s) if s.is_child_alive() => out.push(super::proto::ResumePlacement {
+                agent_id: agent.clone(),
+                session_id: s.session_id().to_string(),
+                epoch: *epoch,
+                // Grid streams replay from a snapshot (see `GridOpen`); no
+                // byte ring on v2 sessions yet.
+                ring: None,
+                child_alive: true,
+                cwd: s.cwd_path().map(|c| c.to_string_lossy().into_owned()),
+                program: s.command(),
+                args: s.args(),
+                label: Some(s.label()),
+            }),
+            _ => dead.push(agent.clone()),
+        }
+    }
+    for agent in dead {
+        p.epochs.remove(&agent);
+        p.sessions.retain(|_, a| a != &agent);
+    }
+    out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    out
+}
+
+/// The grid frame version a snapshot or delta carries (its offset in the
+/// session's frame sequence), read without parsing the whole frame.
+pub(crate) fn frame_version(text: &str) -> Option<u64> {
+    let i = text.find(r#""version":"#)? + r#""version":"#.len();
+    let digits: String = text[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// One connection: handshake, then serve until it closes, fails or goes
@@ -177,8 +224,8 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
         host_name: cfg.host_name.clone(),
         token: cfg.token.clone(),
         labels: cfg.labels.clone(),
-        // S9 fills this with the placements this host still runs.
-        resume: vec![],
+        // W3: the placements this host still runs (S9).
+        resume: resume_list(),
     };
     write.send(Message::Text(hello.encode())).await.map_err(|e| format!("send hello: {e}"))?;
     let host_id = match tokio::time::timeout(t.welcome, read.next()).await {
@@ -205,7 +252,15 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
 
     let (tx, mut out) = mpsc::unbounded_channel::<Frame>();
     let streams: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>> = Arc::default();
-    let placed: Arc<Mutex<Placed>> = Arc::default();
+    let placed = placed();
+    if let Frame::Hello { resume, .. } = &hello {
+        if !resume.is_empty() {
+            log_debug!("[hosts/link] resumed {} placement(s) with the controller", resume.len());
+            k2_core::trace::emit(|| {
+                k2_core::trace::Event::new(super::proto::trace_events::HOST_RESUME).attr("placements", resume.len())
+            });
+        }
+    }
 
     // Any message from the controller (its pings included) moves this on.
     let mut heard = tokio::time::Instant::now();
@@ -321,18 +376,28 @@ fn handle(
                 let _ = tx.send(Frame::Reply { req, status, body });
             });
         }
-        Frame::GridOpen { stream, session_id, as_user, .. } => {
+        Frame::GridOpen { stream, session_id, as_user, ring_offset, .. } => {
             log_debug!(
                 "[hosts/link] grid stream {stream} session {session_id} for {}",
                 as_user.as_deref().unwrap_or("the owner")
             );
+            if let Some(from) = ring_offset {
+                // Deltas aren't kept; the snapshot this stream starts with
+                // holds the Term (screen + scrollback), i.e. every change
+                // after `from`, so the replay is the snapshot.
+                log_debug!("[hosts/link] grid stream {stream} replays from version {from} via its snapshot");
+                k2_core::trace::emit(|| {
+                    k2_core::trace::Event::new(super::proto::trace_events::GRID_REPLAY).pane(&session_id).attr("from", from)
+                });
+            }
             let (ctx, crx) = mpsc::unbounded_channel();
             streams.lock().insert(stream, ctx);
             let tx = tx.clone();
             let streams = Arc::clone(streams);
             tokio::spawn(async move {
                 let reason = match local_grid(&session_id, crx, |text| {
-                    let _ = tx.send(Frame::GridData { stream, text, ring_offset: None });
+                    let ring_offset = frame_version(&text);
+                    let _ = tx.send(Frame::GridData { stream, text, ring_offset });
                 })
                 .await
                 {
@@ -439,6 +504,30 @@ fn handle(
                     }
                 };
                 let _ = tx.send(Frame::InjectResult { req, result });
+            });
+        }
+        Frame::Release { req, agent_id, epoch, reason } => {
+            // The controller holds this agent elsewhere or at a newer epoch
+            // (I1): stop this copy, keep its home.
+            let held = placed.lock().epochs.get(&agent_id).copied();
+            let tx = tx.clone();
+            let placed = Arc::clone(placed);
+            tokio::task::spawn_blocking(move || {
+                if held.is_some_and(|e| e <= epoch) || held.is_none() {
+                    log_debug!("[hosts/link] releasing agent {agent_id} at epoch {epoch}: {reason}");
+                    crate::agent_host::host().unplace(&agent_id);
+                    let mut p = placed.lock();
+                    p.epochs.remove(&agent_id);
+                    p.sessions.retain(|_, a| a != &agent_id);
+                    k2_core::trace::emit(|| {
+                        k2_core::trace::Event::new(super::proto::trace_events::HOST_RELEASE)
+                            .agent(agent_id.as_str())
+                            .attr("epoch", epoch)
+                    });
+                } else {
+                    log_debug!("[hosts/link] release of {agent_id} at epoch {epoch} ignored: holding newer {held:?}");
+                }
+                let _ = tx.send(Frame::Released { req, agent_id, epoch, ring_end: None });
             });
         }
         Frame::TranscriptExists { req, provider, session_id, project_path } => {
