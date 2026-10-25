@@ -269,7 +269,8 @@ starts it without a cap. A separate capped run on head (6 GB, 3 CPUs, `jobs = 1`
 /gate/work, need 20G (K2_GATE_MIN_FREE_GB)". The Docker disk is shared with
 the owner's kind cluster, so I neither freed space nor lowered the minimum.
 The gate's suites are the same two `cargo test` runs as the host rows above,
-but as root on Linux; they still need a run once the Docker disk has room.
+but as root on Linux. Coordinator, 2026-10-25: the Docker disk now has room,
+and the gate runs once on the merged `k2-dist/wave1`, not on this branch.
 
 ### NFR1: spawn latency and idle RSS (`metrics.csv`)
 
