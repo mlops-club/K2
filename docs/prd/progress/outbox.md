@@ -232,9 +232,63 @@ scripts/lab/topology/three-process-msg.sh
 
 ## Status
 
-- Milestone: diagrams written.
-- Next: `k2_core::delivery` store and its unit tests; then the drain and
-  the host handlers.
-- Open question (asked of the coordinator): the delivery hooks need small
-  additive edits in `agent_host/remote.rs` and `hosts/link.rs`, which this
-  task was told not to touch.
+- Milestones: diagrams written; first working slice; done (every
+  acceptance criterion below holds).
+- Next (not this task): route the other `deliver_live` callers
+  (heartbeats, wake) and the controller's own waking of a sleeping
+  recipient (S4) through the outbox; `drain` on SIGTERM (S8: stop taking
+  deliveries); re-adoption after a link blip (S9) so a running recipient
+  does not wait for a re-spawn to be placed again.
+- Open: none blocking. The four hook edits in `agent_host/remote.rs` and
+  `hosts/link.rs` were approved by the coordinator (option A).
+
+### Results
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-core --lib delivery::` | 9 passed: msg ids, dedupe by id per hop, seen table bounded, per-pair order, doubling backoff, `no_ack` dead letter after max attempts (a late ack can't revive it), `rejected` and TTL `expired` → failed with reason, pruning, restart mid-queue keeps every row and its state |
+| `cargo test -p k2-daemon --lib delivery_drain::` (3 runs, with `hosts::`: 27 passed each) | `a_message_from_host_a_reaches_host_b_exactly_once_when_the_link_to_b_drops_before_the_ack`: real hub and drain, fake hosts; up-hop resend → `duplicate`; B delivers, link drops before the ack, B relinks, bob placed again, attempt 2 → `duplicate`, row `delivered`, bob got it once. Also: pair order and a `rejected` ack failing loudly; a restarted controller drains its queue; the receiving side dedupes, retries, rejects and remembers across a host restart; the up hop resends until acked and across a link drop |
+| `scripts/lab/topology/three-process-msg.sh` (runs `20261025T162221Z`, `20261025T162248Z`) | 4/4 PASS, below |
+| `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: 5202 passed, 0 failed, 6 ignored |
+| `cargo test -p k2-core --lib -- --test-threads=3`, throwaway HOME | 3685 passed, 1 failed, 1 ignored. The failure, `fork_tab_repair::tests::repair_splits_a_fork_tab_off_the_source_conversation`, is in a file this branch doesn't touch, on the shared test DB; it passes 3/3 alone |
+
+Three-process run `20261025T162248Z` (controller :17440, host-1 :17441,
+host-2 :17442, `k2-fake-agent` as `claude`, throwaway HOMEs):
+
+```text
+PASS three processes; alice on host-1, bob on host-2
+PASS k2 msg from host-1 lands in bob's session on host-2   msg m_1792945374116_… state=delivered, in bob's transcript 1 time(s)
+     k2 msg: {"attempts":1,"delivery":"accepted","msgId":"m_1792945374116_…","success":true,…}
+PASS inbox compose from host-1 lands in bob's inbox on host-2   <root>/h2/home/work/bob/.k2/inbox/s6-inbox-item-eca1b64b.md
+PASS I2: every message ends delivered or failed after host-2 died mid-delivery
+     8/8 final (8 delivered, 0 failed); reached bob more than once: 0
+```
+
+Check 2 runs the real `cli/k2 msg bob "…" --from alice` in host-1's
+environment (its HOME and daemon token). In run `20261025T162221Z` the
+controller's outbox at the moment host-2 was SIGKILLed held one message
+`sent` (attempt 1, unacked) and three `queued`; after the restart and
+re-placement of bob the controller resent it as attempt 2, and every burst
+message reached bob's transcript exactly once:
+
+```text
+16:22:29.009 [delivery] deliver m_…49009_ccd1f75f… to bob on host host-2 (attempt 1)
+             (host-2 killed; 4 more messages queued while it was down)
+16:22:31.010 [delivery] deliver m_…49009_ccd1f75f… to bob on host host-2 (attempt 2)
+16:22:31.553 [delivery] m_…49009_ccd1f75f… Delivered by host host-2
+16:22:31.553 [delivery] deliver m_…49047_fd0d3b79… to bob on host host-2 (attempt 1)
+…
+```
+
+Known limits of this cut:
+
+- A host acks after the PTY write. A message the agent never processes
+  because its CLI died right after the write counts as delivered (the lab
+  also reports "delivered but not in a transcript"; 0 in both runs).
+- When a host's link drops, the controller forgets its placements (as
+  dist-link does), so a message for an agent that is still running there
+  waits until that agent is spawned again (re-placed) or the TTL. S9
+  re-adoption removes that wait.
+- A message for an agent id the controller never placed waits for the TTL
+  (7 days) before it fails `expired`; `GET /cli/hosts/outbox` shows it as
+  `queued` meanwhile.
