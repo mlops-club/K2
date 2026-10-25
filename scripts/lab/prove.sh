@@ -151,7 +151,10 @@ if ! lab_toolchain "$LAB_REPO" >>"$RUN/build.log" 2>&1; then
     finish
 fi
 say "building k2-daemon, k2-fake-agent, and k2-node + k2-provider-fakes (tests/cli needs them) (rust: $LAB_RUST_SOURCE, $(rustc --version))"
-if ! lab_cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent -p k2-node -p k2-provider-fakes >>"$RUN/build.log" 2>&1; then
+# Two commands: `--bin k2-daemon` would limit EVERY selected package to a
+# bin of that name, leaving the others unbuilt.
+if ! { lab_cargo build -p k2-daemon --bin k2-daemon >>"$RUN/build.log" 2>&1 \
+        && lab_cargo build -p k2-fake-agent -p k2-node -p k2-provider-fakes --bins >>"$RUN/build.log" 2>&1; }; then
     say "build failed (see build.log)"
     NOTES+=("Build failed (build.log). Nothing ran.")
     finish
@@ -159,7 +162,10 @@ fi
 # The suites rebuild target/debug/k2-daemon (some with other features), so
 # the topology and must-not-break use a copy taken now.
 mkdir -p "$LAB_TMP/bin" "$LAB_TMP/shim"
-cp target/debug/k2-daemon target/debug/k2-fake-agent "$LAB_TMP/bin/"
+cp target/debug/k2-daemon target/debug/k2-fake-agent "$LAB_TMP/bin/" || { say "built binaries missing"; finish; }
+for b in k2-node k2-provider-fakes; do
+    [ -x "target/debug/$b" ] || { say "target/debug/$b was not built (see build.log)"; NOTES+=("target/debug/$b was not built; tests/cli scripts that need it will fail."); }
+done
 LAB_DAEMON_BIN="$LAB_TMP/bin/k2-daemon"
 LAB_FAKE_AGENT_BIN="$LAB_TMP/bin/k2-fake-agent"
 "$LAB_FAKE_AGENT_BIN" --install-shims "$LAB_TMP/shim"
