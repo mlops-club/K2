@@ -1,0 +1,107 @@
+# K2 in one pod on kind (PRD "K2 Distributed Runtime", stage P0 "Container").
+#
+# Today's daemon (K2_ROLE=all) as a single-replica StatefulSet with a PVC,
+# in its own namespace. Lab only: deploy/kubernetes/ is the end state (G4)
+# and is not this file.
+#
+#   packaging/oci/build.sh                                   # → k2-daemon:dev
+#   kind load docker-image k2-daemon:dev --name k2lab
+#   kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
+#   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f packaging/oci/kind/solo.yaml
+#   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo rollout status sts/k2-solo
+#   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward svc/k2-solo 7440:7420
+#   curl -fsS http://127.0.0.1:7440/boot-status | jq .
+#
+# Clean up: kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" delete namespace k2-solo
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k2-solo
+  labels:
+    pod-security.kubernetes.io/enforce: restricted   # no root helper, no added capabilities
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k2-solo
+  namespace: k2-solo
+data:
+  HOME: /var/lib/k2                       # until K2_HOME lands (P0 `home` task)
+  K2_ROLE: all                            # new: today's daemon with the in-process agent host
+  K2_LISTEN: lan                          # existing: bind 0.0.0.0
+  K2_DAEMON_PORT: "7420"                  # new: fixed port
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-solo
+  namespace: k2-solo
+spec:
+  selector:
+    app.kubernetes.io/name: k2-solo
+  ports:
+    - name: api
+      port: 7420
+      targetPort: api
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k2-solo
+  namespace: k2-solo
+spec:
+  serviceName: k2-solo
+  replicas: 1                              # ADR-0002: one controller
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-solo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: k2-solo
+        k2.dev/role: all
+    spec:
+      automountServiceAccountToken: false  # K2_ROLE=all never talks to the API server
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        runAsGroup: 0                      # state is group 0 and group-writable (any UID works)
+        fsGroup: 10000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: k2-daemon
+          image: k2-daemon:dev             # loaded with `kind load docker-image`, never pulled
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef: {name: k2-solo}
+          ports:
+            - {name: api, containerPort: 7420}
+          startupProbe:
+            httpGet: {path: /boot-status, port: api}     # existing route; first boot runs migrations
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /boot-status, port: api}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /boot-status, port: api}
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/k2}        # k2.db, vault.db, daemon.port, workspaces
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 5Gi}

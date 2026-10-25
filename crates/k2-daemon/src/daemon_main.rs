@@ -103,6 +103,13 @@ pub fn run() {
         // return type prevents fall-through.
     }
 
+    // K2 distributed runtime P0: K2_ROLE, K2_DAEMON_PORT and K2_CAP_* are
+    // checked before anything starts; a bad value never half-boots.
+    if let Err(e) = boot_settings_check() {
+        eprintln!("[daemon/boot] FATAL: {e}");
+        std::process::exit(2);
+    }
+
     // Runtime stage H: before any thread or child exists, keep systemd's
     // NOTIFY_SOCKET for a hand-off (and drop it from the environment every
     // child inherits) and record the executable path.
@@ -122,6 +129,15 @@ pub fn run() {
         rt.shutdown_background();
         crate::handoff::drain_then_exit();
     }
+}
+
+/// `K2_ROLE`, `K2_DAEMON_PORT` and the `K2_CAP_*` overrides, validated
+/// together at boot (`runtime_role`, `daemon_port`, `capabilities`).
+fn boot_settings_check() -> Result<(), String> {
+    crate::runtime_role::from_env()?;
+    crate::daemon_port::from_env()?;
+    crate::capabilities::overrides_from_env()?;
+    Ok(())
 }
 
 /// Pure early-arg dispatch. Returns `Some(exit_code)` when the process
@@ -581,6 +597,9 @@ async fn async_main() {
     // A vault that can't open leaves the daemon running; status says why.
     crate::vault::boot(&k2so_dir);
     crate::vault::human::serve(&k2so_dir);
+    // P0 capability report: detected once, after the vault opens; logged
+    // and shown on /boot-status. Nothing acts on it yet.
+    log_debug!("{}", crate::capabilities::report().log_line());
     // Clone slice A × B (CL18): a pending imported Thread settling onto
     // the clone's pin posts the clone's deferred "Leave blank" cards.
     crate::clone_vault::install_settle_listener();
@@ -741,7 +760,12 @@ async fn async_main() {
             reused: true,
         })
     });
+    let fixed_port = crate::daemon_port::from_env().unwrap_or_else(|e| {
+        log_debug!("[daemon] FATAL: {e}");
+        std::process::exit(2);
+    });
     let claimed = match inherited_main
+        .or_else(|| fixed_port.map(|p| claim_fixed_port(bind_ip, p)))
         .or_else(|| k2_core::port_claim::claim_port_on(&daemon_port_path, bind_ip))
     {
         Some(c) => c,
@@ -1746,6 +1770,17 @@ async fn bring_up_tunnel_listeners(state: &DaemonState, port: u16) {
             // (`CERT_ISSUE_TIMEOUT`); boot does not wait for it. A tunnel
             // start meanwhile waits on the same serialized ensure.
             tokio::spawn(bring_up);
+        }
+    }
+}
+
+/// `K2_DAEMON_PORT`: bind exactly that port or exit; never a random one.
+fn claim_fixed_port(bind_ip: std::net::Ipv4Addr, port: u16) -> k2_core::port_claim::ClaimedPort {
+    match crate::daemon_port::bind_fixed(bind_ip, port) {
+        Ok(listener) => k2_core::port_claim::ClaimedPort { listener, port, reused: true },
+        Err(e) => {
+            log_debug!("[daemon] FATAL: {e}");
+            std::process::exit(2);
         }
     }
 }

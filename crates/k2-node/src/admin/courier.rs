@@ -161,11 +161,21 @@ fn update_state(node: &Node, o: &UpdateOffer, phase: UpdatePhase, code_s: Option
     })
 }
 
+/// K2 distributed runtime P0: a package manager owns a node installed
+/// under `/usr/` (the daemon's install-kind rule); never swap it.
+pub fn package_owned(exe: Option<&std::path::Path>) -> Option<&'static str> {
+    k2_root_proto::install_kind::is_package_install(exe)
+        .then_some("a package manager installed this k2-node: update it with that package")
+}
+
 /// `update_offer`: start receiving a build for this machine.
 pub fn update_offer(node: &Arc<Node>, tx: &mpsc::Sender<Frame>, o: UpdateOffer) {
     let refuse = |c: &str, m: &str| {
         let _ = tx.try_send(update_state(node, &o, UpdatePhase::Refused, Some(c), Some(m.into())));
     };
+    if let Some(m) = package_owned(std::env::current_exe().ok().as_deref()) {
+        return refuse(code::PACKAGE_OWNED, m);
+    }
     if o.size == 0 || o.size > super::server::MAX_UPDATE_BYTES {
         return refuse(code::TOO_LARGE, "build size out of range");
     }
