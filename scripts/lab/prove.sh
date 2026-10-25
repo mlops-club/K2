@@ -164,7 +164,10 @@ LAB_DAEMON_BIN="$LAB_TMP/bin/k2-daemon"
 LAB_FAKE_AGENT_BIN="$LAB_TMP/bin/k2-fake-agent"
 "$LAB_FAKE_AGENT_BIN" --install-shims "$LAB_TMP/shim"
 LAB_SHIM_DIR="$LAB_TMP/shim"
-export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN LAB_SHIM_DIR
+# The suites' own cargo builds queue in the machine-wide slot too.
+LAB_CARGO_SHIM_DIR="$LAB_TMP/cargo-shim"
+lab_cargo_shim "$LAB_CARGO_SHIM_DIR"
+export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN LAB_SHIM_DIR LAB_CARGO_SHIM_DIR
 
 # ── Topology up, scenario S1 ────────────────────────────────────────────
 say "topology $TOPOLOGY: up"

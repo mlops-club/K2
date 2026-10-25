@@ -49,7 +49,7 @@ suite_env() {
     mkdir -p "$h/home" "$h/tmp"
     printf '%s\n' \
         "HOME=$h/home" "TMPDIR=$h/tmp" "USER=$(id -un)" "LANG=en_US.UTF-8" "TERM=dumb" \
-        "PATH=$LAB_SHIM_DIR:$LAB_NODE_DIR:${CARGO_HOME:+$CARGO_HOME/bin:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        "PATH=$LAB_SHIM_DIR:${LAB_CARGO_SHIM_DIR:+$LAB_CARGO_SHIM_DIR:}$LAB_NODE_DIR:${CARGO_HOME:+$CARGO_HOME/bin:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
         ${CARGO_HOME:+"CARGO_HOME=$CARGO_HOME"} ${RUSTUP_HOME:+"RUSTUP_HOME=$RUSTUP_HOME"} \
         ${OPENSSL_ROOT_DIR:+"OPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR"} \
         ${CARGO_BUILD_JOBS:+"CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS"}
@@ -177,14 +177,10 @@ parity_contract() {
 
 # ── scripts/test-gate-linux.sh <sha>, in Docker ──────────────────────────
 # Owner decision (2026-10-24): unchanged, as root, in a Linux container on
-# this Mac's Docker. The repo is mounted read-only (the worktree and its git
-# dir, so `git archive <sha>` works); the target dir and
-# cargo registry live in named volumes so later runs are warm. Nothing from
-# $HOME is mounted. The gate's workdir is fresh each run; its `target` is a
-# symlink into the volume (the gate removes the link, not the cache).
+# this Mac's Docker. The Docker side (lock, limits, mounts, volumes) is
+# scripts/lab/lib/linux_gate.sh; here it runs inside a cargo slot, last in
+# the run, with its output in parity/linux-gate.log.
 GATE_IMAGE_TAG=k2-lab-gate:1
-GATE_TARGET_VOL=k2-lab-gate-target
-GATE_REGISTRY_VOL=k2-lab-gate-cargo-registry
 
 # LAB_LINUX_GATE=hold (prove.sh --linux-gate hold):
 # never touch Docker; the gate is NOT RUN with LAB_LINUX_GATE_HOLD_REASON.
@@ -208,44 +204,9 @@ parity_linux_gate_start() {
     local common wt
     wt=$LAB_REPO
     common=$(cd "$LAB_REPO" && cd "$(git rev-parse --git-common-dir)" && pwd)
+    # Slot first, then (inside linux_gate.sh) the Docker lock.
     (
-        set -o pipefail
-        # Memory cap (coordinator, 2026-10-24: the 8 GB Docker VM is shared
-        # with the owner's kind cluster): the container runs with 3 GB and no
-        # extra swap, on 3 CPUs (cargo inside sizes its jobs to the CPU quota).
-        # If it is OOM-killed, lower K2_GATE_THREADS / CPUs, never the cap.
-        # The image build only runs apt-get (no compile) and BuildKit has no
-        # --memory flag, so it is not capped beyond the lock.
-        # Shared Docker lock (coordinator, 2026-10-24): one Docker-heavy job
-        # at a time across all workers, to protect the owner's live kind
-        # cluster. Held for the image build and the gate container.
-        mkdir -p "$HOME/.cache"
-        until mkdir "$HOME/.cache/k2-dist-docker.lock" 2>/dev/null; do sleep 20; done
-        trap 'rmdir "$HOME/.cache/k2-dist-docker.lock"' EXIT
-        trap 'exit 143' INT TERM
-        echo "lab: holding the shared Docker lock ($HOME/.cache/k2-dist-docker.lock) from $(date -u +%H:%M:%SZ)"
-        docker build -q -t "$GATE_IMAGE_TAG" -f "$LAB_REPO/scripts/lab/docker/gate.Dockerfile" "$LAB_REPO/scripts/lab/docker" \
-            >"$RUN/parity/linux-gate.image.log" 2>&1 || { echo "lab: building the gate image failed" ; cat "$RUN/parity/linux-gate.image.log"; exit 3; }
-        {
-            echo "image: $GATE_IMAGE_TAG ($(docker image inspect "$GATE_IMAGE_TAG" --format '{{.Id}}'))"
-            echo "base: $(grep -m1 '^FROM' "$LAB_REPO/scripts/lab/docker/gate.Dockerfile" | cut -d' ' -f2)"
-            echo "sha: $LAB_SHA"
-            echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
-            echo "volumes: $GATE_TARGET_VOL (target), $GATE_REGISTRY_VOL (cargo registry)"
-        } >"$RUN/topology/linux-gate.txt"
-        # Docker Desktop cannot mount at a target under /Users, so the repo
-        # sits at /src/wt and its git dir at /src/git; GIT_DIR/GIT_WORK_TREE
-        # let the gate's `git rev-parse` and `git archive <sha>` work there.
-        docker run --rm --name "k2-lab-gate-$$" \
-            --memory=3g --memory-swap=3g \
-            --cap-add NET_ADMIN --cpus "${CARGO_BUILD_JOBS:-3}" -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
-            -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
-            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
-            -v "$wt:/src/wt:ro" -v "$common:/src/git:ro" \
-            -v "$GATE_TARGET_VOL:/cache/target" -v "$GATE_REGISTRY_VOL:/usr/local/cargo/registry" \
-            "$GATE_IMAGE_TAG" \
-            bash -c 'rm -rf /gate/work && mkdir -p /gate/work && ln -s /cache/target /gate/work/target \
-                     && exec bash /src/wt/scripts/test-gate-linux.sh "$0" /gate/work' "$LAB_SHA"
+        lab_slot bash "$LAB_REPO/scripts/lab/lib/linux_gate.sh" "$wt" "$common" "$LAB_SHA" "$RUN" "k2-lab-gate-$$"
     ) >"$log" 2>&1 &
     GATE_PID=$!
 }

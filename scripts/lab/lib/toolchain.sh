@@ -12,6 +12,23 @@
 
 LAB_RUST_VERSION=1.99.1
 
+# Machine-wide cargo queue (coordinator, 2026-10-24: the shared Mac was
+# swapping): at most K2_DIST_SLOTS (2) cargo commands at once across all
+# workers. The slot script keeps its state under the REAL $HOME, so it is
+# resolved here, before any throwaway HOME. Missing script = no queue.
+LAB_CARGO_SLOT=${LAB_CARGO_SLOT:-$HOME/.cache/k2-dist-cargo-slot.sh}
+LAB_REAL_HOME=${LAB_REAL_HOME:-$HOME}
+export LAB_CARGO_SLOT LAB_REAL_HOME
+
+# lab_slot <cmd...>: run <cmd> in a machine-wide cargo slot (waits for one).
+lab_slot() {
+    if [ -x "$LAB_CARGO_SLOT" ]; then
+        HOME="$LAB_REAL_HOME" "$LAB_CARGO_SLOT" "$@"
+    else
+        "$@"
+    fi
+}
+
 lab_toolchain() {
     local repo=$1
     lab_native_env
@@ -72,7 +89,8 @@ lab_native_env() {
     fi
 }
 
-# lab_cargo <args...>: cargo under a clean environment, as the Linux gate's
+# lab_cargo <args...>: cargo in a machine-wide slot (lab_slot), under a
+# clean environment, as the Linux gate's
 # clean_cargo does: env -i, a FRESH HOME and TMPDIR (mktemp -d, removed
 # after), no K2_* / K2SO_* / SHELL, only the toolchain's variables. Some
 # pre-existing tests write under $HOME (seen 2026-10-24: ~/.k2/auth-audit.jsonl,
@@ -85,7 +103,7 @@ lab_cargo() {
     # test keychain's path to `security -i`, capped at INTERACTIVE_LINE_MAX).
     h=$(mktemp -d /tmp/k2c-h.XXXXXX) || return 1
     t=$(mktemp -d /tmp/k2c-t.XXXXXX) || return 1
-    env -i HOME="$h" TMPDIR="$t" PATH="$PATH" USER="$(id -un)" LANG=en_US.UTF-8 \
+    lab_slot env -i HOME="$h" TMPDIR="$t" PATH="$PATH" USER="$(id -un)" LANG=en_US.UTF-8 \
         CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}" \
         ${CARGO_TARGET_DIR:+CARGO_TARGET_DIR="$CARGO_TARGET_DIR"} \
         ${OPENSSL_ROOT_DIR:+OPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"} \
@@ -97,4 +115,23 @@ lab_cargo() {
     chmod -R u+w "$h" "$t" 2>/dev/null
     rm -rf "$h" "$t"
     return $rc
+}
+
+# lab_cargo_shim <dir>: write <dir>/cargo, which runs the real cargo through
+# the slot queue with the caller's environment (HOME included) unchanged.
+# Put <dir> first on a suite's PATH so the suites' own `cargo build`s queue
+# too, without editing them.
+lab_cargo_shim() {
+    local dir=$1 real
+    real=$(command -v cargo) || return 1
+    mkdir -p "$dir"
+    cat >"$dir/cargo" <<SH
+#!/bin/bash
+# lab: queue this cargo command in a machine-wide slot (scripts/lab/lib/toolchain.sh).
+if [ -x '$LAB_CARGO_SLOT' ]; then
+    exec env HOME='$LAB_REAL_HOME' '$LAB_CARGO_SLOT' env HOME="\$HOME" '$real' "\$@"
+fi
+exec '$real' "\$@"
+SH
+    chmod 755 "$dir/cargo"
 }

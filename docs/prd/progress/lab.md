@@ -246,6 +246,12 @@ set.
   8 GB Docker VM is shared with kind; the owner's pod was OOM-killed at
   16:26 while another worker's container ran). An OOM kill is reported as
   such, and the fix is lower parallelism, never a larger cap.
+  Cargo queue: every lab cargo command runs in a machine-wide slot
+  (`~/.cache/k2-dist-cargo-slot.sh`, at most 2 at once): `lab_cargo` wraps
+  itself, the suites get a `cargo` shim first on their PATH (their own
+  `cargo build`s queue too, scripts unchanged), and the Linux gate
+  (`scripts/lab/lib/linux_gate.sh`) runs inside one slot and only then takes
+  the Docker lock: always slot first, then lock.
 - **`lab_cargo` temp paths.** It uses `/tmp/k2c-*` (short) for the throwaway
   HOME and TMPDIR: `macos_keychain_tests` puts the temp keychain path into a
   `security -i` line capped at `INTERACTIVE_LINE_MAX`, and macOS's long
