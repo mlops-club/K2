@@ -6,7 +6,10 @@
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$REPO"
-for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+' || true); do unset "$v"; done
+# Keep the machine-wide cargo slot's own knobs (K2_DIST_PRIORITY, K2_DIST_SLOTS):
+# only ~/.cache/k2-dist-cargo-slot.sh reads them; suites and the daemon start
+# under env -i anyway.
+for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+' | grep -vxE 'K2_DIST_(PRIORITY|SLOTS)' || true); do unset "$v"; done
 
 echo "== flows in sync with the PRD"
 python3 -I tests/lab/extract_flows.py --check

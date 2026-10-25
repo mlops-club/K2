@@ -18,7 +18,10 @@
 #   (one cargo build job, 256 codegen units; debuginfo is already 0), 3 CPUs
 #   and the gate's own K2_GATE_THREADS (3) for the tests. The Docker lock
 #   keeps anything else out of Docker meanwhile. If it is OOM-killed, cut
-#   rustc's memory or the parallelism, never raise the cap.
+#   rustc's memory or the parallelism, never raise the cap on your own.
+#   LAB_GATE_MEMORY (default 6g) and LAB_GATE_LOW_MEMORY (default 1; 0 runs
+#   the gate's normal build) change both only when the coordinator says so
+#   (2026-10-25: Docker VM raised to 14 GB, try 10g without low memory).
 # - the image build only runs apt-get (no compile); BuildKit has no
 #   --memory flag, so the lock is its only limit.
 #
@@ -34,6 +37,16 @@ image=k2-lab-gate:2
 target_vol=k2-lab-gate-target
 registry_vol=k2-lab-gate-cargo-registry
 lock="$HOME/.cache/k2-dist-docker.lock"
+mem=${LAB_GATE_MEMORY:-6g}
+low=${LAB_GATE_LOW_MEMORY:-1}
+case "$mem" in [1-9]g|1[0-9]g) ;; *) echo "lab: LAB_GATE_MEMORY is <N>g, 1g..19g (got '$mem')"; exit 2 ;; esac
+case "$low" in 0|1) ;; *) echo "lab: LAB_GATE_LOW_MEMORY is 0 or 1 (got '$low')"; exit 2 ;; esac
+low_env=()
+low_desc="normal build (K2_GATE_LOW_MEMORY unset)"
+if [ "$low" = 1 ]; then
+    low_env=(-e K2_GATE_LOW_MEMORY=1)
+    low_desc="K2_GATE_LOW_MEMORY=1 (1 build job, 256 codegen units, opt-level 0, debuginfo 0)"
+fi
 
 # A coordinator hold on Docker (e.g. a Docker Desktop restart): while
 # lab-runs/.docker-hold exists, start nothing in Docker and give the slot
@@ -57,7 +70,7 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "base: $(grep -m1 '^FROM' "$repo/scripts/lab/docker/gate.Dockerfile" | cut -d' ' -f2)"
     echo "sha: $sha"
     echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
-    echo "limits: --memory=6g --memory-swap=6g --cpus 3, K2_GATE_LOW_MEMORY=1 (1 build job, 256 codegen units, debuginfo 0), K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
+    echo "limits: --memory=$mem --memory-swap=$mem --cpus 3, $low_desc, K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
     echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
 } >"$run/topology/linux-gate.txt"
 
@@ -66,8 +79,8 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
 mkdir -p "$run/parity/linux-gate-logs"
 
 docker run --rm --name "$name" \
-    --memory=6g --memory-swap=6g --cpus 3 \
-    -e K2_GATE_LOW_MEMORY=1 \
+    --memory="$mem" --memory-swap="$mem" --cpus 3 \
+    ${low_env[@]+"${low_env[@]}"} \
     --cap-add NET_ADMIN -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
     -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
