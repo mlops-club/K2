@@ -30,8 +30,11 @@ graph LR
         DISP[dispatcher<br/><sub>routes/dispatcher.rs · controller gate</sub>]:::changed
         GATE[controller gate<br/><sub>hosts/gate.rs · relay or 501</sub>]:::new
         HUB[host hub<br/><sub>hosts/hub.rs · /cli/hosts/attach</sub>]:::new
-        RH[RemoteHost<br/><sub>agent_host/remote.rs · placement table</sub>]:::new
-        NOLOCAL[no local agents<br/><sub>agent_host/mod.rs · host() refuses spawn</sub>]:::changed
+        RH[RemoteHost · the controller's AgentHost<br/><sub>agent_host/remote.rs · placements, sessions</sub>]:::new
+        HOSTFN[host&#40;&#41; by role<br/><sub>agent_host/mod.rs · RemoteHost on a controller</sub>]:::changed
+        SPAWN[workspace spawn<br/><sub>spawn.rs · forwarded whole as spawn.workspace</sub>]:::changed
+        HOSTFN --> RH
+        SPAWN --> RH
         BUS[session events bus<br/><sub>session_events.rs · /cli/sessions/events</sub>]:::existing
         DISP --> GATE
         GATE -- spawn, close, grid --> RH
@@ -373,12 +376,16 @@ is S9).
 | `GET /cli/sessions/grid` | relayed to the owning host for the owner token and Connect sessions (the desktop app's login), with `all`'s viewer/claimer rules; `/v1` stream tokens get 403 |
 | `GET /cli/sessions/events` | served by the controller as today; host `open_url` arrives here |
 | `GET /cli/hosts/attach`, `GET /cli/hosts/status` | new |
-| every other spawn path (`spawn.rs`, heartbeats, wake, `/v1` sandboxes, sidecars, pinned chat) | `host()` is the "no local agents" host: `spawn` fails with `K2_ROLE=controller runs no agents locally`; lookups find nothing |
+| the workspace spawn (`spawn.rs`: chat overlay / pinned chat, heartbeats, wake, agents routes, sidecars, terminal and remote-session routes) | placed on a host whole (`spawn.workspace`, W1); with no host: the `NO_HOSTS` error |
+| everything that reads or drives a session through `host()` | `host()` is `RemoteHost` (W1): lookups return remote handles, writes/injects/screen reads go to the host |
+| `/v1` sandboxes (`v2_spawn::spawn_session` → `host().spawn(DaemonPtyConfig)`) | refused by `RemoteHost::spawn` ("runs no agents locally"): the low-level spawn has no remote form yet |
 | routes that spawn their own PTY without the trait (listed below) | 501 `{"error":"not available with K2_ROLE=controller (dist-link first cut)"}` |
 
-The ~20 files in agenthost's "bypass" table only look up, list or unplace
-sessions in the in-process placement table. On a controller that table is
-always empty, so they find nothing; none of them can start an agent.
+The files in agenthost's "bypass" table that still read `v2_session_map`
+directly (not `host()`) see an empty table on a controller, so they find
+nothing; none of them can start an agent. W1 moved the ones on the S1, S4,
+S5 and chat-overlay paths (`pinned_chat.rs`, `heartbeat_launch.rs`) to
+`host()`.
 
 The 501 list (`hosts/gate.rs`, `CONTROLLER_NOT_IMPLEMENTED`): routes that
 start a PTY themselves, not through `AgentHost`, or drive one by raw bytes:
@@ -391,10 +398,14 @@ start a PTY themselves, not through `AgentHost`, or drive one by raw bytes:
 | `/cli/sessions/v2/refresh` | sidecar kill-and-resume on the in-process host |
 | `/cli/terminal/*` | the terminal API (read, write, resize, label, pin, reap) on in-process sessions |
 
-Background loops that spawn (`llm_accounts_runtime::spawn`,
-`person_wallet_runtime::spawn_loop`, heartbeats, wake) hit the
-`InProcessHost::spawn` refusal and log it; they never start a process on
-the controller. `/cli/claude-auth/*` reads and refreshes credentials files
+Heartbeats and wake go through the workspace spawn and are placed on a
+host. The login-PTY loops (`llm_accounts_runtime::spawn`,
+`person_wallet_runtime::spawn_loop`) call `DaemonPtySession::spawn`
+directly and are behind the 501 routes above. Nothing reaches
+`InProcessHost` on a controller (`host()` is `RemoteHost`; the
+`InProcessHost::spawn` refusal stays as a backstop), so no agent process
+starts on the controller (two-process check "the controller ran no agent
+processes"). `/cli/claude-auth/*` reads and refreshes credentials files
 and runs no agent, so it stays as is (on a controller it finds none).
 
 ## Merge notes
@@ -434,11 +445,13 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 - Milestones: diagrams written; host env contract (handed to `kind-dist`);
   first working slice; done; host reconnect after read error; app session
   through controller; W0 protocol 2; W1 first working slice; W1 done.
-- Next (P2 follow-ups, not this task): `RemoteHost` as an `impl AgentHost`,
-  stream-token grid relays, `proto=k1` over the link,
-  host re-adoption after a controller restart (S9), the outbox (S3), cwd
-  mapping for pods.
-- Open: the deviation below (`RemoteHost` not yet an `impl AgentHost`).
+- Next: W3 survive (placement store and epochs in the controller DB, hosts
+  "lost" not forgotten, resume/adopt with ring offsets, grid replay; S8,
+  S9, I1). Later: stream-token grid relays, `proto=k1` over the link, cwd
+  mapping for pods, remote `read_home`/`write_home` (FR6), host hook
+  envelopes into the controller's activity store.
+- Open: none. (The first cut's deviation, `RemoteHost` not an
+  `impl AgentHost`, was closed by W1.)
 
 ### Results
 
@@ -503,14 +516,18 @@ Controller trace events added (`K2_TRACE_FILE`): `ctl.host_linked`,
 `host.linked`. The host keeps every existing trace event (`host.spawn`,
 `pty.*`, `cell.*`).
 
-### Known gaps on a controller (next wave)
+### Known gaps on a controller
 
-- The app's chat overlay spawn fails on a controller with
-  `K2_ROLE=controller runs no agents locally`: it spawns through a path
-  other than `POST /cli/sessions/v2/spawn` (the canonical/chat spawn in
-  `spawn.rs`), which hits the `InProcessHost::spawn` refusal instead of
-  being placed on a host. That is W1's scope (route every spawn path
-  through placement).
+- `/v1` sandboxes refuse on a controller (`RemoteHost::spawn`).
+- A Connect user's or a `/v1` stream token's grid: Connect users are
+  relayed with `all`'s rules; stream tokens are refused.
+- Agent home reads (`read_home`/`write_home`) and the activity store's hook
+  plane don't cross the link yet; transcripts are probed on the host for
+  resume decisions (`transcript.exists`).
+- Link loss forgets placements (the agents keep running on the host; a
+  re-spawn finds them). W3 replaces that with "lost" and adoption.
+- (Fixed in W1: the app's chat overlay spawn, which failed with
+  `K2_ROLE=controller runs no agents locally`, now places on a host.)
 
 ### Handoff notes for `kind-dist`
 
@@ -523,17 +540,13 @@ Controller trace events added (`K2_TRACE_FILE`): `ctl.host_linked`,
   its old link. The controller forgets a host's placements when its link
   drops (the agents keep running; a re-spawn of the same `agent_name` finds
   them again on that host).
-- Open questions: none blocking. Deviation to confirm: `RemoteHost` does not
-  implement the `AgentHost` trait yet (see below).
+- Hosts must run the W1 build (protocol 2) for the workspace spawn, ops and
+  the transcript probe; a protocol-1 host is told to update.
 
-### Why `RemoteHost` is not an `impl AgentHost` in this cut
+### `RemoteHost` and the `AgentHost` trait (history)
 
-`AgentSession` is a concrete handle over an in-process
-`Arc<DaemonPtySession>`, and ~15 files read its metadata straight from that
-memory. A remote implementation of the trait needs `AgentSession` to become
-host-polymorphic (cached metadata, remote screen reads), which edits files
-this task doesn't own and collides with the `home` worker's edits. So the
-controller relays the S1 routes to `RemoteHost` directly, and `host()` on a
-controller is a "no local agents" implementation that refuses `spawn`.
-Folding `RemoteHost` into the trait is the next P2 step; the wire protocol
-does not change when that happens.
+The first cut relayed only the S1 routes to `RemoteHost` and refused every
+other spawn on a controller, because `AgentSession` was a concrete
+in-process handle. W1 made `AgentSession` host-polymorphic (`SessionRef`)
+and `RemoteHost` an `impl AgentHost`; see "W1" above. The wire protocol of
+the first cut did not change; W1 only added protocol-2 frames.
