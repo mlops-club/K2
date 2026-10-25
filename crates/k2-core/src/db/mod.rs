@@ -342,9 +342,8 @@ pub fn init_database() -> Result<Arc<ReentrantMutex<Connection>>> {
         return Ok(existing.clone());
     }
 
-    let db_dir = dirs::home_dir()
-        .ok_or_else(|| rusqlite::Error::InvalidParameterName("Could not determine home directory".to_string()))?
-        .join(".k2");
+    let db_dir = crate::paths::k2_home_opt()
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName("Could not determine home directory".to_string()))?;
     std::fs::create_dir_all(&db_dir)
         .map_err(|e| rusqlite::Error::InvalidParameterName(format!("Could not create ~/.k2 directory: {}", e)))?;
     // Owner-only K2 home: the app may create it before the daemon's boot

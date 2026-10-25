@@ -96,6 +96,7 @@ pub fn run_once(trigger: Trigger, remove: bool) -> LastRun {
                 let claude_version = if remove { None } else { claude_version(trigger, at_ms) };
                 let report = install::run(&InstallRequest {
                     home: &home,
+                    k2_home: &k2_core::paths::k2_home(),
                     daemon_version: env!("CARGO_PKG_VERSION"),
                     claude_version,
                     remove,

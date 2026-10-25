@@ -35,10 +35,7 @@ struct SandboxChat {
 /// Root of the per-workspace sandbox homes (daemon-home only — never a caller
 /// path). Mirrors `v1_sandboxes::policy::sandbox_homes_root`.
 pub fn sandbox_homes_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("sandbox-homes")
+    k2_core::paths::k2_home().join("sandbox-homes")
 }
 
 /// Workspace slug the sandbox homes are keyed by, from a project path (last

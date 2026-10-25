@@ -5,10 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn certs_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("certs")
+    k2_core::paths::k2_home().join("certs")
 }
 
 pub fn host_dir(hostname: &str) -> PathBuf {

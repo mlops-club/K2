@@ -515,9 +515,7 @@ fn verify_hash(password: &str, hash: &str) -> bool {
 // ─────────────────────────────────────────────────────────────────────
 
 fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
+    crate::paths::k2_home()
 }
 
 /// Path to `~/.k2so/connect-users.json`.

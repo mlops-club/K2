@@ -90,7 +90,7 @@ fn common_frpc_locations() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         for name in frpc_basenames() {
             v.push(home.join(".local/bin").join(name));
-            v.push(home.join(".k2/bin").join(name));
+            v.push(crate::paths::k2_bin().join(name));
             // Legacy location pre-`.k2so`→`.k2` cutover.
             v.push(home.join(".k2so/bin").join(name));
         }
@@ -200,18 +200,12 @@ pub(crate) fn frpc_config_path() -> PathBuf {
 
 /// The pre-vault location (`~/.k2/frpc.toml`): reaped and removed.
 pub(crate) fn legacy_frpc_config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("frpc.toml")
+    crate::paths::k2_home().join("frpc.toml")
 }
 
 /// Path the frpc child's stdout/stderr is captured to.
 pub fn frpc_log_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("frpc.log")
+    crate::paths::k2_home().join("frpc.log")
 }
 
 /// A child that stayed up at least this long counts as a SUCCESSFUL
