@@ -1,6 +1,6 @@
 # Progress: app-reconnect
 
-Branch `k2-dist/app-reconnect` (from `k2-dist/wave2-preview` 0206a21da), worktree `../app-reconnect`. The fix is f56bb7abe.
+Branch `k2-dist/app-reconnect` (from `k2-dist/wave2-preview` 0206a21da), worktree `../app-reconnect`. The fix is f56bb7abe, and the long-outage test was tightened in a392739e6. The coordinator verified the branch for merge.
 
 ## The bug
 
@@ -29,16 +29,24 @@ The server side was fine. `scripts/kind/reconnect-check.sh --dist --fake` showed
 
 ## Tests
 
-`ConnectionGate.reconnect.test.tsx` drives the real gate under fake timers through four cases:
+`ConnectionGate.reconnect.test.tsx` drives the real gate under fake timers:
 
-| Case | Old gate (3 runs) | Fixed gate (6 runs) |
+| Case | Old gate (3 runs) | Fixed gate (3 runs) |
 |---|---|---|
-| Server refused for 60 s, then back with a new `instanceId` | fails | passes |
+| Server refused for 63, 71, 79, 87 or 95 s, then back with a new `instanceId` | 63 s and 95 s fail; the rest pass | all pass |
 | Requests hang, then are refused, then the server is back | passes | passes |
 | A request that never settles | fails | passes |
 | Window hidden through the whole outage | fails | passes |
 
-The hang case is a regression guard. The refused case also asserts that the arbiter never saw `ready`.
+About the long-outage case:
+
+- The old gate's mistake happens only when the server's return lands on the poll where the arbiter's 30 s throttle has run out, which is one poll in four.
+- My first version of the test left that to random jitter. So it passed on the old gate in some runs: the coordinator saw 4 of 4 passes, while I had seen 3 of 3 failures.
+- It now fixes the jitter and returns the server at five outage lengths one poll apart, so one of them always lands on the arbiter's poll.
+- Each case asserts that the arbiter never saw `ready`, that recovery reaches `connected`, and that the health poll keeps running afterwards.
+- On the old gate, the failing cases are the reload path: `location.reload()` does nothing here, as when a reload doesn't take, and the loop ends.
+
+The hang case passes on the old gate too; it stays as a regression guard.
 
 `ConnectionGate.policy.test.ts` adds the pure `shouldConsultArbiter` case.
 
