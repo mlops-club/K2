@@ -5,6 +5,7 @@
 #
 # Exports <sha> with `git archive` into a FRESH dir (never a copied or mixed
 # tree), builds with its own CARGO_TARGET_DIR, and runs
+#   cargo build -p k2-ptyd --bin k2-ptyd   (k2-core's ptyd_backend execs it)
 #   cargo test -p k2-core   --no-fail-fast
 #   cargo test -p k2-daemon --no-fail-fast
 # under a clean `env -i` (HOME and TMPDIR = fresh temp dirs, no SHELL, no
@@ -107,6 +108,15 @@ clean_cargo() {
 }
 
 STATUS=0
+# k2-core's ptyd_backend tests exec the real k2-ptyd from the target dir
+# (target/debug/k2-ptyd, next to the test binary). `cargo test -p k2-core`
+# builds k2-ptyd only as a library, so on a fresh build box the binary is
+# missing and all of ptyd_backend fails. Build it first, into the same
+# target dir, as CI does (.github/workflows/checks.yml).
+echo "gate: cargo build -p k2-ptyd --bin k2-ptyd (ptyd_backend needs the binary)"
+if ! clean_cargo "$LOGS/k2-ptyd-bin.log" build -p k2-ptyd --bin k2-ptyd; then
+  STATUS=1
+fi
 for pkg in k2-core k2-daemon; do
   echo "gate: cargo test -p $pkg --no-fail-fast"
   if ! clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --no-fail-fast "${THREAD_ARGS[@]}"; then
