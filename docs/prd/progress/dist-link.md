@@ -330,6 +330,54 @@ W1 results:
 | `cargo test -p k2-core --no-fail-fast -- --test-threads=3`, throwaway HOME | 3865 passed, **1 failed**, 1 ignored: `fork_tab_repair::tests::repair_splits_a_fork_tab_off_the_source_conversation` (`repair()` sometimes returns no repair for the fork tab). Unrelated to the probe and flaky on its own: run alone (`-- fork_tab_repair`, where no probe is ever installed, so the probe lines are `None` early-outs) it failed 2 of 3 times. The test doesn't touch the transcript lookups. Not fixed here (not my file); reported to the coordinator |
 | two-process (run `20261025T170926Z`) | **all 9 checks PASS**; W1 25/25, including "the second wake resumed the same conversation (same session id, answered)" and "--resume" in the fake agent's argv (`--resume cb650df8-…`, the first wake's session id) |
 
+## W3: placements survive (S8, S9, I1)
+
+The controller keeps every placement it makes, and the epoch counter, in its
+own `k2.db`:
+
+| Table | Holds |
+|---|---|
+| `host_placements` | `agent_id` (key), `host_id`, `session_id`, `epoch`, `cwd`, `program`, `args_json`, `label`, `label_source`, `updated_at`: written on place, deleted (at that epoch) on close, `session.gone` and "gone" |
+| `host_epoch` | the last epoch issued (one row). The old `hosts-epoch` file is read once as a floor |
+
+Both are `CREATE TABLE IF NOT EXISTS`, created on the first `host()` of a
+controller; no other role touches them. `PlacementStore` has its own
+connection to the file `k2_core::db` opened (`db::shared_path()`), never the
+shared one: its lock is taken while `RemoteHost::inner` is held and inside the
+first `host()` call, and other threads (the active reaper) hold the shared
+lock while they call `host()`. On the shared connection a restarted
+controller hung at boot (`restore` waiting for the reaper's lock, the reaper
+waiting for `restore`); found by the S9 run, covered by
+`hosts::tests::the_placement_store_never_waits_on_the_shared_db_lock`.
+
+What happens when things die:
+
+| Event | Controller | Host |
+|---|---|---|
+| Link drops (protocol 2) | the host is **lost**, not forgotten: placements and sessions stay, marked lost; `/cli/hosts/status` lists it under `lost`; spawning its agent is a 502 "lost" (never placed elsewhere, I1); a grid attach answers an "is lost" error; waiting requests fail | keeps running its agents; reconnects with backoff |
+| Link drops (protocol 1) | forgets the host's placements, as before | |
+| Controller restarts | restores every row as lost until its host links | `hello.resume` lists every agent it still runs: agent, session, epoch, alive, cwd, program, args, label |
+| Host links with `resume` | per agent: same host and epoch → **Adopted** (lost cleared); a newer epoch or one it doesn't know → adopted as sent; held elsewhere or at another epoch → **Released** (the host is told to `release` it, and kills it); placed here but not resumed → **Gone** (`ChildExit`, row deleted) | on `release`: kills the session, answers `released` |
+
+Grid replay: `grid.data.ring_offset` carries the frame's version. v2 sessions
+have no byte ring yet (that needs `k2-core`), so a client that reconnects
+gets the host's snapshot of the screen, which holds everything the agent
+printed while the controller was away; the client re-attaches and loses
+nothing on screen. The old-epoch refusal is a unit test with a fake host
+(`an_old_epoch_placement_is_released_and_a_missing_one_is_gone`), since a
+real controller never issues an older epoch.
+
+W3 results:
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host::` | 39 passed: `placements_survive_a_controller_restart_and_are_adopted`, `an_old_epoch_placement_is_released_and_a_missing_one_is_gone`, `a_real_host_resumes_its_agents_after_a_link_drop`, `grid_frames_carry_their_version_as_the_ring_offset`, `link_loss_fails_waiting_requests_and_keeps_placements_as_lost` (with the protocol-1 forget), `the_placement_store_never_waits_on_the_shared_db_lock` |
+| two-process check 10, S9 (run `20261025T213031Z`) | spawn through the controller, type a prompt (the turn is running: the prompt is in the transcript), `kill -TERM` the controller, start it again: it restores 4 placements, the host relinks and all 4 are **Adopted**; the agent's pid and parent are unchanged (`12929 8664`, the host); the client re-attaches through the new controller and sees banner, prompt and reply in order (positions 0, 81, 95); the prompt is in the transcript once. 8/8 |
+| two-process check 11, S8 (same run) | `kill -9` the host mid-turn: the controller reports `lost: [host-1]`; spawning the agent → 502 "lost"; grid → "is lost" error; the host restarts and links: its dead placements are **Gone**; the agent spawns fresh on the host (`reused: false`), the interrupted prompt is in its transcript and it resumes the same conversation. 10/10 |
+| two-process, every check | **12/12 PASS** (S1, W1 25/25 and the rest unchanged) |
+| `K2_ROLE=all` regression after W3: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: **5204 passed, 0 failed**, 6 ignored |
+| `cargo test -p k2-core -- --test-threads=3` (W3 adds `db::shared_path`), throwaway HOME | 17 test binaries: **3866 passed, 0 failed**, 1 ignored (fork_tab_repair green since `d543108d5`) |
+
 ## Env contract
 
 Names follow `deploy/README.md` and `deploy/compose/compose.yaml`. The task
@@ -444,10 +492,10 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 
 - Milestones: diagrams written; host env contract (handed to `kind-dist`);
   first working slice; done; host reconnect after read error; app session
-  through controller; W0 protocol 2; W1 first working slice; W1 done.
-- Next: W3 survive (placement store and epochs in the controller DB, hosts
-  "lost" not forgotten, resume/adopt with ring offsets, grid replay; S8,
-  S9, I1). Later: stream-token grid relays, `proto=k1` over the link, cwd
+  through controller; W0 protocol 2; W1 first working slice; W1 done;
+  W3 first working slice; W3 checks green; W3 done.
+- Next: whatever the coordinator assigns. Later: a byte ring on v2 sessions
+  (true offset replay, `k2-core`), stream-token grid relays, `proto=k1` over the link, cwd
   mapping for pods, remote `read_home`/`write_home` (FR6), host hook
   envelopes into the controller's activity store.
 - Open: none. (The first cut's deviation, `RemoteHost` not an
