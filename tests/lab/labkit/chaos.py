@@ -67,14 +67,16 @@ class Chaos:
             time.sleep(min(0.1, end - time.monotonic()))
 
     def live_clis(self):
+        """Live agent sessions (a CLI with a pane), sorted by workspace then
+        pid. Helpers a host runs itself (codex app-server) are not agents."""
         cwd_of = {}
         for e in self.fleet.fake_events("cli.exec"):
-            cwd_of[(e.get("pid"))] = (e.get("attrs") or {}).get("cwd") or ""
-        return sorted(((cwd_of.get(p, ""), p) for p in self.fleet.cli_pids()))
+            if e.get("pane"):
+                key = fleetlib.cli_key(self.fleet.st, e.get("host"), e.get("pid"))
+                cwd_of[key] = ((e.get("attrs") or {}).get("cwd") or "", e.get("host"), e.get("pid"))
+        return sorted(cwd_of[k] for k in self.fleet.cli_pids() if k in cwd_of)
 
     def step(self, n, kind, pick, down):
-        layout = self.fleet.layout
-        self.fleet.reload()
         with self.fleet.control(wait=False) as held:
             if not held:
                 self.log(step=n, kind=kind, action="skipped", why="a scenario holds the fleet")
@@ -84,10 +86,10 @@ class Chaos:
                 if not clis:
                     self.log(step=n, kind=kind, action="skipped", why="no live agent CLI")
                     return
-                cwd, pid = clis[int(pick * len(clis))]
+                cwd, host, pid = clis[int(pick * len(clis))]
                 try:
-                    self.fleet.kill_cli(pid)
-                    self.log(step=n, kind=kind, target=cwd, pid=pid, action="SIGKILL", live=len(clis))
+                    self.fleet.kill_cli(pid, host=host)
+                    self.log(step=n, kind=kind, target=cwd, host=host, pid=pid, action="SIGKILL", live=len(clis))
                 except (fleetlib.FleetError, ProcessLookupError) as e:
                     self.log(step=n, kind=kind, target=cwd, pid=pid, action="SIGKILL", result="failed: %s" % e)
                 return
@@ -96,6 +98,7 @@ class Chaos:
                 name = names[int(pick * len(names))]
             else:
                 name = self.fleet.st["controller"]
+            fleetlib.refresh(self.fleet.st)
             pid = self.fleet.proc(name)["pid"]
             gone = self.fleet.kill(name)
             self.log(step=n, kind=kind, target=name, pid=pid, action="SIGKILL", result="gone" if gone else "still running")
@@ -126,7 +129,6 @@ class Chaos:
                 break
             self.step(n, kind_of(layout, kroll), pick, down)
         # Anything still down (a failed start) is started before leaving.
-        self.fleet.reload()
         for name in self.fleet.st["procs"]:
             if not self.fleet.alive(name):
                 try:

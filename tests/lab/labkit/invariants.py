@@ -96,7 +96,7 @@ class Evidence:
             for s in self.samples:
                 if s["ts"] < c["start"]:
                     continue
-                if c["pid"] in s.get("clis", []):
+                if c["pid"] in s.get("clis", []) or "%s:%s" % (c["host"], c["pid"]) in s.get("clis", []):
                     seen = True
                 elif seen:
                     c["end"] = s["ts"]
@@ -130,7 +130,7 @@ def check_i1(ev):
         by_cwd = {}
         for pid in s.get("clis", []):
             for c in ev.clis.values():
-                if c["pid"] == pid and c.get("cwd") and c["start"] <= s["ts"] and (c["end"] is None or c["end"] >= s["ts"]):
+                if pid in (c["pid"], "%s:%s" % (c["host"], c["pid"])) and c.get("cwd") and c["start"] <= s["ts"] and (c["end"] is None or c["end"] >= s["ts"]):
                     by_cwd.setdefault(c["cwd"], set()).add((c["host"], pid))
         for cwd, live in sorted(by_cwd.items()):
             if len(live) > 1:

@@ -196,6 +196,22 @@ class Plan(unittest.TestCase):
         self.assertEqual(len({p["port"] for p in st["procs"].values()}), 3)
         self.assertEqual(len({p["home"] for p in st["procs"].values()}), 3)
 
+    def test_one_process_never_writes_back_anothers_stale_pids(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = fleet.plan("fleet", d, d, "/bin/d", "/bin/f")
+            st["_path"] = os.path.join(d, "fleet.json")
+            fleet.save(st)
+            a, b = fleet.load(st["_path"]), fleet.load(st["_path"])  # two lab processes
+            fleet.update_proc(a, "host-1", pid=111)
+            fleet.update_proc(b, "controller", pid=222)  # b never saw host-1's new pid
+            now = fleet.load(st["_path"])["procs"]
+            self.assertEqual((now["host-1"]["pid"], now["controller"]["pid"]), (111, 222))
+
+    def test_a_pid_that_is_not_this_runs_daemon_is_never_ours(self):
+        st = fleet.plan("fleet", "/r", "/run", "/no/such/k2-daemon", "/bin/f")
+        self.assertFalse(fleet.ours(st, os.getpid()), "this python process is alive but not the daemon")
+        self.assertFalse(fleet.ours(st, None))
+
     def test_solo_plan_is_one_daemon_that_is_controller_and_host(self):
         st = fleet.plan("solo", "/r", "/run", "/bin/d", "/bin/f")
         self.assertEqual(list(st["procs"]), ["solo"])

@@ -552,7 +552,8 @@ def s6(c, sc):
         files = wait_until(lambda: inbox_files(bob_cwd, title), 30)
         sc.check("the controller's outbox ends delivered", state == "delivered", "msg %s state %s" % (msg_id, state))
         sc.check("the item is in bob's inbox exactly once", len(files) == 1, "%s" % files)
-        up = c.outbox(ha, msg_id) or {}
+        # Read once alice's host answers (under --chaos it may be restarting).
+        up = wait_until(lambda: c.outbox(ha, msg_id), 60, 1.0) or {}
         sc.check("alice's host's outbox (hop up) ends delivered", (up.get("message") or {}).get("state") == "delivered",
                  json.dumps(up.get("message"))[:300])
     finally:
@@ -583,6 +584,32 @@ def open_chat(c, sc, cwd, what):
     return sid, csid, resp.get("reused"), sock, grid
 
 
+def ask_chat(c, sc, cwd, a, text, n=None, tries=3):
+    """Type `text` into the open chat `a` and wait for its reply. When the
+    CLI dies first (a chaos kill: the turn in progress is lost, PRD failure
+    table), do what the user would: the next need reopens the agent
+    (ensure-pinned-chat) and the prompt is typed again. Every retry is
+    logged and counted in the scenario's info. Returns (ok, a)."""
+    for attempt in range(1, tries + 1):
+        sid, csid, reused, sock, grid = a
+        want = "%s%s: %s" % (REPLY_MARKER, n, text) if n else text
+        typed = c.type(sock, text)
+        if typed and c.grid_wait(sock, grid, want if n else "%s" % text):
+            if n or wait_until(lambda: c.replied(cwd, text)):
+                return True, a
+        if c.fleet.cli_alive((c.exec_of(csid) or {}).get("host"), (c.exec_of(csid) or {}).get("pid")):
+            return False, a  # the CLI lives: a real failure, no retry
+        sc.info["retries_after_cli_death"] = sc.info.get("retries_after_cli_death", 0) + 1
+        sc.log("the CLI died before answering %r (attempt %d): the next need reopens it" % (text, attempt))
+        sock.close()
+        b = open_chat(c, sc, cwd, "the next need reopens the agent after its CLI died (attempt %d)" % attempt)
+        if not b:
+            return False, a
+        a = b
+        n = None  # the turn number restarts from the transcript; match the text only
+    return False, a
+
+
 def s7(c, sc):
     cwd = c.fleet.workspace("s7-%s" % c.tag)
     pid, why = c.register_enabled(cwd)
@@ -596,8 +623,9 @@ def s7(c, sc):
     try:
         fact = "s7 fact %s" % uuid.uuid4().hex[:6]
         n1 = "s7 first [[remember: %s]]" % fact
-        c.type(sock, n1)
-        if not sc.check("it answered and remembered", c.grid_wait(sock, grid, "%s1: %s" % (REPLY_MARKER, n1)), n1):
+        ok, a = ask_chat(c, sc, cwd, a, n1, 1)
+        sid, csid, _, sock, grid = a
+        if not sc.check("it answered and remembered", ok, n1):
             return
         wait_until(lambda: c.turn_events(csid, "cli.turn.end"), 30)
         ex = c.exec_of(csid)
@@ -617,8 +645,8 @@ def s7(c, sc):
             return
         with c.fleet.control():
             try:
-                c.fleet.kill_cli(cli_pid)
-                killed = wait_until(lambda: not fleetlib.pid_alive(cli_pid), 10)
+                c.fleet.kill_cli(cli_pid, host=host)
+                killed = wait_until(lambda: not c.fleet.cli_alive(host, cli_pid), 10)
             except (fleetlib.FleetError, ProcessLookupError, TypeError) as e:
                 killed = False
                 c.log("kill failed: %s" % e)
@@ -753,9 +781,10 @@ def s9(c, sc):
                  "turn.end %s; controller down %s, restarted %s" % (ended[0]["ts"] if ended else None, t_down, t_up_start))
         execs = c.fake("cli.exec", csid)
         exits = [e for e in c.fake("cli.exit", csid)]
+        alive = c.fleet.cli_alive(host, cli_pid)
         sc.check("the agent's CLI kept running (same pid, no exit, no new exec)",
-                 fleetlib.pid_alive(cli_pid) and not exits and len(execs) == 1,
-                 "pid %s alive=%s; cli.exit %d; cli.exec %d" % (cli_pid, fleetlib.pid_alive(cli_pid), len(exits), len(execs)))
+                 alive and not exits and len(execs) == 1,
+                 "pid %s alive=%s; cli.exit %d; cli.exec %d" % (cli_pid, alive, len(exits), len(execs)))
         adopted = wait_until(lambda: [e for e in c.fleet.daemon_events("controller", "ctl.adopt")
                                       if e.get("agent_id") == name and (e.get("ts") or "") >= t_up_start], 30)
         status = fleetlib.http_json(c.fleet.port, "/cli/hosts/status") or {}
@@ -780,7 +809,7 @@ def s9(c, sc):
         st, raw, resp = c.msg(name, n3, wake=False)
         wait_until(lambda: c.replied(cwd, n3), 60)
         sc.check("k2 msg reaches the same CLI (no re-spawn)",
-                 c.replied(cwd, n3) and len(c.fake("cli.exec", csid)) == 1 and fleetlib.pid_alive(cli_pid),
+                 c.replied(cwd, n3) and len(c.fake("cli.exec", csid)) == 1 and c.fleet.cli_alive(host, cli_pid),
                  "HTTP %s %s" % (st, raw[:200]))
     finally:
         if sock:

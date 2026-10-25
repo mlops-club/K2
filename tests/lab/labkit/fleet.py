@@ -10,6 +10,13 @@ Layouts:
   solo    today's daemon (in-process agent host), named "solo"; it is both
           the controller (the client's URL) and the one host, "local"
 
+Backend `compose` runs the fleet layout as deploy/compose/compose.lab-fleet.yaml
+(scripts/lab/lib/compose.sh builds the image and calls `up_compose`): a
+daemon's "pid" is then its container id, kill is `docker compose kill`,
+start is `docker compose start` (the same container, like a rebooted VM),
+and agent CLIs are named "<host>:<pid>" (pids of different containers can
+be equal). Homes and workspaces are bind mounts at the same absolute paths.
+
 Backend `procs` runs them on this machine. A daemon is started by a short
 /bin/sh that backgrounds it and exits, so the daemon is never a child of a
 Python process (a killed daemon can't linger as a zombie that `kill -0`
@@ -37,6 +44,7 @@ whose executable is inside this run's shim dir.
 """
 
 import contextlib
+import fcntl
 import json
 import os
 import signal
@@ -92,6 +100,33 @@ def load(state_path):
         st = json.load(fh)
     st["_path"] = state_path
     return st
+
+
+@contextlib.contextmanager
+def _state_lock(st):
+    with open(st["_path"] + ".lock", "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def refresh(st):
+    """Take every process's current entry from the file: several lab
+    processes (scenarios, chaos, the monitor) start and kill daemons."""
+    if os.path.isfile(st["_path"]):
+        st["procs"] = load(st["_path"])["procs"]
+    return st
+
+
+def update_proc(st, name, **fields):
+    """Read-modify-write one process's entry under the state lock, so one
+    lab process never writes back another's stale pids."""
+    with _state_lock(st):
+        refresh(st)
+        st["procs"][name].update(fields)
+        save(st)
 
 
 def save(st):
@@ -201,7 +236,7 @@ def wait_ready(st, name, deadline=READY_DEADLINE_S):
     end = time.monotonic() + deadline
     phase = None
     while time.monotonic() < end:
-        if not pid_alive(p["pid"]):
+        if not ours(st, p["pid"]):
             raise FleetError("%s (pid %s) exited during boot; log %s" % (name, p["pid"], p["log"]))
         phase = (http_json(p["port"], "/boot-status") or {}).get("phase")
         if phase == "ready":
@@ -214,15 +249,51 @@ def wait_ready(st, name, deadline=READY_DEADLINE_S):
         name, deadline, phase, ", host not linked" if p["role"] == "host" else ""))
 
 
+def _compose(st, *args, check=False, timeout=180):
+    c = st["compose"]
+    env = dict(os.environ, **c["env"])
+    return subprocess.run(["docker", "compose", "-p", c["project"], "-f", c["file"]] + list(args),
+                          env=env, capture_output=True, text=True, check=check, timeout=timeout)
+
+
+def _running(st, name):
+    out = _compose(st, "ps", "--status", "running", "-q", name).stdout.strip()
+    return out[:12] if out else None
+
+
+def ours(st, pid):
+    """True when `pid` is alive and runs this run's daemon binary: a stale
+    pid that the OS reused for another process is never signalled.
+    (compose: `pid` is a container id; true while it runs.)"""
+    if st.get("backend") == "compose":
+        if not pid:
+            return False
+        names = [n for n, p in st["procs"].items() if p.get("pid") == pid]
+        return bool(names) and _running(st, names[0]) == pid
+    if not pid_alive(pid):
+        return False
+    cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return cmd.split(" ")[0] == st["daemon_bin"]
+
+
 def start(st, name, wait=True):
+    refresh(st)
     p = st["procs"][name]
-    if pid_alive(p["pid"]):
+    if ours(st, p["pid"]):
         raise FleetError("%s is already running (pid %s)" % (name, p["pid"]))
+    if st.get("backend") == "compose":
+        r = _compose(st, "start", name)
+        if r.returncode != 0:
+            raise FleetError("docker compose start %s: %s" % (name, r.stderr.strip()[-300:]))
+        pid = _running(st, name)
+        update_proc(st, name, pid=pid, starts=p["starts"] + 1, started_at=_now_iso())
+        if wait:
+            wait_ready(st, name)
+        return pid
     p["bin"] = st["daemon_bin"]
-    p["pid"] = _spawn_detached(p)
-    p["starts"] += 1
-    p["started_at"] = _now_iso()
-    save(st)
+    pid = _spawn_detached(p)
+    update_proc(st, name, bin=st["daemon_bin"], pid=pid, starts=p["starts"] + 1, started_at=_now_iso())
+    p = st["procs"][name]
     if wait:
         wait_ready(st, name)
     return p["pid"]
@@ -232,10 +303,18 @@ def kill(st, name, sig=signal.SIGKILL, wait_s=None):
     """Signal a daemon and wait for it to be gone. SIGKILL waits briefly;
     SIGTERM waits `wait_s` (a drain may take a while), then gives up and
     returns False (still running)."""
-    p = st["procs"][name]
-    pid = p["pid"]
-    if not pid_alive(pid):
+    refresh(st)
+    pid = st["procs"][name]["pid"]
+    if not ours(st, pid):
         return True
+    if st.get("backend") == "compose":
+        _compose(st, "kill", "-s", signal.Signals(sig).name, name)
+        end = time.monotonic() + (wait_s if wait_s is not None else (10 if sig == signal.SIGKILL else STOP_GRACE_S))
+        while time.monotonic() < end:
+            if not _running(st, name):
+                return True
+            time.sleep(0.2)
+        return not _running(st, name)
     os.kill(pid, sig)
     end = time.monotonic() + (wait_s if wait_s is not None else (5 if sig == signal.SIGKILL else STOP_GRACE_S))
     while time.monotonic() < end:
@@ -246,7 +325,19 @@ def kill(st, name, sig=signal.SIGKILL, wait_s=None):
 
 
 def agent_cli_pids(st):
-    """Live agent CLIs of this run: processes whose executable is in its shim dir."""
+    """Live agent CLIs of this run: processes whose executable is in its shim
+    dir. procs: pids; compose: "<host>:<pid>" from ps in each host container."""
+    if st.get("backend") == "compose":
+        keys = []
+        for h in st["hosts"]:
+            if not _running(st, h["proc"]):
+                continue
+            r = _compose(st, "exec", "-T", h["proc"], "ps", "-eo", "pid=,args=", timeout=30)
+            for line in r.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[1].startswith(st["shim"] + "/"):
+                    keys.append("%s:%s" % (h["name"], parts[0]))
+        return sorted(keys)
     out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
     prefix = st["shim"] + "/"
     pids = []
@@ -257,22 +348,47 @@ def agent_cli_pids(st):
     return sorted(pids)
 
 
-def kill_cli(st, pid, sig=signal.SIGKILL):
-    if pid not in agent_cli_pids(st):
-        raise FleetError("pid %s is not an agent CLI of this run" % pid)
+def cli_key(st, host, pid):
+    """How agent_cli_pids names a CLI."""
+    return "%s:%s" % (host, pid) if st.get("backend") == "compose" else pid
+
+
+def kill_cli(st, pid, sig=signal.SIGKILL, host=None):
+    key = cli_key(st, host, pid)
+    if key not in agent_cli_pids(st):
+        raise FleetError("%s is not an agent CLI of this run" % key)
+    if st.get("backend") == "compose":
+        _compose(st, "exec", "-T", host, "kill", "-%d" % int(sig), str(pid), timeout=30)
+        return
     os.kill(pid, sig)
 
 
+def cli_alive(st, host, pid):
+    if not pid:
+        return False
+    if st.get("backend") == "compose":
+        return cli_key(st, host, pid) in agent_cli_pids(st)
+    return pid_alive(pid)
+
+
 def down(st):
+    refresh(st)
+    if st.get("backend") == "compose":
+        for name in st["procs"]:
+            r = _compose(st, "logs", "--no-color", "--timestamps", name)
+            with open(st["procs"][name]["log"], "a") as fh:
+                fh.write(r.stdout + r.stderr)
+        _compose(st, "down", "--volumes", "--remove-orphans", "-t", "10")
+        return
     for name, p in st["procs"].items():
-        if pid_alive(p["pid"]):
+        if ours(st, p["pid"]):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(p["pid"], signal.SIGTERM)
     end = time.monotonic() + STOP_GRACE_S
-    while time.monotonic() < end and any(pid_alive(p["pid"]) for p in st["procs"].values()):
+    while time.monotonic() < end and any(ours(st, p["pid"]) for p in st["procs"].values()):
         time.sleep(0.1)
     for p in st["procs"].values():
-        if pid_alive(p["pid"]):
+        if ours(st, p["pid"]):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(p["pid"], signal.SIGKILL)
     for pid in agent_cli_pids(st):
@@ -300,6 +416,39 @@ def up(layout, run_dir, state_path, daemon_bin, fake_bin):
     for h in st["hosts"]:
         if h["proc"] != st["controller"]:
             start(st, h["proc"])
+    return st
+
+
+def up_compose(run_dir, state_path, root, image, project, compose_file):
+    """The fleet layout on Docker Compose (scripts/lab/lib/compose.sh calls
+    this after building `image`)."""
+    run_dir = os.path.abspath(run_dir)
+    os.makedirs(os.path.join(run_dir, "traces"), exist_ok=True)
+    st = plan("fleet", root, run_dir, "/usr/bin/k2-daemon", "/usr/bin/k2-fake-agent")
+    st.update(backend="compose", shim="/opt/k2-shim", _path=state_path)
+    for name, p in st["procs"].items():
+        p["env"] = {}  # in the compose file
+        p["service"] = name
+        os.makedirs(p["home"], exist_ok=True)
+    st["compose"] = {"project": project, "file": compose_file, "image": image, "env": {
+        "LAB_COMPOSE_PROJECT": project, "LAB_FLEET_IMAGE": image, "LAB_ROOT": root,
+        "LAB_TRACES": os.path.join(run_dir, "traces"),
+        "LAB_CTL_PORT": str(st["procs"]["controller"]["port"]),
+        "LAB_H1_PORT": str(st["procs"]["host-1"]["port"]), "LAB_H2_PORT": str(st["procs"]["host-2"]["port"]),
+        "LAB_TURN_MS": os.environ.get("LAB_TURN_MS", "300"), "LAB_SEED": os.environ.get("LAB_SEED", "0")}}
+    os.makedirs(st["work"], exist_ok=True)
+    with open(st["host_token_file"], "w") as fh:
+        fh.write(os.urandom(24).hex())
+    for h in st["hosts"]:
+        open(h["fake_trace"], "a").close()
+    save(st)
+    r = _compose(st, "up", "-d", "--no-build", "--pull", "never", timeout=300)
+    if r.returncode != 0:
+        raise FleetError("docker compose up: %s" % r.stderr.strip()[-500:])
+    for name in ("controller", "host-1", "host-2"):
+        update_proc(st, name, pid=_running(st, name), starts=1, started_at=_now_iso())
+    for name in ("controller", "host-1", "host-2"):
+        wait_ready(st, name)
     return st
 
 
@@ -351,7 +500,7 @@ def monitor(state_path, out_path, stop=None):
     with open(out_path, "a") as fh:
         while not done["v"] and not (stop and stop()):
             st = load(state_path)
-            procs = {n: (p["pid"] if pid_alive(p["pid"]) else None) for n, p in st["procs"].items()}
+            procs = {n: (p["pid"] if ours(st, p["pid"]) else None) for n, p in st["procs"].items()}
             fh.write(json.dumps({"ts": _now_iso(), "procs": procs, "clis": agent_cli_pids(st)}) + "\n")
             fh.flush()
             time.sleep(MONITOR_PERIOD_S)
@@ -428,13 +577,17 @@ class Fleet:
         return pid
 
     def alive(self, name):
-        return pid_alive(self.st["procs"][name]["pid"])
+        refresh(self.st)
+        return ours(self.st, self.st["procs"][name]["pid"])
 
     def cli_pids(self):
         return agent_cli_pids(self.st)
 
-    def kill_cli(self, pid, sig=signal.SIGKILL):
-        kill_cli(self.st, pid, sig)
+    def kill_cli(self, pid, sig=signal.SIGKILL, host=None):
+        kill_cli(self.st, pid, sig, host)
+
+    def cli_alive(self, host, pid):
+        return cli_alive(self.st, host, pid)
 
     def control(self, wait=True):
         return control(self.st, wait)

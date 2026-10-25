@@ -94,11 +94,16 @@ PY
 }
 
 topo_down() {
-    [ -n "$FLEET_STATE" ] && [ -f "$FLEET_STATE" ] || return 0
     if [ "${LAB_FLEET_BACKEND:-procs}" = compose ]; then
-        source "$LAB_REPO/scripts/lab/lib/compose.sh"
-        compose_fleet_down "$FLEET_STATE"
-    else
+        # Always: it also gives back the Docker lock when up failed early.
+        if declare -F compose_fleet_down >/dev/null; then
+            compose_fleet_down "$FLEET_STATE"
+        fi
+        FLEET_STATE=""
+        return 0
+    fi
+    [ -n "$FLEET_STATE" ] && [ -f "$FLEET_STATE" ] || return 0
+    if true; then
         python3 -I "$LAB_REPO/tests/lab/lab.py" fleet down --state "$FLEET_STATE"
         local root
         root=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["root"])' "$FLEET_STATE")
