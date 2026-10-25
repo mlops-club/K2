@@ -41,6 +41,8 @@ compose_fleet_up() {
         until mkdir "$lock" 2>/dev/null; do sleep 20; done
         echo "$name" > "$lock/owner"
         echo "fleet compose: holding the Docker lock from $(date -u +%H:%M:%SZ)" >&2
+        # The build box (apt-get only; a no-op when it is up to date).
+        docker build -q -t k2-lab-gate:3 -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo/scripts/lab/docker" >&2 || exit 3
         docker run --rm --name "$name" \
             --memory=10g --memory-swap=10g --cpus 3 \
             -e CARGO_BUILD_JOBS=2 -e CARGO_TARGET_DIR=/cache/target \
