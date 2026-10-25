@@ -150,29 +150,42 @@ async function connect(): Promise<void> {
 }
 
 describe('ConnectionGate: a remote that goes away and comes back reconnects by itself', () => {
-  it('server down (refused) for 60 s, back with a new instanceId → connected within one backoff', async () => {
-    await connect()
+  // The first ok poll after a >60 s outage used to consult the arbiter
+  // whenever its 30 s throttle had run out, i.e. on one poll in four. With
+  // the jitter fixed (polls every ~8 s) these outage lengths, one poll
+  // apart, put the server's return on every phase of that cycle, so one of
+  // them always lands on the arbiter's poll.
+  it.each([63_000, 71_000, 79_000, 87_000, 95_000])(
+    'server refused for %i ms, back with a new instanceId → connected, never treated as a wedge',
+    async (outageMs) => {
+      vi.spyOn(Math, 'random').mockReturnValue(0.999)
+      await connect()
 
-    // The roll: the events WS drops (R1) and every request is refused.
-    h.server.up = false
-    act(() => noteRemoteEventsClosed())
-    await advance(60_000)
-    expect(recovery()).toBe('reconnecting')
+      // The roll: the events WS drops (R1) and every request is refused.
+      h.server.up = false
+      act(() => noteRemoteEventsClosed())
+      await advance(outageMs)
+      expect(recovery()).toBe('reconnecting')
 
-    const pollsWhileDown = h.bootPolls
-    h.server.up = true
-    h.server.instanceId = 'boot-2'
-    // RECOVERY_RECONNECT_MAX_MS (8 s) plus jitter.
-    await advance(12_000)
-    expect(h.bootPolls).toBeGreaterThan(pollsWhileDown)
-    expect(recovery()).toBe('connected')
-    expect(h.app.mounts).toBe(1) // stayed mounted: no sign-in, no remount
-    // The webview's own probe answered, so the out-of-webview arbiter was
-    // never asked: before the fix, the >60 s failure run made the first ok
-    // probe consult it, it said 'ready', and the gate auto-reloaded the
-    // page (a "wedge") and stopped polling.
-    expect(h.arbiterSawReady).toBe(0)
-  })
+      const pollsWhileDown = h.bootPolls
+      h.server.up = true
+      h.server.instanceId = 'boot-2'
+      // RECOVERY_RECONNECT_MAX_MS (8 s), then a margin.
+      await advance(12_000)
+      // The webview's own probe answered, so the out-of-webview arbiter is
+      // not asked. Before the fix it was: it said 'ready', the gate took
+      // the webview's pool for wedged, called location.reload() (a no-op
+      // here, as when a reload doesn't take) and stopped polling.
+      expect(h.arbiterSawReady).toBe(0)
+      expect(recovery()).toBe('connected')
+      // ... and the loop is still alive afterwards: the health poll goes on.
+      const pollsAtRecovery = h.bootPolls
+      expect(pollsAtRecovery).toBeGreaterThan(pollsWhileDown)
+      await advance(30_000)
+      expect(h.bootPolls).toBeGreaterThan(pollsAtRecovery)
+      expect(h.app.mounts).toBe(1) // stayed mounted: no sign-in, no remount
+    },
+  )
 
   it('requests that hang (proxy up, pod gone) then a refused gap, then back → connected', async () => {
     await connect()
