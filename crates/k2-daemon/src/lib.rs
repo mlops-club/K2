@@ -14,6 +14,7 @@ pub mod action_cards;
 pub mod active_reaper;
 pub mod session_reaper;
 pub mod agents_routes;
+pub mod agent_host;
 pub mod agent_name_repair_migrate;
 pub mod agent_retire;
 pub mod awareness_ws;

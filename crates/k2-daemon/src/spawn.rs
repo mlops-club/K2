@@ -13,12 +13,12 @@ use std::sync::{Arc, OnceLock};
 
 use k2_core::log_debug;
 use k2_core::session::SessionId;
-use k2_core::terminal::{DaemonPtyConfig, DaemonPtySession};
+use k2_core::terminal::DaemonPtyConfig;
 use parking_lot::Mutex;
 
+use crate::agent_host::host;
 use crate::pending_live;
 use crate::signal_format;
-use crate::v2_session_map;
 
 /// Per-canonical-key single-flight for mismatch-kill + resume-spawn (R17).
 /// Shared by `ensure_pinned_chat` (including forceRespawn), this helper,
@@ -246,18 +246,18 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
     // and unregister — and gracefully handles the rare case where
     // the observer task panicked or the broadcast channel closed
     // before ChildExit landed.
-    if let Some(existing) = v2_session_map::lookup_by_agent_name(&canonical_key) {
+    if let Some(existing) = host().find_agent(&canonical_key) {
         if existing.is_child_alive()
-            && live_program_matches(existing.program.as_deref(), req.command.as_deref())
+            && live_program_matches(existing.program(), req.command.as_deref())
         {
             log_debug!(
                 "[daemon/spawn] v2 reuse session={} canonical_key={} program={:?}",
-                existing.session_id,
+                existing.session_id(),
                 canonical_key,
-                existing.program,
+                existing.program(),
             );
             return Ok(SpawnWorkspaceSessionOutcome {
-                session_id: existing.session_id,
+                session_id: existing.session_id(),
                 agent_name: req.agent_name,
                 pending_drained: 0,
                 reused: true,
@@ -272,11 +272,11 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
              alive={} live_program={:?} expected={:?}",
             canonical_key,
             existing.is_child_alive(),
-            existing.program,
+            existing.program(),
             req.command,
         );
-        v2_session_map::unregister(&canonical_key);
-        existing.kill();
+        host().unplace(&canonical_key);
+        host().kill(&existing);
     }
 
     // Phase B: seed the session's label with the workspace's
@@ -479,26 +479,18 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
         cfg.cwd.as_deref(),
         cfg.env.get("HOME").map(String::as_str),
     );
-    let session = DaemonPtySession::spawn(cfg).map_err(|e| format!("v2 spawn failed: {e}"))?;
+    let session = host().spawn(cfg).map_err(|e| format!("v2 spawn failed: {e}"))?;
     if let Some(g) = llm_login {
         g.spawned(session.child_pid());
     }
     // Seed last-claimer dims at create (attach-size PR2) so a grid
     // pre-snap has the body fit before the first SetActive.
-    {
-        use std::sync::atomic::Ordering;
-        session
-            .active_cols
-            .store(req.cols.max(1), Ordering::Relaxed);
-        session
-            .active_rows
-            .store(req.rows.max(1), Ordering::Relaxed);
-    }
+    host().set_claimed_size(&session, req.cols.max(1), req.rows.max(1));
 
     // COMPAT-58 — bind per-cell UDS after PTY open (bare-PTY → no chown).
     crate::session_token::activate_cell_uds(session_id, None);
 
-    v2_session_map::register(canonical_key.clone(), session.clone());
+    host().place(&canonical_key, &session);
 
     // Wire the child-exit observer so the v2_session_map slot
     // releases when the child PID dies — keeps the idempotency
@@ -529,7 +521,7 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
     let pending_drained = pending.len();
     for signal in pending {
         let bytes = signal_format::inject_bytes(&signal);
-        session.write(bytes.into_bytes());
+        let _ = host().write(&session, bytes.into_bytes());
     }
 
     log_debug!(

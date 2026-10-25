@@ -1519,26 +1519,10 @@ fn inject_framed_locked(live: &session_lookup::LiveSession, payload: &str) -> In
         }
     };
     let actions = k2_core::inject_flow::compile_inject_flow(&flow, &body);
-    for action in actions {
-        match action {
-            k2_core::inject_flow::InjectAction::Write(bytes) => {
-                if live.write(&bytes).is_err() {
-                    return InjectOutcome::PtyDied;
-                }
-            }
-            k2_core::inject_flow::InjectAction::Sleep(ms) => {
-                if ms > 0 {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-            }
-            k2_core::inject_flow::InjectAction::CheckAlive => {
-                if !live.is_child_alive() {
-                    return InjectOutcome::PtyDied;
-                }
-            }
-        }
+    match crate::agent_host::host().inject(live, actions) {
+        crate::agent_host::InjectResult::Delivered => InjectOutcome::Delivered,
+        crate::agent_host::InjectResult::ChildGone => InjectOutcome::PtyDied,
     }
-    InjectOutcome::Delivered
 }
 
 // ─────────────────────────────────────────────────────────────────────
