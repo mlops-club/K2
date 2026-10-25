@@ -386,16 +386,33 @@ def k2_msg_as(c, host, to, text, sender):
     return r.returncode, out, msg_id, doc
 
 
+def workspace_agent(c, sc, name):
+    """A workspace agent the way the app makes one: the workspace registered
+    (its name is the dir name, `name`) and opened with ensure-pinned-chat.
+    Returns (cwd, project id, chat tuple, host) or None."""
+    cwd = c.fleet.workspace(name)
+    pid, why = c.register_enabled(cwd)
+    if not sc.check("workspace %s registered" % name, pid, why):
+        return None
+    a = open_chat(c, sc, cwd, "%s opened (ensure-pinned-chat)" % name)
+    if not a:
+        return None
+    host = (c.exec_of(a[1]) or {}).get("host")
+    return cwd, pid, a, host
+
+
 def s3(c, sc):
+    """k2 msg <workspace>, as agents address each other today (k2
+    connections list): alice's CLI runs the real cli/k2 on alice's host."""
     alice, bob = "s3-alice-%s" % c.tag, "s3-bob-%s" % c.tag
     agents = {}
     try:
         for n in (alice, bob):
-            a = c.start_agent(sc, n, c.fleet.workspace(n))
-            if not a:
+            w = workspace_agent(c, sc, n)
+            if not w:
                 return
-            agents[n] = a
-        ha, hb = agents[alice][2], agents[bob][2]
+            agents[n] = w
+        ha, hb = agents[alice][3], agents[bob][3]
         sc.info["hosts"] = {alice: ha, bob: hb}
         if c.fleet.layout == "fleet":
             sc.check("alice and bob run on different hosts", ha and hb and ha != hb, "alice %s, bob %s" % (ha, hb))
@@ -403,22 +420,22 @@ def s3(c, sc):
         text = "S3 hello bob from alice %s" % nonce
         rc, out, msg_id, doc = k2_msg_as(c, ha or c.fleet.hosts()[0]["name"], bob, text, alice)
         sc.info["k2_msg"] = {"rc": rc, "out": out[:500], "msg_id": msg_id}
-        sc.check("cli/k2 msg on alice's host accepted it", rc == 0 and (doc or {}).get("success") is not False,
+        sc.check("cli/k2 msg %s on alice's host accepted it" % bob, rc == 0 and (doc or {}).get("success") is not False,
                  "rc %s: %s" % (rc, out[:300]))
         if c.fleet.layout == "fleet":
             state = c.wait_final(msg_id) if msg_id else None
             sc.check("the controller's outbox ends delivered", state == "delivered", "msg %s state %s" % (msg_id, state))
-        bob_cwd = c.fleet.workspace(bob)
+        bob_cwd = agents[bob][0]
         wait_until(lambda: c.replied(bob_cwd, nonce), DEADLINE_S)
         seen = c.prompts_with(bob_cwd, nonce)
         sc.check("bob's transcript has it exactly once, and bob answered", len(seen) == 1 and c.replied(bob_cwd, nonce),
                  "%d time(s): %s" % (len(seen), [(h, s) for h, s, _ in seen]))
-        wrong = c.prompts_with(c.fleet.workspace(alice), nonce)
+        wrong = c.prompts_with(agents[alice][0], nonce)
         sc.check("it did not land on alice", not wrong, "%d time(s) in alice's transcripts" % len(wrong))
     finally:
-        for n, a in agents.items():
-            a[3].close()
-            c.close(n)
+        for n, w in agents.items():
+            w[2][3].close()
+            c.close(w[1])
 
 
 # ── S4, S5: the W1 flows ────────────────────────────────────────────────
@@ -496,16 +513,17 @@ def compose_inbox(c, host, to, title, sender):
 
 
 def s6(c, sc):
+    """Inbox compose to a workspace (by name) survives restarts."""
     alice, bob = "s6-alice-%s" % c.tag, "s6-bob-%s" % c.tag
-    bob_cwd = c.fleet.workspace(bob)
     title = "S6 inbox item %s" % uuid.uuid4().hex[:8]
     agents = {}
     try:
         for n in (alice, bob):
-            a = c.start_agent(sc, n, c.fleet.workspace(n))
-            if not a:
+            w = workspace_agent(c, sc, n)
+            if not w:
                 return
-            agents[n] = a
+            agents[n] = w
+        bob_cwd = agents[bob][0]
         if c.fleet.layout == "solo":
             st, raw, resp = compose_inbox(c, "local", bob, title, alice)
             files = wait_until(lambda: inbox_files(bob_cwd, title), 30)
@@ -523,7 +541,7 @@ def s6(c, sc):
                      len(after) == 1 and open(after[0], "rb").read() == before, "%s" % after)
             return
 
-        ha, hb = agents[alice][2], agents[bob][2]
+        ha, hb = agents[alice][3], agents[bob][3]
         sc.info["hosts"] = {alice: ha, bob: hb}
         if not sc.check("alice and bob run on different hosts", ha and hb and ha != hb, "alice %s, bob %s" % (ha, hb)):
             return
@@ -543,11 +561,11 @@ def s6(c, sc):
             wait_until(lambda: (fleetlib.http_json(c.fleet.proc(ha)["port"], "/cli/hosts/status") or {}).get("linked"), 60)
             c.fleet.start(hb)
             sc.check("bob's host is back", c.fleet.alive(hb), "")
-        # bob's next need: the app spawns him again.
-        agents[bob][3].close()
-        a = c.start_agent(sc, bob, bob_cwd)
-        if a:
-            agents[bob] = a
+        # bob's next need: the app opens him again.
+        agents[bob][2][3].close()
+        b = open_chat(c, sc, bob_cwd, "bob's next need: the app opens him again")
+        if b:
+            agents[bob] = (bob_cwd, agents[bob][1], b, hb)
         state = c.wait_final(msg_id) if msg_id else None
         files = wait_until(lambda: inbox_files(bob_cwd, title), 30)
         sc.check("the controller's outbox ends delivered", state == "delivered", "msg %s state %s" % (msg_id, state))
@@ -557,9 +575,9 @@ def s6(c, sc):
         sc.check("alice's host's outbox (hop up) ends delivered", (up.get("message") or {}).get("state") == "delivered",
                  json.dumps(up.get("message"))[:300])
     finally:
-        for n, a in agents.items():
-            a[3].close()
-            c.close(n)
+        for n, w in agents.items():
+            w[2][3].close()
+            c.close(w[1])
 
 
 # ── S7 ──────────────────────────────────────────────────────────────────
