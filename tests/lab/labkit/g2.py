@@ -98,19 +98,33 @@ class Scenario:
 DAEMON_BACK_S = 90  # how long a client waits for a restarting daemon, as the app does
 
 
-def daemon_down(status, text):
+# Requests the app may simply send again when the daemon died while
+# answering: they converge on one state (register, enable, open, close).
+IDEMPOTENT = ("/cli/projects/add-from-path", "/cli/projects/update", "/cli/workspace/ensure-pinned-chat",
+              "/cli/sessions/v2/close", "/cli/hosts/outbox", "/cli/hosts/status")
+
+
+def daemon_down(status, text, method="POST", path=""):
     """The daemon is not there to answer yet: connection refused (it is
     down: the request never reached it, so sending again cannot duplicate
-    it) or 503 while it boots (`"state":"migrating"`)."""
-    return (status == 0 and "refused" in text) or (status == 503 and '"migrating"' in text)
+    it), 503 while it boots (`"state":"migrating"`), or, for a GET or an
+    idempotent route only, a connection the daemon dropped while dying."""
+    if (status == 0 and "refused" in text) or (status == 503 and '"migrating"' in text):
+        return True
+    dropped = status == 0 and ("closed connection" in text or "reset" in text or "Broken pipe" in text)
+    return dropped and (method == "GET" or path in IDEMPOTENT)
 
 
-def send_waiting_for_daemon(req, log=None):
+def send_waiting_for_daemon(make_req, log=None, method="POST", path=""):
     """urlopen that waits (up to DAEMON_BACK_S) while the daemon is down or
-    booting, like the app reconnecting; anything else is returned as is."""
+    booting, like the app reconnecting; anything else is returned as is.
+    `make_req()` builds the request on every attempt, so it carries the
+    token the daemon has now (a restarted daemon issues a new one). A 403
+    right after waiting is retried once with the new token."""
     end = time.monotonic() + DAEMON_BACK_S
-    waited = False
+    waited = refreshed = False
     while True:
+        req = make_req()
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
                 status, text = r.status, r.read().decode("utf-8", "replace")
@@ -118,7 +132,11 @@ def send_waiting_for_daemon(req, log=None):
             status, text = e.code, e.read().decode("utf-8", "replace")
         except OSError as e:
             status, text = 0, "request failed: %s" % e
-        if not daemon_down(status, text) or time.monotonic() >= end:
+        if waited and status == 403 and not refreshed:
+            refreshed = True  # the token file may have changed under us once more
+            time.sleep(0.5)
+            continue
+        if not daemon_down(status, text, method, path) or time.monotonic() >= end:
             if waited and log:
                 log("the daemon answered again (HTTP %s)" % status)
             return status, text
@@ -144,8 +162,11 @@ class Client:
 
     def http(self, method, path, query=None, body=None, form=None, port=None, token=None):
         q = dict(query or {})
-        q["token"] = token or self.fleet.token()
-        url = "http://127.0.0.1:%d%s?%s" % (port or self.fleet.port, path, urllib.parse.urlencode(q))
+        proc_of_port = next((n for n, p in self.fleet.st["procs"].items() if p["port"] == port), None)
+
+        def url():
+            q["token"] = token if token and not proc_of_port else self.fleet.token(proc_of_port)
+            return "http://127.0.0.1:%d%s?%s" % (port or self.fleet.port, path, urllib.parse.urlencode(q))
         headers = {}
         if form is not None:
             data = urllib.parse.urlencode(form).encode()
@@ -155,8 +176,9 @@ class Client:
             headers["Content-Type"] = "application/json"
         else:
             data = b"" if method == "POST" else None
-        status, text = send_waiting_for_daemon(urllib.request.Request(url, data=data, method=method, headers=headers),
-                                               self.log)
+        status, text = send_waiting_for_daemon(lambda: urllib.request.Request(url(), data=data, method=method,
+                                                                              headers=headers),
+                                               self.log, method, path)
         self.log("%s :%s%s %s -> %s %s" % (method, port or self.fleet.port, path,
                                           json.dumps(form if form is not None else body), status, text[:500]))
         try:
@@ -498,6 +520,7 @@ def w1_flows(c, out, flows):
     os.makedirs(A.out, exist_ok=True)
 
     run = w1.W1(A, c.fleet.token())
+    run.token_fn = c.fleet.token
 
     def fake_events(event, session):
         return [e for e in c.fleet.fake_events(event) if e.get("session_id") == session]
@@ -730,8 +753,9 @@ def s7(c, sc):
             sc.check("MEMORY.md bytes unchanged by the crash and resume", now_bytes == mem_bytes,
                      "%s (resumed on %s; the crash was on %s)" % (now_file, rhost, host))
         n3 = "s7 after %s" % uuid.uuid4().hex[:6]
-        c.type(sock, n3)
-        sc.check("the resumed agent answers", wait_until(lambda: c.replied(cwd, n3)), n3)
+        ok, b = ask_chat(c, sc, cwd, b, n3)
+        sock = b[3]
+        sc.check("the resumed agent answers", ok, n3)
     finally:
         if sock:
             sock.close()

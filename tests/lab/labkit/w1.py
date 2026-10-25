@@ -131,8 +131,11 @@ class W1:
         """JSON body (`body`) or form-encoded body (`form`). Returns
         (status, text, parsed-json-or-{})."""
         q = dict(query or {})
-        q["token"] = self.token
-        url = "http://127.0.0.1:%d%s?%s" % (self.port, path, urllib.parse.urlencode(q))
+
+        def url():
+            # A restarted daemon has a new token (--chaos): read it each time.
+            q["token"] = self.token_fn() if getattr(self, "token_fn", None) else self.token
+            return "http://127.0.0.1:%d%s?%s" % (self.port, path, urllib.parse.urlencode(q))
         headers = {}
         if form is not None:
             data = urllib.parse.urlencode(form).encode()
@@ -142,10 +145,10 @@ class W1:
             headers["Content-Type"] = "application/json"
         else:
             data = b"" if method == "POST" else None
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         shown = form if form is not None else body
         # Waits while the daemon is down or booting (--chaos), as the app does.
-        status, text = g2.send_waiting_for_daemon(req, self.log)
+        status, text = g2.send_waiting_for_daemon(
+            lambda: urllib.request.Request(url(), data=data, method=method, headers=headers), self.log, method, path)
         self.log("%s %s %s -> %s %s" % (method, path, json.dumps(shown), status, text[:600]))
         try:
             parsed = json.loads(text)
@@ -257,7 +260,8 @@ class W1:
         grid = s1.Grid()
         try:
             sock = wslib.WebSocket("127.0.0.1", self.port, "/cli/sessions/grid?" + urllib.parse.urlencode(
-                {"session": sid, "token": self.token}), timeout=DEADLINE_S)
+                {"session": sid, "token": self.token_fn() if getattr(self, "token_fn", None) else self.token}),
+                timeout=DEADLINE_S)
         except (OSError, wslib.WsError) as e:
             self.check(f, "attach WS /cli/sessions/grid", False, str(e))
             return
