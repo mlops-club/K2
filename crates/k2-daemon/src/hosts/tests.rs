@@ -939,8 +939,7 @@ use crate::agent_host::remote::PlacementStore;
 
 /// A controller whose placements live in its own DB file.
 fn store_at(path: &std::path::Path) -> std::sync::Arc<PlacementStore> {
-    let conn = rusqlite::Connection::open(path).expect("open store db");
-    std::sync::Arc::new(PlacementStore::open(std::sync::Arc::new(parking_lot::ReentrantMutex::new(conn))).expect("store"))
+    std::sync::Arc::new(PlacementStore::open_file(path).expect("store"))
 }
 
 impl Controller {
@@ -976,6 +975,41 @@ fn resumed(agent: &str, session: &str, epoch: u64) -> super::proto::ResumePlacem
         program: Some("claude".into()),
         ..Default::default()
     }
+}
+
+/// The store keeps its own connection: restore (a controller's first
+/// `host()`), persist and forget all finish while another thread holds
+/// `k2_core::db::shared()`, as the active reaper does around its `host()`
+/// call. On the shared connection this hung a restarted controller's boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_placement_store_never_waits_on_the_shared_db_lock() {
+    let db = test_env::unique_temp_path("w3-store-lock").with_extension("db");
+    let shared = k2_core::db::shared();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _held = shared.lock();
+        locked_tx.send(()).unwrap();
+        let _ = done_rx.recv();
+    });
+    locked_rx.recv().unwrap();
+    let (session, epoch) = {
+        let c = Controller::start_with_store(&db).await;
+        let mut host = fake_host(&c, "h-lock").await;
+        c.wait_hosts(1).await;
+        place_on(&c, &mut host, "agent-lock").await // persist
+    };
+    let c = Controller::start_with_store(&db).await; // restore
+    let p = c.remote.placement("agent-lock").expect("restored");
+    assert_eq!((p.epoch.0, p.session_id.as_deref()), (epoch, Some(session.as_str())));
+    // The host returns without it: gone, its row deleted (forget).
+    let _host = hello_with(&c, "h-lock", vec![]).await;
+    c.wait_hosts(1).await;
+    assert!(c.remote.placement("agent-lock").is_none());
+    assert!(store_at(&db).load().unwrap().is_empty());
+    done_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let _ = std::fs::remove_file(&db);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

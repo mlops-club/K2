@@ -215,6 +215,18 @@ impl PlacementStore {
         Ok(Self { db })
     }
 
+    /// A store on its own connection to the database file at `path`. The
+    /// controller's store must not share `k2_core::db::shared()`: its lock
+    /// is taken while `RemoteHost::inner` is held (persist, forget) and
+    /// inside `global()`'s first call (restore), and other threads hold the
+    /// shared lock while they call `host()` (the active reaper does), so a
+    /// shared connection deadlocks the controller's boot after a restart.
+    /// Its own lock is a leaf: nothing is locked while it is held.
+    pub fn open_file(path: &Path) -> Result<Self, String> {
+        let conn = k2_core::db::open_private_with_resilience(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Self::open(Arc::new(parking_lot::ReentrantMutex::new(conn)))
+    }
+
     pub fn load(&self) -> Result<Vec<StoredPlacement>, String> {
         let c = self.db.lock();
         let mut st = c
@@ -1734,7 +1746,11 @@ impl AgentHost for RemoteHost {
 pub fn global() -> &'static RemoteHost {
     static REMOTE: OnceLock<RemoteHost> = OnceLock::new();
     static RESTORED: std::sync::Once = std::sync::Once::new();
-    let r = REMOTE.get_or_init(|| match PlacementStore::open(k2_core::db::shared()) {
+    let store = || {
+        let path = k2_core::db::shared_path().ok_or_else(|| "the daemon database is not open".to_string())?;
+        PlacementStore::open_file(&path)
+    };
+    let r = REMOTE.get_or_init(|| match store() {
         Ok(store) => RemoteHost::with_store(Arc::new(store), Some(&EpochCounter::default_path())),
         Err(e) => {
             log_debug!("[hosts] placement store unavailable ({e}); placements won't survive a restart");

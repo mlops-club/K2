@@ -21,6 +21,8 @@ use std::sync::{Arc, OnceLock};
 /// work items, heartbeats). When that changes, swap this for an
 /// `r2d2::Pool<SqliteConnectionManager>` — the public API stays the same.
 static SHARED: OnceLock<Arc<ReentrantMutex<Connection>>> = OnceLock::new();
+/// The file [`init_database`] opened for [`SHARED`].
+static SHARED_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 /// Open a SQLite connection with K2SO's standard resilience + performance
 /// PRAGMAs.
@@ -120,6 +122,14 @@ pub fn try_shared() -> Option<Arc<ReentrantMutex<Connection>>> {
         return Some(scoped);
     }
     SHARED.get().cloned()
+}
+
+/// The database file behind [`shared`], once [`init_database`] opened it.
+/// For a subsystem that must keep its own connection to the same file
+/// (one that can't wait on the shared lock: the controller's placement
+/// store, dist-link W3). Reading it takes no lock.
+pub fn shared_path() -> Option<std::path::PathBuf> {
+    SHARED_PATH.get().cloned()
 }
 
 // ── Scoped per-test DB (quiet-gate PRD §5.1, 0.45.1) ─────────────────
@@ -380,7 +390,10 @@ pub fn init_database() -> Result<Arc<ReentrantMutex<Connection>>> {
     // drop theirs and return the winner's. In practice only one thread
     // calls init_database during startup.
     match SHARED.set(handle.clone()) {
-        Ok(()) => Ok(handle),
+        Ok(()) => {
+            let _ = SHARED_PATH.set(db_path);
+            Ok(handle)
+        }
         Err(_) => Ok(SHARED.get().expect("SHARED just populated").clone()),
     }
 }
