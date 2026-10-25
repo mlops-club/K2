@@ -1646,6 +1646,32 @@ pub fn send_message_to_session_with_command(
     })
 }
 
+/// The ids a `k2 msg` / inbox address may be placed under on a controller
+/// (`delivery_drain::Direct::aliases`), resolved as `K2_ROLE=all`
+/// resolves it ([`resolve_msg_target`]): a workspace name or path gives its
+/// project id (how the app and `ensure-pinned-chat` place it), the name a
+/// wake spawns it under, and its saved session ids; a session id gives
+/// itself. A sidecar or an unknown address gives none.
+pub(crate) fn placement_aliases(recipient: &str) -> Vec<String> {
+    let path = match resolve_msg_target(recipient) {
+        Some(MsgTarget::WorkspaceCanonical { path }) => path,
+        Some(MsgTarget::Session { session_id }) => return vec![session_id],
+        Some(MsgTarget::Sidecar { .. }) | None => return Vec::new(),
+    };
+    let db = k2_core::db::shared();
+    let conn = db.lock();
+    let Some(project_id) = resolve_project_id(&conn, &path) else { return Vec::new() };
+    let row = WorkspaceSession::get(&conn, &project_id).ok().flatten();
+    let mode = Project::get(&conn, &project_id).ok().map(|p| p.agent_mode).unwrap_or_else(|| "off".to_string());
+    let mut out = vec![project_id, resolve_spawn_name(&path, &mode)];
+    if let Some(r) = row {
+        out.extend([r.active_terminal_id, r.session_id].into_iter().flatten());
+    }
+    out.retain(|a| !a.is_empty());
+    out.dedup();
+    out
+}
+
 /// The controller's direct delivery of a `kind=msg` body a host sent up
 /// for a recipient it resolves but that isn't placed
 /// (`delivery_drain::Direct`): today's cascade, `wake` from the body.

@@ -395,6 +395,7 @@ fn fake_cascade() -> (Direct, FakeCascade) {
     let c = Arc::clone(&calls);
     let direct = Direct {
         resolves: Box::new(|r| r.starts_with("/ws/")),
+        aliases: Box::new(|_| Vec::new()),
         deliver: Box::new(move |to: &str, from: &str, body: &Value| {
             if to == "/ws/slow" {
                 held.lock().recv().expect("released");
@@ -482,11 +483,86 @@ async fn a_resend_during_a_wake_gets_no_ack_and_the_wake_runs_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn placed_agents_and_inbox_items_still_go_through_the_outbox() {
     let (direct, _cascade) = fake_cascade();
-    let c = Ctl::start_with(mem_db(), Direct { resolves: Box::new(|_| true), deliver: direct.deliver }).await;
+    let c = Ctl::start_with(mem_db(), Direct { resolves: Box::new(|_| true), aliases: direct.aliases, deliver: direct.deliver }).await;
     let mut b = fake_host(&c, "host-b").await;
     let msg_body = json!({"kind": "msg", "text": "hi", "wake": true});
     assert!(c.drain.is_direct("bob", &msg_body), "not placed, resolvable: today's cascade");
     place(&c, &mut b, "bob").await;
     assert!(!c.drain.is_direct("bob", &msg_body), "placed: the outbox");
     assert!(!c.drain.is_direct("carol", &json!({"kind": "inbox", "title": "t"})), "inbox items always queue");
+}
+
+// ── addresses resolved as K2_ROLE=all does (G2 fleet gap) ─────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_address_reaches_the_agent_placed_under_its_project_id() {
+    // `bob-ws` is a workspace whose agent the app placed under its project
+    // id `p-bob`; `s-carol` is the session id of the agent placed as `carol`.
+    let direct = Direct {
+        resolves: Box::new(|r| r == "bob-ws" || r == "s-carol"),
+        aliases: Box::new(|r| match r {
+            "bob-ws" => vec!["p-bob".into(), "bob-ws".into(), "sess-saved".into()],
+            "s-carol" => vec!["s-carol".into()],
+            _ => vec![],
+        }),
+        deliver: Box::new(|_, _, _| panic!("a placed recipient never takes the direct path")),
+    };
+    let c = Ctl::start_with(mem_db(), direct).await;
+    let mut b = fake_host(&c, "host-b").await;
+    let epoch = place(&c, &mut b, "p-bob").await;
+    place(&c, &mut b, "carol").await;
+    let mut a = fake_host(&c, "host-a").await;
+    let (host_b, got) = counting_host(mem_db());
+
+    let inbox = Frame::Deliver {
+        msg_id: "m_in".into(),
+        agent_id: "bob-ws".into(),
+        epoch: None,
+        from: "agent:alice".into(),
+        body: json!({"kind": "inbox", "title": "t", "body": "b"}),
+        attempt: 1,
+    };
+    for (f, id) in [(msg("m_ws", "bob-ws", "hi bob"), "m_ws"), (inbox, "m_in"), (msg("m_sid", "s-carol", "hi carol"), "m_sid")] {
+        send(&mut a, &f).await;
+        assert_eq!(recv(&mut a).await, ack(id, DeliverStatus::Delivered, None));
+    }
+    // Each reaches host B under the id it is placed as; the row keeps the address.
+    let mut seen = vec![];
+    for _ in 0..3 {
+        let (m, e, _) = next_deliver(&mut b).await;
+        if m.agent_id == "p-bob" {
+            assert_eq!(e, Some(epoch));
+        }
+        seen.push((m.msg_id.clone(), m.agent_id.clone()));
+        let reply = host_b.receive(&m, 1).expect("an ack");
+        send(&mut b, &reply).await;
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("m_in".to_string(), "p-bob".to_string()), ("m_sid".to_string(), "carol".to_string()), ("m_ws".to_string(), "p-bob".to_string())]
+    );
+    for id in ["m_ws", "m_in", "m_sid"] {
+        assert_eq!(c.wait_state(id, State::Delivered).await.state, State::Delivered);
+    }
+    assert_eq!(c.drain.get("m_ws").unwrap().recipient, "bob-ws");
+    assert_eq!(got.lock().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_workspace_address_queued_before_its_agent_is_placed_is_delivered_once_it_is() {
+    let direct = Direct {
+        resolves: Box::new(|_| false),
+        aliases: Box::new(|r| if r == "bob-ws" { vec!["p-bob".into()] } else { vec![] }),
+        deliver: Box::new(|_, _, _| Err("unused".into())),
+    };
+    let c = Ctl::start_with(mem_db(), direct).await;
+    let id = c.drain.send("agent:alice", "bob-ws", json!({"kind": "msg", "text": "later"})).unwrap();
+    let mut b = fake_host(&c, "host-b").await;
+    place(&c, &mut b, "p-bob").await;
+    let (m, _, _) = next_deliver(&mut b).await;
+    assert_eq!((m.msg_id.as_str(), m.agent_id.as_str()), (id.as_str(), "p-bob"));
+    let (host_b, _) = counting_host(mem_db());
+    send(&mut b, &host_b.receive(&m, 1).expect("an ack")).await;
+    c.wait_state(&id, State::Delivered).await;
 }
