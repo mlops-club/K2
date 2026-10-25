@@ -23,6 +23,12 @@
 #                        panics still carry file:line and messages)
 #   K2_GATE_KEEP=1       keep the workdir (logs, target) after the run
 #   K2_GATE_THREADS      --test-threads (default: libtest's choice)
+#   K2_GATE_LOW_MEMORY=1 for a memory-capped box (the lab's 6 GB Docker
+#                        container): one cargo build job and 256 codegen
+#                        units for dev and test, so a single rustc for a crate
+#                        the size of k2-daemon's lib test fits. Debuginfo is
+#                        already 0 (K2_GATE_DEBUG) and incremental off. Unset
+#                        (the default), nothing changes.
 #   K2_GATE_REALPG_PORT / K2_GATE_REALPG_SOCK / K2_GATE_REALPG_BIN
 #                        a throwaway Postgres 16 cluster (TCP port, socket dir,
 #                        bin dir with psql): set all three and the gate RUNS
@@ -87,6 +93,12 @@ RUSTUP_HOME_DIR=${RUSTUP_HOME:-$HOME/.rustup}
 THREAD_ARGS=()
 [ -n "${K2_GATE_THREADS:-}" ] && THREAD_ARGS=(-- "--test-threads=$K2_GATE_THREADS")
 
+LOW_MEM_ENV=()
+if [ "${K2_GATE_LOW_MEMORY:-0}" = 1 ]; then
+  LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256)
+  echo "gate: K2_GATE_LOW_MEMORY=1: ${LOW_MEM_ENV[*]}"
+fi
+
 # Run cargo in a clean environment: only what the toolchain needs, a fresh
 # HOME and TMPDIR per package, no SHELL, no K2_* / K2SO_* variables.
 # Extra VAR=value pairs for one clean_cargo call: EXTRA_ENV=(...) clean_cargo ...
@@ -101,6 +113,7 @@ clean_cargo() {
       CARGO_HOME="$CARGO_HOME_DIR" RUSTUP_HOME="$RUSTUP_HOME_DIR" \
       CARGO_TARGET_DIR="$WORK/target" CARGO_INCREMENTAL=0 \
       CARGO_PROFILE_DEV_DEBUG="${K2_GATE_DEBUG:-0}" CARGO_PROFILE_TEST_DEBUG="${K2_GATE_DEBUG:-0}" \
+      ${LOW_MEM_ENV[@]+"${LOW_MEM_ENV[@]}"} \
       ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} "$CARGO_BIN" "$@" ) > "$log" 2>&1
   rc=$?
   rm -rf "$h" "$t"
