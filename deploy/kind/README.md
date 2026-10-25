@@ -185,6 +185,43 @@ What it does not show: independence from k2.dev. k2.dev is also served on
 Remove it with
 `kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind delete networkpolicy k2-solo-egress`.
 
+## Distributed variant (`--dist`), lab only
+
+`scripts/kind/up.sh --dist` runs K2 split in two (`deploy/kind/dist`, an
+overlay over `deploy/kubernetes/core/{controller,hosts}.yaml`):
+
+- `k2-controller-0` runs `K2_ROLE=controller`, with no agents. The app
+  talks only to it, through the proxy on `127.0.0.1:7443` (`--fake`: 7442).
+- `k2-host-0` runs `K2_ROLE=host` on `k2-agents:dist`. It dials the
+  controller and enrolls with a bootstrap token that `up.sh` generates into
+  the Secret `k2-secrets`; the token is never printed and never in git.
+  Agents run here, and its own volume holds `HOME`, so the Claude login
+  lives on the host.
+- `k2-daemon:dist` must be built from a checkout with `k2-dist/dist-link`:
+  `scripts/kind/build-daemon.sh <that checkout> k2-daemon:dist`. The
+  compile runs in a memory-capped container; `k2-daemon` alone needs about
+  5 GB, so use `K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1`.
+
+**Workspaces are shared through a lab-only workaround.** The app browses
+the controller's files and sends that path, as is, to the host. So both
+pods mount one volume, `k2-work`, at `/var/lib/k2/work` (`work-pvc.yaml`).
+On kind it is ReadWriteOnce (local-path), which works only for pods on the
+same node. The host therefore has a required podAffinity to the controller
+(`host-patch.yaml`), which pins every host to the controller's node. That
+is fine for one host on a laptop. It does not scale, and it would break as
+soon as a host had to run elsewhere. The real fix is the PRD's portable
+agent home (P3), not a shared volume.
+
+Limits of this dist-link cut that matter for the app:
+
+- The controller relays agent terminals (`/cli/sessions/grid`) for the
+  owner token only. The app signs in as a K2 user, so it can't open an
+  agent's terminal, or run `/login` in it, on this variant yet.
+- The controller answers 501 to the LLM login routes.
+
+S1, which uses the owner token, passes:
+`scripts/kind/up.sh --dist --fake && scripts/kind/s1.sh --dist`.
+
 ## Proof without a real agent (S1)
 
 ```sh
