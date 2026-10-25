@@ -521,6 +521,7 @@ def w1_flows(c, out, flows):
 
     run = w1.W1(A, c.fleet.token())
     run.token_fn = c.fleet.token
+    run.cli_alive_fn = c.fleet.cli_alive
 
     def fake_events(event, session):
         return [e for e in c.fleet.fake_events(event) if e.get("session_id") == session]
@@ -741,8 +742,10 @@ def s7(c, sc):
                 c.fleet.kill_cli(cli_pid, host=host)
                 killed = wait_until(lambda: not c.fleet.cli_alive(host, cli_pid), 10)
             except (fleetlib.FleetError, ProcessLookupError, TypeError) as e:
-                killed = False
-                c.log("kill failed: %s" % e)
+                # Already gone (--chaos got there first): the CLI died mid-turn
+                # all the same, which is the state S7 needs.
+                killed = not c.fleet.cli_alive(host, cli_pid)
+                c.log("kill: %s; the CLI is %s" % (e, "already gone" if killed else "still alive"))
         sc.check("the CLI was SIGKILLed mid-turn", killed and len(c.turn_events(csid, "cli.turn.end")) == len(ends),
                  "pid %s on %s" % (cli_pid, host))
         sock.close()

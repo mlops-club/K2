@@ -217,6 +217,30 @@ class W1:
             return t if t and any(REPLY_MARKER in r and needle in r for r in t["replies"]) else None
         return wait_until(done) or self.find_turn(cwd, needle, session)
 
+    def cli_dead(self, session):
+        """True when the newest CLI of `session` is gone (a --chaos kill, or
+        the solo daemon's restart, which ends every agent PTY)."""
+        ex = (self.fake_events("cli.exec", session) or [{}])[-1]
+        pid = ex.get("pid")
+        if not pid:
+            return False
+        alive = self.cli_alive_fn(ex.get("host"), pid) if getattr(self, "cli_alive_fn", None) else pid_alive(pid)
+        return not alive
+
+    def turn_or_again(self, info, cwd, text, again, session=None):
+        """wait_turn_done; when the CLI that took the prompt died before
+        answering, the turn in progress is lost (PRD failure table): do it
+        again once with a fresh prompt made by `again()` (send the message
+        again, fire again). Counted in info. Returns (turn, text)."""
+        turn = self.wait_turn_done(cwd, text, session)
+        answered = turn and any(REPLY_MARKER in r and text in r for r in turn["replies"])
+        if turn and not answered and self.cli_dead(turn["session"]):
+            info["again_after_cli_death"] = info.get("again_after_cli_death", 0) + 1
+            self.log("the CLI died before answering %r: doing it again" % text)
+            text = again()
+            turn = self.wait_turn_done(cwd, text, session)
+        return turn, text
+
     def fake_events(self, event, session):
         return [e for e in read_jsonl(self.fake_trace)
                 if e.get("event") == event and e.get("session_id") == session]
@@ -348,18 +372,11 @@ class W1:
                           status == 200 and resp.get("success") is True and resp.get("woke") is True,
                           "HTTP %s %s" % (status, raw[:300])):
             return
-        turn = self.wait_turn_done(cwd, text1)
-        if not (turn and any(REPLY_MARKER in r and text1 in r for r in turn["replies"])) and turn:
-            # The CLI that took the prompt died before answering (--chaos):
-            # the turn in progress is lost (PRD failure table); the sender's
-            # next message wakes it again. Counted in info.
-            ex = (self.fake_events("cli.exec", turn["session"]) or [{}])[-1]
-            if ex.get("pid") and not pid_alive(ex["pid"]):
-                info["resent_after_cli_death"] = info.get("resent_after_cli_death", 0) + 1
-                self.log("the CLI (pid %s) died before answering %r: sending it again" % (ex["pid"], text1))
-                text1 = "w1 wake %s" % uuid.uuid4().hex[:6]
-                self.send_msg(info, "wake1-again", cwd, text1, wake=True)
-                turn = self.wait_turn_done(cwd, text1)
+        def again1():
+            t = "w1 wake %s" % uuid.uuid4().hex[:6]
+            self.send_msg(info, "wake1-again", cwd, t, wake=True)
+            return t
+        turn, text1 = self.turn_or_again(info, cwd, text1, again1)
         info["turn1"] = turn
         ok = bool(turn) and any(REPLY_MARKER in r and text1 in r for r in turn["replies"])
         self.check(f, "the woken agent got the message and answered (transcript)", ok,
@@ -389,7 +406,11 @@ class W1:
         status, raw, resp = self.send_msg(info, "wake2", cwd, text2, wake=True)
         self.check(f, "a second msg wakes it again", status == 200 and resp.get("success") is True
                    and resp.get("woke") is True, "HTTP %s %s" % (status, raw[:300]))
-        turn2 = self.wait_turn_done(cwd, text2)
+        def again2():
+            t = "w1 wake-again %s" % uuid.uuid4().hex[:6]
+            self.send_msg(info, "wake2-again", cwd, t, wake=True)
+            return t
+        turn2, text2 = self.turn_or_again(info, cwd, text2, again2)
         info["turn2"] = turn2
         self.check(f, "the second wake resumed the same conversation (same session id, answered)",
                    bool(turn2) and turn2["session"] == csid
@@ -434,7 +455,10 @@ class W1:
                               resp.get("terminalId") or resp.get("targetSessionId"))
                           if status == 200 else "HTTP %s %s" % (status, raw[:300])):
             return
-        turn = self.wait_turn_done(cwd, marker)
+        def fire_again():
+            self.http("POST", "/cli/heartbeat/fire", body=fire)
+            return marker  # the same WAKEUP.md instructions
+        turn, _ = self.turn_or_again(info, cwd, marker, fire_again)
         info["turn"] = turn
         self.check(f, "the agent got the wakeup prompt and answered (transcript)",
                    bool(turn) and any(REPLY_MARKER in r and marker in r for r in turn["replies"]),
