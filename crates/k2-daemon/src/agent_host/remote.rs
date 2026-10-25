@@ -367,8 +367,31 @@ impl RemoteHost {
                     log_debug!("[hosts] agent {agent_id} gone on host {host_id}");
                 }
             }
+            Frame::Deliver { .. } | Frame::DeliverAck { .. } => {
+                drop(inner);
+                crate::delivery_drain::on_host_frame(self, host_id, frame);
+            }
             other => log_debug!("[hosts] ignored frame {} from host {host_id}", other.kind()),
         }
+    }
+
+    /// Send `frame` to `host_id` on its link, with no reply expected (the
+    /// outbox's `deliver` and `deliver.ack`). Refused when the host isn't
+    /// linked or its link speaks an older protocol than the frame needs.
+    pub fn send_frame(&self, host_id: &str, frame: Frame) -> Result<(), String> {
+        let inner = self.inner.lock();
+        let Some(link) = inner.links.get(host_id) else {
+            return Err(format!("agent host {host_id} is not connected"));
+        };
+        if link.protocol < frame.min_protocol() {
+            return Err(format!(
+                "agent host {host_id} speaks protocol {}; {} needs {}",
+                link.protocol,
+                frame.kind(),
+                frame.min_protocol()
+            ));
+        }
+        link.tx.send(frame).map_err(|_| format!("agent host {host_id} link is closing"))
     }
 
     // ── requests ───────────────────────────────────────────────────────
