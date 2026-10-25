@@ -16,6 +16,7 @@ Lab only: `deploy/kubernetes/` is the end state.
 | `proxy/Dockerfile`, `*/nodeport.yaml` | The Mac's door: `k2-kind-proxy:dev` (alpine 3.20.10 + socat) relays `127.0.0.1:7440` to the K2 Service's NodePort (30740; fake 30741, dist-fake 30742, dist 30743) on Docker's `kind` network |
 | `scripts/kind/up.sh`, `down.sh` | One command up, one command down |
 | `scripts/kind/forward.sh` | Check (`--status`) or recreate just the door; `--port-forward` for the fallback |
+| `scripts/kind/doors.sh` | Every variant's door: start stopped proxies, set `--restart always`, check each port (`--check` changes nothing) |
 
 ## 1. Bring it up
 
@@ -27,7 +28,7 @@ The script does the following:
 
 - builds `k2-daemon:dev` if it is missing, or always with `--rebuild-daemon`;
 - builds `k2-agents:dev`, runs `kind load` and applies `deploy/kind/agents`;
-- waits for the pod and starts the door, the Docker container `k2-kind-proxy`: `127.0.0.1:7440` → node port 30740 → the pod. Docker restarts it (`--restart unless-stopped`), and each connection is its own socat child, so one broken stream never drops the others. `kubectl port-forward` dropped the whole forward on one bad stream (seen on 2026-10-24); it remains a fallback, `scripts/kind/up.sh --port-forward`, which runs in its own session, logs to `$TMPDIR/k2-kind/agents/port-forward.log` and reconnects by itself.
+- waits for the pod and starts the door, the Docker container `k2-kind-proxy`: `127.0.0.1:7440` → node port 30740 → the pod. Docker restarts it (`--restart always`: quitting Docker Desktop stops every container, and `unless-stopped` counts that as a manual stop, so the doors stayed down after a restart on 2026-10-25), and each connection is its own socat child, so one broken stream never drops the others. `kubectl port-forward` dropped the whole forward on one bad stream (seen on 2026-10-24); it remains a fallback, `scripts/kind/up.sh --port-forward`, which runs in its own session, logs to `$TMPDIR/k2-kind/agents/port-forward.log` and reconnects by itself.
 - creates a K2 login for the app, user `owner` with the Owner role, and a random password;
 - creates a git folder `/var/lib/k2/work/demo` for your first workspace.
 
@@ -45,8 +46,10 @@ shows a new password.
 
 If the app ever can't reach `http://127.0.0.1:7440`, check the door with
 `scripts/kind/forward.sh --status`, and recreate just the door with
-`scripts/kind/forward.sh` (or `--port-forward` for the fallback). Neither
-builds K2 nor applies anything.
+`scripts/kind/forward.sh` (or `--port-forward` for the fallback). After
+Docker Desktop restarts, `scripts/kind/doors.sh` starts every proxy that
+is stopped, without replacing it. None of them builds K2 or applies
+anything.
 
 Port 7440 must be free on the Mac. Use `K2_KIND_PORT=7450 scripts/kind/up.sh`
 otherwise, and also if your own local K2 daemon happens to use 7440.

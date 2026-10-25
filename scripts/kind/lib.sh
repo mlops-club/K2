@@ -106,17 +106,22 @@ kind_stop_forward() {
     done
 }
 
-# Start (or replace) this variant's proxy container. It restarts with
-# Docker (unless-stopped), and socat forks one child per connection, so a
-# broken stream never takes the door down. Capped: the Docker VM is shared.
+# Start (or replace) this variant's proxy container. --restart always:
+# quitting Docker Desktop stops every container (exit 143), and Docker
+# counts that as a manual stop, so unless-stopped left the doors down after
+# the 2026-10-25 restart. socat forks one child per connection, so a broken
+# stream never takes the door down. Capped: the Docker VM is shared.
 kind_start_proxy() {
     kind_stop_forward
+    local was
+    was=$(docker inspect -f '{{.State.Status}}' "$KIND_PROXY" 2>/dev/null) || true
+    case "$was" in ""|running) ;; *) say "proxy $KIND_PROXY was $was; replacing it" ;; esac
     kind_stop_proxy
     if lsof -nP -iTCP:"$KIND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "127.0.0.1:$KIND_PORT is already in use; set K2_KIND_PORT to a free port" >&2
         return 1
     fi
-    docker run -d --name "$KIND_PROXY" --restart unless-stopped \
+    docker run -d --name "$KIND_PROXY" --restart always \
         --memory 64m --memory-swap 64m --cpus 0.5 --network kind \
         --label "k2.dev/deploy=kind-$KIND_VARIANT" \
         -p "127.0.0.1:$KIND_PORT:$KIND_PORT" "$KIND_PROXY_IMAGE" \
@@ -126,6 +131,25 @@ kind_start_proxy() {
 
 kind_stop_proxy() {
     docker rm -f "$KIND_PROXY" >/dev/null 2>&1 || true
+}
+
+# Bring this variant's existing proxy back without replacing it: restart
+# policy always, started if stopped. Prints one line; returns 1 when there
+# is no proxy container (forward.sh creates one) or it won't start.
+kind_ensure_proxy() {
+    local state policy
+    state=$(docker inspect -f '{{.State.Status}}' "$KIND_PROXY" 2>/dev/null) \
+        || { echo "$KIND_PROXY: no container (scripts/kind/forward.sh$KIND_FLAGS creates it)"; return 1; }
+    policy=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$KIND_PROXY")
+    if [ "$policy" != always ]; then
+        docker update --restart always "$KIND_PROXY" >/dev/null
+        policy="$policy → always"
+    fi
+    if [ "$state" != running ]; then
+        docker start "$KIND_PROXY" >/dev/null || { echo "$KIND_PROXY: $state, restart $policy; docker start FAILED"; return 1; }
+        state="$state → started"
+    fi
+    echo "$KIND_PROXY: $state, restart $policy"
 }
 
 # Start the port-forward loop (port-forward.sh) for this variant, after
