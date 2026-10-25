@@ -295,9 +295,24 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 
 ## Status
 
-- Milestone: diagrams written.
-- Next: protocol types and the controller hub, then the host link, then
-  the gate, then the two-process run.
+- Milestones: diagrams written; host env contract (stable, handed to
+  `kind-dist`).
+- Code: protocol, controller hub, `RemoteHost`, host link, gate, boot
+  wiring, loopback tests and the two-process script are committed.
+- Next: run the `hosts::` tests and the two-process S1 run, then the
+  `K2_ROLE=all` regression suite.
+
+### Handoff notes for `kind-dist`
+
+- The spawn body's `cwd` goes to the host verbatim. The desktop app on the
+  Mac sends Mac paths; in a host pod the directory must exist on the host's
+  volume (or the app must send a pod path). This cut does no path mapping.
+- Claude credentials are the host's `$HOME/.claude`: `/login` once per host
+  pod, through the controller (the `open_url` event reaches the app).
+- One host link per host name; a restarted pod with the same name replaces
+  its old link. The controller forgets a host's placements when its link
+  drops (the agents keep running; a re-spawn of the same `agent_name` finds
+  them again on that host).
 - Open questions: none blocking. Deviation to confirm: `RemoteHost` does not
   implement the `AgentHost` trait yet (see below).
 
