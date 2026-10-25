@@ -202,6 +202,16 @@ S1 after host restart PASS
     curls its loopback `/cli/hosts/status` for `"linked":true`, because the
     host's API listens on loopback only, so the kubelet can't `httpGet`
     it.
+- **After the coordinator's verification (6/6):**
+  - Every probe on both pods has `timeoutSeconds: 5`, and readiness has
+    `failureThreshold: 3`. The host's exec probes run `curl --max-time 3`,
+    and the 1 s default logged "timed out after 1s" under load. Committed
+    in the overlays only; nothing live redeployed.
+  - `deploy/kind/README.md` has a "Distributed variant" section. It
+    documents `k2-work` as ReadWriteOnce with same-node podAffinity, a
+    lab-only workaround; the real fix is the PRD's portable home (P3).
+  - Next: deploy the real agents variant (`k2-agents:dist`, with claude)
+    once dist-link lands the app-session fix for `/cli/sessions/grid`.
 - **Workspaces (coordinator decision):** one `k2-work` PVC (RWO,
   local-path) at `/var/lib/k2/work` in both pods, because the app browses
   the controller's files and dist-link sends that cwd to the host verbatim.
