@@ -77,7 +77,10 @@ BASELINE="tests/lab/baselines/$GATE-$TOPOLOGY.json"
 NOTES=()
 say() { printf '%s lab: %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$RUN/prove.log"; }
 
-for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+' || true); do unset "$v"; done
+# Keep the machine-wide cargo slot's own knobs (K2_DIST_PRIORITY, K2_DIST_SLOTS):
+# only ~/.cache/k2-dist-cargo-slot.sh reads them; suites and the daemon start
+# under env -i anyway.
+for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+' | grep -vxE 'K2_DIST_(PRIORITY|SLOTS)' || true); do unset "$v"; done
 
 # run.json: merge key=value (value is JSON when it parses as JSON).
 run_set() {

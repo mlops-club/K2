@@ -243,7 +243,7 @@ parity_linux_gate_finish() {
         result_json linux-gate "$title" pass "" "parity/linux-gate.log" $rc $secs
     elif [ "$rc" -eq 137 ] || grep -qiE 'out of memory|oom-?kill|signal: 9, SIGKILL' "$log" \
             || grep -qsE 'signal: 9, SIGKILL' "$RUN"/parity/linux-gate-logs/*.log; then
-        result_json linux-gate "$title" fail "a compiler was SIGKILLed under the 6 GB cap (OOM; see parity/linux-gate-logs/), exit $rc: cut rustc's memory (K2_GATE_LOW_MEMORY), never raise the cap" "parity/linux-gate.log" $rc $secs
+        result_json linux-gate "$title" fail "a compiler was SIGKILLed under the ${LAB_GATE_MEMORY:-6g} cap (OOM; see parity/linux-gate-logs/), exit $rc: cut rustc's memory (K2_GATE_LOW_MEMORY), never raise the cap" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run (held by the lab' "$log"; then
         result_json linux-gate "$title" not_run "$(grep -m1 '^refusing to run (held by the lab' "$log" | sed 's/^refusing to run //')" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run' "$log"; then
