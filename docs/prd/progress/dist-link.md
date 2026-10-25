@@ -295,12 +295,53 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 
 ## Status
 
-- Milestones: diagrams written; host env contract (stable, handed to
-  `kind-dist`).
-- Code: protocol, controller hub, `RemoteHost`, host link, gate, boot
-  wiring, loopback tests and the two-process script are committed.
-- Next: run the `hosts::` tests and the two-process S1 run, then the
-  `K2_ROLE=all` regression suite.
+- Milestones: diagrams written; host env contract (handed to `kind-dist`);
+  first working slice (loopback tests and the two-process S1 pass).
+- Next: the `K2_ROLE=all` regression suite (`cargo test -p k2-daemon`).
+- Open: the deviation below (`RemoteHost` not yet an `impl AgentHost`).
+
+### Results
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host::` | 21 passed: 13 new (`hosts::`), 8 existing `agent_host` |
+| `hosts::tests::real_host_link_runs_the_agent_and_relays_its_pty` | the real link with real PTYs: spawn placed on the host, snapshot relayed, typed text echoed back through the relay, close kills and reaps the child |
+| `hosts::tests::fake_host_s1_…` | placement and epoch, reuse goes back to the same host, grid both ways, hooks accepted only for a placed session at its epoch, `open_url` on the session events bus, close drops the placement |
+| `hosts::tests::spawn_with_no_host_connected_is_a_clear_error` | 503 with the `NO_HOSTS` message (criterion 3) |
+| `scripts/lab/topology/two-process.sh` (run `20261025T005250Z`) | all six checks PASS, below |
+
+Two-process run (controller :17420, host :17421, `k2-fake-agent` as
+`claude`, throwaway HOMEs):
+
+```text
+PASS zero hosts: spawn is refused HTTP 503 {"error":"no agent host is connected to this controller (…)"}
+PASS host linked {"hosts":[{"hooks":0,"host_id":"host-1","host_name":"host-1","placements":0}],"role":"controller"}
+PASS S1 through the controller status=pass          (8/8 checks; spawn→banner 391 ms, type→reply 626 ms)
+PASS agent is a child of the host                    agent ppid 9955 = host 9955; controller 8874 has no children
+PASS open_url from the host reaches the controller's /cli/sessions/events
+     controller event: {"kind":"open_url","url":"https://claude.ai/oauth/authorize?dist-link=8759","source":"shim"}
+PASS hook events reached the controller              3 hook lines in controller.log
+```
+
+The controller's log for the run:
+
+```text
+[hosts] placed agent lab-s1-086a306b on host host-1 epoch 1792889574017 session dbb07f71-…
+[hosts] hook SessionStart from host host-1 agent lab-s1-086a306b session dbb07f71-…
+[hosts] hook UserPromptSubmit from host host-1 agent lab-s1-086a306b session dbb07f71-…
+[hosts] placed agent parent-probe-8759 on host host-1 epoch 1792889574018 session 29068e16-…
+[hosts] hook SessionStart from host host-1 agent parent-probe-8759 session 29068e16-…
+```
+
+Every hook the host ingested reached the controller (3 of 3). The fake
+agent's `Stop` hook for the S1 turn started 0.1 s before S1's forced close
+and never reached the host's ingest, so it isn't in either count; that is
+S1's timing, not the link.
+
+Controller trace events added (`K2_TRACE_FILE`): `ctl.host_linked`,
+`ctl.host_unlinked`, `ctl.place`, `ctl.hook`, `ctl.open_url`; host:
+`host.linked`. The host keeps every existing trace event (`host.spawn`,
+`pty.*`, `cell.*`).
 
 ### Handoff notes for `kind-dist`
 
