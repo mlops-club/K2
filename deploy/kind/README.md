@@ -212,12 +212,33 @@ is fine for one host on a laptop. It does not scale, and it would break as
 soon as a host had to run elsewhere. The real fix is the PRD's portable
 agent home (P3), not a shared volume.
 
-Limits of this dist-link cut that matter for the app:
+Using it from the app is the same as the one-pod setup (sections 2 to 5),
+with three differences:
 
-- The controller relays agent terminals (`/cli/sessions/grid`) for the
-  owner token only. The app signs in as a K2 user, so it can't open an
-  agent's terminal, or run `/login` in it, on this variant yet.
-- The controller answers 501 to the LLM login routes.
+- **Server URL** is `http://127.0.0.1:7443`.
+- **The password** is in a file, never printed: `scripts/kind/up.sh --dist
+  --password-file=$HOME/.local/state/k2-kind/dist/owner-password` writes it
+  there (mode 0600). Read it with `cat` when you add the server.
+- **The workspace** is `/var/lib/k2/work/demo` (in the folder picker:
+  `work`, then `demo`). It is on the shared volume, so the controller's
+  picker and the host's agents see the same path.
+
+`/login` happens in a Claude tab, as in section 4, and the login lands on
+the host's volume (`/var/lib/k2-host/.claude`).
+
+Limits of this dist-link cut (k2-dist/dist-link 2c95fc4c2):
+
+- Agent terminals work with the app's own login: the controller relays
+  `/cli/sessions/grid` for app session tokens (dist-link f3f2ed2dd), as
+  checked by `scripts/kind/app-check.sh --dist`.
+- The controller still answers 501 to the LLM login wallet routes
+  (Settings → LLMs sign-in) and to `/cli/terminal/*`. Use `/login` inside a
+  Claude tab.
+
+Check the app's path without any agent CLI:
+`scripts/kind/app-check.sh --dist --password-file=<that file>`. It logs in,
+spawns a plain `sh` with the session token, attaches, and shows that the
+shell runs in `k2-host-0`.
 
 S1, which uses the owner token, passes:
 `scripts/kind/up.sh --dist --fake && scripts/kind/s1.sh --dist`.

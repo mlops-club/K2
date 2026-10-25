@@ -167,7 +167,8 @@ S1 after host restart PASS
 
 ## Status
 
-- **Milestone:** S1 runs distributed. Every acceptance check passes on
+- **Milestone:** 7443 ready for the owner (the real dist variant;
+  details below). Earlier: S1 runs distributed. Every acceptance check passes on
   `k2-kind-dist-fake` (see Evidence). The namespace is left up for the
   coordinator; `scripts/kind/down.sh --dist --fake` removes it.
 - **First build attempt (18:35–19:05), killed by the coordinator:**
@@ -202,6 +203,33 @@ S1 after host restart PASS
     curls its loopback `/cli/hosts/status` for `"linked":true`, because the
     host's API listens on loopback only, so the kubelet can't `httpGet`
     it.
+- **The owner's real deployment (2026-10-25, 09:12 local):**
+  - `k2-daemon:dist` rebuilt from dist-link 2c95fc4c2 (with the
+    app-session-token fix f3f2ed2dd and the reconnect fix b962aa4a2). It
+    was incremental: only `k2-daemon` recompiled, in about 6.5 min at 6 GB
+    and 1 job.
+  - No regression on `k2-kind-dist-fake`: `s1.sh --dist` PASS/PASS/PASS
+    (`lab-runs/kind-dist/2026-10-25T15-09-46Z/`, 8/8 both times).
+    `app-check.sh --dist --fake` PASS: login, then spawn and attach with
+    the session token; the fake agent ran in `k2-host-0` (pid 183) and
+    the controller had none.
+  - `k2-kind-dist` is up: `k2-controller-0` on `k2-daemon:dist`,
+    `k2-host-0` on `k2-agents:dist` (claude 2.1.308,
+    `DISABLE_AUTOUPDATER=1`), both on `k2lab-worker2`. The door is the
+    `k2-kind-dist-proxy` container, 127.0.0.1:7443 to NodePort 30743. The
+    host is linked (`/cli/hosts/status`: `linked:true`, 5 attempts while
+    the controller came up).
+  - The app login `owner` was created with a random password, written
+    only to `~/.local/state/k2-kind/dist/owner-password` (0600) and
+    never printed.
+  - `/var/lib/k2/work/demo` (git) is on `k2-work`. Both pods see it, and a
+    file written by the controller is read on the host.
+  - `app-check.sh --dist` PASS, with no agent CLI: login, then spawn `sh`
+    with the session token. The grid shows `K2CHECK host=k2-host-0
+    uid=10000 cwd=/var/lib/k2/work/demo`; /proc shows it in `k2-host-0`
+    and none in `k2-controller-0`; close returns 200.
+  - The owner's `k2-kind` and `k2-kind-proxy` were not touched (7440 still
+    returns 200).
 - **After the coordinator's verification (6/6):**
   - Every probe on both pods has `timeoutSeconds: 5`, and readiness has
     `failureThreshold: 3`. The host's exec probes run `curl --max-time 3`,
