@@ -4,9 +4,10 @@
 #
 #   scripts/kind/up.sh [--dist] [--fake] [--rebuild-daemon] [--reset-password] [--port-forward]
 #
-# 1. builds k2-daemon:dev (packaging/oci/build.sh) when it is missing, or
-#    always with --rebuild-daemon; then k2-agents:dev (deploy/kind/
-#    Dockerfile.agents: the daemon plus the Claude Code CLI);
+# 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
+#    compile, then a runtime-only image) when it is missing, or always with
+#    --rebuild-daemon; then k2-agents:dev (deploy/kind/Dockerfile.agents:
+#    the daemon plus the Claude Code CLI) and the proxy image;
 # 2. loads it into k2lab and applies deploy/kind/agents (namespace k2-kind);
 # 3. waits for the pod, then opens the Mac's door: a socat container
 #    (k2-kind-proxy, deploy/kind/proxy) from 127.0.0.1:7440 to the
@@ -55,28 +56,29 @@ kind_kubeconfig
 cd "$KIND_REPO"
 
 # ── 1. images ───────────────────────────────────────────────────────────
-# Docker-heavy steps (builds, kind load) take the machine-wide lock the
-# k2-dist workers share, so only one runs in the Docker VM at a time.
-DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
-mkdir -p "$HOME/.cache"
-until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
-trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
-# Builds that compile Rust also take a slot in the machine-wide cargo queue.
-slot=()
-[ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
 # The daemon image comes from this tree, or from K2_KIND_DAEMON_SRC (for
-# --dist: a checkout of k2-dist/dist-link until it is merged here).
+# --dist: a checkout of k2-dist/dist-link until it is merged here). It is
+# compiled by scripts/kind/build-daemon.sh in a memory-capped container,
+# which takes the Docker lock and a cargo slot itself.
 daemon_src=${K2_KIND_DAEMON_SRC:-$KIND_REPO}
 if [ "$rebuild_daemon" = 1 ] || ! docker image inspect "$KIND_BASE_IMAGE" >/dev/null 2>&1; then
     if [ "$KIND_DIST" = 1 ] && ! [ -d "$daemon_src/crates/k2-daemon/src/hosts" ]; then
         echo "up.sh: $daemon_src has no dist-link (crates/k2-daemon/src/hosts); set K2_KIND_DAEMON_SRC to a checkout of k2-dist/dist-link" >&2
         exit 1
     fi
-    say "building $KIND_BASE_IMAGE from $daemon_src (packaging/oci/build.sh; a cold build takes a while)"
-    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3} ${slot[@]+"${slot[@]}"} "$daemon_src/packaging/oci/build.sh" "$KIND_BASE_IMAGE" >&2
+    "$KIND_REPO/scripts/kind/build-daemon.sh" "$daemon_src" "$KIND_BASE_IMAGE" >/dev/null
 else
     say "$KIND_BASE_IMAGE exists (--rebuild-daemon to rebuild it)"
 fi
+# The rest (no Rust compile except the fake agent's small cargo stage, which
+# also takes a cargo slot) holds the machine-wide Docker lock the k2-dist
+# workers share, so only one Docker-heavy job runs at a time.
+DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
+mkdir -p "$HOME/.cache"
+until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
+trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
+slot=()
+[ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
 say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
 build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" --build-arg "BASE_IMAGE=$KIND_BASE_IMAGE"
     --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")

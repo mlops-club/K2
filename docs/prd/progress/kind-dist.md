@@ -126,8 +126,27 @@ scripts/kind/down.sh --dist
 ## Status
 
 - **Milestone:** manifests aligned with dist-link's final env contract
-  (`k2-dist/dist-link` @862b3c762). Waiting on the Docker lock (held by
-  `image`'s `cargo test` container) to build `k2-daemon:dist` and run.
+  (`k2-dist/dist-link` @862b3c762). Waiting for RESUME-BUILD to build `k2-daemon:dist`
+  (capped, see below), then run.
+- **First build attempt (18:35–19:05), killed by the coordinator:**
+  - `packaging/oci/build.sh` compiles inside `docker build`, where
+    BuildKit can't cap memory. After 29 min the Docker API had been wedged
+    for 26 min (the VM at about 650% CPU, kind starved, the owner's 7440
+    down).
+  - Replacement: `scripts/kind/build-daemon.sh <tree> <tag>`. Its steps:
+    - compiles in a plain `docker run` on `k2-kind-toolchain:1.99.1`
+      (`deploy/kind/Dockerfile.toolchain`, the same packages as
+      packaging/oci's toolchain stage), with `--memory 4g
+      --memory-swap 4g --cpus 2` and `CARGO_BUILD_JOBS=2`;
+    - mounts the source read-only, with cargo's registry and target in
+      named volumes;
+    - builds the image with `deploy/kind/Dockerfile.daemon-prebuilt` (the
+      runtime stage of packaging/oci, unchanged), which copies the two
+      binaries in, with no compile;
+    - holds the Docker lock and a cargo slot for the whole run.
+  - The agents images build FROM it, so the binary is compiled once.
+  - `up.sh` calls it before taking its own lock. Not run yet: waiting for
+    the coordinator's RESUME-BUILD.
 - **Contract, as used here:**
   - controller: `K2_ROLE=controller`, `K2_HOSTS=1`,
     `K2_HOST_BOOTSTRAP_TOKEN_FILE`, `K2_DAEMON_PORT=7420`, `K2_LISTEN=lan`.
