@@ -244,7 +244,7 @@ HOME, every `K2_*`/`K2SO_*` unset, `CARGO_BUILD_JOBS=3`, 3 test threads.
 | tier 1, tier 3, must-not-break | fail, fail, pass | fail, fail, pass (same reasons, word for word) |
 | `tests/cli/*.sh` | 150 of 158 pass | 150 of 158 pass after reruns; the same 7 always fail on both |
 | report statuses | fail (Linux gate held, S12 and I5 NOT RUN) | identical |
-| Linux gate (`test-gate-linux.sh` in Docker) | held | see below |
+| Linux gate (`test-gate-linux.sh` in Docker) | held | NOT RUN: the Docker VM has 11 GB free, the gate needs 20 GB |
 
 The 4 `k2-daemon` failures, all from load on a shared Mac: a port clash in
 `publish_runtime` (`bind clash ... already accepting connections`), the
@@ -264,8 +264,12 @@ own `run_clean`, all 5 pass on both base and head.
 
 The Linux gate was held on both full runs (`--linux-gate hold`): its
 container must be memory-capped on this machine and `parity.sh` (not mine)
-starts it without a cap. It runs on head separately, capped at 6 GB, 3 CPUs
-and `jobs = 1` (`$TMPDIR/.../gate/run-gate.sh`, same mounts as `parity.sh`).
+starts it without a cap. A separate capped run on head (6 GB, 3 CPUs, `jobs = 1`, same mounts as
+`parity.sh`, under the shared Docker lock) refused to start: "11G free under
+/gate/work, need 20G (K2_GATE_MIN_FREE_GB)". The Docker disk is shared with
+the owner's kind cluster, so I neither freed space nor lowered the minimum.
+The gate's suites are the same two `cargo test` runs as the host rows above,
+but as root on Linux; they still need a run once the Docker disk has room.
 
 ### NFR1: spawn latency and idle RSS (`metrics.csv`)
 
@@ -286,7 +290,8 @@ dispatch per call and one short `String` per placement.
 
 ## Status
 
-- **Milestone:** done, pending the capped Linux gate on head.
+- **Milestone:** done. The Linux gate is NOT RUN for lack of Docker disk
+  (on base it was held too, so the comparison is like for like).
 - **Next:** for P2, the remote host (see "What P2's remote host needs").
 - **Open questions:** none.
 
