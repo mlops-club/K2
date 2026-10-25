@@ -235,7 +235,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         echo "host children:"; pgrep -lP "$TP_HOST_PID" || echo "(none)"
     } > "$RUN/process-tree.txt"
     ok=0
-    if [ "$code" = 200 ] && [ "$(echo $agent_ppids)" = "$TP_HOST_PID" ] && ! pgrep -P "$TP_CTL_PID" >/dev/null; then ok=1; fi
+    # Only this run's agents: processes whose command is under this run's
+    # throwaway shim dir. Exactly one parent, the host, never the controller.
+    agent_ppids=$(echo $agent_ppids)
+    if [ "$code" = 200 ] && [ -n "$agent_ppids" ] && [ "$agent_ppids" = "$TP_HOST_PID" ] \
+        && [ "$agent_ppids" != "$TP_CTL_PID" ] && ! pgrep -P "$TP_CTL_PID" >/dev/null; then ok=1; fi
     check "agent is a child of the host" "$ok" "spawn HTTP $code; agent ppid(s): $agent_ppids; host $TP_HOST_PID; controller $TP_CTL_PID"
     post "$TP_CTL_PORT" /cli/sessions/v2/close "$ctl_token" "{\"agent_name\":\"$agent\",\"force\":true,\"clear_index\":true}" >/dev/null
 
