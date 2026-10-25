@@ -152,6 +152,31 @@ Rules:
   `[delivery] FAILED <msg_id> (<from> → <to>, hop <up|down>): <reason>`, and
   emits the trace event `delivery.failed`.
 
+## Sleeping recipients and `--wake` (G2 S4 fix)
+
+The outbox delivers only to a placed agent. A recipient that isn't placed
+but that the controller resolves itself (a workspace path or name, a
+sidecar, a session id) is asleep, and `k2 msg` keeps today's
+`K2_ROLE=all` rules for it: the controller runs the existing cascade
+(`delivery_drain::Direct`, `workspace_msg::deliver_for_controller`).
+
+- `k2 msg` sent to the controller: `delivery_drain::send` returns `None`
+  for it and `deliver_live_with_receipt` runs the cascade as under `all`.
+  Without `--wake` the answer is `dormant_no_wake` (or `no_agent_mode`);
+  with `--wake` the agent is spawned on a host through `host()` (W1's
+  `RemoteHost`), with the message as its launch prompt or injected once it's
+  ready, and the answer carries `woke: true`.
+- `k2 msg` on a host: the body carries `wake` and `wake_timeout_ms`, and
+  the host waits up to 5 s plus the wake timeout for the ack. The
+  controller's `take` runs the cascade off the link's task and acks
+  `delivered`, or `rejected` with the cascade's reason (the host's answer
+  keeps it, e.g. `reason: "dormant_no_wake"`). It records the msg_id in
+  `delivery_seen` first (`handling`, then the answer): a resend during the
+  wake gets no ack, and one after it gets the same answer, so the wake runs
+  once.
+- A placed recipient, an agent name the controller doesn't resolve, and
+  every inbox item still go through the outbox as before.
+
 ## Protocol
 
 The frames are W0's protocol-2 `deliver` / `deliver.ack`, unchanged
