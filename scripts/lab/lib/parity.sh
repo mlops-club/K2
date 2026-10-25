@@ -241,8 +241,9 @@ parity_linux_gate_finish() {
     local secs=$((SECONDS - GATE_T0))
     if grep -q '^GATE GREEN' "$log"; then
         result_json linux-gate "$title" pass "" "parity/linux-gate.log" $rc $secs
-    elif [ "$rc" -eq 137 ] || grep -qiE 'out of memory|oom-?kill|signal: 9, SIGKILL' "$log"; then
-        result_json linux-gate "$title" fail "OOM-killed under the 6 GB cap (exit $rc): lower the gate's parallelism (LAB_TEST_THREADS; build jobs are already 1), never the cap" "parity/linux-gate.log" $rc $secs
+    elif [ "$rc" -eq 137 ] || grep -qiE 'out of memory|oom-?kill|signal: 9, SIGKILL' "$log" \
+            || grep -qsE 'signal: 9, SIGKILL' "$RUN"/parity/linux-gate-logs/*.log; then
+        result_json linux-gate "$title" fail "a compiler was SIGKILLed under the 6 GB cap (OOM; see parity/linux-gate-logs/), exit $rc: cut rustc's memory (K2_GATE_LOW_MEMORY), never raise the cap" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run (held by the lab' "$log"; then
         result_json linux-gate "$title" not_run "$(grep -m1 '^refusing to run (held by the lab' "$log" | sed 's/^refusing to run //')" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run' "$log"; then
