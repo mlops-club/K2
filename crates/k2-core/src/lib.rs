@@ -177,6 +177,8 @@ pub use k2_client::editors;
 // Opens NO network trust boundary; inert until later phases wire ingress.
 // Gated behind the default-OFF `K2_FEDERATION` flag (see `federation::enabled`).
 pub mod federation;
+// Durable delivery outbox between hosts (k2-dist outbox: FR4, S3, I2).
+pub mod delivery;
 // Feedback F1 (prd-agent-feedback-notifications) — durable agent→human
 // asks (`k2 feedback ask`) + per-item comment threads.
 pub mod feedback;

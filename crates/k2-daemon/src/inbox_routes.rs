@@ -293,6 +293,35 @@ pub fn handle_compose_post(params: &HashMap<String, String>) -> CliResponse {
         let _ = std::fs::remove_file(&tmp);
         return resp;
     }
+    // K2_ROLE=host / controller: the recipient may run on another host, so
+    // the item goes through the controller's delivery outbox and is
+    // composed on the recipient's host (k2-dist outbox). `all`: unchanged.
+    if crate::runtime_role::current() != crate::runtime_role::Role::All {
+        let title = str_param(params, "title");
+        if title.is_empty() {
+            return CliResponse::bad_request("Missing title");
+        }
+        let body = serde_json::json!({
+            "kind": "inbox",
+            "title": title,
+            "body": str_param(params, "body"),
+            "priority": str_param(params, "priority"),
+            "source": str_param(params, "source"),
+        });
+        let from = opt_param(params, "from").unwrap_or_default();
+        return match crate::delivery_drain::send(&from, &target_token, body) {
+            Some(Ok(sent)) if sent.state != "failed" => CliResponse::ok_json(
+                serde_json::json!({"queued": true, "msgId": sent.msg_id, "delivery": sent.state}).to_string(),
+            ),
+            Some(Ok(sent)) => CliResponse::bad_request(format!(
+                "delivery failed for {}: {}",
+                sent.msg_id,
+                sent.reason.unwrap_or_default()
+            )),
+            Some(Err(e)) => CliResponse::internal_error(format!("couldn't queue the inbox item: {e}")),
+            None => CliResponse::internal_error("delivery outbox unavailable"),
+        };
+    }
     let Some(resolved_path) = crate::workspace_msg::resolve_workspace_allowing_handle(&target_token)
     else {
         // Same "unknown workspace" shape as live msg — not a connection
