@@ -321,6 +321,7 @@ W1 results:
 | `cargo test -p k2-daemon --lib -- hosts:: agent_host:: runtime_role:: pinned_chat::` | 53 passed |
 | two-process (run `20261025T160857Z`) | checks 1–7 PASS (S1 still PASS); check 8 W1 23/25; the controller ran no agent processes |
 | W1 via the controller | chat overlay: ensure-pinned-chat spawns on the host, banner and reply on the relayed grid, reuse; wake (S4): asleep → `k2 msg --wake` wakes it on the host, message answered; close puts it back to sleep; heartbeat fire (S5): fired on the host, wakeup answered |
+| `K2_ROLE=all` regression after W1: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 160 test binaries: 5198 passed, 0 failed, 6 ignored |
 | known gap | a **second** wake starts a fresh conversation instead of `--resume`: the resume resolver checks transcripts on the controller's disk (`k2_core::chat_history::*_session_file_exists`, `sidecar::conversation_exists`); they are on the host. Needs a k2-core probe hook (asked the coordinator, option A) or FR6 |
 
 ## Env contract
