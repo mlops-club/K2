@@ -266,4 +266,24 @@ agent never calls `xdg-open`.
   - The owner's running forward (pid 23886, started by the coordinator) is
     still the old code. A `scripts/kind/forward.sh` swaps it with a blip of
     about a second.
+- **The Mac's door is now a proxy (coordinator decision, after
+  `kubectl port-forward` dropped the owner's forward at 16:52:50 on one
+  broken stream).**
+  - What: `deploy/kind/proxy` (`alpine:3.20.10` + `socat=1.8.0.0-r0`, as
+    nobody) runs as container `<namespace>-proxy`, with `--restart
+    unless-stopped`, 64 MB and 0.5 CPU, on Docker's `kind` network. It
+    relays `127.0.0.1:<port>` to `k2lab-control-plane:<NodePort>`.
+  - NodePorts are fixed per variant in the overlays: agents 30740, fake
+    30741, dist-fake 30742, dist 30743.
+  - `up.sh` creates or replaces the proxy (`--port-forward` for the
+    fallback), `down.sh` removes it, and `forward.sh` checks or recreates
+    either door.
+  - Verified on `k2-kind-fake` (18:33):
+    - S1 PASS through the proxy (`lab-runs/kind/2026-10-25T00-33-25Z/`);
+    - `kubectl delete pod k2-solo-0`, and `/boot-status` answers through
+      the untouched proxy 1 s after the rollout (0 proxy restarts);
+    - S1 PASS again (`…T00-33-53Z/`);
+    - `down.sh --fake`: proxy container gone, 7441 free.
+  - The owner's `k2-kind-proxy` was not touched. A later `up.sh` on agents
+    replaces it with the same thing aimed at the control-plane node.
 - **Open questions:** none.
