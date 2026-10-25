@@ -1,0 +1,187 @@
+# k2-dist · lab-g2: gate G2 on solo and fleet (PRD section 3)
+
+Task `lab-g2` (W4), branch `k2-dist/lab-g2`, from `k2-dist/wave2-preview`
+(wave 1 + dist-link W0/W1 + outbox W2). It grows the G0 lab
+(`docs/prd/progress/lab.md`) into the G2 gate:
+
+```sh
+scripts/lab/prove.sh G2 --topology fleet [--chaos seed=N]   # controller + 2 hosts
+scripts/lab/prove.sh G2 --topology solo  [--chaos seed=N]   # today's daemon
+```
+
+New: the `fleet` topology (backends `procs`, the default, and `compose`),
+scenario clients S2 to S9, `--chaos seed=N`, and checkers for invariants I1
+to I4. S8 and S9 need dist-link's W3 (host drain, controller re-adoption);
+they are written now and stay red until W3 lands.
+
+## What changes
+
+```mermaid
+graph TD
+    %% ── Colour legend ──────────────────────────────────────────────
+    %% Blue = exists today, unchanged · Violet = changed in this task
+    %% Green = new in this task · Orange = outside K2 · Slate = files, state
+    %% Shapes: rect = process, stadium = files, hexagon = generated report
+
+    %% ── RUNNER · scripts/lab ───────────────────────────────────────
+    subgraph runner [Runner · scripts/lab]
+        P[prove.sh<br/><sub>G0 solo · G2 solo, fleet</sub>]:::changed
+        FS[fleet adapter<br/><sub>topology/fleet.sh · LAB_FLEET_BACKEND</sub>]:::new
+        SO[solo adapter<br/><sub>topology/solo.sh · + fleet state file</sub>]:::changed
+    end
+
+    %% ── LAB KIT · tests/lab/labkit ─────────────────────────────────
+    subgraph kit [Lab kit · tests/lab/labkit · python3 stdlib]
+        FL[fleet manager<br/><sub>fleet.py · up, down, kill, restart, monitor</sub>]:::new
+        SC[scenarios S2 to S9<br/><sub>g2.py · one client, the app's routes</sub>]:::new
+        W1[S4 wake, S5 heartbeat<br/><sub>w1.py · several agent homes</sub>]:::changed
+        CH[chaos<br/><sub>chaos.py · seeded kills, chaos.log</sub>]:::new
+        INV[invariant checkers<br/><sub>invariants.py · I1 to I4</sub>]:::new
+        RW[report writer<br/><sub>report.py · G2 matrix</sub>]:::changed
+    end
+
+    %% ── FLEET · procs backend · this Mac ───────────────────────────
+    subgraph fleet [Fleet · procs · each process its own HOME=mktemp -d]
+        C[k2-daemon K2_ROLE=controller<br/><sub>the one URL clients use</sub>]:::existing
+        H1[k2-daemon K2_ROLE=host<br/><sub>host-1 · dials the controller</sub>]:::existing
+        H2[k2-daemon K2_ROLE=host<br/><sub>host-2 · dials the controller</sub>]:::existing
+        FA[k2-fake-agent as claude<br/><sub>children of the hosts</sub>]:::changed
+        TR([traces<br/><sub>daemon K2_TRACE_FILE + fake agent per host</sub>]):::state
+    end
+
+    %% ── FLEET · compose backend · Docker, 10g cap ──────────────────
+    subgraph comp [Fleet · compose · deploy/compose/compose.lab-fleet.yaml]
+        CC[controller · host-1 · host-2<br/><sub>k2-lab-fleet image · Linux build</sub>]:::new
+    end
+
+    B{{lab-runs/G2/ts/<br/><sub>report.html · invariants.txt · chaos.log · scenarios/</sub>}}:::new
+
+    P -- up / down --> FS
+    P -- up / down --> SO
+    FS -- procs --> FL
+    FS -. compose, final evidence .-> CC
+    FL -- starts, kills, restarts --> C
+    FL -- starts, kills, restarts --> H1
+    FL -- starts, kills, restarts --> H2
+    H1 -- link --> C
+    H2 -- link --> C
+    H1 -- spawns --> FA
+    H2 -- spawns --> FA
+    C -. writes .-> TR
+    FA -. writes .-> TR
+    SC -- HTTP + WS, controller only --> C
+    W1 -- HTTP + WS --> C
+    CH -- kill CLI, host, controller --> FL
+    INV -. reads .-> TR
+    P --> SC
+    P --> INV
+    P --> RW
+    RW --> B
+
+    classDef existing fill:#dbeafe,stroke:#2563eb,color:#1e3a5f
+    classDef changed  fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef new      fill:#d1fae5,stroke:#059669,color:#064e3b
+    classDef external fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+    classDef state    fill:#f1f5f9,stroke:#64748b,color:#1e293b
+```
+
+## One G2 run
+
+```mermaid
+sequenceDiagram
+    participant P as prove.sh<br/>(runner)
+    participant F as fleet.py<br/>(fleet manager)
+    participant S as g2.py / w1.py<br/>(scenario clients)
+    participant X as chaos.py<br/>(seeded killer)
+    participant K as controller + hosts<br/>(k2-daemon)
+    participant I as invariants.py<br/>(checkers)
+
+    Note over P,K: Phase 1: up
+    P->>F: up (backend procs: 1 controller, 2 hosts)
+    F->>K: start each with K2_ROLE, own HOME, K2_TRACE_FILE
+    F->>K: wait boot-status ready, hosts linked
+    F-->>P: fleet.json (ports, pids, homes, traces)
+    P->>F: monitor (samples live agent CLIs every 0.5 s)
+
+    Note over P,K: Phase 2: scenarios
+    P->>S: S1, S2 (no chaos)
+    P->>X: chaos seed=N (only with --chaos)
+    P->>S: S3 to S9
+    X->>F: kill a CLI / a host / the controller at seeded times
+    F->>K: SIGKILL, then restart after a seeded pause
+    X-->>P: chaos.log
+    P->>X: stop (it restores anything still down)
+
+    Note over P,I: Phase 3: settle and judge
+    P->>K: wait until every outbox row is final
+    P->>I: traces, monitor samples, outbox listings, message ledger
+    I-->>P: I1 to I4 verdicts
+    P->>F: down
+    P->>P: parity suites, I5, flows, report
+```
+
+## Scenarios
+
+The client only ever talks to the controller's URL (on solo: the daemon).
+Each scenario writes `scenarios/<S>.json` (checks with details) and
+`scenarios/<S>.log`. Agents are `k2-fake-agent` as `claude`.
+
+| | Scenario | What the client does | Pass when |
+|---|---|---|---|
+| S1 | Spawn, attach, type, see output | `labkit/s1.py` (G0), against the controller | 8/8 checks, as at G0 |
+| S2 | Hook events land on the right agent | Two agents (fleet: one per host), a prompt typed into each | Every hook each CLI fired (SessionStart, UserPromptSubmit, Stop) reached the controller for that agent's session, and none for the other |
+| S3 | `k2 msg` between agents on different hosts | alice on host-1 runs the real `cli/k2 msg bob …` in host-1's environment | The message is `delivered` and is in bob's transcript exactly once |
+| S4 | Message wakes a sleeping agent | `w1.py wake`: an enabled agent with no process gets `k2 msg --wake` | Woken on a host, answers; asleep again, a second message resumes the same conversation |
+| S5 | Heartbeat fires on a sleeping agent | `w1.py heartbeat`: add, then fire | Spawned on a host, the wakeup prompt answered |
+| S6 | Inbox delivery survives restarts | fleet: host-2 (bob's) down, inbox item composed on host-1, the controller restarted, host-2 back, bob's next need | The item is in bob's inbox exactly once, its outbox rows `delivered`. solo: the item survives a daemon restart byte for byte |
+| S7 | CLI killed mid-turn, next need resumes | An agent woken by a message with a long turn; its CLI SIGKILLed mid-turn; a second message | The second message resumes it with the same provider session id and the same MEMORY.md bytes, and is answered |
+| S8 | Host killed mid-turn, nothing lost silently (fleet) | bob mid-turn on host-2; SIGTERM to host-2; a message to bob while it is down; host-2 restarted | host-2 drains (the turn's Stop before exit), bob is resumed by the replacement with no re-spawn by anyone, and the message is delivered once |
+| S9 | Controller restart, agents keep running (fleet) | A client attached to bob; a prompt with a long turn; the controller restarted mid-turn | bob's CLI pid never changes, the turn finishes while the controller is down, the controller re-adopts bob, the reattached client sees the reply, typing and `k2 msg` reach the same pid |
+
+Fake-agent directives (anywhere in a prompt, so they survive `k2 msg`'s
+`[from …]` prefix): `[[turn-ms=N]]` sets this turn's length (S7, S8, S9
+need a turn long enough to interrupt), `[[remember: text]]` appends to
+MEMORY.md like a `remember ` prompt.
+
+## Invariants
+
+Judged after the scenarios from evidence, not from the scenarios' own
+checks: daemon traces (`K2_TRACE_FILE`, one per process), fake-agent traces
+(one per host, so every CLI event has its host), the fleet monitor's
+samples, the outbox listings, and the lab's ledger of every message it sent.
+
+| | Invariant | Checker |
+|---|---|---|
+| I1 | At most one live placement per agent; epochs | No monitor sample shows two live CLIs for one agent (keyed by its workspace) on any hosts; every `ctl.place` epoch is greater than every earlier one, across controller restarts |
+| I2 | Every message reaches a final state | Every message in the ledger, the outboxes or the traces ends `delivered` or `failed` with a reason (fleet: controller hop down, each host's hop up); solo: `k2 msg` answered success, or failure with a reason |
+| I3 | A resumed agent keeps its session id and memory byte for byte | For every resumed `cli.exec`: same provider session id as the agent's previous CLI, and the MEMORY.md sha256 it starts with equals the one the previous CLI last recorded |
+| I4 | An agent's home is written by one host at a time | No agent has home writes (turns, memory, inbox items) from two hosts while the CLI on one of them is alive |
+| I5 | Solo output matches the pre-change baseline | As at G0, against `tests/lab/baselines/G0-solo.json` |
+
+## Chaos
+
+`--chaos seed=N` starts `chaos.py` before S3 and stops it after S9. From
+the seed it draws the schedule: every 4 to 12 s a target, a CLI (50 %), a
+host (30 %) or the controller (20 %; solo: the daemon, 30 %), SIGKILLed and,
+for a daemon, restarted after 1 to 5 s. Which CLI is drawn from the live
+ones sorted by workspace. A scenario that is restarting processes itself
+(S6, S8, S9) holds the fleet lock; chaos then logs a skip. `chaos.log`
+records every step (time, target, pid, what happened); the seed is in the
+report, so a failure replays with the same seed.
+
+## How to try it
+
+```sh
+scripts/lab/prove.sh G2 --topology fleet --parity none          # scenarios + invariants only
+scripts/lab/prove.sh G2 --topology fleet --chaos seed=4117 --parity none
+scripts/lab/prove.sh G2 --topology solo --parity none
+LAB_FLEET_BACKEND=compose scripts/lab/prove.sh G2 --topology fleet   # Docker: lock + slot, 10g cap
+tests/lab/run_tests.sh                                            # the lab's own tests
+```
+
+## Status
+
+- Milestones: diagrams written.
+- Next: fake-agent directives and evidence fields; fleet procs; S1 to S5
+  green on fleet procs (first working slice); S6 to S9; chaos; I1 to I4;
+  solo G2; compose backend and one compose run.
