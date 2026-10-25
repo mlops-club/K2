@@ -296,8 +296,11 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 ## Status
 
 - Milestones: diagrams written; host env contract (handed to `kind-dist`);
-  first working slice (loopback tests and the two-process S1 pass).
-- Next: the `K2_ROLE=all` regression suite (`cargo test -p k2-daemon`).
+  first working slice; done (every acceptance criterion below holds).
+- Next (P2 follow-ups, not this task): `RemoteHost` as an `impl AgentHost`,
+  connect-user and stream-token grid relays, `proto=k1` over the link,
+  host re-adoption after a controller restart (S9), the outbox (S3), cwd
+  mapping for pods.
 - Open: the deviation below (`RemoteHost` not yet an `impl AgentHost`).
 
 ### Results
@@ -308,7 +311,8 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 | `hosts::tests::real_host_link_runs_the_agent_and_relays_its_pty` | the real link with real PTYs: spawn placed on the host, snapshot relayed, typed text echoed back through the relay, close kills and reaps the child |
 | `hosts::tests::fake_host_s1_…` | placement and epoch, reuse goes back to the same host, grid both ways, hooks accepted only for a placed session at its epoch, `open_url` on the session events bus, close drops the placement |
 | `hosts::tests::spawn_with_no_host_connected_is_a_clear_error` | 503 with the `NO_HOSTS` message (criterion 3) |
-| `scripts/lab/topology/two-process.sh` (run `20261025T005250Z`) | all six checks PASS, below |
+| `scripts/lab/topology/two-process.sh` (runs `20261025T005250Z`, `20261025T005539Z`) | all six checks PASS, below |
+| `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME, 3 jobs | 161 test binaries: 5185 passed, 2 failed, 6 ignored. Both failures are environmental and pass on rerun: `ptyd_p76_integration` needs the `k2-ptyd` binary built (`cargo build -p k2-ptyd`; then 1/1 ok); `skin_integration::skin_sixth_login_with_forwarded_ip_is_429` got 401 instead of 429 once under heavy machine load, then passed with its whole binary (33/33). The new dispatcher hook returns early for every path but `/cli/hosts/*` under `all`. |
 
 Two-process run (controller :17420, host :17421, `k2-fake-agent` as
 `claude`, throwaway HOMEs):
@@ -317,7 +321,8 @@ Two-process run (controller :17420, host :17421, `k2-fake-agent` as
 PASS zero hosts: spawn is refused HTTP 503 {"error":"no agent host is connected to this controller (…)"}
 PASS host linked {"hosts":[{"hooks":0,"host_id":"host-1","host_name":"host-1","placements":0}],"role":"controller"}
 PASS S1 through the controller status=pass          (8/8 checks; spawn→banner 391 ms, type→reply 626 ms)
-PASS agent is a child of the host                    agent ppid 9955 = host 9955; controller 8874 has no children
+PASS agent is a child of the host                    agent ppid 46032 = host 46032, != controller 45144; controller has no children
+                                                     (only this run's agents: commands under its throwaway shim dir)
 PASS open_url from the host reaches the controller's /cli/sessions/events
      controller event: {"kind":"open_url","url":"https://claude.ai/oauth/authorize?dist-link=8759","source":"shim"}
 PASS hook events reached the controller              3 hook lines in controller.log
