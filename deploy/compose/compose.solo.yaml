@@ -20,6 +20,8 @@ services:
     image: ${K2_IMAGE:-k2-daemon:dev}            # packaging/oci/Dockerfile; binary at /usr/bin => install_kind="package", no self-update
     restart: unless-stopped
     init: true
+    mem_limit: 3g                                # fits beside a kind cluster in an 8 GB Docker VM; raise for many awake agents
+    cpus: 4
     environment:
       HOME: /var/lib/k2                          # until K2_HOME lands (P0 `home` task): state goes to /var/lib/k2/.k2
       K2_ROLE: all                               # new: "all" (default, today) | "controller" (refused until P2)

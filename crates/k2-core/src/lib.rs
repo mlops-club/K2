@@ -250,6 +250,9 @@ pub use k2_client::macos_keychain;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "macos_keychain_tests.rs"]
 mod macos_keychain_tests;
+// K2 Distributed Runtime P0: `K2_HOME` moves every K2-home path.
+#[cfg(test)]
+mod k2_home_env_tests;
 // K2 Mail (prd-email-server-v1 pre-mortem #14) — the ONE mail-domain
 // normalization helper (lowercase punycode A-label) used at every
 // boundary. Store only what it returns; display-decode at the edge.

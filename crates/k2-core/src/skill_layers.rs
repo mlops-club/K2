@@ -23,10 +23,7 @@ fn layers_dir(tier: &str) -> Result<PathBuf, String> {
     if !valid.contains(&tier) {
         return Err(format!("Invalid tier: {}. Must be one of: {:?}", tier, valid));
     }
-    let dir = dirs::home_dir()
-        .ok_or("No home directory")?
-        .join(".k2/templates")
-        .join(tier);
+    let dir = crate::paths::k2_home_opt().ok_or("No home directory")?.join("templates").join(tier);
     let _ = fs::create_dir_all(&dir);
     Ok(dir)
 }

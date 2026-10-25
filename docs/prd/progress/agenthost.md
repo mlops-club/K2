@@ -228,14 +228,81 @@ requested / PTY opened), `place` and `unplace` (placement changes, with the
 epoch), `attach`/`detach` (viewer attach), `inject` (delivery attempt and
 result), `kill`, and `mark_exited` (CLI exit seen).
 
+## Results (zero behavior change)
+
+Base is `66f48678a` (the tip of `k2-dist/lab` this branch was cut from);
+head is this branch. Everything ran on this Mac with a fresh `mktemp -d`
+HOME, every `K2_*`/`K2SO_*` unset, `CARGO_BUILD_JOBS=3`, 3 test threads.
+
+| Check | Base | Head |
+|---|---|---|
+| `cargo test -p k2-core` | not rerun (no `k2-core` change) | 3854 passed, 0 failed, 1 ignored (17 binaries) |
+| `cargo test -p k2-daemon` | – | 5151 passed; 4 failed under load and all 4 pass when rerun alone (below) |
+| in-process host tests | – | 10 of 10 pass |
+| clippy, files changed | – | 0 findings on lines this branch added (9 old ones on untouched lines) |
+| `prove.sh G0 --topology solo` S1 | pass | pass |
+| tier 1, tier 3, must-not-break | fail, fail, pass | fail, fail, pass (same reasons, word for word) |
+| `tests/cli/*.sh` | 150 of 158 pass | 150 of 158 pass after reruns; the same 7 always fail on both |
+| report statuses | fail (Linux gate held, S12 and I5 NOT RUN) | identical |
+| Linux gate (`test-gate-linux.sh` in Docker) | held | NOT RUN: the Docker VM has 11 GB free, the gate needs 20 GB |
+
+The 4 `k2-daemon` failures, all from load on a shared Mac: a port clash in
+`publish_runtime` (`bind clash ... already accepting connections`), the
+`k2-ptyd` binary not yet built for `ptyd_p76_integration` (built, then it
+passes), a job-state timing assertion in `compute_integration`, and a
+cancel-before-argv race in `llm_accounts_integration`. Each passes when
+run alone.
+
+`tests/cli`: 7 fail on both base and head every time (`app_runtime_cli_smoke`,
+`compute_cli_smoke`, `compute_node_install_linux`, `mail_calendar_providers`,
+`node_admin_linux`, `node_admin_linux_container`, `permission_off_golden`:
+Linux-only or need this Mac's services). 5 more differed between the two
+full runs (`app_resources`, `git_changes_headless`, `sources_cli_smoke`,
+`zen_cli` failed on head; `changes_cli_headless` on base), all on timeouts
+while the Mac was swapping and later asleep; rerun alone through the lab's
+own `run_clean`, all 5 pass on both base and head.
+
+The Linux gate was held on both full runs (`--linux-gate hold`): its
+container must be memory-capped on this machine and `parity.sh` (not mine)
+starts it without a cap. A separate capped run on head (6 GB, 3 CPUs, `jobs = 1`, same mounts as
+`parity.sh`, under the shared Docker lock) refused to start: "11G free under
+/gate/work, need 20G (K2_GATE_MIN_FREE_GB)". The Docker disk is shared with
+the owner's kind cluster, so I neither freed space nor lowered the minimum.
+The gate's suites are the same two `cargo test` runs as the host rows above,
+but as root on Linux. Coordinator, 2026-10-25: the Docker disk now has room,
+and the gate runs once on the merged `k2-dist/wave1`, not on this branch.
+
+### NFR1: spawn latency and idle RSS (`metrics.csv`)
+
+S1-only lab runs (`--parity none`), base and head interleaved, 20 rounds
+each:
+
+| metric | base median | head median | change |
+|---|---|---|---|
+| `daemon_rss_idle` (KiB) | 69616 | 69360 | -0.4% |
+| `daemon_rss_after_s1` (KiB) | 86968 | 86816 | -0.2% |
+| `spawn_to_banner_ms` | 293.4 | 305.9 | +4.3% |
+| `type_to_reply_ms` | 525.7 | 529.1 | +0.7% |
+
+Both within 5%. Spawn latency is noisy on a shared machine (base 269 to
+397 ms, head 266 to 532 ms); the difference is not significant
+(Mann-Whitney U = 143.5, p = 0.13). The code path adds one dynamic
+dispatch per call and one short `String` per placement.
+
 ## Status
 
-- **Milestone:** first working slice. The trait, the in-process host and
-  its 10 tests pass (`cargo test -p k2-daemon --lib -- agent_host::`);
-  groups 1 to 4 are moved and the daemon builds with no new warnings.
-- **Next:** both crates' full suites, clippy against the base, then
-  `prove.sh G0 --topology solo` and the metrics on base and head.
+- **Milestone:** done. The Linux gate is NOT RUN for lack of Docker disk
+  (on base it was held too, so the comparison is like for like).
+- **Next:** for P2, the remote host (see "What P2's remote host needs").
 - **Open questions:** none.
+
+### Lab findings (for the `lab` worker)
+
+- `prove.sh` builds with `cargo build -p k2-daemon --bin k2-daemon -p
+  k2-fake-agent`; `--bin k2-daemon` applies to every package, so
+  `k2-fake-agent` is never built. On a clean checkout the copy fails and S1
+  is NOT RUN. Workaround used here: `cargo build -p k2-fake-agent` first.
+- `parity.sh` starts the gate container with `--cpus` only, no memory cap.
 
 ### Decisions inside owned files
 
@@ -255,6 +322,8 @@ result), `kill`, and `mark_exited` (CLI exit seen).
   assert on the first frame of that process-wide bus; a publishing test
   here would make them flaky. It checks that the owner check finds panes
   through the placement, and that the receiver is live.
+- **Spawn latency measured over 20 interleaved rounds**, not one run: a
+  single run on this machine swung from 598 to 1195 ms with no code change.
 - **Two test lines in `v2_spawn.rs` adapted**: `current_dims` now takes an
   `AgentSession`, so the attach-only test wraps its `Arc` (no assertion
   changed).

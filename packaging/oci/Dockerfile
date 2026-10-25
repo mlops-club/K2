@@ -25,7 +25,7 @@ RUN apt-get update \
 # ── build: k2-ptyd first, then k2-daemon embedding it (P84) ──────────────
 FROM toolchain AS build
 # Parallel rustc jobs; keep it modest on a shared laptop (build.sh passes it).
-ARG CARGO_BUILD_JOBS=4
+ARG CARGO_BUILD_JOBS=3
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # dev (default): Cargo's release profile without LTO, 16 codegen units and no
 # debug info, so k2-daemon:dev builds in minutes. ship: Cargo.toml's release

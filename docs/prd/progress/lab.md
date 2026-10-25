@@ -164,17 +164,40 @@ hook) contain every step's event in order. A trace with no event from the
 system under test (only `lab` and `k2-fake-agent`) leaves every flow
 "expected only"; that is wave 1's state. The fake agent already emits
 `cli.exec`, `cli.hook` (`attrs.hook` = SessionStart, UserPromptSubmit, Stop,
-SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
-`K2_FAKE_AGENT_TRACE` is set.
+SessionEnd; written BEFORE the hook command starts, as a real CLI starts the
+hook before the daemon receives it), `cli.hook.done` (after, `attrs.exit`),
+`cli.turn.start`, `cli.turn.end` and `cli.exit` when `K2_FAKE_AGENT_TRACE` is
+set.
 
 ## Status
 
-- **Milestone:** first working slice. `prove.sh G0 --topology solo --parity none`
-  runs end to end: builds the daemon and fake agent, boots the solo sandbox,
-  S1 passes over the app's routes, and the bundle is written (gate red, as it
-  must be without parity). First full-parity run in progress.
-- **Next:** full parity run (Linux gate in Docker, `tests/cli/*.sh`, tiers,
-  must-not-break), record the I5 baseline, tests for the report writer.
+- **Milestone:** done. `prove.sh G0 --topology solo` runs end to end on this
+  Mac and writes the bundle; S1 passes; every parity suite is run and
+  reported; I5 compares the four local suites against the committed
+  baseline (`tests/lab/baselines/G0-solo.json`, crates/ = the wave-1 base)
+  and they match; the gate is red, as it must be, for the reasons below
+  (S12 not built, pre-existing suite failures, the Linux gate's k2-daemon
+  build not fitting 6 GB).
+- **Acceptance (host, 2026-10-24):** with every `K2_*` unset, through
+  `lab_cargo` (throwaway HOME, 3 jobs, 3 threads), after `cargo build -p
+  k2-ptyd --bin k2-ptyd` (as CI does; `ptyd_backend` needs it):
+  `cargo test -p k2-core` exit 0 (3854 passed, 1 ignored);
+  `cargo test -p k2-daemon` exit 0 (5145 passed, 6 ignored).
+- **Was waiting on:** the coordinator's go (the Mac is shared; image's kind build
+  is the critical path) before the next heavy runs: `cargo test -p k2-core` and
+  `-p k2-daemon` under `lab_cargo`, then `prove.sh --record-baseline`, then a
+  verification run for I5.
+- **Safety incident (2026-10-24, fixed):** an early host `cargo test -p
+  k2-core` here ran with the real HOME; pre-existing tests
+  (`garden_data/signer_gate.rs`, a workspace lifecycle-seed test) wrote
+  `~/.k2/auth-audit.jsonl` and `~/.k2/wiki`. Since commit 2078ac05b every lab
+  cargo command goes through `lab_cargo` (env -i, throwaway HOME and TMPDIR,
+  as the Linux gate's `clean_cargo`); the two tests are the coordinator's
+  follow-up, not lab files.
+- **First full run (exploratory, pre-fixes):** S1 pass; must-not-break pass
+  (its 3 `k2 db` checks are reported not run off Linux, by the suite itself);
+  tier 3 and tier 1 fail (pre-existing, below); `tests/cli` 156 scripts, a few
+  Linux-only ones fail; the Linux gate did not run (old invocation).
 
 ### Decisions inside owned files
 
@@ -220,11 +243,36 @@ SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
   NOT RUN with its own message). `hold` stays for iterating. The Docker path
   mounts the repo read-only at `/src/wt` (Docker Desktop cannot mount at a
   target under `/Users`) and finds the sha through `GIT_DIR`.
-- **CPU budget.** The Mac is shared by three workers. Every cargo command in
-  the lab gets `CARGO_BUILD_JOBS=4` (also passed into the suites' clean env);
-  test runs use 4 threads; the gate container gets `--cpus 4` and the gate's
-  own `K2_GATE_THREADS=4`; the Linux gate runs last, after the local suites,
-  never alongside another heavy build.
+- **CPU and Docker budget (coordinator, 2026-10-24, after the Docker VM
+  froze the owner's kind cluster).** Host cargo: `CARGO_BUILD_JOBS=3` and 3
+  test threads (also passed into the suites' clean env). Docker-heavy work
+  (the gate image build and the gate container) takes the shared lock
+  `$HOME/.cache/k2-dist-docker.lock` (`until mkdir …; do sleep 20; done`),
+  released on exit, INT or TERM; a run killed while still waiting never
+  removes another holder's lock. The gate container runs on 3 CPUs with the
+  gate's own `K2_GATE_THREADS=3`, last in the run, never alongside another
+  heavy build. The lab never uses kind (namespace `k2-kind` is the owner's).
+  Memory: every container is capped (the 8 GB Docker VM is shared with
+  kind; the owner's pod was OOM-killed at 16:26 while another worker's
+  container ran). The gate compiles k2-core and k2-daemon for Linux (about
+  5 GB), so per the coordinator it alone gets `--memory=6g --memory-swap=6g`
+  with ONE cargo build job (a mounted `config.toml`; the gate's `env -i`
+  drops `CARGO_BUILD_JOBS`), 3 CPUs and 3 test threads, with nothing else in
+  Docker (the lock). The lab never touches `k2-kind`, `k2-kind-proxy` or
+  `k2-kind-dist-fake`. An OOM kill is reported as
+  such, and the fix is lower parallelism, never a larger cap.
+  Cargo queue: every lab cargo command runs in a machine-wide slot
+  (`~/.cache/k2-dist-cargo-slot.sh`, at most 2 at once): `lab_cargo` wraps
+  itself, the suites get a `cargo` shim first on their PATH (their own
+  `cargo build`s queue too, scripts unchanged), and the Linux gate
+  (`scripts/lab/lib/linux_gate.sh`) runs inside one slot and only then takes
+  the Docker lock: always slot first, then lock.
+- **`lab_cargo` temp paths.** It uses `/tmp/k2c-*` (short) for the throwaway
+  HOME and TMPDIR: `macos_keychain_tests` puts the temp keychain path into a
+  `security -i` line capped at `INTERACTIVE_LINE_MAX`, and macOS's long
+  `$TMPDIR` made `a_wallet_add_and_restore_cycle_leaves_claudes_item_readable_by_security`
+  fail under the lab only (all 18 pass with short paths). Worth knowing for
+  anyone running k2-core tests under a deep TMPDIR.
 - **S12 at G0.** Confirmed: G0 on solo stays red with S12 NOT RUN until S12
   exists; S2 and S7 are reported, not required.
 - **Tier 1.** Today's daemon makes the `~/.k2so -> ~/.k2` compat link, so tier
@@ -241,8 +289,86 @@ SessionEnd), `cli.turn.start`, `cli.turn.end` and `cli.exit` when
 - Some `tests/cli` scripts expect Linux (for example `app_runtime_cli_smoke`
   wants the App-box doctor's helper check).
 
+### tests/cli on this Mac (first full run, 156 scripts)
+
+147 pass. The lab now builds `k2-node` and `k2-provider-fakes` with the daemon
+(`compute_cli_smoke` and `mail_calendar_providers` failed only because they
+were not built). Scripts that exit after printing their own refusal to run
+here are NOT RUN with that line as the reason (`parity/cli/not-run.txt`), not
+FAIL; the suite is then NOT RUN, never green:
+
+- `compute_node_install_linux`, `node_admin_linux`: refuse outside a
+  disposable Linux box (`K2_DISPOSABLE_BOX`), by design.
+- `node_admin_linux_container`: a build-box script that needs an output dir
+  argument and podman.
+- `sign_app_engine`, `sign_k2_node`: need `minisign`, which this Mac does not
+  have. The owner approved it and the coordinator installed
+  `/opt/homebrew/bin/minisign` 0.12 (2026-10-24); the suites' clean PATH
+  includes `/opt/homebrew/bin`, so both run from the next full run on.
+
+Real failures (pre-existing): `app_runtime_cli_smoke` (expects the Linux App
+box doctor), `permission_off_golden` (its schema golden is stale against
+`k2 zen widget errors`). The image branch updates that golden for its new
+capabilities key: **recheck `permission_off_golden` after integration.**
+
 ### I5 baseline
 
 While the Linux gate is held, a baseline records the suites that ran and lists
 the rest under `not_recorded` with their reason. I5 is then NOT RUN (never
 pass) and names the suite it could not compare, even when the others match.
+
+## Hand-off: what `prove.sh G1 --topology solo` needs
+
+G1 (PRD P1: AgentHost interface, in-process only, zero behaviour change) on
+solo requires, per the PRD's P1 proof and scenario matrix:
+
+| Item | Status in wave 1 | To do |
+|---|---|---|
+| Parity suites, I5 against the **pre-refactor** baseline | done (`tests/lab/baselines/G0-solo.json`, recorded at the G0 sha) | Compare G1 runs against that G0 baseline, not a re-recorded one: point `run.json.baseline` at it for G1 |
+| S1 | done | none |
+| S2 hook events land on the right agent | not built | `labkit/s2.py`: two agents, check each agent's `cli.hook` lands on its own agent in the daemon (activity route or the new trace) |
+| S7 CLI killed mid-turn, next need resumes | not built | `labkit/s7.py`: start a turn with a long `K2_FAKE_AGENT_TURN_MS`, kill the fake agent's pid (in its trace, `cli.exec`), make a need (type again), check the respawn passes `--resume <same id>`; then I3: memory bytes and session id equal (the fake agent's `remember ` writes the memory) |
+| S12 Postgres, Apps, mail, Sew, front door parity | not built (required since G0) | its own task; on a Mac most of it is Linux-only, so solo S12 may need the container topology's Linux |
+| Trace diff for `spawn`, `hook` and the CLI-crash flow | checker done, flows `expected only` | Daemon emits the JSONL above to a file the lab names (for example an env var set by `topology/solo.sh` into `$RUN/topology/daemon.trace.jsonl`); scenarios merge it into `S*.trace.jsonl`; `report.py` gets a per-gate list of **required** flows (G1 solo: `spawn`, `hook`, `crash`) that must be `pass` |
+| Bench: no change in spawn latency or idle RSS (NFR1: within 5%) | one sample each in `metrics.csv` | N spawns per run (median, p95), the G0 run's numbers stored with the baseline, and a report row comparing them |
+
+Code seams: `report.SCENARIOS[("G1", "solo")]`, `report.INVARIANT_NA[("G1",
+"solo")]` (I3 no longer n/a once S7 exists), the gate/topology guard at the
+top of `prove.sh`, and a scenario loop in `prove.sh` instead of the S1
+block. Note for **trace**: commit 3105385e6 (on top of 66f48678a) lets
+`docs/prd/flows/` hold flow files beyond the 11 PRD flows; before it,
+`test_flows.py` failed on any extra file such as `crash.json`.
+
+## The Linux gate on this Mac (first real runs, 2026-10-25)
+
+`test-gate-linux.sh` ran in Docker (rust 1.99.1, slot then Docker lock,
+`--memory=6g`, one cargo build job, 3 test threads). The first two runs were
+GATE RED. Each failure, classified (coordinator's scheme: (a) this Mac or
+VM, (b) pre-existing on the base, (c) caused by wave 1):
+
+| Failure | Class | What was done |
+|---|---|---|
+| `ptyd_backend` (7 tests): "k2-ptyd binary not found" | gap in the gate itself: `cargo test -p k2-core` builds `k2-ptyd` only as a library, so any fresh gate box fails these | **Fixed** in `scripts/test-gate-linux.sh` (now owned by this task, coordinator 2026-10-25): build `k2-ptyd --bin k2-ptyd` first into the same target dir, as CI does. Commit a02c8a719 |
+| `terminal::daemon_pty::tests::child_self_exit_releases_pty_master_fd`, `kill_releases_pty_master_fd_with_arc_retained`: "lsof must be runnable: NotFound" | (a) the lab's gate image had no `lsof` | **Fixed**: `gate.Dockerfile` installs `lsof` (image `k2-lab-gate:2`). Commit b6d5e22fa |
+| `could not compile k2-daemon (lib test)`: rustc `signal: 9, SIGKILL` | (a) the 6 GB container cap | Per the coordinator, cut rustc's memory instead of raising the cap: `scripts/test-gate-linux.sh` gained `K2_GATE_LOW_MEMORY=1` (unset by default, CI unchanged): one build job, 256 codegen units, opt-level 0 for dev and test (debuginfo was already 0, incremental off). Commits a98aa512b, 59ca3ab9f; the lab sets it (48b18d03c). **Still SIGKILLed at 6 GB with all of it**: the single rustc for k2-daemon's lib-test crate does not fit in this Docker VM. Needs a bigger box or cap; the coordinator's call. The report names it as an OOM kill (45fadea9e) |
+| `fork_tab_repair::tests::repair_splits_a_fork_tab_off_the_source_conversation` (`assert_eq!(mine.len(), 1)`, got 0) | (b) pre-existing, order-dependent: passed in the previous gate run and on the host; `repair()` sweeps the shared test DB, so a parallel test can take this test's fork tab first (docs/testing.md rule 6). wave 1 does not touch `crates/` | Reported to the coordinator, not fixed (not lab files) |
+
+The gate's per-package logs now stay in the bundle
+(`parity/linux-gate-logs/`, a symlink from the gate's workdir to a bind mount).
+In the gate, k2-core passes 3834/3834 (one run) and 3645/3646 (the next, the
+fork_tab_repair flake above); `ptyd_backend` passes 8/8 after the fix.
+
+### Last run (lab-runs/G0/2026-10-25T18-07-28Z, sha 45fadea9e)
+
+- S1 PASS; contract PASS; cli 3 fail, 3 NOT RUN; tier 3 and tier 1 fail
+  (pre-existing); S12 NOT RUN.
+- Linux gate NOT RUN: the gate refused, "10G free under /gate/work, need
+  20G" (Docker disk filled again since the 50 GB clean-up).
+- **I5 FAIL**, one difference: `tests/cli/changes_cli_headless` failed
+  ("FAIL: the pinned chat got no passport") where the baseline passed. Same
+  `crates/` tree as the baseline (230857a3d04e). The same message failed
+  `mail_calendar_providers` once (in a run the overnight sleep disturbed), and
+  both scripts passed in every other run: class (b), an intermittent,
+  pre-existing daemon behaviour (the pinned chat's passport is not always
+  stamped in time), not caused by the lab or wave 1. I5 did its job: it
+  flags a run that differs from the baseline instead of passing it.

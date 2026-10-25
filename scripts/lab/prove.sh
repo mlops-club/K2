@@ -23,7 +23,8 @@
 # --linux-gate run (default) builds scripts/lab/docker/gate.Dockerfile and
 # runs test-gate-linux.sh in it AFTER the local suites (never alongside
 # another heavy build); hold never touches Docker and reports it NOT RUN.
-# CPU budget: CARGO_BUILD_JOBS=4 and 4 test threads unless set.
+# CPU budget: CARGO_BUILD_JOBS=3 and 3 test threads unless set; Docker jobs
+# take the shared lock $HOME/.cache/k2-dist-docker.lock (one at a time).
 #
 # Touches nothing outside the repo, lab-runs/ and temp dirs: the daemon and
 # every suite run under throwaway HOMEs; Rust comes from PATH or is installed
@@ -53,7 +54,7 @@ done
 case "$PARITY" in full|none) ;; *) echo "prove.sh: --parity is full or none" >&2; exit 2 ;; esac
 case "$LAB_LINUX_GATE" in hold|run) ;; *) echo "prove.sh: --linux-gate is hold or run" >&2; exit 2 ;; esac
 export LAB_LINUX_GATE
-export LAB_TEST_THREADS=${LAB_TEST_THREADS:-4}
+export LAB_TEST_THREADS=${LAB_TEST_THREADS:-3}
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 if [ "$GATE" != G0 ] || [ "$TOPOLOGY" != solo ]; then
@@ -99,7 +100,7 @@ run_set gate "$GATE" topology "$TOPOLOGY" sha "$LAB_SHA" branch "$(git rev-parse
     started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" args "$(json_list "$GATE" --topology "$TOPOLOGY" ${CHAOS:+--chaos "$CHAOS"} --parity "$PARITY")" \
     baseline "$BASELINE" recorded_baseline "$([ $RECORD_BASELINE = 1 ] && echo true || echo false)"
 
-if [ -n "$(git status --porcelain -- . ':!lab-runs')" ]; then
+if [ -n "$(git status --porcelain --untracked-files=no -- . ':!lab-runs')" ]; then
     NOTES+=("The working tree has uncommitted changes. Solo and the local suites ran on the working tree; the Linux gate ran on the committed sha $LAB_SHA.")
 fi
 if [ -n "$CHAOS" ]; then
@@ -149,8 +150,11 @@ if ! lab_toolchain "$LAB_REPO" >>"$RUN/build.log" 2>&1; then
     [ "$PARITY" = none ] && parity_none
     finish
 fi
-say "building k2-daemon and k2-fake-agent (rust: $LAB_RUST_SOURCE, $(rustc --version))"
-if ! cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent >>"$RUN/build.log" 2>&1; then
+say "building k2-daemon, k2-fake-agent, and k2-node + k2-provider-fakes (tests/cli needs them) (rust: $LAB_RUST_SOURCE, $(rustc --version))"
+# Two commands: `--bin k2-daemon` would limit EVERY selected package to a
+# bin of that name, leaving the others unbuilt.
+if ! { lab_cargo build -p k2-daemon --bin k2-daemon >>"$RUN/build.log" 2>&1 \
+        && lab_cargo build -p k2-fake-agent -p k2-node -p k2-provider-fakes --bins >>"$RUN/build.log" 2>&1; }; then
     say "build failed (see build.log)"
     NOTES+=("Build failed (build.log). Nothing ran.")
     finish
@@ -158,12 +162,18 @@ fi
 # The suites rebuild target/debug/k2-daemon (some with other features), so
 # the topology and must-not-break use a copy taken now.
 mkdir -p "$LAB_TMP/bin" "$LAB_TMP/shim"
-cp target/debug/k2-daemon target/debug/k2-fake-agent "$LAB_TMP/bin/"
+cp target/debug/k2-daemon target/debug/k2-fake-agent "$LAB_TMP/bin/" || { say "built binaries missing"; finish; }
+for b in k2-node k2-provider-fakes; do
+    [ -x "target/debug/$b" ] || { say "target/debug/$b was not built (see build.log)"; NOTES+=("target/debug/$b was not built; tests/cli scripts that need it will fail."); }
+done
 LAB_DAEMON_BIN="$LAB_TMP/bin/k2-daemon"
 LAB_FAKE_AGENT_BIN="$LAB_TMP/bin/k2-fake-agent"
 "$LAB_FAKE_AGENT_BIN" --install-shims "$LAB_TMP/shim"
 LAB_SHIM_DIR="$LAB_TMP/shim"
-export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN LAB_SHIM_DIR
+# The suites' own cargo builds queue in the machine-wide slot too.
+LAB_CARGO_SHIM_DIR="$LAB_TMP/cargo-shim"
+lab_cargo_shim "$LAB_CARGO_SHIM_DIR"
+export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN LAB_SHIM_DIR LAB_CARGO_SHIM_DIR
 
 # ── Topology up, scenario S1 ────────────────────────────────────────────
 say "topology $TOPOLOGY: up"
@@ -216,7 +226,7 @@ if [ "$PARITY" = full ]; then
     parity_cli | tee -a "$RUN/prove.log"
     # Last, on its own: the gate is a full cold-or-warm build of k2-core and
     # k2-daemon tests, and the Mac is shared (one heavy build at a time).
-    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "scripts/test-gate-linux.sh in Docker, 4 CPUs (log: parity/linux-gate.log)" || echo "held by --linux-gate hold, NOT RUN")"
+    say "parity: Linux gate: $([ "$LAB_LINUX_GATE" = run ] && echo "scripts/test-gate-linux.sh in Docker, 3 CPUs, after taking the shared Docker lock (log: parity/linux-gate.log)" || echo "held by --linux-gate hold, NOT RUN")"
     parity_linux_gate_start
     parity_linux_gate_finish
 else
