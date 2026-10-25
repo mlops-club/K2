@@ -100,6 +100,18 @@ cli_not_run_reason() {
     return 1
 }
 
+# Builds a script documents as its prerequisite and does not do itself,
+# run (queued, throwaway HOME) right before it; the plain daemon build is
+# restored right after, so later scripts get the default binary.
+#   mail_calendar_providers.sh header: "cargo build -p k2-daemon --bin
+#   k2-daemon --features provider-fakes" (it refuses a daemon without it, so
+#   it can never call the real Microsoft or Google endpoints).
+cli_prebuild() {
+    case "$1" in
+        mail_calendar_providers) echo "-p k2-daemon --bin k2-daemon --features provider-fakes" ;;
+    esac
+}
+
 parity_cli() {
     local dir="$RUN/parity/cli" items="$RUN/parity/cli.items" t0=$SECONDS f name rc st skips why
     local fails=0 notrun=0 n=0
@@ -108,7 +120,15 @@ parity_cli() {
         name=$(basename "$f" .sh)
         case "$name" in _*) continue ;; esac
         n=$((n + 1))
+        local pre; pre=$(cli_prebuild "$name")
+        if [ -n "$pre" ]; then
+            # shellcheck disable=SC2086
+            ( cd "$LAB_REPO" && lab_cargo build $pre ) >"$dir/$name.prebuild.log" 2>&1
+        fi
         run_clean "$dir/$name.log" "$LAB_REPO" 900 bash "$f"; rc=$?
+        if [ -n "$pre" ]; then
+            ( cd "$LAB_REPO" && lab_cargo build -p k2-daemon --bin k2-daemon ) >>"$dir/$name.prebuild.log" 2>&1
+        fi
         if [ $rc -eq 0 ]; then
             st=pass
         elif why=$(cli_not_run_reason "$dir/$name.log"); then
@@ -223,6 +243,8 @@ parity_linux_gate_finish() {
         result_json linux-gate "$title" pass "" "parity/linux-gate.log" $rc $secs
     elif [ "$rc" -eq 137 ] || grep -qiE 'out of memory|oom-?kill|signal: 9, SIGKILL' "$log"; then
         result_json linux-gate "$title" fail "OOM-killed under the 3 GB cap (exit $rc): lower the gate's parallelism (CARGO_BUILD_JOBS / LAB_TEST_THREADS), never the cap" "parity/linux-gate.log" $rc $secs
+    elif grep -q '^refusing to run (held by the lab' "$log"; then
+        result_json linux-gate "$title" not_run "$(grep -m1 '^refusing to run (held by the lab' "$log" | sed 's/^refusing to run //')" "parity/linux-gate.log" $rc $secs
     elif grep -q '^refusing to run' "$log"; then
         result_json linux-gate "$title" not_run "the gate refused to start: $(grep -m1 '^refusing to run' "$log")" "parity/linux-gate.log" $rc $secs
     else

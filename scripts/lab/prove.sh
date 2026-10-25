@@ -100,7 +100,7 @@ run_set gate "$GATE" topology "$TOPOLOGY" sha "$LAB_SHA" branch "$(git rev-parse
     started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" args "$(json_list "$GATE" --topology "$TOPOLOGY" ${CHAOS:+--chaos "$CHAOS"} --parity "$PARITY")" \
     baseline "$BASELINE" recorded_baseline "$([ $RECORD_BASELINE = 1 ] && echo true || echo false)"
 
-if [ -n "$(git status --porcelain -- . ':!lab-runs')" ]; then
+if [ -n "$(git status --porcelain --untracked-files=no -- . ':!lab-runs')" ]; then
     NOTES+=("The working tree has uncommitted changes. Solo and the local suites ran on the working tree; the Linux gate ran on the committed sha $LAB_SHA.")
 fi
 if [ -n "$CHAOS" ]; then
