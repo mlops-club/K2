@@ -167,7 +167,10 @@ g2_scenarios() {
         CHAOS_PID=$!
     fi
     say "scenarios S3 to S9"
-    python3 -I tests/lab/lab.py g2 --state "$LAB_FLEET_STATE" --out "$RUN/scenarios" --only "${only#S2,}" | tee -a "$RUN/prove.log"
+    # Under chaos the set repeats in rounds for at least LAB_CHAOS_MIN_S (180 s),
+    # so chaos acts even where the scenarios are quick (solo).
+    python3 -I tests/lab/lab.py g2 --state "$LAB_FLEET_STATE" --out "$RUN/scenarios" --only "${only#S2,}" \
+        ${CHAOS:+--min-seconds "${LAB_CHAOS_MIN_S:-180}"} | tee -a "$RUN/prove.log"
     if [ -n "$CHAOS_PID" ]; then
         say "chaos: off (it restores anything it took down)"
         kill "$CHAOS_PID" 2>/dev/null

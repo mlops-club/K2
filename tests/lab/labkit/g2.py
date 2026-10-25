@@ -838,9 +838,41 @@ def s9(c, sc):
 SCENARIOS = {"S2": s2, "S3": s3, "S6": s6, "S7": s7, "S8": s8, "S9": s9}
 
 
-def run(state_path, out, only):
+def run(state_path, out, only, min_seconds=0):
+    """Run `only` once into `out`; with min_seconds (a --chaos window), run
+    the set in rounds (out/round-<k>/) until that long has passed, and write
+    each scenario's verdict over all rounds to out/<S>.json: pass only if
+    every round passed. The message ledger is always out/messages.jsonl."""
+    if not min_seconds:
+        return run_once(state_path, out, only, out)
+    start, rounds, k = time.monotonic(), [], 0
+    while k == 0 or time.monotonic() - start < min_seconds:
+        k += 1
+        rounds.append(run_once(state_path, os.path.join(out, "round-%d" % k), only, out))
+    results = {}
+    for sid in only:
+        per = [(i + 1, r[sid]) for i, r in enumerate(rounds) if sid in r]
+        statuses = {d["status"] for _, d in per}
+        status = "n/a" if statuses == {"n/a"} else ("pass" if statuses <= {"pass", "n/a"} else "fail")
+        checks = [{"name": "round %d: %s" % (i, d["status"].upper()), "ok": d["status"] in ("pass", "n/a"),
+                   "detail": "; ".join("%s -- %s" % (c["name"], c["detail"][:200]) for c in d["checks"] if not c["ok"])
+                   or "%d checks passed" % len(d["checks"])} for i, d in per]
+        doc = {"scenario": sid, "title": TITLES.get(sid, sid), "status": status, "checks": checks,
+               "rounds": len(per), "info": {"round_dirs": ["round-%d" % i for i, _ in per]}}
+        if status == "n/a":
+            doc["reason"] = per[0][1].get("reason")
+        with open(os.path.join(out, sid + ".json"), "w") as fh:
+            json.dump(doc, fh, indent=2, default=str)
+        with open(os.path.join(out, sid + ".log"), "w") as fh:
+            fh.write("%d round(s) under chaos; logs in round-<k>/%s.log\n" % (len(per), sid))
+        print("%s %s over %d round(s)" % (sid, status.upper(), len(per)), flush=True)
+        results[sid] = doc
+    return results
+
+
+def run_once(state_path, out, only, ledger_dir):
     os.makedirs(out, exist_ok=True)
-    c = Client(state_path, out)
+    c = Client(state_path, ledger_dir)
     results = {}
     w1_set = [s for s in only if s in ("S4", "S5")]
     for sid in only:

@@ -91,7 +91,7 @@ def cmd_g2(a):
     if bad:
         print("lab.py g2: unknown scenario(s) %s" % ",".join(bad), file=sys.stderr)
         return 2
-    res = g2.run(a.state, a.out, only)
+    res = g2.run(a.state, a.out, only, a.min_seconds)
     return 0 if all(r["status"] in ("pass", "n/a") for r in res.values()) else 1
 
 
@@ -184,6 +184,8 @@ def main(argv):
     g.add_argument("--state", required=True)
     g.add_argument("--out", required=True)
     g.add_argument("--only", default=",".join(g2.TITLES))
+    g.add_argument("--min-seconds", type=float, default=0,
+                   help="repeat the set in rounds until this long has passed (the --chaos window)")
     g.set_defaults(fn=cmd_g2)
     co = sub.add_parser("collect")
     co.add_argument("--state", required=True)
