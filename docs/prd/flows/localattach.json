@@ -1,0 +1,98 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "localattach",
+  "name": "Controller unreachable",
+  "note": "The laptop is offline from the cloud controller, but its own agents keep running and stay usable.",
+  "proof": [
+    "S14"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.localattach",
+  "correlate": "host",
+  "participants": [
+    {
+      "id": "app",
+      "name": "K2 app",
+      "role": "on the laptop"
+    },
+    {
+      "id": "ctl",
+      "name": "Controller",
+      "role": "cloud"
+    },
+    {
+      "id": "lap",
+      "name": "Laptop host",
+      "role": "k2-host"
+    },
+    {
+      "id": "cli",
+      "name": "claude CLI",
+      "role": "pinned agent"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "app",
+      "to": "ctl",
+      "kind": "fail",
+      "label": "connect: unreachable",
+      "event": "app.controller_unreachable",
+      "say": "No network, or the controller is down. Today's desktop app would show nothing useful."
+    },
+    {
+      "n": 2,
+      "from": "app",
+      "to": "lap",
+      "kind": "call",
+      "label": "attach via K2_HOST_LOCAL_ATTACH",
+      "event": "host.local_attach",
+      "say": "The app falls back to the laptop's own host on a loopback port, authenticated with a token only this machine holds."
+    },
+    {
+      "n": 3,
+      "from": "lap",
+      "to": "app",
+      "kind": "reply",
+      "label": "local agents + scrollback",
+      "event": "host.local_list",
+      "say": "The host lists the agents it runs and replays their output from the PTY rings."
+    },
+    {
+      "n": 4,
+      "from": "app",
+      "to": "lap",
+      "kind": "call",
+      "label": "keystrokes",
+      "event": "host.local_input",
+      "say": "Typing goes straight to the agent's terminal. The agent never noticed the controller was gone."
+    },
+    {
+      "n": 5,
+      "from": "lap",
+      "to": "cli",
+      "kind": "call",
+      "label": "write to PTY",
+      "event": "cli.pty_write",
+      "say": "Same terminal, same process as before."
+    },
+    {
+      "n": 6,
+      "from": "app",
+      "to": "lap",
+      "kind": "call",
+      "label": "k2 msg cloud-agent (queued)",
+      "event": "host.queue",
+      "say": "Anything that needs the controller is accepted and shown as pending: new agents, messages to other machines, heartbeats."
+    },
+    {
+      "n": 7,
+      "from": "lap",
+      "to": "ctl",
+      "kind": "call",
+      "label": "reconnect, flush queue",
+      "event": "host.reconnect_flush",
+      "say": "When the link returns, the host replays queued events and the app switches back to the controller."
+    }
+  ]
+}

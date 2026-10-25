@@ -4240,6 +4240,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "k2-fake-agent"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "k2-menubar"
 version = "0.46.3"
 dependencies = [

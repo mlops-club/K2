@@ -15,6 +15,7 @@ members = [
     # TEST ONLY: Google / Microsoft OAuth + Graph fakes for the headless
     # mail smokes (prd-app-mail-calendar-surfaces-v1 §8.2). Never shipped.
     "tests/fakes/oauth-providers",
+    "tests/fakes/k2-fake-agent", # TEST ONLY: fake agent CLI for the lab (scripts/lab). Never shipped.
     "crates/k2-ptyd",
 ]
 

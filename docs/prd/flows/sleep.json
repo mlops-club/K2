@@ -1,0 +1,121 @@
+{
+  "$schema": "../../../tests/lab/flows.schema.json",
+  "id": "sleep",
+  "name": "Sleep, then scheduled wake",
+  "note": "An agent leaves the active set, sleeps with no process, and wakes for its 09:00 heartbeat.",
+  "proof": [
+    "S5"
+  ],
+  "source": "docs/prd/k2-distributed-runtime.html, FLOWS.sleep",
+  "correlate": "agent_id",
+  "participants": [
+    {
+      "id": "life",
+      "name": "Lifecycle",
+      "role": "active set"
+    },
+    {
+      "id": "store",
+      "name": "Store",
+      "role": "SQLite"
+    },
+    {
+      "id": "host",
+      "name": "Agent host",
+      "role": "k2-host"
+    },
+    {
+      "id": "prov",
+      "name": "Provisioner",
+      "role": ""
+    },
+    {
+      "id": "sched",
+      "name": "Scheduler",
+      "role": "heartbeats"
+    }
+  ],
+  "steps": [
+    {
+      "n": 1,
+      "from": "life",
+      "to": "store",
+      "kind": "call",
+      "label": "who left the active set?",
+      "event": "lifecycle.scan",
+      "say": "Today's rule, unchanged: not pinned and untouched for 24 hours (active_window_hours)."
+    },
+    {
+      "n": 2,
+      "from": "life",
+      "to": "host",
+      "kind": "call",
+      "label": "Release{agent}",
+      "event": "host.release",
+      "say": "The host saves the session id so --resume works later, then ends the CLI."
+    },
+    {
+      "n": 3,
+      "from": "host",
+      "to": "life",
+      "kind": "reply",
+      "label": "Released{session_id}",
+      "event": "host.released",
+      "say": "The agent now costs no process anywhere. NFR2."
+    },
+    {
+      "n": 4,
+      "from": "life",
+      "to": "prov",
+      "kind": "call",
+      "label": "host idle? scale down",
+      "event": "provisioner.scale_down",
+      "say": "If a host pod has had no awake agents for a while, the provisioner may stop it. On the Sandbox tier the agent's Sandbox is suspended."
+    },
+    {
+      "n": 5,
+      "from": "sched",
+      "to": "sched",
+      "kind": "self",
+      "label": "heartbeat due 09:00",
+      "event": "scheduler.due",
+      "say": "The heartbeat monitor checks every 60 s, as today."
+    },
+    {
+      "n": 6,
+      "from": "sched",
+      "to": "life",
+      "kind": "call",
+      "label": "need(agent, heartbeat)",
+      "event": "lifecycle.need",
+      "say": "A heartbeat fire counts as a need, which also resets the 24-hour clock."
+    },
+    {
+      "n": 7,
+      "from": "life",
+      "to": "prov",
+      "kind": "call",
+      "label": "ensure host",
+      "event": "provisioner.ensure_host",
+      "say": "Start a host if none is running for this agent."
+    },
+    {
+      "n": 8,
+      "from": "life",
+      "to": "host",
+      "kind": "call",
+      "label": "Spawn{resume, --append-system-prompt}",
+      "event": "host.spawn",
+      "say": "Today's heartbeat launch, sent to a host."
+    },
+    {
+      "n": 9,
+      "from": "host",
+      "to": "life",
+      "kind": "reply",
+      "label": "Ready",
+      "event": "host.ready",
+      "say": "Wake latency is measured here and reported in metrics.csv for NFR3."
+    }
+  ]
+}
