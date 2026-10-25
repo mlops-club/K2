@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# k2-lab-runner:dist-fake — TEST ONLY. The pod that runs the lab's G2
+# scenario clients inside k2-kind-dist-fake (scripts/kind/fleet-g2.sh): the
+# fake host image (same UID, git config, fake-agent shims, the k2 CLI's
+# needs: bash, curl) plus python3 for tests/lab and cli/k2, and kubectl for
+# the lab's kind backend (scripts/kind/fleet_kind.py: exec, delete pod).
+# The lab code is copied in per run, never baked in.
+#
+# Build context: deploy/kind (nothing from it is copied).
+ARG BASE_IMAGE=k2-agents:dist-fake
+FROM ${BASE_IMAGE}
+ARG KUBECTL_VERSION=v1.37.0
+ARG TARGETARCH
+USER 0
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3 ca-certificates curl; \
+    rm -rf /var/lib/apt/lists/*; \
+    arch=${TARGETARCH:-$(dpkg --print-architecture)}; \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl"; \
+    echo "$(curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl.sha256")  /usr/local/bin/kubectl" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/kubectl; \
+    install -d -m 0770 -o 10000 -g 0 /lab
+USER 10000:0
+WORKDIR /lab
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

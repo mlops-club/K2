@@ -2,8 +2,8 @@
 # K2 on the kind cluster k2lab, ready for the desktop app on this Mac
 # (deploy/kind/README.md has the app steps).
 #
-#   scripts/kind/up.sh [--dist] [--fake] [--rebuild-daemon] [--reset-password] [--port-forward]
-#                      [--password-file=PATH]
+#   scripts/kind/up.sh [--dist [--hosts=N]] [--fake] [--rebuild-daemon] [--reset-password]
+#                      [--port-forward] [--password-file=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
 #    compile, then a runtime-only image) when it is missing, or always with
@@ -28,6 +28,11 @@
 # one agent host, namespace k2-kind-dist, port 7443; with --fake,
 # k2-kind-dist-fake on 7442). It also creates the Secret k2-secrets with a
 # fresh host bootstrap token, once, from stdin: never printed, never in git.
+# --hosts=N (default 1) runs N agent hosts (k2-host-0 .. k2-host-N-1), each
+# with its own HOME volume, so its own Claude login. They all mount the one
+# shared workspaces volume (k2-work), which is ReadWriteOnce: every pod must
+# be on the controller's node (podAffinity), so N hosts share one node's
+# CPU and memory. Scaling down keeps the removed hosts' volumes.
 #
 # Uses only k2lab, through an explicit kubeconfig; never the current kube
 # context. No credential goes into git, an image or a log: the owner signs
@@ -37,7 +42,7 @@ set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file=
+fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -46,10 +51,15 @@ for a in "$@"; do
         --reset-password) reset_password=1 ;;
         --port-forward) door=port-forward ;;
         --password-file=*) password_file=${a#--password-file=} ;;
-        -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --hosts=*) hosts=${a#--hosts=} ;;
+        -h|--help) sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
+case "$hosts" in ''|*[!0-9]*|0) echo "up.sh: --hosts=N takes a number from 1" >&2; exit 2 ;; esac
+if [ "$hosts" != 1 ] && [ "$dist" = 0 ]; then
+    echo "up.sh: --hosts=N needs --dist (the solo pod is its own host)" >&2; exit 2
+fi
 kind_variant_from_flags "$fake" "$dist"
 user=${K2_KIND_USER:-owner}
 for t in docker kind kubectl curl python3; do
@@ -99,7 +109,17 @@ for img in $KIND_LOAD; do
 done
 rmdir "$DOCKER_LOCK"; trap - EXIT
 rendered="$KIND_STATE/rendered.yaml"
-kubectl kustomize --load-restrictor LoadRestrictionsNone "$KIND_OVERLAY" > "$rendered"
+overlay="$KIND_REPO/$KIND_OVERLAY"
+if [ "$KIND_DIST" = 1 ]; then
+    # --hosts=N: the overlay with k2-host's replicas set, from a throwaway
+    # kustomization in the state dir (the overlays in git keep 1).
+    overlay="$KIND_STATE/hosts-$hosts"
+    mkdir -p "$overlay"
+    printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s\nreplicas:\n  - {name: k2-host, count: %s}\n' \
+        "$(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/$KIND_OVERLAY" "$overlay")" \
+        "$hosts" > "$overlay/kustomization.yaml"
+fi
+kubectl kustomize --load-restrictor LoadRestrictionsNone "$overlay" > "$rendered"
 if [ "$KIND_DIST" = 1 ]; then
     # The namespace first, then the bootstrap Secret, so the pods find it.
     kc apply -f "$rendered" -l k2.dev/bootstrap=namespace >&2
@@ -115,7 +135,7 @@ print(json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
         say "created Secret $KIND_NS/k2-secrets (host bootstrap token, not shown)"
     fi
 fi
-say "applying $KIND_OVERLAY (namespace $KIND_NS)"
+say "applying $KIND_OVERLAY (namespace $KIND_NS)$( [ "$KIND_DIST" = 1 ] && echo ", $hosts host(s)")"
 kc apply -f "$rendered" >&2
 # Same tag, new image: each pod template carries its image's id, so a
 # rebuilt image rolls its pods and an unchanged one does not.

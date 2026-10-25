@@ -12,7 +12,7 @@ KIND_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 #   agents      one pod, k2-agents:dev (the owner's)            k2-kind            7440
 #   fake        one pod, k2-agents:fake (test only)             k2-kind-fake       7441
 #   dist        controller + host, host on k2-agents:dist       k2-kind-dist       7443
-#   dist-fake   controller + host, host on k2-agents:dist-fake  k2-kind-dist-fake  7442
+#   dist-fake   controller + N hosts, k2-agents:dist-fake       k2-kind-dist-fake  7442
 # KIND_POD is where the daemon token lives (the pod the app talks to);
 # KIND_AGENT_POD is where agents run. KIND_ROLLOUT pairs each StatefulSet
 # with the image whose id rolls it.
@@ -22,7 +22,8 @@ kind_variant() {
     # tree with k2-dist/dist-link (K2_ROLE=controller|host).
     case "$1" in
         agents|fake) KIND_BASE_IMAGE=k2-daemon:dev ;;
-        dist|dist-fake) KIND_BASE_IMAGE=k2-daemon:dist ;;
+        dist) KIND_BASE_IMAGE=k2-daemon:dist ;;
+        dist-fake) KIND_BASE_IMAGE=k2-daemon:dist-fake ;;   # its own tag: a test build never reaches the owner's pods
         *) echo "unknown variant $1" >&2; return 2 ;;
     esac
     case "$1" in
@@ -33,7 +34,9 @@ kind_variant() {
     esac
     case "$1" in
         agents|dist) KIND_DOCKERFILE=deploy/kind/Dockerfile.agents KIND_CONTEXT=deploy/kind ;;
-        fake|dist-fake) KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=. ;;
+        # K2_KIND_FAKE_SRC: a tree whose tests/fakes/k2-fake-agent to build
+        # (e.g. an export of the lab's branch); default this one.
+        fake|dist-fake) KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=${K2_KIND_FAKE_SRC:-.} ;;
     esac
     case "$1" in
         agents) KIND_NS=k2-kind KIND_OVERLAY=deploy/kind/agents KIND_PORT=${K2_KIND_PORT:-7440} KIND_NODEPORT=30740 KIND_FLAGS="" ;;

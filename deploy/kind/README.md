@@ -253,6 +253,64 @@ pods, and polls until the same token gets the socket's `hello` again (7 s
 on 2026-10-25), then checks whoami and the host link. It restarts pods, so
 it refuses the owner's variants unless `--restart-live` is given.
 
+### More than one host (`--hosts=N`)
+
+`scripts/kind/up.sh --dist --hosts=2` runs `k2-host-0` and `k2-host-1`
+(default 1). Each host has its own `HOME` volume (`data-k2-host-<i>`), so
+each has its own Claude login: `/login` once per host. Hosts are named after
+their pods (`K2_HOST_NAME`), and the controller places each agent on one of
+them; `curl http://127.0.0.1:7443/cli/hosts/status` lists the hosts and
+their placements.
+
+**The limit:** every host mounts the same `k2-work` volume, which is
+ReadWriteOnce, so every host must run on the controller's node (the
+podAffinity above). N hosts share one node's CPU and memory, and the
+Docker VM's: each host may use up to 3 GiB. More hosts on kind means more
+memory, not more machines. Scaling down (`--hosts=1`) stops the extra pods
+and keeps their volumes, logins included. Re-running `up.sh` without
+`--hosts` sets the count back to 1.
+
+### The lab's G2 scenarios on kind (`--dist --fake`, test only)
+
+```sh
+scripts/kind/up.sh --dist --fake --hosts=2      # k2-kind-dist-fake, 127.0.0.1:7442
+scripts/kind/fleet-g2.sh                        # S1 to S7 → lab-runs/kind-g2-<time>/
+scripts/kind/fleet-g2.sh --chaos=seed=7         # with chaos during S3 to S7
+```
+
+The lab (`tests/lab`, branch `k2-dist/lab-g2`) checks its scenarios by
+reading agent homes, traces and workspaces from disk. So `fleet-g2.sh`
+runs it inside the cluster, in a runner pod (`k2-lab-runner`,
+`deploy/kind/Dockerfile.lab-runner`). The runner mounts the controller's
+volume, every host's volume and `k2-work`, as the lab's compose fleet
+bind-mounts its containers' directories. The lab's kind backend,
+`scripts/kind/fleet_kind.py`, gives the lab what its process manager
+expects:
+
+- The controller's and each host's API on `127.0.0.1:<port>` in the
+  runner. The port is closed while that daemon is down, so a client sees
+  "connection refused".
+- Kill and start. In this variant every daemon runs under
+  `deploy/kind/dist-fake/supervise.sh`. A hold file on the pod's volume
+  keeps it down; the lab kills it with `kubectl exec … kill`, or with
+  `--kill=pod` by deleting the pod. Removing the hold file starts it again,
+  in the same pod, with no kubelet back-off.
+- Agent CLIs per host, `<host>:<pid>` (`kubectl exec` over `/proc`), for
+  chaos and S7.
+
+The runner's ServiceAccount may exec into and delete pods in
+`k2-kind-dist-fake` only (`deploy/kind/dist-fake/lab.yaml`). For the
+runner, hosts in this variant also listen on the pod network
+(`K2_LISTEN=lan`), and traces go to `$HOME/.k2-lab/traces/` on each pod's
+volume. Neither applies to the owner's `k2-kind-dist`. The test variant
+has its own daemon tag, `k2-daemon:dist-fake`, so a test build never
+reaches the owner's pods.
+
+S1 is a one-host scenario: `fleet-g2.sh` holds the other hosts down while
+it runs. The evidence (scenario results and logs, traces, `samples.jsonl`,
+`chaos.log`, `invariants.json`, `/cli/hosts/status` at the start and the
+end) is copied back to `lab-runs/kind-g2-<time>/`.
+
 ## Proof without a real agent (S1)
 
 ```sh

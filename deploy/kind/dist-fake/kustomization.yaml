@@ -1,19 +1,87 @@
 # TEST ONLY: distributed K2 on kind with the lab's k2-fake-agent as every
-# agent CLI on the host (k2-agents:fake), for scenario S1 through
-# 127.0.0.1:7442 (scripts/kind/s1.sh --dist). Its own namespace, so a test
-# run never touches k2-kind or k2-kind-dist.
+# agent CLI on the hosts (k2-agents:dist-fake), for scenario S1 through
+# 127.0.0.1:7442 (scripts/kind/s1.sh --dist) and the lab's G2 scenarios
+# on N hosts (scripts/kind/fleet-g2.sh, up.sh --dist --fake --hosts=N).
+# Its own namespace and its own daemon tag (k2-daemon:dist-fake), so a
+# test run never touches k2-kind or k2-kind-dist, nor the images they run.
+#
+# What the lab adds over deploy/kind/dist (lab.yaml, the patches below):
+#   - every daemon runs under supervise.sh (a hold file the lab's kind
+#     backend writes keeps it down; see that file);
+#   - traces on each pod's own HOME volume: $HOME/.k2-lab/traces/
+#     (K2_TRACE_FILE; the hosts' K2_FAKE_AGENT_TRACE, K2_FAKE_AGENT_HOST);
+#   - hosts listen on the pod network too (K2_LISTEN=lan, as the lab's
+#     compose fleet does), so the runner pod can reach their API;
+#   - DNS for pods that are not ready yet (a held or booting daemon);
+#   - the runner's ServiceAccount, allowed to exec into and delete pods of
+#     this namespace only.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: k2-kind-dist-fake
 resources:
   - ../dist
+  - lab.yaml
+configMapGenerator:
+  - name: k2-lab-supervise
+    files: [supervise.sh]
+    options:
+      disableNameSuffixHash: true
+      labels:
+        k2.dev/deploy: kind-dist-fake
 images:
+  - name: k2-daemon
+    newTag: dist-fake             # scripts/kind/up.sh --dist --fake builds it; never the owner's k2-daemon:dist
   - name: k2-agents
-    newTag: dist-fake             # deploy/kind/Dockerfile.fake FROM k2-daemon:dist
+    newTag: dist-fake             # deploy/kind/Dockerfile.fake FROM k2-daemon:dist-fake
 patches:
   - target: {kind: Service, name: k2-controller-nodeport}
     patch: |-
       - {op: replace, path: /spec/ports/0/nodePort, value: 30742}
+  - target: {kind: Service, name: k2-host}
+    patch: |-
+      - {op: add, path: /spec/publishNotReadyAddresses, value: true}
+  - target: {kind: StatefulSet, name: k2-controller}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-controller
+      spec:
+        template:
+          spec:
+            containers:
+              - name: k2-daemon
+                args: [sh, /opt/k2-lab/supervise.sh, k2-daemon]
+                env:
+                  - {name: K2_TRACE_FILE, value: /var/lib/k2/.k2-lab/traces/daemon.jsonl}
+                volumeMounts:
+                  - {name: k2-lab-supervise, mountPath: /opt/k2-lab, readOnly: true}
+            volumes:
+              - name: k2-lab-supervise
+                configMap: {name: k2-lab-supervise}
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            containers:
+              - name: k2-host
+                args: [sh, /opt/k2-lab/supervise.sh, k2-daemon]
+                env:
+                  - {name: K2_LISTEN, value: lan}
+                  - {name: K2_TRACE_FILE, value: /var/lib/k2-host/.k2-lab/traces/daemon.jsonl}
+                  - {name: K2_FAKE_AGENT_TRACE, value: /var/lib/k2-host/.k2-lab/traces/fake.jsonl}
+                  - name: K2_FAKE_AGENT_HOST
+                    valueFrom: {fieldRef: {fieldPath: metadata.name}}   # = K2_HOST_NAME
+                volumeMounts:
+                  - {name: k2-lab-supervise, mountPath: /opt/k2-lab, readOnly: true}
+            volumes:
+              - name: k2-lab-supervise
+                configMap: {name: k2-lab-supervise}
 labels:
   - pairs:
       k2.dev/deploy: kind-dist-fake
