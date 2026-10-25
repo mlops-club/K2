@@ -7,7 +7,10 @@
 #    the password read from PATH) → a session token, as the app gets one
 # 2. with that session token, never the owner token:
 #    POST /cli/sessions/v2/spawn a plain `sh` in <work>/demo that prints
-#    "K2CHECK host=<hostname> uid=<uid> cwd=<cwd>" and then waits
+#    "K2CHECK host=<hostname> uid=<uid> cwd=<cwd>" and then waits. With
+#    --fake the spawn guard allows only the shims, so it spawns `claude`
+#    (the fake agent) with the marker as its --session-id and waits for its
+#    banner instead.
 # 3. WS /cli/sessions/grid?session=…&token=<session> (the app's terminal
 #    view) until that line is on the grid
 # 4. /proc in the agents pod and in the app's pod: where does it run?
@@ -33,7 +36,7 @@ done
 kind_variant_from_flags "$fake" "$dist"
 kind_kubeconfig
 cd "$KIND_REPO"
-marker="k2check-$(python3 -I -c 'import uuid; print(uuid.uuid4().hex[:8])')"
+marker=$(python3 -I -c 'import uuid; print(uuid.uuid4())')   # also the fake agent's --session-id
 proc_scan() {  # proc_scan <pod> <container> → lines for processes whose argv has the marker
     kc -n "$KIND_NS" exec "$1" -c "$2" -- env M="$marker" sh -c '
         for p in /proc/[0-9]*; do
@@ -48,7 +51,7 @@ fifo=$(mktemp -u "${TMPDIR:-/tmp}/k2-app-check-XXXXXX"); mkfifo "$fifo"
 trap 'rm -f "$fifo"' EXIT
 exec 3<>"$fifo"     # read-write: neither side blocks on open, and reads can time out
 PORT=$KIND_PORT USER_NAME=${K2_KIND_USER:-owner} PASSWORD_FILE=$password_file \
-    WORK=$KIND_WORK MARKER=$marker LABKIT="$KIND_REPO/tests/lab" FIFO=$fifo python3 -I - <<'PY' &
+    WORK=$KIND_WORK MARKER=$marker FAKE=$fake LABKIT="$KIND_REPO/tests/lab" FIFO=$fifo python3 -I - <<'PY' &
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
 sys.path.insert(0, os.environ["LABKIT"])
 from labkit import ws
@@ -76,18 +79,22 @@ if st != 200 or not d.get("token"):
 tok = d["token"]
 print("ok   login as %s -> session token (%d chars)" % (d.get("username"), len(tok)), flush=True)
 agent = "kind-app-check-" + marker[-8:]
-# No exec: the shell itself stays, so the marker stays in its argv for /proc.
-script = 'echo "K2CHECK host=$(hostname) uid=$(id -u) cwd=$(pwd)"; sleep 300; : %s' % marker
+if os.environ["FAKE"] == "1":
+    # The fake images resolve only shims: the fake agent, marker as its session id.
+    command, args, want = "claude", ["--session-id", marker], "k2-fake-agent (as claude)"
+else:
+    # No exec: the shell itself stays, so the marker stays in its argv for /proc.
+    command, args, want = "sh", ["-c", 'echo "K2CHECK host=$(hostname) uid=$(id -u) cwd=$(pwd)"; sleep 300; : %s' % marker], "K2CHECK"
 st, d = call("/cli/sessions/v2/spawn", {"agent_name": agent, "cwd": os.environ["WORK"] + "/demo",
-                                        "command": "sh", "args": ["-c", script], "cols": 120, "rows": 32}, tok)
-print("%s spawn sh with the session token -> HTTP %s %s" % ("ok  " if st == 200 else "FAIL", st, json.dumps(d)[:200]), flush=True)
+                                        "command": command, "args": args, "cols": 120, "rows": 32}, tok)
+print("%s spawn %s with the session token -> HTTP %s %s" % ("ok  " if st == 200 else "FAIL", command, st, json.dumps(d)[:200]), flush=True)
 if st != 200:
     done(False, "spawn")
 grid = Grid()
 sock = ws.WebSocket("127.0.0.1", port, "/cli/sessions/grid?" + urllib.parse.urlencode(
     {"session": d["sessionId"], "token": tok}), timeout=30)
 deadline, line = time.monotonic() + 30, ""
-while time.monotonic() < deadline and "K2CHECK" not in grid.text():
+while time.monotonic() < deadline and want not in grid.text():
     sock.settimeout(max(0.1, deadline - time.monotonic()))
     kind, data = sock.recv()
     if kind == "close":
@@ -97,7 +104,7 @@ while time.monotonic() < deadline and "K2CHECK" not in grid.text():
         if not grid.apply(msg) and msg.get("event") in ("error", "child_exit"):
             print("FAIL grid event: %s" % data[:300], flush=True)
             break
-line = next((l for l in grid.text().splitlines() if "K2CHECK" in l), "")
+line = next((l for l in grid.text().splitlines() if want in l), "")
 sock.close()
 print("%s attach /cli/sessions/grid with the session token: %r" % ("ok  " if line else "FAIL", line), flush=True)
 open(os.environ["FIFO"], "w").write("scan\n")       # the shell side scans /proc now
