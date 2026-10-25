@@ -124,6 +124,78 @@ impl InjectStep {
     }
 }
 
+/// One `AgentHost` operation in an `op` frame, and what `op.result`'s
+/// `value` holds for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionOp {
+    /// Bytes for the PTY (`text`, or `b64` when not UTF-8). No reply.
+    Write {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        b64: Option<String>,
+    },
+    /// Debounced resize. No reply.
+    Resize { cols: u16, rows: u16 },
+    /// Resize now → `[cols, rows]` after.
+    ResizeNow { cols: u16, rows: u16 },
+    /// → `[cols, rows]`.
+    Size,
+    /// → `[cols, rows]`.
+    ClaimedSize,
+    SetClaimedSize { cols: u16, rows: u16 },
+    Pin {
+        #[serde(default)]
+        dims: Option<(u16, u16)>,
+        #[serde(default)]
+        set_by: Option<String>,
+    },
+    /// → the label now in effect.
+    SetLabel { label: String, lock: bool },
+    /// Kill and reap → `null`.
+    Kill,
+    /// → the last `lines` lines of scrollback plus screen.
+    Screen { lines: usize },
+    /// → the visible rows as text.
+    VisibleRows,
+    /// → [`SessionMeta`].
+    Meta,
+}
+
+/// The live state of a session, `op.result` for [`SessionOp::Meta`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SessionMeta {
+    pub alive: bool,
+    pub label: String,
+    /// `seed`, `locked` or `pty`.
+    pub label_source: String,
+    pub bracketed_paste: bool,
+    pub subscribers: usize,
+    pub ever_attached: bool,
+}
+
+/// What a host's `spawn.workspace` reply carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnedSession {
+    pub session_id: String,
+    pub reused: bool,
+    pub pending_drained: usize,
+    pub launch_prompt_attached: bool,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub program: Option<String>,
+    /// The durable args (never a fire-once launch prompt).
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub label_source: String,
+}
+
 /// How a host answered one `deliver`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +325,42 @@ pub enum Frame {
         agent_id: String,
         #[serde(default)]
         epoch: Option<u64>,
+        /// Protocol 2: the child's exit code, when the host knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
+
+    // ── protocol 2: the AgentHost trait, remote (W1) ───────────────────
+    /// The workspace spawn (`spawn::SpawnWorkspaceSessionRequest`: chats,
+    /// heartbeats, wake, agents routes, sidecars), run whole on the host
+    /// so the scoped hook token, cell socket, vault env, identity and
+    /// child-exit observer live next to the agent. Answered with `reply`
+    /// (`status` 200 and the [`SpawnedSession`] JSON, or an error).
+    #[serde(rename = "spawn.workspace")]
+    SpawnWorkspace {
+        req: u64,
+        agent_id: String,
+        epoch: u64,
+        request: serde_json::Value,
+    },
+    /// One `AgentHost` operation on a placed session. `req` is `None` for
+    /// fire-and-forget ops (write, resize): those run in the order sent.
+    #[serde(rename = "op")]
+    Op {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        req: Option<u64>,
+        session_id: String,
+        epoch: u64,
+        op: SessionOp,
+    },
+    #[serde(rename = "op.result")]
+    OpResult {
+        req: u64,
+        /// The op's value (see [`SessionOp`]); `null` on error.
+        #[serde(default)]
+        value: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     // ── protocol 2: messages (S3, FR4) ─────────────────────────────────
@@ -355,6 +463,9 @@ impl Frame {
             Frame::Hook { .. } => "hook",
             Frame::OpenUrl { .. } => "open_url",
             Frame::SessionGone { .. } => "session.gone",
+            Frame::SpawnWorkspace { .. } => "spawn.workspace",
+            Frame::Op { .. } => "op",
+            Frame::OpResult { .. } => "op.result",
             Frame::Deliver { .. } => "deliver",
             Frame::DeliverAck { .. } => "deliver.ack",
             Frame::Inject { .. } => "inject",
@@ -368,7 +479,10 @@ impl Frame {
     /// The oldest protocol a link must speak to carry this frame.
     pub fn min_protocol(&self) -> u32 {
         match self {
-            Frame::Deliver { .. }
+            Frame::SpawnWorkspace { .. }
+            | Frame::Op { .. }
+            | Frame::OpResult { .. }
+            | Frame::Deliver { .. }
             | Frame::DeliverAck { .. }
             | Frame::Inject { .. }
             | Frame::InjectResult { .. }
@@ -530,6 +644,26 @@ mod tests {
             assert_eq!(f.min_protocol(), 2, "{} needs protocol 2", f.kind());
             round_trip(&f);
         }
+        // W1: the trait, remote.
+        for f in [
+            Frame::SpawnWorkspace { req: 4, agent_id: "p1".into(), epoch: 41, request: json!({"agent_name": "a"}) },
+            Frame::Op { req: None, session_id: "s1".into(), epoch: 41, op: SessionOp::Write { text: Some("hi".into()), b64: None } },
+            Frame::Op { req: Some(5), session_id: "s1".into(), epoch: 41, op: SessionOp::Screen { lines: 40 } },
+            Frame::Op { req: Some(6), session_id: "s1".into(), epoch: 41, op: SessionOp::Pin { dims: Some((80, 24)), set_by: Some("o".into()) } },
+            Frame::OpResult { req: 5, value: json!(["row"]), error: None },
+            Frame::OpResult { req: 6, value: serde_json::Value::Null, error: Some("not placed".into()) },
+        ] {
+            assert_eq!(f.min_protocol(), 2, "{}", f.kind());
+            round_trip(&f);
+        }
+        // An optional field a protocol-1 controller simply ignores.
+        let gone = Frame::SessionGone { agent_id: "a".into(), epoch: Some(41), exit_code: Some(0) };
+        assert_eq!(gone.min_protocol(), 1);
+        round_trip(&gone);
+        assert_eq!(
+            serde_json::to_value(Frame::Op { req: None, session_id: "s".into(), epoch: 1, op: SessionOp::Resize { cols: 80, rows: 24 } }).unwrap(),
+            json!({"t": "op", "session_id": "s", "epoch": 1, "op": {"kind": "resize", "cols": 80, "rows": 24}})
+        );
         // `attempt` defaults to the first send.
         assert!(matches!(
             Frame::decode(r#"{"t":"deliver","msg_id":"m","agent_id":"a","from":"user:o","body":{}}"#),

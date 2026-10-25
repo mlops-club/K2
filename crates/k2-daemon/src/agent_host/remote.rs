@@ -9,27 +9,41 @@
 //! [`RemoteHost::connect`], [`RemoteHost::on_frame`] and the frame
 //! channel each link drains.
 //!
-//! Not an `impl AgentHost` yet: `AgentSession` is an in-process handle
-//! (see `docs/prd/progress/dist-link.md`). The controller's S1 routes call
-//! [`RemoteHost::spawn`], [`RemoteHost::close`] and
-//! [`RemoteHost::open_grid`] directly.
+//! W1: `RemoteHost` is the controller's `AgentHost` (`agent_host::host()`
+//! on `K2_ROLE=controller`). Placed sessions are [`RemoteSession`]
+//! handles inside `AgentSession`: fixed metadata from the spawn, liveness
+//! from `session.gone`, live terminal state by asking the host (`op`).
+//! The workspace spawn (chats, heartbeats, wake, agents routes) is
+//! forwarded whole (`spawn.workspace`, [`RemoteHost::spawn_workspace_blocking`]);
+//! the HTTP S1 routes still call [`RemoteHost::spawn`], [`RemoteHost::close`]
+//! and [`RemoteHost::open_grid`].
 
 use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use k2_core::log_debug;
+use k2_core::session::SessionId;
+use k2_core::terminal::{AlacEvent, DaemonPtyConfig, LabelSource};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use super::PlacementEpoch;
-use crate::hosts::proto::{trace_events, Frame, ResumePlacement};
+use super::{
+    AgentHome, AgentHost, AgentSession, Attachment, GridStream, InjectResult, Placement, PlacementEpoch,
+};
+use crate::hosts::proto::{
+    trace_events, Frame, InjectOutcome, InjectStep, ResumePlacement, SessionMeta, SessionOp, SpawnedSession,
+};
 
 /// How long the controller waits for a host to answer a spawn or close.
 /// Only stops a request to a hung host; tests never depend on it.
 const REPLY_DEADLINE: Duration = Duration::from_secs(120);
+/// The same for one session op (screen read, kill, inject).
+const OP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Message when a spawn finds no host (acceptance criterion 3).
 pub const NO_HOSTS: &str =
@@ -97,6 +111,26 @@ impl Drop for RemoteGrid {
     }
 }
 
+/// Who waits for a request's answer: async route code or a sync
+/// `AgentHost` call on a blocking thread.
+enum Waiter {
+    Async(oneshot::Sender<Frame>),
+    Sync(std::sync::mpsc::Sender<Frame>),
+}
+
+impl Waiter {
+    fn send(self, f: Frame) {
+        match self {
+            Waiter::Async(t) => {
+                let _ = t.send(f);
+            }
+            Waiter::Sync(t) => {
+                let _ = t.send(f);
+            }
+        }
+    }
+}
+
 struct Link {
     conn: u64,
     host_name: String,
@@ -104,7 +138,7 @@ struct Link {
     /// frames (`Frame::min_protocol` 2) are never sent on a 1 link.
     protocol: u32,
     tx: mpsc::UnboundedSender<Frame>,
-    pending: HashMap<u64, oneshot::Sender<(String, String)>>,
+    pending: HashMap<u64, Waiter>,
     streams: HashMap<u64, mpsc::UnboundedSender<GridEvent>>,
 }
 
@@ -114,6 +148,9 @@ struct Inner {
     links: HashMap<String, Link>,
     /// Keyed by agent id.
     placements: HashMap<String, RemotePlacement>,
+    /// The session handle for each placement whose spawn answered, keyed
+    /// by agent id like `placements`.
+    sessions: HashMap<String, Arc<RemoteSession>>,
 }
 
 /// An HTTP-shaped answer for the controller's routes: status line and
@@ -287,6 +324,14 @@ impl RemoteHost {
                 return;
             }
             inner.placements.retain(|_, p| p.host_id != host_id);
+            let gone: Vec<String> =
+                inner.sessions.iter().filter(|(_, s)| s.host_id == host_id).map(|(a, _)| a.clone()).collect();
+            for agent in gone {
+                if let Some(s) = inner.sessions.remove(&agent) {
+                    // Unknown from here on; a re-spawn finds it on the host.
+                    s.mark_exited();
+                }
+            }
             inner.links.remove(host_id)
         };
         if let Some(link) = link {
@@ -311,9 +356,9 @@ impl RemoteHost {
             return;
         }
         match frame {
-            Frame::Reply { req, status, body } => {
+            reply @ (Frame::Reply { req, .. } | Frame::OpResult { req, .. } | Frame::InjectResult { req, .. }) => {
                 if let Some(waiter) = inner.links.get_mut(host_id).and_then(|l| l.pending.remove(&req)) {
-                    let _ = waiter.send((status, body));
+                    waiter.send(reply);
                 }
             }
             Frame::GridData { stream, text, .. } => {
@@ -357,13 +402,16 @@ impl RemoteHost {
                 k2_core::trace::emit(|| k2_core::trace::Event::new("ctl.open_url").attr("host", host_id));
                 let _ = crate::session_events::emit(crate::session_events::SessionEvent::OpenUrl { url, source });
             }
-            Frame::SessionGone { agent_id, epoch } => {
+            Frame::SessionGone { agent_id, epoch, exit_code } => {
                 let stale = match inner.placements.get(&agent_id) {
                     Some(p) => p.host_id != host_id || epoch.is_some_and(|e| e != p.epoch.0),
                     None => true,
                 };
                 if !stale {
                     inner.placements.remove(&agent_id);
+                    if let Some(s) = inner.sessions.remove(&agent_id) {
+                        s.exited(exit_code);
+                    }
                     log_debug!("[hosts] agent {agent_id} gone on host {host_id}");
                 }
             }
@@ -382,14 +430,18 @@ impl RemoteHost {
             let Some(link) = inner.links.get_mut(host_id) else {
                 return Err(answer("502 Bad Gateway", json!({"error": format!("agent host {host_id} is not connected")})));
             };
-            link.pending.insert(req, tx);
+            link.pending.insert(req, Waiter::Async(tx));
             if link.tx.send(make(req)).is_err() {
                 link.pending.remove(&req);
                 return Err(answer("502 Bad Gateway", json!({"error": format!("agent host {host_id} link is closing")})));
             }
         }
         match tokio::time::timeout(REPLY_DEADLINE, rx).await {
-            Ok(Ok(reply)) => Ok(reply),
+            Ok(Ok(Frame::Reply { status, body, .. })) => Ok((status, body)),
+            Ok(Ok(other)) => Err(answer(
+                "502 Bad Gateway",
+                json!({"error": format!("agent host {host_id} answered with {}", other.kind())}),
+            )),
             Ok(Err(_)) => Err(answer(
                 "502 Bad Gateway",
                 json!({"error": format!("agent host {host_id} disconnected before it answered")}),
@@ -419,7 +471,7 @@ impl RemoteHost {
     /// `agent_name` as today: an agent already placed goes back to its
     /// host (which answers `reused: true`); a new one goes to
     /// [`Self::pick_host`] at a new epoch.
-    pub async fn spawn(&self, body: &[u8]) -> Answer {
+    pub async fn spawn(&'static self, body: &[u8]) -> Answer {
         let parsed: Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(e) => {
@@ -468,6 +520,17 @@ impl RemoteHost {
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new("ctl.place").agent(agent_id.as_str()).attr("host", host_id.as_str()).attr("epoch", epoch.0)
         });
+        let meta = SpawnedMeta {
+            cwd: parsed.get("cwd").and_then(Value::as_str).map(PathBuf::from),
+            program: parsed.get("command").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string),
+            args: parsed
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            label: String::new(),
+            label_source: LabelSource::Pty,
+        };
         let result = self
             .request(&host_id, |req| Frame::Spawn { req, agent_id: agent_id.clone(), epoch: epoch.0, body: parsed })
             .await;
@@ -480,6 +543,9 @@ impl RemoteHost {
                     .and_then(|v| v.get("sessionId").and_then(Value::as_str).map(str::to_string));
                 if let Some(p) = inner.placements.get_mut(&agent_id).filter(|p| ours(p)) {
                     p.session_id = session.clone();
+                    if let Some(sid) = session.as_deref().and_then(SessionId::parse) {
+                        self.keep_session(&mut inner, &agent_id, &host_id, epoch, sid, meta);
+                    }
                 }
                 log_debug!(
                     "[hosts] placed agent {agent_id} on host {host_id} epoch {} session {}",
@@ -537,12 +603,222 @@ impl RemoteHost {
                     let mut inner = self.inner.lock();
                     if inner.placements.get(&agent_id).is_some_and(|p| p.epoch == epoch) {
                         inner.placements.remove(&agent_id);
+                        if let Some(s) = inner.sessions.remove(&agent_id) {
+                            s.mark_exited();
+                        }
                     }
                 }
                 (status, body)
             }
             Err(e) => e,
         }
+    }
+
+    // ── the workspace spawn and the trait's transport (W1) ─────────────
+
+    /// The handle for `agent_id`'s session `sid`: the existing one when the
+    /// host answered with the same session (reuse), a new one otherwise.
+    fn keep_session(
+        &'static self,
+        inner: &mut Inner,
+        agent_id: &str,
+        host_id: &str,
+        epoch: PlacementEpoch,
+        sid: SessionId,
+        meta: SpawnedMeta,
+    ) -> Arc<RemoteSession> {
+        if let Some(s) = inner.sessions.get(agent_id).filter(|s| s.session_id == sid) {
+            return Arc::clone(s);
+        }
+        let s = Arc::new(RemoteSession::new(self, agent_id, host_id, epoch, sid, meta));
+        if let Some(old) = inner.sessions.insert(agent_id.to_string(), Arc::clone(&s)) {
+            old.mark_exited();
+        }
+        s
+    }
+
+    /// Reserve `agent_id`'s placement: its current host and epoch, or a
+    /// new placement on [`Self::pick_host`] at a new epoch.
+    fn reserve(&self, agent_id: &str) -> Result<(String, PlacementEpoch), String> {
+        let mut inner = self.inner.lock();
+        if let Some(p) = inner.placements.get(agent_id) {
+            return Ok((p.host_id.clone(), p.epoch));
+        }
+        let host_id = Self::pick_host(&inner).ok_or_else(|| NO_HOSTS.to_string())?;
+        let epoch = PlacementEpoch(self.epochs.next().map_err(|e| format!("can't persist the placement epoch: {e}"))?);
+        k2_core::trace::emit(|| k2_core::trace::Event::new(trace_events::CTL_EPOCH).agent(agent_id).attr("epoch", epoch.0));
+        inner.placements.insert(
+            agent_id.to_string(),
+            RemotePlacement { agent_id: agent_id.to_string(), host_id: host_id.clone(), session_id: None, epoch, hooks: 0 },
+        );
+        Ok((host_id, epoch))
+    }
+
+    /// Drop a reservation whose spawn failed (only if it is still ours and
+    /// never got a session).
+    fn unreserve(&self, agent_id: &str, host_id: &str, epoch: PlacementEpoch) {
+        let mut inner = self.inner.lock();
+        if inner
+            .placements
+            .get(agent_id)
+            .is_some_and(|p| p.host_id == host_id && p.epoch == epoch && p.session_id.is_none())
+        {
+            inner.placements.remove(agent_id);
+        }
+    }
+
+    /// The workspace spawn (`spawn::spawn_agent_session_v2_blocking` on a
+    /// controller): find-or-spawn under the request's canonical key, run
+    /// whole on the agent's host. Blocks until the host answered.
+    pub(crate) fn spawn_workspace_blocking(
+        &'static self,
+        req: &crate::spawn::SpawnWorkspaceSessionRequest,
+    ) -> Result<(SpawnedSession, AgentSession), String> {
+        let agent_id = crate::spawn::canonical_key_for_request(req);
+        let (host_id, epoch) = self.reserve(&agent_id)?;
+        let request = serde_json::to_value(req).map_err(|e| format!("encode the spawn request: {e}"))?;
+        k2_core::trace::emit(|| {
+            k2_core::trace::Event::new("ctl.place").agent(agent_id.as_str()).attr("host", host_id.as_str()).attr("epoch", epoch.0)
+        });
+        let reply = self.request_blocking(
+            &host_id,
+            |r| Frame::SpawnWorkspace { req: r, agent_id: agent_id.clone(), epoch: epoch.0, request },
+            REPLY_DEADLINE,
+        );
+        let (status, body) = match reply {
+            Ok(Frame::Reply { status, body, .. }) => (status, body),
+            Ok(other) => {
+                self.unreserve(&agent_id, &host_id, epoch);
+                return Err(format!("agent host {host_id} answered the spawn with {}", other.kind()));
+            }
+            Err(e) => {
+                self.unreserve(&agent_id, &host_id, epoch);
+                return Err(e);
+            }
+        };
+        if !status.starts_with('2') {
+            self.unreserve(&agent_id, &host_id, epoch);
+            let why = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or(body);
+            return Err(format!("agent host {host_id}: {why}"));
+        }
+        let spawned: SpawnedSession =
+            serde_json::from_str(&body).map_err(|e| format!("agent host {host_id} spawn reply: {e}"))?;
+        let sid = SessionId::parse(&spawned.session_id)
+            .ok_or_else(|| format!("agent host {host_id} answered a bad session id {:?}", spawned.session_id))?;
+        let meta = SpawnedMeta {
+            cwd: spawned.cwd.clone().map(PathBuf::from),
+            program: spawned.program.clone(),
+            args: spawned.args.clone(),
+            label: spawned.label.clone(),
+            label_source: label_source_from_wire(&spawned.label_source),
+        };
+        let session = {
+            let mut inner = self.inner.lock();
+            match inner.placements.get_mut(&agent_id) {
+                Some(p) if p.host_id == host_id && p.epoch == epoch => p.session_id = Some(spawned.session_id.clone()),
+                // Closed while the spawn was in flight: answer, don't place.
+                _ => return Err(format!("agent {agent_id} was unplaced while its spawn ran")),
+            }
+            self.keep_session(&mut inner, &agent_id, &host_id, epoch, sid, meta)
+        };
+        log_debug!(
+            "[hosts] placed agent {agent_id} on host {host_id} epoch {} session {} (workspace spawn, reused={})",
+            epoch.0,
+            spawned.session_id,
+            spawned.reused
+        );
+        Ok((spawned, AgentSession::remote(session)))
+    }
+
+    /// Send `make(req)` to `host_id` and wait, blocking this thread, for
+    /// the frame that answers it. For the sync `AgentHost` methods; inside
+    /// a multi-thread runtime the wait runs under `block_in_place`.
+    fn request_blocking(&self, host_id: &str, make: impl FnOnce(u64) -> Frame, deadline: Duration) -> Result<Frame, String> {
+        let req = self.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let mut inner = self.inner.lock();
+            let link = inner.links.get_mut(host_id).ok_or_else(|| format!("agent host {host_id} is not connected"))?;
+            let frame = make(req);
+            if frame.min_protocol() > link.protocol {
+                return Err(format!(
+                    "agent host {host_id} speaks protocol {}; {} needs {} (update k2 on the host)",
+                    link.protocol,
+                    frame.kind(),
+                    frame.min_protocol()
+                ));
+            }
+            link.pending.insert(req, Waiter::Sync(tx));
+            if link.tx.send(frame).is_err() {
+                link.pending.remove(&req);
+                return Err(format!("agent host {host_id} link is closing"));
+            }
+        }
+        let wait = || rx.recv_timeout(deadline);
+        let got = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(wait),
+            Ok(_) => {
+                if let Some(link) = self.inner.lock().links.get_mut(host_id) {
+                    link.pending.remove(&req);
+                }
+                return Err("a sync host request can't wait inside a current-thread runtime".into());
+            }
+            Err(_) => wait(),
+        };
+        match got {
+            Ok(f) => Ok(f),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(format!("agent host {host_id} disconnected before it answered"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(link) = self.inner.lock().links.get_mut(host_id) {
+                    link.pending.remove(&req);
+                }
+                Err(format!("agent host {host_id} did not answer within {deadline:?}"))
+            }
+        }
+    }
+
+    /// One session op, waiting for its value.
+    fn op(&self, s: &RemoteSession, op: SessionOp) -> Result<Value, String> {
+        let kind = format!("{op:?}");
+        let session_id = s.session_id.to_string();
+        let reply = self.request_blocking(
+            &s.host_id,
+            |req| Frame::Op { req: Some(req), session_id, epoch: s.epoch.0, op },
+            OP_DEADLINE,
+        )?;
+        match reply {
+            Frame::OpResult { error: None, value, .. } => Ok(value),
+            Frame::OpResult { error: Some(e), .. } => Err(e),
+            other => Err(format!("op {kind} answered with {}", other.kind())),
+        }
+    }
+
+    /// One session op, not waiting (write, resize). Ops on one link run on
+    /// the host in the order they were sent.
+    fn op_send(&self, s: &RemoteSession, op: SessionOp) -> io::Result<()> {
+        let inner = self.inner.lock();
+        let link = inner
+            .links
+            .get(&s.host_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, format!("agent host {} is not connected", s.host_id)))?;
+        if link.protocol < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("agent host {} speaks protocol 1 (update k2 on the host)", s.host_id),
+            ));
+        }
+        link.tx
+            .send(Frame::Op { req: None, session_id: s.session_id.to_string(), epoch: s.epoch.0, op })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, format!("agent host {} link is closing", s.host_id)))
+    }
+
+    fn session_for(&self, agent_id: &str) -> Option<Arc<RemoteSession>> {
+        self.inner.lock().sessions.get(agent_id).cloned()
     }
 
     // ── grid ───────────────────────────────────────────────────────────
@@ -638,6 +914,399 @@ impl RemoteHost {
             .collect();
         hosts.sort_by(|a, b| a["host_id"].as_str().cmp(&b["host_id"].as_str()));
         json!({"role": "controller", "hosts": hosts})
+    }
+}
+
+/// What a spawn told the controller about a session's fixed metadata.
+pub(crate) struct SpawnedMeta {
+    pub cwd: Option<PathBuf>,
+    pub program: Option<String>,
+    pub args: Vec<String>,
+    pub label: String,
+    pub label_source: LabelSource,
+}
+
+pub(crate) fn label_source_wire(l: LabelSource) -> &'static str {
+    match l {
+        LabelSource::Pty => "pty",
+        LabelSource::Seed => "seed",
+        LabelSource::Locked => "locked",
+    }
+}
+
+pub(crate) fn label_source_from_wire(s: &str) -> LabelSource {
+    match s {
+        "seed" => LabelSource::Seed,
+        "locked" => LabelSource::Locked,
+        _ => LabelSource::Pty,
+    }
+}
+
+struct Cached {
+    alive: bool,
+    label: String,
+    label_source: LabelSource,
+    ever_attached: bool,
+}
+
+/// A session placed on a remote host, as the controller sees it (the
+/// remote half of `AgentSession`). Fixed metadata comes from its spawn;
+/// liveness from `session.gone` (and link loss); everything else is asked
+/// of the host.
+pub struct RemoteSession {
+    remote: &'static RemoteHost,
+    pub agent_id: String,
+    pub host_id: String,
+    pub session_id: SessionId,
+    pub epoch: PlacementEpoch,
+    pub cwd: Option<PathBuf>,
+    pub program: Option<String>,
+    pub args: Vec<String>,
+    cached: Mutex<Cached>,
+    events: broadcast::Sender<AlacEvent>,
+    labels: broadcast::Sender<String>,
+    pins: broadcast::Sender<Option<(u16, u16)>>,
+}
+
+impl RemoteSession {
+    fn new(
+        remote: &'static RemoteHost,
+        agent_id: &str,
+        host_id: &str,
+        epoch: PlacementEpoch,
+        session_id: SessionId,
+        meta: SpawnedMeta,
+    ) -> Self {
+        Self {
+            remote,
+            agent_id: agent_id.to_string(),
+            host_id: host_id.to_string(),
+            session_id,
+            epoch,
+            cwd: meta.cwd,
+            program: meta.program,
+            args: meta.args,
+            cached: Mutex::new(Cached { alive: true, label: meta.label, label_source: meta.label_source, ever_attached: false }),
+            events: broadcast::channel(64).0,
+            labels: broadcast::channel(16).0,
+            pins: broadcast::channel(16).0,
+        }
+    }
+
+    pub fn is_child_alive(&self) -> bool {
+        self.cached.lock().alive
+    }
+
+    pub(crate) fn mark_exited(&self) {
+        self.cached.lock().alive = false;
+    }
+
+    /// The child exited on the host: liveness off, and `ChildExit` to
+    /// every events subscriber (code 0 when the host didn't say).
+    fn exited(&self, code: Option<i32>) {
+        self.mark_exited();
+        let _ = self.events.send(AlacEvent::ChildExit(exit_status(code.unwrap_or(0))));
+    }
+
+    pub fn label(&self) -> String {
+        self.cached.lock().label.clone()
+    }
+
+    pub fn label_source(&self) -> LabelSource {
+        self.cached.lock().label_source
+    }
+
+    pub fn set_label(&self, label: String, lock: bool) -> String {
+        let now = match self.remote.op(self, SessionOp::SetLabel { label: label.clone(), lock }) {
+            Ok(v) => v.as_str().map(str::to_string).unwrap_or(label),
+            Err(e) => {
+                log_debug!("[hosts] set_label on {} failed: {e}", self.session_id);
+                return self.label();
+            }
+        };
+        {
+            let mut c = self.cached.lock();
+            c.label = now.clone();
+            if lock {
+                c.label_source = LabelSource::Locked;
+            }
+        }
+        let _ = self.labels.send(now.clone());
+        now
+    }
+
+    pub fn kill(&self) {
+        if let Err(e) = self.remote.op(self, SessionOp::Kill) {
+            log_debug!("[hosts] kill {} on host {} failed: {e}", self.session_id, self.host_id);
+        }
+    }
+
+    /// The host's live state, refreshing the cached label.
+    fn meta(&self) -> Option<SessionMeta> {
+        match self.remote.op(self, SessionOp::Meta).and_then(|v| serde_json::from_value::<SessionMeta>(v).map_err(|e| e.to_string())) {
+            Ok(m) => {
+                let mut c = self.cached.lock();
+                c.label = m.label.clone();
+                c.label_source = label_source_from_wire(&m.label_source);
+                c.ever_attached |= m.ever_attached;
+                if !m.alive {
+                    c.alive = false;
+                }
+                Some(m)
+            }
+            Err(e) => {
+                log_debug!("[hosts] meta of {} on host {} failed: {e}", self.session_id, self.host_id);
+                None
+            }
+        }
+    }
+
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.meta().is_some_and(|m| m.bracketed_paste)
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.meta().map(|m| m.subscribers).unwrap_or(0)
+    }
+
+    pub fn ever_attached(&self) -> bool {
+        self.meta();
+        self.cached.lock().ever_attached
+    }
+
+    pub fn visible_text_rows(&self) -> Vec<String> {
+        self.rows(SessionOp::VisibleRows)
+    }
+
+    fn rows(&self, op: SessionOp) -> Vec<String> {
+        match self.remote.op(self, op).and_then(|v| serde_json::from_value::<Vec<String>>(v).map_err(|e| e.to_string())) {
+            Ok(rows) => rows,
+            Err(e) => {
+                log_debug!("[hosts] screen read of {} on host {} failed: {e}", self.session_id, self.host_id);
+                Vec::new()
+            }
+        }
+    }
+
+    fn dims(&self, op: SessionOp) -> (u16, u16) {
+        self.remote
+            .op(self, op)
+            .ok()
+            .and_then(|v| serde_json::from_value::<(u16, u16)>(v).ok())
+            .unwrap_or((0, 0))
+    }
+}
+
+#[cfg(unix)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw((code & 0xff) << 8)
+}
+
+#[cfg(windows)]
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code as u32)
+}
+
+fn remote_of(session: &AgentSession) -> &Arc<RemoteSession> {
+    session.as_remote().expect("the controller's host only hands out remote sessions")
+}
+
+/// The controller's `AgentHost`: every agent on a remote host.
+impl AgentHost for RemoteHost {
+    fn kind(&self) -> &'static str {
+        "remote"
+    }
+
+    /// Epochs are per placement here ([`AgentSession::epoch`]); this is
+    /// the last one issued.
+    fn epoch(&self) -> PlacementEpoch {
+        PlacementEpoch(*self.epochs.last.lock())
+    }
+
+    /// The low-level spawn has no remote form: the workspace spawn and the
+    /// v2 spawn routes place agents on hosts whole (`spawn.workspace`,
+    /// `spawn`), with the hook token, cell socket and observer on the host.
+    fn spawn(&self, _config: DaemonPtyConfig) -> io::Result<AgentSession> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, super::in_process::CONTROLLER_RUNS_NO_AGENTS))
+    }
+
+    fn place(&self, agent_id: &str, session: &AgentSession) -> Placement {
+        let s = remote_of(session);
+        let mut inner = self.inner.lock();
+        inner.placements.insert(
+            agent_id.to_string(),
+            RemotePlacement {
+                agent_id: agent_id.to_string(),
+                host_id: s.host_id.clone(),
+                session_id: Some(s.session_id.to_string()),
+                epoch: s.epoch,
+                hooks: 0,
+            },
+        );
+        inner.sessions.insert(agent_id.to_string(), Arc::clone(s));
+        Placement { agent_id: agent_id.to_string(), session_id: s.session_id, epoch: s.epoch }
+    }
+
+    /// Remove the placement and close it on the host (kill, no index
+    /// clearing), as the in-process unplace does.
+    fn unplace(&self, agent_id: &str) -> Option<AgentSession> {
+        let (placement, session) = {
+            let mut inner = self.inner.lock();
+            (inner.placements.remove(agent_id), inner.sessions.remove(agent_id))
+        };
+        let placement = placement?;
+        let body = json!({"agent_name": agent_id, "force": true});
+        let r = self.request_blocking(
+            &placement.host_id,
+            |req| Frame::Close { req, agent_id: agent_id.to_string(), epoch: placement.epoch.0, body },
+            REPLY_DEADLINE,
+        );
+        if let Err(e) = r {
+            log_debug!("[hosts] unplace {agent_id}: close on host {} failed: {e}", placement.host_id);
+        }
+        session.map(|s| {
+            s.mark_exited();
+            AgentSession::remote(s)
+        })
+    }
+
+    fn find_agent(&self, agent_id: &str) -> Option<AgentSession> {
+        self.session_for(agent_id).map(AgentSession::remote)
+    }
+
+    fn find_session(&self, session_id: &SessionId) -> Option<AgentSession> {
+        let inner = self.inner.lock();
+        inner.sessions.values().find(|s| &s.session_id == session_id).cloned().map(AgentSession::remote)
+    }
+
+    fn placements(&self) -> Vec<(String, AgentSession)> {
+        let inner = self.inner.lock();
+        inner.sessions.iter().map(|(a, s)| (a.clone(), AgentSession::remote(Arc::clone(s)))).collect()
+    }
+
+    /// Events, labels and pins from the controller's view of the session;
+    /// the relayed grid stream is the host's viewer, so nothing registers.
+    fn attach(&self, session: &AgentSession) -> Attachment {
+        let s = remote_of(session);
+        Attachment { events: s.events.subscribe(), labels: s.labels.subscribe(), pins: s.pins.subscribe(), _viewer: None }
+    }
+
+    fn detach(&self, _session: &AgentSession, _subscriber_id: u64) {}
+
+    /// The grid pipeline runs on the host; a controller relays its frames
+    /// (`hosts::hub::serve_grid`) and never reaches this.
+    fn stream(&self, session: &AgentSession, _pane_id: &str, _wants_k1: bool) -> GridStream {
+        let s = remote_of(session);
+        panic!("grid stream of remote session {} requested on the controller (relayed by hosts::hub instead)", s.session_id)
+    }
+
+    fn events(&self, session: &AgentSession) -> broadcast::Receiver<AlacEvent> {
+        remote_of(session).events.subscribe()
+    }
+
+    fn mark_exited(&self, session: &AgentSession) {
+        remote_of(session).mark_exited();
+    }
+
+    fn read_screen(&self, session: &AgentSession, lines: usize) -> Vec<String> {
+        remote_of(session).rows(SessionOp::Screen { lines })
+    }
+
+    fn write(&self, session: &AgentSession, bytes: Vec<u8>) -> io::Result<()> {
+        let s = remote_of(session);
+        let op = match String::from_utf8(bytes) {
+            Ok(text) => SessionOp::Write { text: Some(text), b64: None },
+            Err(e) => {
+                use base64::Engine;
+                SessionOp::Write { text: None, b64: Some(base64::engine::general_purpose::STANDARD.encode(e.as_bytes())) }
+            }
+        };
+        self.op_send(s, op)
+    }
+
+    fn inject(&self, session: &AgentSession, steps: Vec<k2_core::inject_flow::InjectAction>) -> InjectResult {
+        let s = remote_of(session);
+        let steps = steps.iter().map(InjectStep::from_action).collect();
+        let r = self.request_blocking(
+            &s.host_id,
+            |req| Frame::Inject { req, agent_id: s.agent_id.clone(), epoch: s.epoch.0, steps, msg_id: None },
+            OP_DEADLINE,
+        );
+        match r {
+            Ok(Frame::InjectResult { result: InjectOutcome::Delivered, .. }) => InjectResult::Delivered,
+            Ok(other) => {
+                log_debug!("[hosts] inject into {} on host {}: {other:?}", s.session_id, s.host_id);
+                InjectResult::ChildGone
+            }
+            Err(e) => {
+                log_debug!("[hosts] inject into {} on host {} failed: {e}", s.session_id, s.host_id);
+                InjectResult::ChildGone
+            }
+        }
+    }
+
+    fn resize(&self, session: &AgentSession, cols: u16, rows: u16) {
+        let s = remote_of(session);
+        if let Err(e) = self.op_send(s, SessionOp::Resize { cols, rows }) {
+            log_debug!("[hosts] resize {} failed: {e}", s.session_id);
+        }
+    }
+
+    fn resize_now(&self, session: &AgentSession, cols: u16, rows: u16) -> (u16, u16) {
+        remote_of(session).dims(SessionOp::ResizeNow { cols, rows })
+    }
+
+    fn size(&self, session: &AgentSession) -> (u16, u16) {
+        remote_of(session).dims(SessionOp::Size)
+    }
+
+    fn claimed_size(&self, session: &AgentSession) -> (u16, u16) {
+        remote_of(session).dims(SessionOp::ClaimedSize)
+    }
+
+    fn set_claimed_size(&self, session: &AgentSession, cols: u16, rows: u16) {
+        let s = remote_of(session);
+        if let Err(e) = self.op_send(s, SessionOp::SetClaimedSize { cols, rows }) {
+            log_debug!("[hosts] set_claimed_size {} failed: {e}", s.session_id);
+        }
+    }
+
+    fn pin(&self, session: &AgentSession, dims: Option<(u16, u16)>, set_by: Option<String>) {
+        let s = remote_of(session);
+        match self.op(s, SessionOp::Pin { dims, set_by }) {
+            Ok(_) => {
+                let _ = s.pins.send(dims);
+            }
+            Err(e) => log_debug!("[hosts] pin {} failed: {e}", s.session_id),
+        }
+    }
+
+    fn set_label(&self, session: &AgentSession, label: String, lock: bool) -> String {
+        remote_of(session).set_label(label, lock)
+    }
+
+    fn kill(&self, session: &AgentSession) {
+        remote_of(session).kill();
+    }
+
+    /// Host hook envelopes are not yet replayed into this controller's
+    /// hook plane (the activity store reads `hook_ingest` directly); hook
+    /// frames arrive on [`RemoteHost::hook_events`]. A receiver that only
+    /// closes.
+    fn hook_events(&self) -> broadcast::Receiver<crate::hook_ingest::IngestEvent> {
+        broadcast::channel(1).1
+    }
+
+    /// The agent's home lives on its host (FR6 moves it); not readable
+    /// from the controller in this build.
+    fn read_home(&self, _home: &AgentHome, rel: &Path) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent home on a remote host: {}", rel.display())))
+    }
+
+    fn write_home(&self, _home: &AgentHome, rel: &Path, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent home on a remote host: {}", rel.display())))
     }
 }
 

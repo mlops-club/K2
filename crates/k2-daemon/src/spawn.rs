@@ -95,7 +95,7 @@ fn project_path_for_id(project_id: &str) -> Option<String> {
 /// `project_id` remains `Option<String>` for the rare bare-name
 /// caller (no workspace context available). v2 callers that DO have
 /// workspace context should always set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SpawnWorkspaceSessionRequest {
     pub agent_name: String,
     pub project_id: Option<String>,
@@ -209,6 +209,9 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
 ) -> Result<SpawnWorkspaceSessionOutcome, String> {
     if req.agent_name.is_empty() {
         return Err("agent_name required".into());
+    }
+    if crate::runtime_role::current() == crate::runtime_role::Role::Controller {
+        return spawn_on_agent_host(req);
     }
 
     // Canonical key construction.
@@ -537,6 +540,47 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
         pending_drained,
         reused: false,
         launch_prompt_attached: attached,
+    })
+}
+
+/// `K2_ROLE=controller` (dist-link W1): the same find-or-spawn, run whole
+/// on an agent host (`remote::RemoteHost::spawn_workspace_blocking`). The
+/// controller resolves the tab label (it has the projects table), and
+/// drains its own pending-live signals into the new session, as below.
+fn spawn_on_agent_host(mut req: SpawnWorkspaceSessionRequest) -> Result<SpawnWorkspaceSessionOutcome, String> {
+    if req.label.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        req.label = req
+            .project_id
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(project_path_for_id)
+            .map(|p| k2_core::workspace::display::agent_display_name(&p));
+    }
+    let canonical_key = canonical_key_for_request(&req);
+    let (spawned, session) = crate::agent_host::remote::global().spawn_workspace_blocking(&req)?;
+    let session_id = session.session_id();
+    let mut pending_drained = spawned.pending_drained;
+    if !spawned.reused {
+        let pending = pending_live::drain_for_agent(&canonical_key);
+        pending_drained += pending.len();
+        for signal in pending {
+            let bytes = signal_format::inject_bytes(&signal);
+            let _ = host().write(&session, bytes.into_bytes());
+        }
+    }
+    log_debug!(
+        "[daemon/spawn] remote session={} canonical_key={} reused={} pending_drained={}",
+        session_id,
+        canonical_key,
+        spawned.reused,
+        pending_drained,
+    );
+    Ok(SpawnWorkspaceSessionOutcome {
+        session_id,
+        agent_name: req.agent_name,
+        pending_drained,
+        reused: spawned.reused,
+        launch_prompt_attached: spawned.launch_prompt_attached,
     })
 }
 

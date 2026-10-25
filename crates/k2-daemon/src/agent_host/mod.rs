@@ -117,7 +117,9 @@ pub struct Attachment {
     pub labels: broadcast::Receiver<String>,
     /// Pin-to-size changes.
     pub pins: broadcast::Receiver<Option<(u16, u16)>>,
-    _viewer: ViewerRegistration,
+    /// In-process: the viewer registration. Remote: `None` (the host
+    /// counts the relayed grid stream as its viewer).
+    _viewer: Option<ViewerRegistration>,
 }
 
 /// One subscriber's share of the session's grid frame stream
@@ -128,6 +130,50 @@ pub(crate) struct GridStream {
     pub format_reg: crate::grid_emitter::FormatRegistration,
 }
 
+/// What an [`AgentSession`] points at: a session in this process, or one
+/// on a remote agent host (`K2_ROLE=controller`, `remote::RemoteSession`).
+///
+/// Also the `.0` older call sites read (`.0.label()`, `.0.set_label()`,
+/// `.0.kill()`), so it answers those directly.
+#[derive(Clone)]
+pub enum SessionRef {
+    Local(Arc<DaemonPtySession>),
+    Remote(Arc<remote::RemoteSession>),
+}
+
+impl SessionRef {
+    pub fn label(&self) -> String {
+        match self {
+            SessionRef::Local(p) => p.label(),
+            SessionRef::Remote(r) => r.label(),
+        }
+    }
+
+    pub fn label_source(&self) -> LabelSource {
+        match self {
+            SessionRef::Local(p) => p.label_source(),
+            SessionRef::Remote(r) => r.label_source(),
+        }
+    }
+
+    /// Set the label; `lock` stops PTY titles overwriting it. Returns the
+    /// label now in effect.
+    pub fn set_label(&self, label: String, lock: bool) -> String {
+        match self {
+            SessionRef::Local(p) => p.set_label(label, lock),
+            SessionRef::Remote(r) => r.set_label(label, lock),
+        }
+    }
+
+    /// Kill and reap the child. Idempotent.
+    pub fn kill(&self) {
+        match self {
+            SessionRef::Local(p) => p.kill(),
+            SessionRef::Remote(r) => r.kill(),
+        }
+    }
+}
+
 /// A handle to one agent session on some host. Cheap to clone; dropping
 /// it never tears the session down unless it was the last reference.
 ///
@@ -135,29 +181,63 @@ pub(crate) struct GridStream {
 /// use). Its accessors read session metadata; everything that drives the
 /// session goes through [`AgentHost`] (`write` and `resize` here are
 /// shorthands for [`host`]`().write` / `.resize`).
+///
+/// A remote handle answers the fixed metadata (id, cwd, program, args)
+/// from what its spawn returned, liveness from host events, and the live
+/// terminal state (screen rows, bracketed paste, viewers) by asking the
+/// host.
 #[derive(Clone)]
-pub struct AgentSession(pub(crate) Arc<DaemonPtySession>);
+pub struct AgentSession(pub(crate) SessionRef);
 
 impl AgentSession {
     /// Wrap an in-process session (one the placement table already holds).
     pub(crate) fn in_process(pty: Arc<DaemonPtySession>) -> Self {
-        Self(pty)
+        Self(SessionRef::Local(pty))
+    }
+
+    pub(crate) fn remote(r: Arc<remote::RemoteSession>) -> Self {
+        Self(SessionRef::Remote(r))
+    }
+
+    /// True for a session on a remote agent host.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.0, SessionRef::Remote(_))
+    }
+
+    pub(crate) fn as_remote(&self) -> Option<&Arc<remote::RemoteSession>> {
+        match &self.0 {
+            SessionRef::Remote(r) => Some(r),
+            SessionRef::Local(_) => None,
+        }
     }
 
     /// The in-process session behind this handle. Host-side code only
-    /// (the grid pipeline and the viewport arbitration it owns); the
-    /// controller side uses [`AgentHost`]. P2 turns this into a match on
-    /// the host kind.
+    /// (the in-process host, the grid pipeline and the viewport
+    /// arbitration it owns), which never sees a remote handle: on a
+    /// controller the gate relays `/cli/sessions/grid` before the grid
+    /// handler runs, and the in-process host only hands out local handles.
     pub(crate) fn pty(&self) -> &Arc<DaemonPtySession> {
-        &self.0
+        match &self.0 {
+            SessionRef::Local(p) => p,
+            SessionRef::Remote(r) => panic!(
+                "in-process session expected, got remote session {} on host {} (host-side code reached on a controller)",
+                r.session_id, r.host_id
+            ),
+        }
     }
 
     pub fn session_id(&self) -> SessionId {
-        self.0.session_id
+        match &self.0 {
+            SessionRef::Local(p) => p.session_id,
+            SessionRef::Remote(r) => r.session_id,
+        }
     }
 
     pub fn epoch(&self) -> PlacementEpoch {
-        IN_PROCESS_EPOCH
+        match &self.0 {
+            SessionRef::Local(_) => IN_PROCESS_EPOCH,
+            SessionRef::Remote(r) => r.epoch,
+        }
     }
 
     /// Write bytes to the child's stdin (through [`AgentHost::write`]).
@@ -178,42 +258,50 @@ impl AgentSession {
 
     /// The cwd the child was spawned in.
     pub fn cwd_path(&self) -> Option<&Path> {
-        self.0.cwd.as_deref()
+        match &self.0 {
+            SessionRef::Local(p) => p.cwd.as_deref(),
+            SessionRef::Remote(r) => r.cwd.as_deref(),
+        }
     }
 
     /// The cwd as a string, empty when unknown. Companion endpoints match
     /// this against `projects.path` to attribute sessions to workspaces.
     pub fn cwd(&self) -> String {
-        self.0
-            .cwd
-            .as_ref()
-            .map(PathBuf::as_path)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        self.cwd_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
     }
 
     /// The program the child runs, when one was given.
     pub fn program(&self) -> Option<&str> {
-        self.0.program.as_deref()
+        match &self.0 {
+            SessionRef::Local(p) => p.program.as_deref(),
+            SessionRef::Remote(r) => r.program.as_deref(),
+        }
     }
 
     /// Owned [`Self::program`] (the older `LiveSession` name).
     pub fn command(&self) -> Option<String> {
-        self.0.program.clone()
+        self.program().map(str::to_string)
     }
 
     /// The durable spawn args (never a fire-once launch prompt).
     pub fn args(&self) -> Vec<String> {
-        self.0.args.clone()
+        self.args_ref().to_vec()
     }
 
     /// Borrowed [`Self::args`].
     pub fn args_ref(&self) -> &[String] {
-        &self.0.args
+        match &self.0 {
+            SessionRef::Local(p) => &p.args,
+            SessionRef::Remote(r) => &r.args,
+        }
     }
 
     pub fn sandbox(&self) -> k2_core::terminal::SandboxSpec {
-        self.0.sandbox
+        match &self.0 {
+            SessionRef::Local(p) => p.sandbox,
+            // Daemon spawns on hosts are passthrough in this build.
+            SessionRef::Remote(_) => k2_core::terminal::SandboxSpec::Passthrough,
+        }
     }
 
     /// Kept for older call sites that branched on the renderer; every
@@ -223,11 +311,19 @@ impl AgentSession {
     }
 
     pub fn is_child_alive(&self) -> bool {
-        self.0.is_child_alive()
+        match &self.0 {
+            SessionRef::Local(p) => p.is_child_alive(),
+            SessionRef::Remote(r) => r.is_child_alive(),
+        }
     }
 
+    /// The child's pid. `None` for a remote session: its pid is in the
+    /// host's process namespace, meaningless here.
     pub fn child_pid(&self) -> Option<i32> {
-        self.0.child_pid()
+        match &self.0 {
+            SessionRef::Local(p) => p.child_pid(),
+            SessionRef::Remote(_) => None,
+        }
     }
 
     pub fn label(&self) -> String {
@@ -241,46 +337,71 @@ impl AgentSession {
     /// Plain-text projection of the visible grid rows (verified injection
     /// reads it to confirm the input box cleared).
     pub fn visible_text_rows(&self) -> Vec<String> {
-        self.0.visible_text_rows()
+        match &self.0 {
+            SessionRef::Local(p) => p.visible_text_rows(),
+            SessionRef::Remote(r) => r.visible_text_rows(),
+        }
     }
 
     /// True when the child has bracketed-paste mode on.
     pub fn bracketed_paste_active(&self) -> bool {
-        self.0.bracketed_paste_active()
+        match &self.0 {
+            SessionRef::Local(p) => p.bracketed_paste_active(),
+            SessionRef::Remote(r) => r.bracketed_paste_active(),
+        }
     }
 
     /// Clients attached right now ([`Attachment`]s held), not internal
     /// event observers. The age-out reaper and the close guard read it.
     pub fn subscriber_count(&self) -> usize {
-        self.0.subscriber_count()
+        match &self.0 {
+            SessionRef::Local(p) => p.subscriber_count(),
+            SessionRef::Remote(r) => r.subscriber_count(),
+        }
     }
 
     /// True once any viewer has ever attached (the bare-tab cap counts
     /// only shells nobody ever watched).
     pub fn ever_attached(&self) -> bool {
-        self.0.ever_attached.load(std::sync::atomic::Ordering::Relaxed)
+        match &self.0 {
+            SessionRef::Local(p) => p.ever_attached.load(std::sync::atomic::Ordering::Relaxed),
+            SessionRef::Remote(r) => r.ever_attached(),
+        }
     }
 
     /// True when both handles name the same live session.
     pub fn same_session(&self, other: &AgentSession) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        match (&self.0, &other.0) {
+            (SessionRef::Local(a), SessionRef::Local(b)) => Arc::ptr_eq(a, b),
+            (SessionRef::Remote(a), SessionRef::Remote(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
     }
 
     /// A handle that does not keep the session alive (an observer that
     /// must not outlive the session's last real holder).
     pub fn downgrade(&self) -> WeakAgentSession {
-        WeakAgentSession(Arc::downgrade(&self.0))
+        match &self.0 {
+            SessionRef::Local(p) => WeakAgentSession::Local(Arc::downgrade(p)),
+            SessionRef::Remote(r) => WeakAgentSession::Remote(Arc::downgrade(r)),
+        }
     }
 }
 
 /// [`AgentSession::downgrade`]'s handle.
 #[derive(Clone)]
-pub struct WeakAgentSession(Weak<DaemonPtySession>);
+pub enum WeakAgentSession {
+    Local(Weak<DaemonPtySession>),
+    Remote(Weak<remote::RemoteSession>),
+}
 
 impl WeakAgentSession {
     /// The session, if anything still holds it.
     pub fn upgrade(&self) -> Option<AgentSession> {
-        self.0.upgrade().map(AgentSession)
+        match self {
+            WeakAgentSession::Local(w) => w.upgrade().map(AgentSession::in_process),
+            WeakAgentSession::Remote(w) => w.upgrade().map(AgentSession::remote),
+        }
     }
 }
 
@@ -392,7 +513,11 @@ pub(crate) trait AgentHost: Send + Sync {
 
 static IN_PROCESS: InProcessHost = InProcessHost;
 
-/// The daemon's agent host. P1: always the in-process host.
+/// The daemon's agent host: the remote hosts on a `K2_ROLE=controller`
+/// daemon (`remote::RemoteHost`), the in-process host otherwise.
 pub(crate) fn host() -> &'static dyn AgentHost {
-    &IN_PROCESS
+    match crate::runtime_role::current() {
+        crate::runtime_role::Role::Controller => remote::global(),
+        crate::runtime_role::Role::All | crate::runtime_role::Role::Host => &IN_PROCESS,
+    }
 }

@@ -285,9 +285,9 @@ async fn placement_spreads_and_session_gone_drops_it() {
     assert_eq!(c.remote.placement("a2").unwrap().host_id, "h2");
 
     // A stale session.gone (wrong epoch) changes nothing; the right one drops it.
-    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1 + 1) }).await;
-    send(&mut h1, &Frame::SessionGone { agent_id: "a2".into(), epoch: Some(e2) }).await; // not h1's
-    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1) }).await;
+    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1 + 1), exit_code: None }).await;
+    send(&mut h1, &Frame::SessionGone { agent_id: "a2".into(), epoch: Some(e2), exit_code: None }).await; // not h1's
+    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1), exit_code: None }).await;
     within("a1 to go", async {
         while c.remote.placement("a1").is_some() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -718,4 +718,153 @@ async fn protocol_1_hosts_are_still_accepted_and_resume_is_handed_to_adopt() {
         vec![("kept".to_string(), crate::agent_host::remote::AdoptDecision::Deferred)]
     );
     assert_eq!(c.remote.placement("kept"), None);
+}
+
+// ── W1: RemoteHost is the controller's AgentHost ─────────────────────────
+
+/// Poll a sync read (bounded; fails loudly).
+async fn until_sync<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
+    within(what, async {
+        loop {
+            if let Some(v) = read() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_host_drives_a_workspace_spawn_through_the_agent_host_trait() {
+    use crate::agent_host::{AgentHost, InjectResult};
+    use k2_core::inject_flow::InjectAction;
+    use k2_core::terminal::{AlacEvent, LabelSource};
+
+    let home = TempHome::new();
+    let _shim = AgentShim::install();
+    let _ = k2_core::db::init_for_tests();
+    let c = Controller::start().await;
+    let cfg = HostConfig { attach_url: c.attach_url.clone(), token: TOKEN.into(), host_name: "w1-host".into(), labels: vec![] };
+    let link_task = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
+    c.wait_hosts(1).await;
+    let ctl: &'static dyn AgentHost = c.remote;
+    assert_eq!(ctl.kind(), "remote");
+
+    // The workspace spawn (chat, heartbeat, wake), forwarded whole.
+    let key = format!("w1-{}", uuid::Uuid::new_v4());
+    let cwd = home.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let req = crate::spawn::SpawnWorkspaceSessionRequest {
+        agent_name: key.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        command: Some("claude".into()),
+        args: Some(vec![]),
+        cols: 90,
+        rows: 28,
+        canonical_key: Some(key.clone()),
+        label: Some("W1 agent".into()),
+        ..Default::default()
+    };
+    let remote = c.remote;
+    let (spawned, session) = {
+        let req = req.clone();
+        within("the workspace spawn", tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req)))
+            .await
+            .unwrap()
+            .expect("spawned on the host")
+    };
+    assert!(!spawned.reused);
+    assert!(session.is_remote());
+    // On the host: an in-process session under the same key.
+    let on_host = crate::agent_host::host().find_agent(&key).expect("in the host's table");
+    assert_eq!(on_host.session_id(), session.session_id());
+    assert!(!on_host.is_remote());
+
+    // Lookups and metadata through the trait.
+    let found = ctl.find_agent(&key).expect("find_agent");
+    assert!(found.same_session(&session));
+    assert!(ctl.find_session(&session.session_id()).is_some_and(|s| s.same_session(&session)));
+    assert!(ctl.placements().iter().any(|(a, s)| a == &key && s.same_session(&session)));
+    assert_eq!(found.program(), Some("claude"));
+    assert_eq!(found.cwd_path(), Some(cwd.as_path()));
+    assert_eq!((found.label(), found.label_source()), ("W1 agent".to_string(), LabelSource::Locked));
+    assert!(found.is_child_alive());
+    assert_eq!(found.child_pid(), None, "a host pid is meaningless on the controller");
+    // A second spawn of the same key is the host's reuse.
+    let again = {
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req)).await.unwrap().unwrap()
+    };
+    assert!(again.0.reused);
+    assert!(again.1.same_session(&session), "the same handle");
+
+    // Live state, asked of the host.
+    assert_eq!(ctl.size(&found), (90, 28));
+    assert_eq!(ctl.resize_now(&found, 100, 30), (100, 30));
+    assert_eq!(ctl.size(&found), (100, 30));
+    assert!(!found.bracketed_paste_active(), "cat never asks for bracketed paste");
+    assert_eq!(found.subscriber_count(), 0);
+
+    // write reaches the PTY; the screen read comes back from the host.
+    let typed = format!("w1-write-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    ctl.write(&found, format!("{typed}\r").into_bytes()).unwrap();
+    until_sync("the write on the screen", || ctl.read_screen(&found, 50).iter().any(|l| l.contains(&typed)).then_some(())).await;
+    assert!(found.visible_text_rows().iter().any(|l| l.contains(&typed)));
+    // inject runs as one unit on the host.
+    let injected = format!("w1-inject-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let r = tokio::task::block_in_place(|| {
+        ctl.inject(
+            &found,
+            vec![InjectAction::Write(injected.clone().into_bytes()), InjectAction::Sleep(20), InjectAction::Write(b"\r".to_vec()), InjectAction::CheckAlive],
+        )
+    });
+    assert_eq!(r, InjectResult::Delivered);
+    until_sync("the inject on the screen", || ctl.read_screen(&found, 50).iter().any(|l| l.contains(&injected)).then_some(())).await;
+    // Labels and pins.
+    assert_eq!(ctl.set_label(&found, "renamed".into(), true), "renamed");
+    assert_eq!(on_host.label(), "renamed");
+    let mut pins = ctl.attach(&found).pins;
+    ctl.pin(&found, Some((80, 24)), Some("test".into()));
+    assert_eq!(pins.recv().await.unwrap(), Some((80, 24)));
+
+    // kill ends it: ChildExit reaches the controller's subscribers and the
+    // placement goes.
+    let mut events = ctl.events(&found);
+    tokio::task::block_in_place(|| ctl.kill(&found));
+    within("ChildExit on the controller", async {
+        loop {
+            if let Ok(AlacEvent::ChildExit(_)) = events.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(!found.is_child_alive());
+    until_sync("the placement to go", || ctl.find_agent(&key).is_none().then_some(())).await;
+    assert!(crate::agent_host::host().find_agent(&key).is_none());
+
+    // unplace closes it on the host.
+    let key2 = format!("{key}-2");
+    let req2 = crate::spawn::SpawnWorkspaceSessionRequest { agent_name: key2.clone(), canonical_key: Some(key2.clone()), ..req };
+    tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req2)).await.unwrap().unwrap();
+    assert!(crate::agent_host::host().find_agent(&key2).is_some());
+    let gone = tokio::task::block_in_place(|| ctl.unplace(&key2)).expect("was placed");
+    assert!(!gone.is_child_alive());
+    assert!(ctl.find_agent(&key2).is_none());
+    assert!(crate::agent_host::host().find_agent(&key2).is_none(), "closed on the host");
+
+    // The low-level spawn has no remote form.
+    assert!(ctl.spawn(k2_core::terminal::DaemonPtyConfig::default()).is_err());
+    link_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspace_spawn_with_no_host_is_the_clear_error() {
+    let c = Controller::start().await;
+    let remote = c.remote;
+    let req = crate::spawn::SpawnWorkspaceSessionRequest { agent_name: "x".into(), canonical_key: Some("x".into()), ..Default::default() };
+    let err = tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req).map(|_| ())).await.unwrap().unwrap_err();
+    assert_eq!(err, NO_HOSTS);
+    assert!(c.remote.placements().is_empty());
 }

@@ -262,7 +262,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                     let mut p = placed.lock();
                     if let Some(epoch) = p.epochs.remove(&agent_name) {
                         p.sessions.retain(|_, a| a != &agent_name);
-                        let _ = tx.send(Frame::SessionGone { agent_id: agent_name, epoch: Some(epoch) });
+                        let _ = tx.send(Frame::SessionGone { agent_id: agent_name, epoch: Some(epoch), exit_code: None });
                     }
                 }
                 Ok(_) => {}
@@ -355,6 +355,92 @@ fn handle(
             // Dropping the sender ends the local stream.
             streams.lock().remove(&stream);
         }
+        Frame::SpawnWorkspace { req, agent_id, epoch, request } => {
+            placed.lock().epochs.insert(agent_id.clone(), epoch);
+            let tx = tx.clone();
+            let placed = Arc::clone(placed);
+            tokio::spawn(async move {
+                let r = tokio::task::spawn_blocking(move || spawn_workspace(request)).await;
+                let (status, body) = match r {
+                    Ok(Ok(spawned)) => {
+                        log_debug!(
+                            "[hosts/link] spawned agent {agent_id} session {} epoch {epoch} (workspace spawn, reused={}, pid {})",
+                            spawned.session_id,
+                            spawned.reused,
+                            std::process::id()
+                        );
+                        placed.lock().sessions.insert(spawned.session_id.clone(), agent_id);
+                        ("200 OK".to_string(), serde_json::to_string(&spawned).unwrap_or_default())
+                    }
+                    Ok(Err(e)) => ("500 Internal Server Error".to_string(), serde_json::json!({"error": e}).to_string()),
+                    Err(e) => ("500 Internal Server Error".to_string(), serde_json::json!({"error": format!("spawn: {e}")}).to_string()),
+                };
+                let _ = tx.send(Frame::Reply { req, status, body });
+            });
+        }
+        Frame::Op { req, session_id, epoch, op } => {
+            let current = {
+                let p = placed.lock();
+                p.sessions.get(&session_id).and_then(|a| p.epochs.get(a)).copied()
+            };
+            let session = k2_core::session::SessionId::parse(&session_id)
+                .and_then(|sid| crate::agent_host::host().find_session(&sid));
+            let found = match (session, current) {
+                (Some(s), Some(e)) if e == epoch => Ok(s),
+                (Some(_), Some(e)) => Err(format!("stale epoch {epoch} for session {session_id} (now {e})")),
+                // Spawned before this link (not in `placed`): accept by id.
+                (Some(s), None) => Ok(s),
+                (None, _) => Err(format!("session {session_id} is not on this host")),
+            };
+            match (found, req) {
+                (Err(e), Some(req)) => {
+                    let _ = tx.send(Frame::OpResult { req, value: serde_json::Value::Null, error: Some(e) });
+                }
+                (Err(e), None) => log_debug!("[hosts/link] op on {session_id} dropped: {e}"),
+                // Writes and resizes run here, in the order they arrived.
+                (Ok(s), None) => {
+                    if let Err(e) = run_op(&s, op) {
+                        log_debug!("[hosts/link] op on {session_id}: {e}");
+                    }
+                }
+                (Ok(s), Some(req)) => {
+                    let tx = tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let f = match run_op(&s, op) {
+                            Ok(value) => Frame::OpResult { req, value, error: None },
+                            Err(e) => Frame::OpResult { req, value: serde_json::Value::Null, error: Some(e) },
+                        };
+                        let _ = tx.send(f);
+                    });
+                }
+            }
+        }
+        Frame::Inject { req, agent_id, epoch, steps, .. } => {
+            let current = placed.lock().epochs.get(&agent_id).copied();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                use super::proto::InjectOutcome;
+                let session = crate::agent_host::host().find_agent(&agent_id);
+                let result = match (session, current) {
+                    (Some(_), Some(e)) if e != epoch => InjectOutcome::NotPlaced,
+                    (None, _) => InjectOutcome::NotPlaced,
+                    (Some(s), _) => {
+                        let actions: Result<Vec<_>, String> = steps.iter().map(|st| st.to_action()).collect();
+                        match actions {
+                            Ok(actions) => match crate::agent_host::host().inject(&s, actions) {
+                                crate::agent_host::InjectResult::Delivered => InjectOutcome::Delivered,
+                                crate::agent_host::InjectResult::ChildGone => InjectOutcome::ChildGone,
+                            },
+                            Err(e) => {
+                                log_debug!("[hosts/link] inject into {agent_id}: {e}");
+                                InjectOutcome::ChildGone
+                            }
+                        }
+                    }
+                };
+                let _ = tx.send(Frame::InjectResult { req, result });
+            });
+        }
         Frame::Refused { code, message } => return Err(format!("refused: {code}: {message}")),
         other => log_debug!("[hosts/link] ignored frame {}", other.kind()),
     }
@@ -421,4 +507,78 @@ pub(crate) async fn local_grid(
     // The handler returns once its socket closes; don't wait on it.
     handler.abort();
     result
+}
+
+/// `spawn.workspace` on this host: today's workspace spawn, then the
+/// metadata the controller caches.
+fn spawn_workspace(request: serde_json::Value) -> Result<super::proto::SpawnedSession, String> {
+    let req: crate::spawn::SpawnWorkspaceSessionRequest =
+        serde_json::from_value(request).map_err(|e| format!("spawn request: {e}"))?;
+    let out = crate::spawn::spawn_agent_session_v2_blocking(req)?;
+    let s = crate::agent_host::host()
+        .find_session(&out.session_id)
+        .ok_or_else(|| format!("session {} vanished right after its spawn", out.session_id))?;
+    Ok(super::proto::SpawnedSession {
+        session_id: out.session_id.to_string(),
+        reused: out.reused,
+        pending_drained: out.pending_drained,
+        launch_prompt_attached: out.launch_prompt_attached,
+        cwd: s.cwd_path().map(|p| p.to_string_lossy().into_owned()),
+        program: s.command(),
+        args: s.args(),
+        label: s.label(),
+        label_source: crate::agent_host::remote::label_source_wire(s.label_source()).to_string(),
+    })
+}
+
+/// One `op` against an in-process session; the value `op.result` carries.
+fn run_op(s: &crate::agent_host::AgentSession, op: super::proto::SessionOp) -> Result<serde_json::Value, String> {
+    use super::proto::SessionOp;
+    use serde_json::json;
+    let h = crate::agent_host::host();
+    Ok(match op {
+        SessionOp::Write { text, b64 } => {
+            let bytes = match (text, b64) {
+                (Some(t), _) => t.into_bytes(),
+                (None, Some(b)) => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.decode(b).map_err(|e| format!("write b64: {e}"))?
+                }
+                (None, None) => Vec::new(),
+            };
+            h.write(s, bytes).map_err(|e| e.to_string())?;
+            serde_json::Value::Null
+        }
+        SessionOp::Resize { cols, rows } => {
+            h.resize(s, cols, rows);
+            serde_json::Value::Null
+        }
+        SessionOp::ResizeNow { cols, rows } => json!(h.resize_now(s, cols, rows)),
+        SessionOp::Size => json!(h.size(s)),
+        SessionOp::ClaimedSize => json!(h.claimed_size(s)),
+        SessionOp::SetClaimedSize { cols, rows } => {
+            h.set_claimed_size(s, cols, rows);
+            serde_json::Value::Null
+        }
+        SessionOp::Pin { dims, set_by } => {
+            h.pin(s, dims, set_by);
+            serde_json::Value::Null
+        }
+        SessionOp::SetLabel { label, lock } => json!(h.set_label(s, label, lock)),
+        SessionOp::Kill => {
+            h.kill(s);
+            serde_json::Value::Null
+        }
+        SessionOp::Screen { lines } => json!(h.read_screen(s, lines)),
+        SessionOp::VisibleRows => json!(s.visible_text_rows()),
+        SessionOp::Meta => serde_json::to_value(super::proto::SessionMeta {
+            alive: s.is_child_alive(),
+            label: s.label(),
+            label_source: crate::agent_host::remote::label_source_wire(s.label_source()).to_string(),
+            bracketed_paste: s.bracketed_paste_active(),
+            subscribers: s.subscriber_count(),
+            ever_attached: s.ever_attached(),
+        })
+        .map_err(|e| e.to_string())?,
+    })
 }

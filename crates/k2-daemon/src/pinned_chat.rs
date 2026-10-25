@@ -146,20 +146,12 @@ const DEFAULT_ROWS: u16 = 24;
 /// Resolve cols/rows for an ensure response / spawn body.
 /// Prefer last claimer dims on the live session, else live PTY size,
 /// else VT 80×24. Never hardcode 80×24 when a stored fit exists.
-fn session_fit_or_default(
-    session: &std::sync::Arc<k2_core::terminal::DaemonPtySession>,
-) -> (u16, u16) {
-    use k2_core::terminal::Dimensions;
-    use std::sync::atomic::Ordering;
-    let ac = session.active_cols.load(Ordering::Relaxed);
-    let ar = session.active_rows.load(Ordering::Relaxed);
+fn session_fit_or_default(session: &crate::agent_host::AgentSession) -> (u16, u16) {
+    let (ac, ar) = crate::agent_host::host().claimed_size(session);
     if ac > 0 && ar > 0 {
         return (ac, ar);
     }
-    let term_mutex = session.term();
-    let term = term_mutex.lock();
-    let cols = term.columns() as u16;
-    let rows = term.screen_lines() as u16;
+    let (cols, rows) = crate::agent_host::host().size(session);
     if cols > 0 && rows > 0 {
         (cols, rows)
     } else {
@@ -265,19 +257,19 @@ fn ensure_pinned_chat_inner(
     //    child receives SIGHUP. The fresh spawn below then emits
     //    SessionAdded — net: Removed-then-Added on force_respawn.
     if force_respawn {
-        if let Some(existing) = crate::v2_session_map::lookup_by_agent_name(&canonical_key) {
+        if let Some(existing) = crate::agent_host::host().find_agent(&canonical_key) {
             log_debug!(
                 "[daemon/pinned-chat] force_respawn: unregistering live canonical_key={} (session={})",
                 canonical_key,
-                existing.session_id,
+                existing.session_id(),
             );
-            crate::v2_session_map::unregister(&canonical_key);
+            crate::agent_host::host().unplace(&canonical_key);
             // Belt-and-suspenders: the last map Arc just dropped, but
             // the WS subscriber may still hold one. kill() is
             // idempotent + best-effort and guarantees the child's
             // teardown so the fresh spawn doesn't collide on the
             // resumed --session-id.
-            existing.kill();
+            crate::agent_host::host().kill(&existing);
         }
     }
 
@@ -295,7 +287,7 @@ fn ensure_pinned_chat_inner(
     // 80×24 as true last-resort — no client measure on this headless
     // ensure door.
     let (spawn_cols, spawn_rows) =
-        if let Some(existing) = crate::v2_session_map::lookup_by_agent_name(&canonical_key) {
+        if let Some(existing) = crate::agent_host::host().find_agent(&canonical_key) {
             if existing.is_child_alive() && !force_respawn {
                 session_fit_or_default(&existing)
             } else {
@@ -329,7 +321,7 @@ fn ensure_pinned_chat_inner(
     // Echo real session geometry (claimer dims or live PTY), not the
     // hardcoded default — clients attach with this as the expected size.
     let (out_cols, out_rows) =
-        if let Some(live) = crate::v2_session_map::lookup_by_agent_name(&canonical_key) {
+        if let Some(live) = crate::agent_host::host().find_agent(&canonical_key) {
             session_fit_or_default(&live)
         } else {
             (spawn_cols, spawn_rows)
@@ -647,7 +639,7 @@ fn handle_skin_ensure_pinned_chat_find_only(
         return crate::skin_routes::missing_cap_response(crate::skin_routes::THREAD_READ);
     }
     let canonical_key = canonical_key_for(&resolved.project_id);
-    let Some(live) = crate::v2_session_map::lookup_by_agent_name(&canonical_key) else {
+    let Some(live) = crate::agent_host::host().find_agent(&canonical_key) else {
         return crate::cli_response::CliResponse {
             status: "404 Not Found",
             content_type: "application/json",
@@ -671,7 +663,7 @@ fn handle_skin_ensure_pinned_chat_find_only(
         }
     };
     let out = EnsurePinnedChatOutcome {
-        session_id: live.session_id.to_string(),
+        session_id: live.session_id().to_string(),
         claude_session_id,
         resumed_existing: true,
         command: String::new(),

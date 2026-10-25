@@ -87,7 +87,7 @@ impl AgentHost for InProcessHost {
             events,
             labels,
             pins,
-            _viewer: viewer,
+            _viewer: Some(viewer),
         }
     }
 

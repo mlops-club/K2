@@ -3485,7 +3485,7 @@ mod tests {
             survive: false,
         };
         let s = DaemonPtySession::spawn(cfg).expect("spawn cat");
-        session_lookup::LiveSession(s)
+        session_lookup::LiveSession::in_process(s)
     }
 
     #[cfg(unix)]
