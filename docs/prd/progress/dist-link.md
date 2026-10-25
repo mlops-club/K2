@@ -323,6 +323,8 @@ W1 results:
 | W1 via the controller | chat overlay: ensure-pinned-chat spawns on the host, banner and reply on the relayed grid, reuse; wake (S4): asleep → `k2 msg --wake` wakes it on the host, message answered; close puts it back to sleep; heartbeat fire (S5): fired on the host, wakeup answered |
 | `K2_ROLE=all` regression after W1: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 160 test binaries: 5198 passed, 0 failed, 6 ignored |
 | resume after sleep (was the gap; fixed, option A approved) | `k2_core::transcript_probe`: a process-wide probe consulted first by `ProviderResume::session_file_exists`, `chat_history::claude_session_file_exists` and `sidecar::conversation_exists`. None is installed except on a controller, so under every other role those functions run exactly as before. The controller's probe sends `transcript.exists {req, provider, session_id, project_path}` (protocol 2, answered by `op.result` with a bool) to the host that last ran an agent in that project (or a worktree of it), or to every protocol-2 host when none is known; no answer falls back to the local check. Tests: `k2_core::transcript_probe::tests` (each of the three lookups consults the probe; an id it doesn't answer for is the local check), `hosts::tests::transcript_probe_asks_the_host_that_ran_the_project` |
+| `K2_ROLE=all` regression after W1 + probe: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: **5200 passed, 0 failed**, 6 ignored |
+| `cargo test -p k2-core --no-fail-fast -- --test-threads=3`, throwaway HOME | 3865 passed, **1 failed**, 1 ignored: `fork_tab_repair::tests::repair_splits_a_fork_tab_off_the_source_conversation` (`repair()` sometimes returns no repair for the fork tab). Unrelated to the probe and flaky on its own: run alone (`-- fork_tab_repair`, where no probe is ever installed, so the probe lines are `None` early-outs) it failed 2 of 3 times. The test doesn't touch the transcript lookups. Not fixed here (not my file); reported to the coordinator |
 | two-process (run `20261025T170926Z`) | **all 9 checks PASS**; W1 25/25, including "the second wake resumed the same conversation (same session id, answered)" and "--resume" in the fake agent's argv (`--resume cb650df8-…`, the first wake's session id) |
 
 ## Env contract
@@ -430,7 +432,8 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 ## Status
 
 - Milestones: diagrams written; host env contract (handed to `kind-dist`);
-  first working slice; done (every acceptance criterion below holds).
+  first working slice; done; host reconnect after read error; app session
+  through controller; W0 protocol 2; W1 first working slice; W1 done.
 - Next (P2 follow-ups, not this task): `RemoteHost` as an `impl AgentHost`,
   stream-token grid relays, `proto=k1` over the link,
   host re-adoption after a controller restart (S9), the outbox (S3), cwd
