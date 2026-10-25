@@ -172,19 +172,23 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         # The shared Mac's build-slot queue, when this machine has one.
         slot=()
         [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
-        ${slot[@]+"${slot[@]}"} cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent || exit 1
+        # Two commands: `--bin k2-daemon` would also filter the fake agent out.
+        ${slot[@]+"${slot[@]}"} cargo build -p k2-daemon --bin k2-daemon || exit 1
+        ${slot[@]+"${slot[@]}"} cargo build -p k2-fake-agent || exit 1
     fi
     target=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
         | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
     RUN="$REPO/lab-runs/dist-link/$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$RUN/bin" "$RUN/scenarios"
-    cp "$target/debug/k2-daemon" "$target/debug/k2-fake-agent" "$RUN/bin/"
+    cp "$target/debug/k2-daemon" "$target/debug/k2-fake-agent" "$RUN/bin/" || exit 1
     LAB_DAEMON_BIN="$RUN/bin/k2-daemon" LAB_FAKE_AGENT_BIN="$RUN/bin/k2-fake-agent"
     export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN
     trap topo_down EXIT
     FAILS=0
     check() { # name ok detail
-        if [ "$2" = 1 ]; then echo "PASS $1 $3"; else echo "FAIL $1 $3"; FAILS=$((FAILS + 1)); fi | tee -a "$RUN/checks.txt"
+        local line="PASS $1 $3"
+        if [ "$2" != 1 ]; then line="FAIL $1 $3"; FAILS=$((FAILS + 1)); fi
+        echo "$line" | tee -a "$RUN/checks.txt"
     }
     post() { # port path token body
         curl -s -o "$RUN/post.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
@@ -222,11 +226,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         "{\"agent_name\":\"$agent\",\"cwd\":\"$LAB_WORKSPACE\",\"command\":\"claude\",\"args\":[\"--session-id\",\"$(uuidgen | tr A-Z a-z)\"]}")
     sleep 1
     ps -axo pid=,ppid=,command= > "$RUN/ps.txt"
-    agent_ppids=$(awk -v root="$TP_ROOT/shim" 'index($0, root) || /k2-fake-agent/ {print $2}' "$RUN/ps.txt" | sort -u | tr '\n' ' ')
+    agent_ppids=$(awk -v root="$TP_ROOT/shim/" 'index($0, root) {print $2}' "$RUN/ps.txt" | sort -u | tr '\n' ' ')
     {
         echo "controller pid $TP_CTL_PID, host pid $TP_HOST_PID"
         echo "agent processes (pid ppid command):"
-        awk -v root="$TP_ROOT/shim" 'index($0, root) || /k2-fake-agent/' "$RUN/ps.txt"
+        awk -v root="$TP_ROOT/shim/" 'index($0, root)' "$RUN/ps.txt"
         echo "controller children:"; pgrep -lP "$TP_CTL_PID" || echo "(none)"
         echo "host children:"; pgrep -lP "$TP_HOST_PID" || echo "(none)"
     } > "$RUN/process-tree.txt"
