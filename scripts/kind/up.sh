@@ -193,6 +193,39 @@ unset owner_token
 kc -n "$KIND_NS" exec "$KIND_AGENT_POD" -c "$KIND_AGENT_CONTAINER" -- env D="$KIND_WORK/demo" sh -c \
     '[ -d "$D/.git" ] || { mkdir -p "$D" && git -C "$D" init -q; }'
 
+# Claude Code's first-run screens (theme picker, onboarding) on the pod that
+# runs agents: seed hasCompletedOnboarding and theme=dark into its
+# $HOME/.claude.json so a Claude tab from the app opens straight to the
+# prompt. Only keys that are absent are set (a theme the owner picked
+# stays), the file keeps its mode, and nothing is written when both are
+# there. The real-agent images only: the fake agent has no such screens.
+if [ "$KIND_DOCKERFILE" = deploy/kind/Dockerfile.agents ]; then
+    seeded=$(kc -n "$KIND_NS" exec "$KIND_AGENT_POD" -c "$KIND_AGENT_CONTAINER" -- perl -MJSON::PP -e '
+        my $f = "$ENV{HOME}/.claude.json";
+        my ($d, $mode) = ({}, 0600);
+        if (-e $f) {
+            open(my $in, "<", $f) or die "read $f: $!\n";
+            my $text = do { local $/; <$in> };
+            close $in;
+            $d = JSON::PP->new->utf8->decode($text) if $text =~ /\S/;
+            $mode = (stat $f)[2] & 07777;
+        }
+        ref $d eq "HASH" or die "$f is not a JSON object\n";
+        my %want = (hasCompletedOnboarding => JSON::PP::true, theme => "dark");
+        my @set = grep { !exists $d->{$_} } sort keys %want;
+        if (!@set) { print "unchanged"; exit 0 }
+        $d->{$_} = $want{$_} for @set;
+        my $tmp = "$f.k2-seed.$$";
+        open(my $out, ">", $tmp) or die "write $tmp: $!\n";
+        print $out JSON::PP->new->utf8->canonical->pretty->encode($d);
+        close $out or die "write $tmp: $!\n";
+        chmod $mode, $tmp;
+        rename $tmp, $f or die "rename $tmp: $!\n";
+        print join(" ", @set);') \
+        || { echo "up.sh: seeding \$HOME/.claude.json in $KIND_AGENT_POD failed" >&2; exit 1; }
+    say "Claude Code first-run settings in $KIND_AGENT_POD:\$HOME/.claude.json: $seeded"
+fi
+
 flag=$KIND_FLAGS
 if [ -n "$password" ] && [ -n "$password_file" ]; then
     mkdir -p "$(dirname "$password_file")"

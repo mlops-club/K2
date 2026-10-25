@@ -104,10 +104,10 @@ Everything under `/var/lib/k2` is on the pod's volume and survives restarts.
    **Claude**. The built-in preset runs `claude --dangerously-skip-permissions`
    in the pod. The daemon finds `/usr/local/bin/claude` on its agent PATH,
    as it would on a Linux box.
-2. Claude's first-run screens appear: theme, then the login method.
-   *Unverified: the exact screens depend on Claude Code 2.1.308. No real
-   claude was run for this runbook.* Choose your Claude account. If Claude
-   doesn't offer a login on first run, type `/login`.
+2. `up.sh` seeds `hasCompletedOnboarding` and `theme: "dark"` into the
+   agent pod's `$HOME/.claude.json` (only keys that are absent), so the
+   theme and onboarding screens are skipped and the tab opens at the
+   prompt. Type `/login` and choose your Claude account.
 3. **What happens to the login URL.** This was checked by reading the code,
    not by clicking:
    - On Linux, Claude opens the URL with `xdg-open`. Inside a K2 session,
@@ -245,6 +245,13 @@ shell runs in `k2-host-0`.
 
 S1, which uses the owner token, passes:
 `scripts/kind/up.sh --dist --fake && scripts/kind/s1.sh --dist`.
+
+Reconnect after a restart, as the app does:
+`scripts/kind/reconnect-check.sh --dist --fake --password-file=<its file>`
+logs in, opens `/cli/sessions/events` with the session token, deletes both
+pods, and polls until the same token gets the socket's `hello` again (7 s
+on 2026-10-25), then checks whoami and the host link. It restarts pods, so
+it refuses the owner's variants unless `--restart-live` is given.
 
 ## Proof without a real agent (S1)
 
