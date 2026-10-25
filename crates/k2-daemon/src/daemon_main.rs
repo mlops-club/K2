@@ -103,8 +103,9 @@ pub fn run() {
         // return type prevents fall-through.
     }
 
-    // K2 distributed runtime P0: K2_ROLE, K2_DAEMON_PORT and K2_CAP_* are
-    // checked before anything starts; a bad value never half-boots.
+    // K2 distributed runtime P0: K2_ROLE, K2_DAEMON_PORT, K2_CAP_* and
+    // K2_TRACE_FILE are checked before anything starts; a bad value never
+    // half-boots.
     if let Err(e) = boot_settings_check() {
         eprintln!("[daemon/boot] FATAL: {e}");
         std::process::exit(2);
@@ -131,12 +132,14 @@ pub fn run() {
     }
 }
 
-/// `K2_ROLE`, `K2_DAEMON_PORT` and the `K2_CAP_*` overrides, validated
-/// together at boot (`runtime_role`, `daemon_port`, `capabilities`).
+/// `K2_ROLE`, `K2_DAEMON_PORT`, the `K2_CAP_*` overrides and
+/// `K2_TRACE_FILE`, validated together at boot (`runtime_role`,
+/// `daemon_port`, `capabilities`, `k2_core::trace`).
 fn boot_settings_check() -> Result<(), String> {
     crate::runtime_role::from_env()?;
     crate::daemon_port::from_env()?;
     crate::capabilities::overrides_from_env()?;
+    k2_core::trace::boot_check().map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -178,13 +178,30 @@ verdicts and every flow on the whole trace), `S1/`, `S7.json`,
 
 ## Status
 
-- **Milestone:** done (2026-10-25).
+- **Milestone:** done (2026-10-25); integrated on `k2-dist/wave1`
+  (`b1a5c311a`) the same day: rebased, boot check wired, solo sets
+  `K2_TRACE_FILE`.
+- **After the rebase and integration commit (2026-10-25):**
+  - `g1_solo.sh`: G1 solo trace PASS; `spawn` 7 of 8 (`placement.choose`
+    not in solo), `hook` 5 of 5, `crash` 11 of 11, with `solo.sh` setting
+    `K2_TRACE_FILE` (no wrapper). Bundle `lab-runs/G1-trace/2026-10-25T20-42-57Z`.
+  - Boot check, built daemon under `env -i` and a temp HOME: a relative
+    path, a directory, a missing parent and a read-only directory each
+    exit 2 with `[daemon/boot] FATAL: K2_TRACE_FILE="…" …` before
+    `daemon.port` exists; unset boots to `ready`.
+  - Sink unit tests (`trace::`): 12 passed. Lab suite: 28 OK.
+  - Clippy: nothing on changed lines; the same 3 pre-existing `k2-daemon`
+    deny errors as below.
+  - The one rebase conflict: agenthost moved `inject_framed_locked`'s
+    write loop behind `agent_host().inject`; the `host.inject` line now
+    sits just before that call.
+- **Checks before the rebase:**
 - **Checks (all on this Mac, temp HOME, every `K2_*` unset, 3 jobs, 3
   threads):**
   - `tests/lab/scenarios/g1_solo.sh`: S1 PASS, S7 PASS; `spawn` PASS
     (7 of 8 steps, `placement.choose` not in solo), `hook` PASS (5 of 5),
     `crash` PASS (11 of 11). Bundle `lab-runs/G1-trace/2026-10-25T15-06-24Z`.
-  - Sink unit tests (`trace::`): 11 passed.
+  - Sink unit tests (`trace::`): 11 passed (12 with the boot-check test).
   - `cargo test -p k2-core`: all pass (lib 3676 + 1 ignored, every
     integration binary). Two environment notes: `tests/ptyd_backend.rs`
     needs `cargo build -p k2-ptyd --bin k2-ptyd` first (8/8 then), and
@@ -226,12 +243,12 @@ verdicts and every flow on the whole trace), `S1/`, `S7.json`,
 - `K2_TRACE_FILE`: absolute path; the daemon appends one JSONL event per
   line. Unset or empty means off: no trace work at all. Set but not
   absolute, or not openable for append, is an error, never a silent off
-  (coordinator, 2026-10-24): `k2_core::trace::boot_check()` returns it so
-  the daemon can refuse to start, and the first use logs
-  `[trace] ERROR: K2_TRACE_FILE="…" …` to stderr. **Integration:**
-  `daemon_main.rs` (not mine) should call `k2_core::trace::boot_check()`
-  at boot and exit non-zero on `Err`, as it does for a relative `K2_HOME`.
-  For `deploy/README.md` at integration.
+  (coordinator, 2026-10-24): `daemon_main.rs`'s `boot_settings_check()`
+  calls `k2_core::trace::boot_check()` next to `K2_ROLE` and
+  `K2_DAEMON_PORT`, so the daemon exits 2 before anything starts. The
+  check opens and closes the file and starts no thread (it runs before
+  `handoff::capture_process_context()`, which wants no threads yet); the
+  sink starts on the first emission. In `deploy/README.md` as *new (P1)*.
 
 ### Decisions inside owned files
 
@@ -274,9 +291,9 @@ verdicts and every flow on the whole trace), `S1/`, `S7.json`,
 
 ### Hand-off: `prove.sh G1 --topology solo` (lab worker)
 
-1. Start the solo daemon with `K2_TRACE_FILE=$RUN/daemon.trace.jsonl` (add
-   it to `SOLO_ENV` in `scripts/lab/topology/solo.sh`; `g1_solo.sh` does it
-   with a two-line wrapper only because it may not edit `solo.sh`).
+1. `scripts/lab/topology/solo.sh` now starts the daemon with
+   `K2_TRACE_FILE=$run_dir/daemon.trace.jsonl` (`LAB_DAEMON_TRACE`
+   overrides it; empty runs the trace off, as the bench's off phase does).
 2. Merge `daemon.trace.jsonl`, `fake-agent.trace.jsonl` and the
    scenarios' lab events, sorted by `ts` (the checker sorts too).
 3. Run S7 as `tests/lab/scenarios/g1_solo.py`'s `Crash` does: register the
@@ -290,9 +307,8 @@ verdicts and every flow on the whole trace), `S1/`, `S7.json`,
    (`spawn` step 2, `placement.choose`). Check each flow on its
    scenario's events (`g1_solo.scoped`), so another agent's events never
    complete it.
-5. `crates/k2-daemon` must call `k2_core::trace::boot_check()` at boot
-   (integration, `daemon_main.rs`), and `deploy/README.md` gains
-   `K2_TRACE_FILE`.
+5. Done at integration: the boot check in `daemon_main.rs` and
+   `K2_TRACE_FILE` in `deploy/README.md`.
 
 ### Flow steps that exist only with remote hosts (P2)
 
@@ -307,6 +323,9 @@ verdicts and every flow on the whole trace), `S1/`, `S7.json`,
   `serve_session_grid_connection`.
 - `crates/k2-core/src/terminal/daemon_pty.rs`: trace lines only, plus
   `write` converts `bytes` once (to count them) and passes the `Cow` on.
-- Cherry-picked lab commits that drop out at rebase: `3105385e6`
-  (test_flows accepts extra flow files), `9cb30dde7` (fake agent
-  `cli.hook` before the hook, `cli.hook.done` after).
+- `crates/k2-daemon/src/workspace_msg.rs`: one line, before
+  `agent_host().inject` in `inject_framed_locked`.
+- `crates/k2-daemon/src/daemon_main.rs`: one line in
+  `boot_settings_check()` (integration commit).
+- The cherry-picked lab commits (`3105385e6`, `9cb30dde7`) dropped out at
+  the rebase onto `k2-dist/wave1` (`git cherry` marked them upstream).

@@ -8,9 +8,8 @@
 #   G1_BASE_DAEMON=<base k2-daemon> ... --bench 9   # and vs the base commit
 #
 # Reuses the lab unchanged: scripts/lab/lib/toolchain.sh,
-# scripts/lab/topology/solo.sh, tests/lab/labkit. solo.sh starts the daemon
-# under `env -i`, so the daemon binary it is given is a two-line wrapper
-# that sets K2_TRACE_FILE and execs the real binary (same pid).
+# scripts/lab/topology/solo.sh, tests/lab/labkit. solo.sh sets K2_TRACE_FILE
+# from LAB_DAEMON_TRACE (empty: trace off).
 # Output: lab-runs/G1-trace/<ts>/ (trace.jsonl, flows.json, logs).
 set -uo pipefail
 
@@ -46,14 +45,8 @@ export LAB_FAKE_AGENT_BIN
 up() {
     local dir=$1 trace=$2
     mkdir -p "$dir"
-    if [ -n "$trace" ]; then
-        printf '#!/bin/sh\nK2_TRACE_FILE=%s exec %s "$@"\n' "$trace" "$RUN/bin/k2-daemon" > "$dir/k2-daemon"
-        chmod +x "$dir/k2-daemon"
-        LAB_DAEMON_BIN="$dir/k2-daemon"
-    else
-        LAB_DAEMON_BIN="$RUN/bin/k2-daemon"
-    fi
-    export LAB_DAEMON_BIN
+    LAB_DAEMON_BIN="$RUN/bin/k2-daemon" LAB_DAEMON_TRACE=$trace
+    export LAB_DAEMON_BIN LAB_DAEMON_TRACE
     topo_up "$dir" || { say "solo did not come up ($dir/daemon.log)"; return 1; }
     LAB_CRASH_CWD="$LAB_HOME/work/lab-crash"
     mkdir -p "$LAB_CRASH_CWD"
@@ -86,8 +79,8 @@ if [ "$BENCH" -gt 0 ]; then
         if [ "$phase" = base ]; then
             cp "$G1_BASE_DAEMON" "$RUN/bin/k2-daemon-base"
             mkdir -p "$dir"
-            LAB_DAEMON_BIN="$RUN/bin/k2-daemon-base"
-            export LAB_DAEMON_BIN
+            LAB_DAEMON_BIN="$RUN/bin/k2-daemon-base" LAB_DAEMON_TRACE=
+            export LAB_DAEMON_BIN LAB_DAEMON_TRACE
             topo_up "$dir" || { say "solo did not come up ($dir/daemon.log)"; exit 1; }
             LAB_CRASH_CWD="$LAB_HOME/work/lab-crash"
             printf '%s' "$LAB_TOKEN" > "$dir/token"

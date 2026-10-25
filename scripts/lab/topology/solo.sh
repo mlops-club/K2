@@ -21,17 +21,19 @@ topo_up() {
     LAB_HOME="$SOLO_ROOT/home"
     LAB_WORKSPACE="$LAB_HOME/work/lab-agent"
     LAB_FAKE_TRACE="$run_dir/fake-agent.trace.jsonl"
+    # The daemon's own trace (K2_TRACE_FILE); LAB_DAEMON_TRACE= (empty) runs it off.
+    LAB_DAEMON_TRACE="${LAB_DAEMON_TRACE-$run_dir/daemon.trace.jsonl}"
     mkdir -p "$LAB_WORKSPACE"
     git -C "$LAB_WORKSPACE" init -q
     : > "$LAB_FAKE_TRACE"
-    export LAB_HOME LAB_WORKSPACE LAB_FAKE_TRACE
+    export LAB_HOME LAB_WORKSPACE LAB_FAKE_TRACE LAB_DAEMON_TRACE
 
     SOLO_ENV=(
         PATH="$SOLO_ROOT/shim:/usr/bin:/bin:/usr/sbin:/sbin"
         HOME="$LAB_HOME" TMPDIR="$SOLO_ROOT/tmp" XDG_RUNTIME_DIR="$SOLO_ROOT/run" K2_RUNTIME_DIR=
         USER="$(id -un)" LANG=en_US.UTF-8
         K2_TEST_AGENT_SHIM_DIR="$SOLO_ROOT/shim"
-        K2_FAKE_AGENT_TRACE="$LAB_FAKE_TRACE"
+        K2_FAKE_AGENT_TRACE="$LAB_FAKE_TRACE" K2_TRACE_FILE="$LAB_DAEMON_TRACE"
         K2_FAKE_AGENT_TURN_MS="${LAB_TURN_MS:-300}" K2_FAKE_AGENT_SEED="${LAB_SEED:-0}"
     )
     env -i "${SOLO_ENV[@]}" "$LAB_DAEMON_BIN" >"$run_dir/daemon.log" 2>&1 &
