@@ -173,7 +173,12 @@ set.
 
 - **Milestone:** first working slice, hardened. `prove.sh G0 --topology solo`
   (and `--parity none`) runs end to end; S1 passes over the app's routes.
-- **Waiting on:** the coordinator's go (the Mac is shared; image's kind build
+- **Acceptance (host, 2026-10-24):** with every `K2_*` unset, through
+  `lab_cargo` (throwaway HOME, 3 jobs, 3 threads), after `cargo build -p
+  k2-ptyd --bin k2-ptyd` (as CI does; `ptyd_backend` needs it):
+  `cargo test -p k2-core` exit 0 (3854 passed, 1 ignored);
+  `cargo test -p k2-daemon` exit 0 (5145 passed, 6 ignored).
+- **Was waiting on:** the coordinator's go (the Mac is shared; image's kind build
   is the critical path) before the next heavy runs: `cargo test -p k2-core` and
   `-p k2-daemon` under `lab_cargo`, then `prove.sh --record-baseline`, then a
   verification run for I5.
