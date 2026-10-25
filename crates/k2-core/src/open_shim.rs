@@ -39,14 +39,14 @@ pub const SHIM_CONTENT: &str = include_str!("../../../scripts/k2-open");
 /// on the next daemon boot.
 const VERSION_PREFIX: &str = "# K2_OPEN_SHIM_VERSION:";
 
-/// `<home>/.k2/bin` — the staging directory.
-pub fn bin_dir_at(home: &Path) -> PathBuf {
-    home.join(".k2").join("bin")
+/// `<k2_home>/bin` — the staging directory.
+pub fn bin_dir_at(k2_home: &Path) -> PathBuf {
+    k2_home.join("bin")
 }
 
-/// `<home>/.k2/bin/k2-open` — the canonical shim path.
-pub fn shim_path_at(home: &Path) -> PathBuf {
-    bin_dir_at(home).join("k2-open")
+/// `<k2_home>/bin/k2-open` — the canonical shim path.
+pub fn shim_path_at(k2_home: &Path) -> PathBuf {
+    bin_dir_at(k2_home).join("k2-open")
 }
 
 /// Extract the value of the `# K2_OPEN_SHIM_VERSION:` line, trimmed.
@@ -82,13 +82,13 @@ fn write_exec(path: &Path, content: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Testable core — stage into an explicit home root. `stage_xdg_open`
+/// Testable core — stage into an explicit K2 home. `stage_xdg_open`
 /// selects the Linux-only `xdg-open` copy (callers pass
 /// `cfg!(target_os = "linux")`; tests pass both). Returns the paths
 /// that are now staged and current (whether freshly written or already
 /// up to date).
-pub fn stage_at(home: &Path, stage_xdg_open: bool) -> Result<Vec<PathBuf>, String> {
-    let bin = bin_dir_at(home);
+pub fn stage_at(k2_home: &Path, stage_xdg_open: bool) -> Result<Vec<PathBuf>, String> {
+    let bin = bin_dir_at(k2_home);
     std::fs::create_dir_all(&bin).map_err(|e| format!("create {}: {e}", bin.display()))?;
 
     let mut staged = Vec::new();
@@ -106,19 +106,18 @@ pub fn stage_at(home: &Path, stage_xdg_open: bool) -> Result<Vec<PathBuf>, Strin
     Ok(staged)
 }
 
-/// Stage against the real `$HOME` (daemon boot). `xdg-open` is staged
+/// Stage into the K2 home (daemon boot). `xdg-open` is staged
 /// on Linux ONLY — see the module docs for why macOS keeps its `open`.
 pub fn stage() -> Result<Vec<PathBuf>, String> {
-    let home = dirs::home_dir().ok_or("no home dir")?;
-    stage_at(&home, cfg!(target_os = "linux"))
+    let k2_home = crate::paths::k2_home_opt().ok_or("no home dir")?;
+    stage_at(&k2_home, cfg!(target_os = "linux"))
 }
 
 /// The staged shim's absolute path, `Some` only when the file actually
 /// exists on disk — the PTY env block gates on this so a failed staging
 /// never points `BROWSER` at a dangling path.
 pub fn staged_shim_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let path = shim_path_at(&home);
+    let path = shim_path_at(&crate::paths::k2_home_opt()?);
     if path.is_file() {
         Some(path)
     } else {

@@ -251,6 +251,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
     k2_core::trace::emit(|| k2_core::trace::Event::new("host.linked").attr("host", host_id.as_str()));
 
     let (tx, mut out) = mpsc::unbounded_channel::<Frame>();
+    crate::delivery_drain::host_linked(tx.clone());
     let streams: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>> = Arc::default();
     let placed = placed();
     if let Frame::Hello { resume, .. } = &hello {
@@ -539,6 +540,7 @@ fn handle(
             });
         }
         Frame::Refused { code, message } => return Err(format!("refused: {code}: {message}")),
+        f @ (Frame::Deliver { .. } | Frame::DeliverAck { .. }) => crate::delivery_drain::on_controller_frame(f, tx),
         other => log_debug!("[hosts/link] ignored frame {}", other.kind()),
     }
     Ok(())

@@ -97,14 +97,26 @@ pub const GEMINI_EVENTS: &[&str] = &["BeforeAgent", "AfterAgent", "AfterTool"];
 /// Timeout on `claude --version` (DA9).
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `~/.k2/hooks/notify.sh` under `home`.
-pub fn script_path(home: &Path) -> PathBuf {
-    home.join(".k2").join("hooks").join("notify.sh")
+/// `<k2_home>/hooks/notify.sh`.
+pub fn script_path(k2_home: &Path) -> PathBuf {
+    k2_home.join("hooks").join("notify.sh")
 }
 
-/// `~/.k2/hooks/statusline.sh` under `home`.
-pub fn statusline_script_path(home: &Path) -> PathBuf {
-    home.join(".k2").join("hooks").join("statusline.sh")
+/// `<k2_home>/hooks/statusline.sh`.
+pub fn statusline_script_path(k2_home: &Path) -> PathBuf {
+    k2_home.join("hooks").join("statusline.sh")
+}
+
+/// The heartbeat port file as `notify.sh` names it. The default layout
+/// keeps `"$HOME/.k2/heartbeat.port"` (the script's own `$HOME`, byte for
+/// byte what it has always been); with `K2_HOME` set it is that absolute
+/// path, shell-quoted, since the agent CLI's `$HOME` is not the K2 home.
+fn hook_port_file() -> String {
+    if crate::paths::k2_home_overridden() {
+        shell_escape(&crate::paths::k2_file("heartbeat.port").to_string_lossy())
+    } else {
+        "\"$HOME/.k2/heartbeat.port\"".to_string()
+    }
 }
 
 fn claude_settings_path(home: &Path) -> PathBuf {
@@ -206,7 +218,7 @@ fi
 # Retry over loopback TCP with the SAME passport (the cell socket can be
 # stale after a daemon restart; the port is read at exec time). The
 # daemon accepts the passport there only for this session's own pane.
-PORT="$(cat "$HOME/.k2/heartbeat.port" 2>/dev/null)"
+PORT="$(cat {port_file} 2>/dev/null)"
 [ -z "$PORT" ] && exit 0
 printf '%s' "$BODY" | curl -s -K /dev/fd/3 -X POST --connect-timeout 1 --max-time 2 \
     "${{HDR[@]}}" \
@@ -216,6 +228,7 @@ exit 0
 "#,
         max_body = super::envelope::MAX_BODY_BYTES,
         protocol = HOOK_PROTOCOL,
+        port_file = hook_port_file(),
     )
 }
 
@@ -591,7 +604,10 @@ impl InstallReport {
 /// One installer run.
 #[derive(Debug, Clone)]
 pub struct InstallRequest<'a> {
+    /// The provider home (`~/.claude`, `~/.cursor`, … live here).
     pub home: &'a Path,
+    /// The K2 home (`hooks/notify.sh`, `hooks/statusline.sh` live here).
+    pub k2_home: &'a Path,
     /// This daemon's version (the script stamp).
     pub daemon_version: &'a str,
     /// From [`probe_claude_version`] (the caller runs the probe).
@@ -604,7 +620,7 @@ pub struct InstallRequest<'a> {
 /// Install (or remove) K2's hooks under `req.home`.
 pub fn run(req: &InstallRequest<'_>) -> InstallReport {
     let (claude_events, full) = claude_events_for(req.claude_version.as_deref());
-    let script = script_path(req.home);
+    let script = script_path(req.k2_home);
     let mut report = InstallReport {
         action: if req.remove { "remove" } else { "install" },
         daemon_version: req.daemon_version.to_string(),
@@ -710,12 +726,12 @@ pub fn run(req: &InstallRequest<'_>) -> InstallReport {
         let desired = if req.remove { desired.emptied() } else { desired };
         let mut statusline: Option<StatusLineState> = None;
         if cli == "claude" && !req.remove {
-            let feed = statusline_script_path(req.home);
+            let feed = statusline_script_path(req.k2_home);
             if let Err(e) = write_script(&feed, req.daemon_version, generate_statusline_script(req.daemon_version)) {
                 crate::log_debug!("[hooks] statusline script: {e}");
             }
         }
-        let feed_command = statusline_command(&statusline_script_path(req.home));
+        let feed_command = statusline_command(&statusline_script_path(req.k2_home));
         let result = edit_config(&path, |root| {
             apply(root, &desired)?;
             if cli == "claude" {
@@ -994,7 +1010,7 @@ fn k2_events(root: &Value, flat: bool) -> Vec<String> {
 /// events, configUnreadable}`, plus the script's path, presence and stamp.
 /// DA18: Gemini is read from `~/.gemini/settings.json`, the file the
 /// installer writes.
-pub fn check_hook_injections(home: &Path) -> Value {
+pub fn check_hook_injections(home: &Path, k2_home: &Path) -> Value {
     let check = |cli: &str, path: PathBuf, flat: bool| -> Value {
         let path_str = path.to_string_lossy().into_owned();
         let Ok(bytes) = std::fs::read(&path) else {
@@ -1015,7 +1031,7 @@ pub fn check_hook_injections(home: &Path) -> Value {
             _ => json!({ "cli": cli, "path": path_str, "exists": true, "injected": false, "events": [], "configUnreadable": true }),
         }
     };
-    let script = script_path(home);
+    let script = script_path(k2_home);
     let stamp = std::fs::read_to_string(&script).ok().and_then(|b| script_stamp(&b));
     json!({
         "notify_script": {
@@ -1058,6 +1074,7 @@ mod tests {
     fn req(home: &Path, version: &str, claude: Option<&str>) -> InstallRequest<'static> {
         InstallRequest {
             home: Box::leak(home.to_path_buf().into_boxed_path()),
+            k2_home: Box::leak(home.join(".k2").into_boxed_path()),
             daemon_version: Box::leak(version.to_string().into_boxed_str()),
             claude_version: claude.map(str::to_string),
             remove: false,
@@ -1140,13 +1157,13 @@ mod tests {
         assert!(cmd.starts_with("[ -x '") && cmd.contains("K2_HOOK_AGENT_PID=$PPID K2_HOOK_SOURCE=claude") && cmd.ends_with("\"$@\" || true"), "{cmd}");
 
         let before_cfg = mtime(&claude_settings_path(h));
-        let before_script = mtime(&script_path(h));
+        let before_script = mtime(&script_path(&h.join(".k2")));
         std::thread::sleep(Duration::from_millis(20));
         let r2 = run(&req(h, "0.44.3", Some("2.1.292")));
         assert_eq!(r2.script.state, ScriptState::Unchanged);
         assert!(r2.clis.iter().all(|c| c.state != ConfigState::Written), "{:?}", r2.clis);
         assert_eq!(mtime(&claude_settings_path(h)), before_cfg);
-        assert_eq!(mtime(&script_path(h)), before_script);
+        assert_eq!(mtime(&script_path(&h.join(".k2"))), before_script);
     }
 
     /// T-S1a+ (A2): malformed stays byte-identical, an old-format K2 entry
@@ -1200,7 +1217,7 @@ mod tests {
         assert_eq!(hooks["Stop"][0]["hooks"][0]["command"], SUPERSET);
         assert_eq!(hooks["PostToolUse"][0]["hooks"][0]["command"], SUPERSET);
         assert!(!serde_json::to_string(&v).unwrap().contains("notify.sh"));
-        assert!(script_path(h).exists(), "uninstall leaves the script");
+        assert!(script_path(&h.join(".k2")).exists(), "uninstall leaves the script");
     }
 
     #[test]
@@ -1224,14 +1241,14 @@ mod tests {
         let h = home.path();
         std::fs::create_dir_all(h.join(".claude")).unwrap();
         run(&req(h, "0.45.0", Some("2.1.292")));
-        let script_before = std::fs::read(script_path(h)).unwrap();
+        let script_before = std::fs::read(script_path(&h.join(".k2"))).unwrap();
         // Drop the K2 entries so an older run would visibly re-add them.
         std::fs::write(claude_settings_path(h), b"{}").unwrap();
         let r = run(&req(h, "0.44.3", None));
         assert_eq!(r.script.state, ScriptState::SkippedNewer);
         assert_eq!(r.script.on_disk_version.as_deref(), Some("0.45.0"));
         assert!(r.clis.iter().all(|c| c.state == ConfigState::SkippedNewer));
-        assert_eq!(std::fs::read(script_path(h)).unwrap(), script_before);
+        assert_eq!(std::fs::read(script_path(&h.join(".k2"))).unwrap(), script_before);
         assert_eq!(std::fs::read(claude_settings_path(h)).unwrap(), b"{}");
         // Same or newer version does write.
         assert_eq!(run(&req(h, "0.45.1", None)).script.state, ScriptState::Written);
@@ -1256,7 +1273,7 @@ mod tests {
         assert_eq!(v["hooks"]["afterFileEdit"][0]["command"], "./fmt.sh");
         let cmd = v["hooks"]["beforeSubmitPrompt"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("K2_HOOK_SOURCE=cursor") && cmd.contains(" Start || true"), "{cmd}");
-        let status = check_hook_injections(h);
+        let status = check_hook_injections(h, &h.join(".k2"));
         assert_eq!(status["cursor"]["injected"], true);
         assert_eq!(status["cursor"]["events"].as_array().unwrap().len(), CURSOR_EVENTS.len());
     }
@@ -1268,7 +1285,7 @@ mod tests {
         let h = home.path();
         std::fs::create_dir_all(h.join(".gemini")).unwrap();
         run(&req(h, "0.44.3", None));
-        let s = check_hook_injections(h);
+        let s = check_hook_injections(h, &h.join(".k2"));
         assert_eq!(s["gemini"]["path"], gemini_settings_path(h).to_string_lossy().as_ref());
         assert_eq!(s["gemini"]["injected"], true);
         assert_eq!(s["gemini"]["events"], json!(["AfterAgent", "AfterTool", "BeforeAgent"]));
@@ -1433,7 +1450,7 @@ mod tests {
     #[cfg(unix)]
     fn run_script(home: &Path, env: &[(&str, &str)], stdin: &[u8]) -> (i32, Vec<u8>, Duration) {
         use std::io::Write;
-        let script = script_path(home);
+        let script = script_path(&home.join(".k2"));
         let mut cmd = Command::new("/bin/bash");
         cmd.arg(&script)
             .env_clear()
@@ -1464,7 +1481,7 @@ mod tests {
     #[test]
     fn t_s1b_script_posts_the_raw_payload_over_the_cell_socket() {
         let home = TempHome::new("s1b");
-        write_script(&script_path(home.path()), "0.44.3", generate_hook_script("0.44.3")).expect("script");
+        write_script(&script_path(&home.path().join(".k2")), "0.44.3", generate_hook_script("0.44.3")).expect("script");
         let sock = PathBuf::from(format!("/tmp/k2s1b-{}-{}.sock", std::process::id(), Instant::now().elapsed().as_nanos() % 100000));
         let _ = std::fs::remove_file(&sock);
         let server = serve_one(ServerSock::Unix(std::os::unix::net::UnixListener::bind(&sock).expect("bind")), "204 No Content");
@@ -1508,7 +1525,7 @@ mod tests {
     #[test]
     fn t_s1b_script_falls_back_to_tcp_and_truncates_huge_bodies() {
         let home = TempHome::new("s1b-tcp");
-        write_script(&script_path(home.path()), "0.44.3", generate_hook_script("0.44.3")).expect("script");
+        write_script(&script_path(&home.path().join(".k2")), "0.44.3", generate_hook_script("0.44.3")).expect("script");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::fs::write(home.path().join(".k2/heartbeat.port"), port.to_string()).unwrap();
@@ -1545,7 +1562,7 @@ mod tests {
     #[test]
     fn t_s1b_script_without_a_passport_sends_nothing() {
         let home = TempHome::new("s1b-nopass");
-        write_script(&script_path(home.path()), "0.44.3", generate_hook_script("0.44.3")).expect("script");
+        write_script(&script_path(&home.path().join(".k2")), "0.44.3", generate_hook_script("0.44.3")).expect("script");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::fs::write(home.path().join(".k2/heartbeat.port"), port.to_string()).unwrap();
@@ -1586,7 +1603,7 @@ mod tests {
     #[test]
     fn t_s1b_script_exits_zero_quickly_with_the_daemon_down() {
         let home = TempHome::new("s1b-down");
-        write_script(&script_path(home.path()), "0.44.3", generate_hook_script("0.44.3")).expect("script");
+        write_script(&script_path(&home.path().join(".k2")), "0.44.3", generate_hook_script("0.44.3")).expect("script");
         // A reserved port nobody listens on.
         let closed = crate::test_env::ClosedPort::new();
         let port = closed.port();
@@ -1611,7 +1628,7 @@ mod tests {
     #[test]
     fn t_s1b_tokens_never_on_curl_argv() {
         let home = TempHome::new("s1b-argv");
-        write_script(&script_path(home.path()), "0.44.3", generate_hook_script("0.44.3")).expect("script");
+        write_script(&script_path(&home.path().join(".k2")), "0.44.3", generate_hook_script("0.44.3")).expect("script");
         let shim_dir = home.path().join("shim");
         std::fs::create_dir_all(&shim_dir).unwrap();
         let argv_log = home.path().join("curl-argv.log");
@@ -1711,7 +1728,7 @@ mod tests {
         assert!(cmd.contains(STATUSLINE_FRAGMENT), "{cmd}");
         assert_eq!(v["statusLine"]["type"], json!("command"));
         assert_eq!(v["model"], json!("opus"), "other settings kept");
-        let feed = statusline_script_path(home.path());
+        let feed = statusline_script_path(&home.path().join(".k2"));
         assert!(feed.is_file(), "the feed script is written");
         #[cfg(unix)]
         {

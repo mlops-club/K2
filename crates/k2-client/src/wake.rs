@@ -64,8 +64,7 @@ pub struct DaemonPlist {
 impl DaemonPlist {
     /// Canonical config: k2so-daemon, always-on, logs under `~/.k2so/`.
     pub fn canonical(program: PathBuf) -> Self {
-        let k2so_dir = dirs::home_dir()
-            .map(|h| h.join(".k2"))
+        let k2so_dir = crate::paths::k2_home_opt()
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             label: "dev.k2.daemon".to_string(),
@@ -83,8 +82,7 @@ impl DaemonPlist {
     /// `dev.k2.app`). `RunAtLoad` so login shows the icon without opening
     /// the window. Quit-daemon must not unload this label.
     pub fn menu_bar_helper(program: PathBuf) -> Self {
-        let k2_dir = dirs::home_dir()
-            .map(|h| h.join(".k2"))
+        let k2_dir = crate::paths::k2_home_opt()
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             label: MENU_BAR_HELPER_LABEL.to_string(),

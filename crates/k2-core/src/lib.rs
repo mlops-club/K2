@@ -177,6 +177,8 @@ pub use k2_client::editors;
 // Opens NO network trust boundary; inert until later phases wire ingress.
 // Gated behind the default-OFF `K2_FEDERATION` flag (see `federation::enabled`).
 pub mod federation;
+// Durable delivery outbox between hosts (k2-dist outbox: FR4, S3, I2).
+pub mod delivery;
 // Feedback F1 (prd-agent-feedback-notifications) — durable agent→human
 // asks (`k2 feedback ask`) + per-item comment threads.
 pub mod feedback;
@@ -248,6 +250,9 @@ pub use k2_client::macos_keychain;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "macos_keychain_tests.rs"]
 mod macos_keychain_tests;
+// K2 Distributed Runtime P0: `K2_HOME` moves every K2-home path.
+#[cfg(test)]
+mod k2_home_env_tests;
 // K2 Mail (prd-email-server-v1 pre-mortem #14) — the ONE mail-domain
 // normalization helper (lowercase punycode A-label) used at every
 // boundary. Store only what it returns; display-decode at the edge.

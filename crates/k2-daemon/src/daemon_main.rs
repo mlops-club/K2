@@ -342,6 +342,13 @@ async fn async_main() {
     // A no-op on builds without one; nothing runs ptyd until the switch is on.
     crate::ptyd_status::register_embedded();
 
+    // K2_HOME (P0): a relative value would follow the working directory;
+    // refuse it before anything resolves a path under the K2 home.
+    if let Some(e) = k2_core::paths::k2_home_env_error() {
+        eprintln!("[daemon] FATAL: {e}");
+        std::process::exit(2);
+    }
+
     // 0.40.0 rebrand — one-time ~/.k2so → ~/.k2 home migration. MUST
     // run before db::shared(), the port claim, or anything else that
     // touches the home dir; the app's boot path runs the same call, so
@@ -359,8 +366,8 @@ async fn async_main() {
     // workspace files the daemon writes. Unix only; no-op on Windows.
     {
         let report = k2_core::private_home::tighten_home();
-        if let Some(home) = dirs::home_dir() {
-            if let Some(line) = report.log_line(&home.join(".k2")) {
+        if let Some(k2) = k2_core::paths::k2_home_opt() {
+            if let Some(line) = report.log_line(&k2) {
                 k2_core::log_debug!("{line}");
             }
         }
@@ -494,8 +501,8 @@ async fn async_main() {
 
     log_debug!("[daemon] {}", BANNER);
 
-    let k2so_dir = match dirs::home_dir() {
-        Some(h) => h.join(".k2"),
+    let k2so_dir = match k2_core::paths::k2_home_opt() {
+        Some(h) => h,
         None => {
             log_debug!("[daemon] FATAL: cannot determine home directory");
             std::process::exit(2);

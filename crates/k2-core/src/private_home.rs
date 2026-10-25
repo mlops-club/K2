@@ -7,7 +7,7 @@
 //! OS user on the machine could read them.
 //!
 //! Two pieces:
-//! - [`tighten_home_at`] runs once at daemon boot: the home dir (and a
+//! - [`tighten_home`] runs once at daemon boot: the home dir (and a
 //!   real legacy `~/.k2so` dir, if one still exists) goes to 0700, every
 //!   SQLite / redb database plus its `-wal` / `-shm` / `-journal` goes to
 //!   0600, and the dirs that hold secrets go to 0700.
@@ -125,39 +125,44 @@ pub fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Boot sweep against the real `$HOME`. See module docs.
+/// Boot sweep of the K2 home ([`crate::paths::k2_home`]). See module docs.
+/// The legacy `~/.k2so` exists only in the default layout, so it is
+/// checked only when `K2_HOME` is not set.
 pub fn tighten_home() -> TightenReport {
-    match dirs::home_dir() {
-        Some(home) => tighten_home_at(&home),
-        None => TightenReport::default(),
-    }
+    let legacy = if crate::paths::k2_home_overridden() {
+        None
+    } else {
+        dirs::home_dir().map(|h| h.join(".k2so"))
+    };
+    tighten_k2_home_at(&crate::paths::k2_home(), legacy.as_deref())
 }
 
-/// Testable core of [`tighten_home`]: operates on an explicit `$HOME`.
-pub fn tighten_home_at(home: &Path) -> TightenReport {
+/// Testable core of [`tighten_home`]: operates on an explicit K2 home and
+/// (optionally) the legacy `~/.k2so` beside it.
+pub fn tighten_k2_home_at(canonical: &Path, legacy: Option<&Path>) -> TightenReport {
     let mut report = TightenReport::default();
     #[cfg(unix)]
     {
-        let canonical = home.join(".k2");
         // `~/.k2` itself may be a symlink an operator made to another disk;
         // follow it (chmod applies to the target dir, which is ours).
         if canonical.is_dir() {
-            sweep_root(&canonical, &mut report);
+            sweep_root(canonical, &mut report);
         }
         // Legacy `~/.k2so`: normally a compat SYMLINK to `~/.k2` (nothing
         // to do — the target was just swept). A REAL dir is a mixed-version
         // leftover that still holds an old k2so.db; tighten it too.
-        let legacy = home.join(".k2so");
-        let legacy_is_real_dir = std::fs::symlink_metadata(&legacy)
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false);
-        if legacy_is_real_dir {
-            sweep_root(&legacy, &mut report);
+        if let Some(legacy) = legacy {
+            let legacy_is_real_dir = std::fs::symlink_metadata(legacy)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if legacy_is_real_dir {
+                sweep_root(legacy, &mut report);
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = home;
+        let _ = (canonical, legacy);
     }
     report
 }
@@ -302,6 +307,11 @@ pub fn restrict_path(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The default layout under an explicit `$HOME`: `~/.k2` plus `~/.k2so`.
+    fn tighten_home_at(home: &Path) -> TightenReport {
+        tighten_k2_home_at(&home.join(".k2"), Some(&home.join(".k2so")))
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {

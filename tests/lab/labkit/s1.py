@@ -252,7 +252,7 @@ class Run:
             "claude_session": self.claude_session,
             "checks": self.checks,
             "metrics": self.metrics,
-            "hooks_seen_by_agent": [e["attrs"] for e in fake if e["event"] == "cli.hook"],
+            "hooks_seen_by_agent": [e["attrs"] for e in fake if e["event"] == "cli.hook.done"],
             "trace": "S1.trace.jsonl",
             "trace_note": "lab and k2-fake-agent events only; the daemon emits no trace events until wave 2",
         }

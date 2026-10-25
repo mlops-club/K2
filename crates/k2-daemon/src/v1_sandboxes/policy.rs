@@ -230,10 +230,7 @@ fn sanitize_id(s: &str) -> String {
 
 /// The root under which per-session ephemeral workspaces are provisioned.
 fn sandbox_sessions_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("sandbox-sessions")
+    k2_core::paths::k2_home().join("sandbox-sessions")
 }
 
 /// Provision a fresh, EMPTY per-session workspace dir for the cell.
@@ -406,10 +403,7 @@ fn continuity_settings_json() -> String {
 /// layers live: `~/.k2/sandbox-overlays`. Derived ONLY from the daemon's home
 /// dir (never a caller path), mirroring [`sandbox_sessions_root`].
 fn sandbox_overlays_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("sandbox-overlays")
+    k2_core::paths::k2_home().join("sandbox-overlays")
 }
 
 /// The root under which per-WORKSPACE sandbox homes live:
@@ -417,10 +411,7 @@ fn sandbox_overlays_root() -> PathBuf {
 /// sandbox session transcripts + memory (mounted at `<home>/.claude` in every
 /// cell for that workspace). Derived ONLY from the daemon's home dir.
 fn sandbox_homes_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".k2")
-        .join("sandbox-homes")
+    k2_core::paths::k2_home().join("sandbox-homes")
 }
 
 /// The daemon's real home dir = the in-cell `HOME` for a mirror session (e.g.

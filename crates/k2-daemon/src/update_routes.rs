@@ -757,8 +757,8 @@ fn clear_jobs_for_test() -> k2_core::test_env::SerialGuard {
 /// + verified artifacts. Falls back to the system temp dir if `$HOME`
 /// can't be resolved.
 fn job_stage_dir(job_id: &str) -> PathBuf {
-    let base = dirs::home_dir()
-        .map(|h| h.join(".k2").join("update"))
+    let base = k2_core::paths::k2_home_opt()
+        .map(|k2| k2.join("update"))
         .unwrap_or_else(|| std::env::temp_dir().join("k2so-update"));
     base.join(job_id)
 }
@@ -767,8 +767,8 @@ fn job_stage_dir(job_id: &str) -> PathBuf {
 /// running binary before the swap, so the detached helper can restore it
 /// if the new binary fails its health-check.
 fn backup_path(version: &str) -> PathBuf {
-    let base = dirs::home_dir()
-        .map(|h| h.join(".k2").join("update"))
+    let base = k2_core::paths::k2_home_opt()
+        .map(|k2| k2.join("update"))
         .unwrap_or_else(|| std::env::temp_dir().join("k2so-update"));
     base.join(format!("backup-{version}"))
 }
@@ -1429,9 +1429,7 @@ fn pending_update_path() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn k2_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join(".k2")
+    k2_core::paths::k2_home_opt().unwrap_or_else(|| PathBuf::from("/.k2"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1710,8 +1708,8 @@ exit 0
 /// which is the safe direction).
 #[cfg(not(target_os = "linux"))]
 fn daemon_port_hint() -> String {
-    dirs::home_dir()
-        .map(|h| h.join(".k2").join("daemon.port"))
+    k2_core::paths::k2_home_opt()
+        .map(|k2| k2.join("daemon.port"))
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

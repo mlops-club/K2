@@ -119,6 +119,7 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
     if path == super::proto::ATTACH_PATH {
         return match super::controller() {
             Some(cfg) => {
+                crate::delivery_drain::ensure_controller_drain();
                 super::hub::serve_attach(&mut *stream, remote::global(), &cfg.token).await;
                 true
             }
@@ -128,6 +129,15 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
                 true
             }
         };
+    }
+    if path == crate::delivery_drain::OUTBOX_PATH {
+        let Some(body) = crate::delivery_drain::outbox_status(query) else { return false };
+        if !http::token_ok(query, owner_token) {
+            reply(stream, buf, "403 Forbidden", r#"{"error":"invalid or missing token"}"#).await;
+        } else {
+            reply(stream, buf, "200 OK", &body.to_string()).await;
+        }
+        return true;
     }
     if role != Role::Controller {
         return false;

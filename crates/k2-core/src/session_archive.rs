@@ -190,15 +190,17 @@ pub fn archive_project_sessions(
 }
 
 /// Archive every slug NOT claimed by a known project into the global
-/// catch-all at `~/.k2/session-archive/claude/<slug>/`.
+/// catch-all at `~/.k2/session-archive/claude/<slug>/`. `home` is the
+/// provider home (`~/.claude` lives there), `k2_home` the K2 home.
 pub fn archive_global_catchall(
     home: &Path,
+    k2_home: &Path,
     known_slugs: &[String],
     min_age_days: u32,
     now: SystemTime,
 ) -> ArchiveStats {
     let projects_dir = home.join(".claude").join("projects");
-    let dest_root = home.join(".k2").join("session-archive").join("claude");
+    let dest_root = k2_home.join("session-archive").join("claude");
     let mut stats = ArchiveStats::default();
     let Ok(entries) = std::fs::read_dir(&projects_dir) else {
         return stats;
@@ -256,6 +258,7 @@ pub fn run_daily_sweep() -> ArchiveStats {
     }
     stats.absorb(archive_global_catchall(
         &home,
+        &crate::paths::k2_home(),
         &known_slugs,
         min_age_days,
         now,
