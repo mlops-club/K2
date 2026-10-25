@@ -130,18 +130,89 @@ stateDiagram-v2
     failed --> [*]
 ```
 
-Rules (details fill in as the code lands):
+Rules:
 
 - `msg_id`: `m_<13-digit ms>_<16 hex>`, minted where the message enters K2
-  (the sender's host, or the controller for a message sent there). The same
+  (the sender's host, or the controller for a `k2 msg` sent to it). The same
   id travels every hop and is the dedupe key end to end.
-- Order per (sender, recipient): the drain only sends the oldest unfinished
-  row of a pair; the next goes after the head is `delivered` or `failed`.
+- Order per (sender, recipient): `outbox::due` only returns the oldest
+  unfinished row of a pair, so the next one goes after the head is
+  `delivered` or `failed`. A pair is keyed by the caller's `from` (not the
+  `[from …]` label, which carries a per-send id).
 - Attempts only count when a `deliver` actually went out on a link. A
-  recipient with no placement (host away, agent not running) waits, without
-  burning attempts, until it is placed again or the TTL ends it.
+  recipient with no placement (host down, agent not running) waits, without
+  spending attempts, until it is placed again or the TTL ends it.
+- Backoff: the ack wait after attempt n is `2 s × 2^(n-1)`, capped at 60 s
+  (`Policy::PRODUCTION`). After 10 sends without an ack: `failed`,
+  `no_ack: 10 attempts without an ack`. TTL 7 days (the PRD's away-host
+  hold): `failed`, `expired: …`. A `rejected` ack: `failed`,
+  `rejected by host <h>: <reason>`. Finished rows are kept 7 days for
+  inspection; the receiver remembers the last 20 000 ids.
 - Failures are loud: a `failed` row keeps its reason, the daemon logs
-  `[delivery] FAILED <msg_id> …`, and a trace event records it.
+  `[delivery] FAILED <msg_id> (<from> → <to>, hop <up|down>): <reason>`, and
+  emits the trace event `delivery.failed`.
+
+## Protocol
+
+The frames are W0's protocol-2 `deliver` / `deliver.ack`, unchanged
+(`docs/prd/progress/dist-link.md`, "Protocol 2"). Both are refused on a
+protocol-1 link (`RemoteHost::send_frame` checks `min_protocol`): a message
+for an agent on a protocol-1 host waits until the host is upgraded or the TTL.
+
+| Hop | Frame | Sender does | Receiver does |
+|---|---|---|---|
+| up | `deliver {msg_id, agent_id: recipient, from: agent:<name>, body, attempt}` (no `epoch`) | host: row `up` queued; sends while linked; resends after the backoff with `attempt + 1`; on relink resends what is due | controller: `enqueue(down)`; new → ack `delivered` (accepted), already there → `duplicate`; empty id, recipient or body → `rejected` |
+| up | `deliver.ack` | | host: row `delivered` (accepted) or `failed`; wakes the waiting `k2 msg` |
+| down | `deliver {msg_id, agent_id, epoch: placement epoch, from, body, attempt}` | controller drain: head of each pair, recipient placed on a linked host | host: seen? → `duplicate` (or `rejected` again); else deliver locally: done → record id, ack `delivered`; not now (no live session, PTY busy) → no ack; malformed → record, ack `rejected` |
+| down | `deliver.ack` | | controller: `delivered` / `duplicate` → row `delivered`; `rejected` → `failed` with the reason |
+
+`body` is `{"kind": "msg", "text", "command", "label"}` for `k2 msg` (the
+recipient's host injects `[from <label>] text` into the agent's live
+session through `send_message_to_session_with_command`, the composer's
+locked inject) or `{"kind": "inbox", "title", "body", "priority", "source"}`
+for inbox compose (composed with `k2_core::inbox::compose` in the agent's
+cwd). The receiving host never spawns.
+
+What `k2 msg` answers on a host (the canonical `MsgResponse` plus two
+optional fields; under `all` the JSON is unchanged):
+
+```json
+{"success": true, "target_session_id": null, "attempts": 1, "reason": null,
+ "hint": "queued for delivery; GET /cli/hosts/outbox?msg_id=… shows when it lands",
+ "msgId": "m_1792953600000_3f2a…", "delivery": "accepted"}
+```
+
+`delivery` is `accepted` (the controller has it), `queued` (no ack within
+5 s; durable on this host, forwarded when the link is back) or `failed`
+(`success: false`, `reason: delivery_failed: …`).
+
+`GET /cli/hosts/outbox[?msg_id=…]` (owner token; controller: hop down,
+host: hop up): `{"hop", "counts": {queued, sent, delivered, failed},
+"messages": [{seq, msg_id, sender, recipient, state, attempts, created_ms,
+updated_ms, reason}]}`, or `{"hop", "message": {…}}` for one id. Bodies are
+not listed.
+
+Trace events (`K2_TRACE_FILE`): W0's `ctl.deliver` (attempt, host),
+`ctl.deliver_ack` (status), `host.deliver` (status, duplicate); new here:
+`host.msg_send` (up hop, attempt), `ctl.msg_accept` (host, status),
+`host.msg_ack` (status), `delivery.failed` (hop, reason). Each carries
+`msg_id` and the recipient as `agent_id`.
+
+### Where it hooks in
+
+| File | Change |
+|---|---|
+| `k2-core/src/delivery/` (new) | `outbox` and `seen` tables, `Policy`, `new_msg_id`; tables created with `CREATE TABLE IF NOT EXISTS` on first use (no migration file touched) |
+| `k2-daemon/src/delivery_drain.rs` (new) | `Controller` (accept, drain, acks), `HostSide` (up hop, receive), `send`, `OUTBOX_PATH` |
+| `agent_host/remote.rs` | approved hook: `deliver`/`deliver.ack` arm in `on_frame` → `delivery_drain::on_host_frame`; new `RemoteHost::send_frame` |
+| `hosts/link.rs` | approved hooks: `deliver`/`deliver.ack` arm in `handle` → `delivery_drain::on_controller_frame`; `delivery_drain::host_linked(tx)` once linked |
+| `hosts/gate.rs` | the controller drain starts when a host attaches (so a restarted controller drains its queue); `GET /cli/hosts/outbox` |
+| `workspace_msg.rs` | `deliver_live_with_receipt` (the `/cli/workspace/msg` path, i.e. `k2 msg`) hands off to `delivery_drain::send` on host/controller; `deliver_to_local_agent` for the receiving host; `msgId`/`delivery` in `MsgResponse` |
+| `inbox_routes.rs` | `handle_compose_post` on host/controller → `delivery_drain::send` with `kind: inbox` |
+
+Other internal callers of `deliver_live` (heartbeats, compute, federation)
+keep their local behaviour on a host; only `k2 msg` and inbox compose go
+through the controller in this cut.
 
 ## How to try it
 
