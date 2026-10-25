@@ -171,8 +171,13 @@ set.
 
 ## Status
 
-- **Milestone:** first working slice, hardened. `prove.sh G0 --topology solo`
-  (and `--parity none`) runs end to end; S1 passes over the app's routes.
+- **Milestone:** done. `prove.sh G0 --topology solo` runs end to end on this
+  Mac and writes the bundle; S1 passes; every parity suite is run and
+  reported; I5 compares the four local suites against the committed
+  baseline (`tests/lab/baselines/G0-solo.json`, crates/ = the wave-1 base)
+  and they match; the gate is red, as it must be, for the reasons below
+  (S12 not built, pre-existing suite failures, the Linux gate's k2-daemon
+  build not fitting 6 GB).
 - **Acceptance (host, 2026-10-24):** with every `K2_*` unset, through
   `lab_cargo` (throwaway HOME, 3 jobs, 3 threads), after `cargo build -p
   k2-ptyd --bin k2-ptyd` (as CI does; `ptyd_backend` needs it):
@@ -345,8 +350,10 @@ VM, (b) pre-existing on the base, (c) caused by wave 1):
 |---|---|---|
 | `ptyd_backend` (7 tests): "k2-ptyd binary not found" | gap in the gate itself: `cargo test -p k2-core` builds `k2-ptyd` only as a library, so any fresh gate box fails these | **Fixed** in `scripts/test-gate-linux.sh` (now owned by this task, coordinator 2026-10-25): build `k2-ptyd --bin k2-ptyd` first into the same target dir, as CI does. Commit a02c8a719 |
 | `terminal::daemon_pty::tests::child_self_exit_releases_pty_master_fd`, `kill_releases_pty_master_fd_with_arc_retained`: "lsof must be runnable: NotFound" | (a) the lab's gate image had no `lsof` | **Fixed**: `gate.Dockerfile` installs `lsof` (image `k2-lab-gate:2`). Commit b6d5e22fa |
-| `could not compile k2-daemon (lib test)`: rustc `signal: 9, SIGKILL` | (a) the 6 GB container cap: with ONE build job, the single rustc for the k2-daemon lib-test crate needs more than 6 GB | **Not fixable here under the rules** (no parallelism left to lower; the cap may not be raised). Reported to the coordinator. The report shows it as "OOM-killed under the 6 GB cap" |
+| `could not compile k2-daemon (lib test)`: rustc `signal: 9, SIGKILL` | (a) the 6 GB container cap | Per the coordinator, cut rustc's memory instead of raising the cap: `scripts/test-gate-linux.sh` gained `K2_GATE_LOW_MEMORY=1` (unset by default, CI unchanged): one build job, 256 codegen units, opt-level 0 for dev and test (debuginfo was already 0, incremental off). Commits a98aa512b, 59ca3ab9f; the lab sets it (48b18d03c). **Still SIGKILLed at 6 GB with all of it**: the single rustc for k2-daemon's lib-test crate does not fit in this Docker VM. Needs a bigger box or cap; the coordinator's call. The report names it as an OOM kill (45fadea9e) |
+| `fork_tab_repair::tests::repair_splits_a_fork_tab_off_the_source_conversation` (`assert_eq!(mine.len(), 1)`, got 0) | (b) pre-existing, order-dependent: passed in the previous gate run and on the host; `repair()` sweeps the shared test DB, so a parallel test can take this test's fork tab first (docs/testing.md rule 6). wave 1 does not touch `crates/` | Reported to the coordinator, not fixed (not lab files) |
 
 The gate's per-package logs now stay in the bundle
 (`parity/linux-gate-logs/`, a symlink from the gate's workdir to a bind mount).
-No class (b) or (c) failure was found in the gate's k2-core results.
+In the gate, k2-core passes 3834/3834 (one run) and 3645/3646 (the next, the
+fork_tab_repair flake above); `ptyd_backend` passes 8/8 after the fix.
