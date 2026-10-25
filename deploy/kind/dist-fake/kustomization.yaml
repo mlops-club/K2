@@ -9,7 +9,7 @@ resources:
   - ../dist
 images:
   - name: k2-agents
-    newTag: fake
+    newTag: dist-fake             # deploy/kind/Dockerfile.fake FROM k2-daemon:dist
 patches:
   - target: {kind: Service, name: k2-controller-nodeport}
     patch: |-

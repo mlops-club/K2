@@ -125,58 +125,50 @@ scripts/kind/down.sh --dist
 
 ## Status
 
-- **Milestone:** code written, manifests checked against the API.
-  `deploy/kind/dist` and `deploy/kind/dist-fake` (over
-  `deploy/kubernetes/core/{controller,hosts}.yaml`, untouched), the shared
-  no-k2dev component (now on every ConfigMap: `k2-controller`, `k2-host`),
-  and `--dist` in `up.sh`, `down.sh` and `s1.sh`. `s1.sh --dist` runs S1,
-  then a placement check (/proc scan of both pods while an agent is alive),
-  then deletes `k2-host-0` and runs S1 again.
-- **Checked on `k2-kind-dist-fake` (by hand, then deleted):**
-  - The namespace, then the Secret `k2-secrets` (piped to `kubectl create`,
-    no annotations, token not shown), then the rest applied cleanly.
-  - Both pods pass `restricted` Pod Security, schedule, mount the Secret
-    and their PVCs, and start.
-  - Today's daemon then refuses both roles, which is what `dist-link`
-    adds:
-    - `k2-controller-0`: `FATAL: K2_ROLE=controller needs agent hosts (PRD P2); not available yet`
-    - `k2-host-0`: `FATAL: K2_ROLE="host" is not a role; allowed values: all, controller`
-  - The solo fake path still passes after the refactor (`up.sh --fake`,
-    S1 PASS `lab-runs/kind/2026-10-24T22-35-04Z/`, `down.sh --fake`).
-- **Next:** when `dist-link` publishes its env contract, align the
-  provisional names, rebuild `k2-daemon:dev` from a tree that has
-  `dist-link`, then run `up.sh --dist --fake` and `s1.sh --dist` on
-  `k2-kind-dist-fake` (7442).
-- **Provisional names** (from `deploy/README.md` and what the coordinator
-  relayed; set side by side until `dist-link` confirms):
-  - host: `K2_ROLE=host`, `K2_CONTROLLER_URL=ws://k2-controller:7420`,
-    `K2_HOST_ENROLL_TOKEN_FILE` (deploy/README) and `K2_HOST_TOKEN_FILE`
-    (relayed), both pointing at `/run/secrets/k2/host-enroll-token`,
-    `K2_HOST_NAME` (pod name), `K2_HOST_LABELS`, `K2_HOST_MAX_AWAKE`.
+- **Milestone:** manifests aligned with dist-link's final env contract
+  (`k2-dist/dist-link` @862b3c762). Waiting on the Docker lock (held by
+  `image`'s `cargo test` container) to build `k2-daemon:dist` and run.
+- **Contract, as used here:**
   - controller: `K2_ROLE=controller`, `K2_HOSTS=1`,
-    `K2_HOST_BOOTSTRAP_TOKEN_FILE`, `K2_PROVISIONER=static`.
-  - `up.sh --dist` reads `GET /cli/hosts` for an informational report.
-    It creates the demo workspace on the host, assuming workspaces live
-    there.
-- **Decisions (mine):**
-  - Port 7443 for the non-fake dist variant: 7440 is the owner's live
-    `k2-kind` port-forward.
-  - Lab-sized:
-    - one host; requests 250m/512Mi; limits 2 Gi (controller) and 3 Gi
-      (host), because the Docker VM is 8 GB and shared with the owner's pod;
-    - a 60 s grace period (the end state's 600 s would make "delete
-      k2-host-0" slow);
-    - no `k2-host health` readiness probe (no such binary in our image;
-      provisional);
-    - no PodDisruptionBudget.
-  - Both pods use the `default` ServiceAccount with no token
-    (`rbac.yaml` is out: the static provisioner never calls the API).
-  - Host UID 10001 (the end state's). The fake image's `/work` is
-    group-0 writable and a git `safe.directory` for that reason.
-  - Docker: builds hold `~/.cache/k2-dist-docker.lock`; the fake agent's
-    cargo build is capped at `CARGO_BUILD_JOBS=3` (BuildKit can't cap
-    memory).
-- **Open questions (for dist-link):** where the controller resolves a
-  spawn's `cwd` (on the host, I assume); what a host's readiness check is;
-  whether the controller needs `K2_KEK_FILE` (not set here; solo runs
-  without it); `K2_HOST_ENROLL_TOKEN_FILE` vs `K2_HOST_TOKEN_FILE`.
+    `K2_HOST_BOOTSTRAP_TOKEN_FILE`, `K2_DAEMON_PORT=7420`, `K2_LISTEN=lan`.
+  - host: `K2_ROLE=host`, `K2_CONTROLLER_URL=ws://k2-controller:7420`,
+    `K2_HOST_ENROLL_TOKEN_FILE` (same Secret key), `K2_HOST_NAME` (the pod
+    name), `K2_DAEMON_PORT=7420` (loopback only).
+  - Dropped `K2_HOST_TOKEN_FILE`, the relayed name: dist-link uses
+    deploy/README's. `K2_PROVISIONER=static` stays (declared in
+    deploy/README; dist-link doesn't read it yet).
+  - Readiness: the controller's `/boot-status`. For the host, an exec probe
+    curls its loopback `/cli/hosts/status` for `"linked":true`, because the
+    host's API listens on loopback only, so the kubelet can't `httpGet`
+    it.
+- **Workspaces (coordinator decision):** one `k2-work` PVC (RWO,
+  local-path) at `/var/lib/k2/work` in both pods, because the app browses
+  the controller's files and dist-link sends that cwd to the host verbatim.
+  The host has podAffinity to the controller (RWO is per node). Each pod
+  keeps its own HOME volume. `up.sh --dist` seeds `/var/lib/k2/work/demo`
+  from the host pod.
+- **Host UID 10000** (the end state uses 10001): both pods write the shared
+  workspaces, and git refuses a repo another UID owns.
+- **Images:**
+  - `k2-daemon:dist` is built from a dist-link checkout:
+    `K2_KIND_DAEMON_SRC=<that worktree> scripts/kind/up.sh --dist [--fake]`.
+    `up.sh` refuses a tree without `crates/k2-daemon/src/hosts`.
+  - `k2-agents:dist` and `k2-agents:dist-fake` build `FROM k2-daemon:dist`
+    (`--build-arg BASE_IMAGE`).
+  - Rust-compiling builds take a cargo slot and use `CARGO_BUILD_JOBS=3`.
+- **The Mac's door:** proxy container `k2-kind-dist-fake-proxy` on
+  127.0.0.1:7442 to NodePort 30742 (`k2-controller-nodeport`); dist uses
+  7443 and 30743.
+- **Limits of this cut (from dist-link's notes), relevant to the app:**
+  - The controller relays `/cli/sessions/grid` for the owner token only. A
+    desktop-app login (Connect session) gets an error frame, so the owner's
+    app can't yet attach to an agent's terminal on the dist variant. S1
+    uses the owner token.
+  - The controller 501s the LLM login routes. `/login` inside a claude
+    session would go through the grid, so it is blocked for the app by the
+    same limit.
+  - Mac paths aren't mapped. The app must send pod paths, which the
+    controller's folder picker gives it.
+- **Acceptance (pending the run):** on `k2-kind-dist-fake`, `s1.sh --dist`
+  must show S1 PASS through 7442, the fake agent in `k2-host-0` and not
+  in `k2-controller-0`, then S1 PASS again after `k2-host-0` is deleted.

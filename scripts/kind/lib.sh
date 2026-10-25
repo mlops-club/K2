@@ -11,18 +11,29 @@ KIND_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # Variant (each has its own namespace, port and state dir):
 #   agents      one pod, k2-agents:dev (the owner's)            k2-kind            7440
 #   fake        one pod, k2-agents:fake (test only)             k2-kind-fake       7441
-#   dist        controller + host, host on k2-agents:dev        k2-kind-dist       7443
-#   dist-fake   controller + host, host on k2-agents:fake       k2-kind-dist-fake  7442
+#   dist        controller + host, host on k2-agents:dist       k2-kind-dist       7443
+#   dist-fake   controller + host, host on k2-agents:dist-fake  k2-kind-dist-fake  7442
 # KIND_POD is where the daemon token lives (the pod the app talks to);
 # KIND_AGENT_POD is where agents run. KIND_ROLLOUT pairs each StatefulSet
 # with the image whose id rolls it.
 kind_variant() {
+    # KIND_BASE_IMAGE is the daemon image the agents image is built FROM (and
+    # the controller's image for dist): today's daemon, or one built from a
+    # tree with k2-dist/dist-link (K2_ROLE=controller|host).
     case "$1" in
-        agents|dist)
-            KIND_IMAGE=k2-agents:dev KIND_DOCKERFILE=deploy/kind/Dockerfile.agents KIND_CONTEXT=deploy/kind ;;
-        fake|dist-fake)
-            KIND_IMAGE=k2-agents:fake KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=. ;;
+        agents|fake) KIND_BASE_IMAGE=k2-daemon:dev ;;
+        dist|dist-fake) KIND_BASE_IMAGE=k2-daemon:dist ;;
         *) echo "unknown variant $1" >&2; return 2 ;;
+    esac
+    case "$1" in
+        agents) KIND_IMAGE=k2-agents:dev ;;
+        fake) KIND_IMAGE=k2-agents:fake ;;
+        dist) KIND_IMAGE=k2-agents:dist ;;
+        dist-fake) KIND_IMAGE=k2-agents:dist-fake ;;
+    esac
+    case "$1" in
+        agents|dist) KIND_DOCKERFILE=deploy/kind/Dockerfile.agents KIND_CONTEXT=deploy/kind ;;
+        fake|dist-fake) KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=. ;;
     esac
     case "$1" in
         agents) KIND_NS=k2-kind KIND_OVERLAY=deploy/kind/agents KIND_PORT=${K2_KIND_PORT:-7440} KIND_NODEPORT=30740 KIND_FLAGS="" ;;
@@ -39,11 +50,13 @@ kind_variant() {
         agents|fake)
             KIND_DIST=0 KIND_SVC=k2-solo KIND_POD=k2-solo-0
             KIND_AGENT_POD=k2-solo-0 KIND_AGENT_CONTAINER=k2-daemon KIND_AGENT_HOME=/var/lib/k2
-            KIND_ROLLOUT="k2-solo=$KIND_IMAGE" KIND_LOAD="$KIND_IMAGE" ;;
+            KIND_ROLLOUT="k2-solo=$KIND_IMAGE" KIND_LOAD="$KIND_IMAGE"
+            KIND_WORK=/var/lib/k2/work ;;
         dist|dist-fake)
             KIND_DIST=1 KIND_SVC=k2-controller KIND_POD=k2-controller-0
             KIND_AGENT_POD=k2-host-0 KIND_AGENT_CONTAINER=k2-host KIND_AGENT_HOME=/var/lib/k2-host
-            KIND_ROLLOUT="k2-controller=k2-daemon:dev k2-host=$KIND_IMAGE" KIND_LOAD="k2-daemon:dev $KIND_IMAGE" ;;
+            KIND_WORK=/var/lib/k2/work      # the shared k2-work volume, same path in both pods
+            KIND_ROLLOUT="k2-controller=$KIND_BASE_IMAGE k2-host=$KIND_IMAGE" KIND_LOAD="$KIND_BASE_IMAGE $KIND_IMAGE" ;;
     esac
     KIND_VARIANT=$1
     KIND_STATE="${TMPDIR:-/tmp}/k2-kind/$KIND_VARIANT"

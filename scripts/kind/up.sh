@@ -64,14 +64,21 @@ trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
 # Builds that compile Rust also take a slot in the machine-wide cargo queue.
 slot=()
 [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
-if [ "$rebuild_daemon" = 1 ] || ! docker image inspect k2-daemon:dev >/dev/null 2>&1; then
-    say "building k2-daemon:dev (packaging/oci/build.sh; a cold build takes a while)"
-    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3} ${slot[@]+"${slot[@]}"} packaging/oci/build.sh k2-daemon:dev >&2
+# The daemon image comes from this tree, or from K2_KIND_DAEMON_SRC (for
+# --dist: a checkout of k2-dist/dist-link until it is merged here).
+daemon_src=${K2_KIND_DAEMON_SRC:-$KIND_REPO}
+if [ "$rebuild_daemon" = 1 ] || ! docker image inspect "$KIND_BASE_IMAGE" >/dev/null 2>&1; then
+    if [ "$KIND_DIST" = 1 ] && ! [ -d "$daemon_src/crates/k2-daemon/src/hosts" ]; then
+        echo "up.sh: $daemon_src has no dist-link (crates/k2-daemon/src/hosts); set K2_KIND_DAEMON_SRC to a checkout of k2-dist/dist-link" >&2
+        exit 1
+    fi
+    say "building $KIND_BASE_IMAGE from $daemon_src (packaging/oci/build.sh; a cold build takes a while)"
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3} ${slot[@]+"${slot[@]}"} "$daemon_src/packaging/oci/build.sh" "$KIND_BASE_IMAGE" >&2
 else
-    say "k2-daemon:dev exists (--rebuild-daemon to rebuild it)"
+    say "$KIND_BASE_IMAGE exists (--rebuild-daemon to rebuild it)"
 fi
 say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
-build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE"
+build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" --build-arg "BASE_IMAGE=$KIND_BASE_IMAGE"
     --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")
 case "$KIND_DOCKERFILE" in *fake*) build=(${slot[@]+"${slot[@]}"} "${build[@]}") ;; esac   # its cargo stage
 DOCKER_BUILDKIT=1 "${build[@]}" >/dev/null
@@ -162,26 +169,23 @@ elif [ "$reset_password" = 1 ]; then
         "$(k2_call /cli/users/set-password "$(B_username="$user" B_password="$password" body username password)" )"
     say "set a new password for K2 login '$user'"
 fi
-# --dist: report what the controller says about its hosts (PROVISIONAL
-# route, dist-link). Informational: names and states only, never fatal.
+# --dist: the controller's view of its hosts (GET /cli/hosts/status, no
+# token: role, host ids and names, placements). Informational, never fatal.
 if [ "$KIND_DIST" = 1 ]; then
-    hosts=$(k2_call /cli/hosts 2>/dev/null || true)
-    say "controller /cli/hosts: $(python3 -I -c 'import json,sys
+    say "controller /cli/hosts/status: $(curl -s --max-time 5 "$base/cli/hosts/status" | python3 -I -c 'import json,sys
 try:
-    d = json.loads(sys.argv[1])
+    d = json.load(sys.stdin)
 except ValueError:
-    print("no JSON (" + repr(sys.argv[1][:120]) + ")"); sys.exit()
-hs = d.get("hosts", d) if isinstance(d, dict) else d
-if isinstance(hs, list):
-    print("%d host(s): " % len(hs) + ", ".join("%s (%s)" % (h.get("name", "?"), h.get("state", h.get("status", "?"))) for h in hs if isinstance(h, dict)))
-else:
-    print("unexpected shape: " + ", ".join(sorted(d)) if isinstance(d, dict) else "unexpected shape")' "$hosts")"
+    print("no JSON"); sys.exit()
+hs = d.get("hosts", [])
+print("role=%s, %d host(s): %s" % (d.get("role"), len(hs), ", ".join("%s (%s placements)" % (h.get("host_name"), len(h.get("placements") or [])) for h in hs)))')"
 fi
 unset owner_token
 
-# A git folder on the agents' volume for the app's "Add Workspace" picker.
-# PROVISIONAL for --dist: assumes workspaces live on the host (dist-link).
-kc -n "$KIND_NS" exec "$KIND_AGENT_POD" -c "$KIND_AGENT_CONTAINER" -- env D="$KIND_AGENT_HOME/work/demo" sh -c \
+# A git folder for the app's "Add Workspace" picker, made by the pod that
+# runs agents. --dist: on the shared work volume, the same path in both pods
+# (the app browses the controller's files; the host gets that cwd verbatim).
+kc -n "$KIND_NS" exec "$KIND_AGENT_POD" -c "$KIND_AGENT_CONTAINER" -- env D="$KIND_WORK/demo" sh -c \
     '[ -d "$D/.git" ] || { mkdir -p "$D" && git -C "$D" init -q; }'
 
 flag=$KIND_FLAGS
