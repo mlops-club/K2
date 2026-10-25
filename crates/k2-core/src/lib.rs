@@ -326,6 +326,8 @@ pub mod trace;
 // prd-daemon-activity-and-thread-working-v1 S3: the one transcript
 // follower the Chat view and the activity store share.
 pub mod transcript_follow;
+// dist-link W1: the controller asks the agent's host before a --resume.
+pub mod transcript_probe;
 // K2 Connect tunnel connector (source-available client side): renders an frpc
 // config + supervises the `frpc` child that dials our hosted frps so the
 // local daemon is reachable at https://<user>.k2.dev. See module docs +

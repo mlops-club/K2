@@ -346,6 +346,9 @@ impl ProviderResume {
         if session_id.is_empty() {
             return false;
         }
+        if let Some(found) = crate::transcript_probe::ask(self.provider, session_id, project_path) {
+            return found;
+        }
         match self.provider {
             "claude" => crate::chat_history::claude_session_file_exists(session_id, project_path),
             "grok" => crate::chat_history::grok_session_file_exists(session_id, project_path),

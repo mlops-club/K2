@@ -151,6 +151,9 @@ struct Inner {
     /// The session handle for each placement whose spawn answered, keyed
     /// by agent id like `placements`.
     sessions: HashMap<String, Arc<RemoteSession>>,
+    /// The host that last ran an agent in each cwd: where that project's
+    /// transcripts are ([`RemoteHost::transcript_exists`]).
+    last_host_for_cwd: HashMap<PathBuf, String>,
 }
 
 /// An HTTP-shaped answer for the controller's routes: status line and
@@ -630,6 +633,9 @@ impl RemoteHost {
         if let Some(s) = inner.sessions.get(agent_id).filter(|s| s.session_id == sid) {
             return Arc::clone(s);
         }
+        if let Some(cwd) = &meta.cwd {
+            inner.last_host_for_cwd.insert(cwd.clone(), host_id.to_string());
+        }
         let s = Arc::new(RemoteSession::new(self, agent_id, host_id, epoch, sid, meta));
         if let Some(old) = inner.sessions.insert(agent_id.to_string(), Arc::clone(&s)) {
             old.mark_exited();
@@ -815,6 +821,58 @@ impl RemoteHost {
         link.tx
             .send(Frame::Op { req: None, session_id: s.session_id.to_string(), epoch: s.epoch.0, op })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, format!("agent host {} link is closing", s.host_id)))
+    }
+
+    /// The resume decision's disk check, asked of the hosts (the
+    /// controller's `k2_core::transcript_probe`). The host that last ran an
+    /// agent in this project (or a worktree of it) is asked; when none is
+    /// known, every linked protocol-2 host. `Some(true)` if any holds the
+    /// conversation, `Some(false)` if every one asked said no, `None` if
+    /// none could answer (the caller then checks this machine, as before).
+    pub fn transcript_exists(&self, provider: &str, session_id: &str, project_path: &str) -> Option<bool> {
+        let hosts: Vec<String> = {
+            let inner = self.inner.lock();
+            let project = Path::new(project_path);
+            let mut known: Vec<String> = inner
+                .last_host_for_cwd
+                .iter()
+                .filter(|(cwd, _)| cwd.starts_with(project) || project.starts_with(cwd))
+                .map(|(_, h)| h.clone())
+                .filter(|h| inner.links.contains_key(h))
+                .collect();
+            known.sort();
+            known.dedup();
+            if known.is_empty() {
+                inner.links.iter().filter(|(_, l)| l.protocol >= 2).map(|(h, _)| h.clone()).collect()
+            } else {
+                known
+            }
+        };
+        let mut answered = false;
+        for host in hosts {
+            let r = self.request_blocking(
+                &host,
+                |req| Frame::TranscriptExists {
+                    req,
+                    provider: provider.to_string(),
+                    session_id: session_id.to_string(),
+                    project_path: project_path.to_string(),
+                },
+                OP_DEADLINE,
+            );
+            match r {
+                Ok(Frame::OpResult { value: Value::Bool(found), error: None, .. }) => {
+                    answered = true;
+                    if found {
+                        log_debug!("[hosts] {provider} conversation {session_id} is on host {host}");
+                        return Some(true);
+                    }
+                }
+                Ok(other) => log_debug!("[hosts] transcript probe on {host}: {other:?}"),
+                Err(e) => log_debug!("[hosts] transcript probe on {host} failed: {e}"),
+            }
+        }
+        answered.then_some(false)
     }
 
     fn session_for(&self, agent_id: &str) -> Option<Arc<RemoteSession>> {

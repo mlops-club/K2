@@ -353,6 +353,16 @@ pub enum Frame {
         epoch: u64,
         op: SessionOp,
     },
+    /// Does the host hold provider `provider`'s conversation `session_id`
+    /// for this project (the resume decision's disk check, asked of the
+    /// agent's host)? Answered with `op.result` (`value`: bool).
+    #[serde(rename = "transcript.exists")]
+    TranscriptExists {
+        req: u64,
+        provider: String,
+        session_id: String,
+        project_path: String,
+    },
     #[serde(rename = "op.result")]
     OpResult {
         req: u64,
@@ -466,6 +476,7 @@ impl Frame {
             Frame::SpawnWorkspace { .. } => "spawn.workspace",
             Frame::Op { .. } => "op",
             Frame::OpResult { .. } => "op.result",
+            Frame::TranscriptExists { .. } => "transcript.exists",
             Frame::Deliver { .. } => "deliver",
             Frame::DeliverAck { .. } => "deliver.ack",
             Frame::Inject { .. } => "inject",
@@ -482,6 +493,7 @@ impl Frame {
             Frame::SpawnWorkspace { .. }
             | Frame::Op { .. }
             | Frame::OpResult { .. }
+            | Frame::TranscriptExists { .. }
             | Frame::Deliver { .. }
             | Frame::DeliverAck { .. }
             | Frame::Inject { .. }
@@ -651,6 +663,7 @@ mod tests {
             Frame::Op { req: Some(5), session_id: "s1".into(), epoch: 41, op: SessionOp::Screen { lines: 40 } },
             Frame::Op { req: Some(6), session_id: "s1".into(), epoch: 41, op: SessionOp::Pin { dims: Some((80, 24)), set_by: Some("o".into()) } },
             Frame::OpResult { req: 5, value: json!(["row"]), error: None },
+            Frame::TranscriptExists { req: 7, provider: "claude".into(), session_id: "c1".into(), project_path: "/w".into() },
             Frame::OpResult { req: 6, value: serde_json::Value::Null, error: Some("not placed".into()) },
         ] {
             assert_eq!(f.min_protocol(), 2, "{}", f.kind());

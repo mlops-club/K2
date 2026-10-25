@@ -441,6 +441,14 @@ fn handle(
                 let _ = tx.send(Frame::InjectResult { req, result });
             });
         }
+        Frame::TranscriptExists { req, provider, session_id, project_path } => {
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                // This host's own disk (no probe is installed on a host).
+                let found = k2_core::sidecar::conversation_exists(&provider, &session_id, &project_path);
+                let _ = tx.send(Frame::OpResult { req, value: serde_json::Value::Bool(found), error: None });
+            });
+        }
         Frame::Refused { code, message } => return Err(format!("refused: {code}: {message}")),
         other => log_debug!("[hosts/link] ignored frame {}", other.kind()),
     }

@@ -868,3 +868,48 @@ async fn workspace_spawn_with_no_host_is_the_clear_error() {
     assert_eq!(err, NO_HOSTS);
     assert!(c.remote.placements().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transcript_probe_asks_the_host_that_ran_the_project() {
+    let home = TempHome::new();
+    let _shim = AgentShim::install();
+    let _ = k2_core::db::init_for_tests();
+    let c = Controller::start().await;
+    let remote = c.remote;
+    // No host: no answer (the caller then checks this machine, as before).
+    assert_eq!(tokio::task::block_in_place(|| remote.transcript_exists("claude", "any", "/w")), None);
+
+    let cfg = HostConfig { attach_url: c.attach_url.clone(), token: TOKEN.into(), host_name: "tp-host".into(), labels: vec![] };
+    let link_task = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
+    c.wait_hosts(1).await;
+    let project = home.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_s = project.to_string_lossy().into_owned();
+    // A Claude transcript on the host's disk (this test process is the host).
+    let sid = uuid::Uuid::new_v4().to_string();
+    let canonical = std::fs::canonicalize(&project).unwrap();
+    let slug = k2_core::chat_history::claude_project_hash(&canonical.to_string_lossy());
+    let dir = home.path().join(".claude").join("projects").join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+    assert!(k2_core::chat_history::claude_session_file_exists(&sid, &project_s), "the host's own check finds it");
+
+    // No placement yet: every linked host is asked.
+    assert_eq!(tokio::task::block_in_place(|| remote.transcript_exists("claude", &sid, &project_s)), Some(true));
+    assert_eq!(tokio::task::block_in_place(|| remote.transcript_exists("claude", "not-there", &project_s)), Some(false));
+    // After an agent ran in the project, its host is the one asked.
+    let req = crate::spawn::SpawnWorkspaceSessionRequest {
+        agent_name: format!("tp-{}", uuid::Uuid::new_v4()),
+        cwd: project_s.clone(),
+        command: Some("claude".into()),
+        args: Some(vec![]),
+        cols: 80,
+        rows: 24,
+        ..Default::default()
+    };
+    let key = crate::spawn::canonical_key_for_request(&req);
+    tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req).map(|_| ())).await.unwrap().unwrap();
+    assert_eq!(tokio::task::block_in_place(|| remote.transcript_exists("claude", &sid, &project_s)), Some(true));
+    tokio::task::block_in_place(|| crate::agent_host::AgentHost::unplace(remote, &key));
+    link_task.abort();
+}

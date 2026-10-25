@@ -145,9 +145,16 @@ pub fn start() {
         },
         crate::runtime_role::Role::Controller => {
             k2_core::log_debug!("[hosts] K2_ROLE=controller: waiting for agent hosts on {}", proto::ATTACH_PATH);
+            // Transcripts are on the agents' hosts: the resume decision asks them.
+            k2_core::transcript_probe::set(Some(controller_transcript_probe));
         }
         crate::runtime_role::Role::All => {}
     }
+}
+
+/// The controller's `k2_core::transcript_probe`.
+fn controller_transcript_probe(provider: &str, session_id: &str, project_path: &str) -> Option<bool> {
+    crate::agent_host::remote::global().transcript_exists(provider, session_id, project_path)
 }
 
 /// `GET /cli/hosts/status` (public, no secrets): the role and its link
