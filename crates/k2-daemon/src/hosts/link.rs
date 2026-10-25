@@ -177,6 +177,8 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
         host_name: cfg.host_name.clone(),
         token: cfg.token.clone(),
         labels: cfg.labels.clone(),
+        // S9 fills this with the placements this host still runs.
+        resume: vec![],
     };
     write.send(Message::Text(hello.encode())).await.map_err(|e| format!("send hello: {e}"))?;
     let host_id = match tokio::time::timeout(t.welcome, read.next()).await {
@@ -330,7 +332,7 @@ fn handle(
             let streams = Arc::clone(streams);
             tokio::spawn(async move {
                 let reason = match local_grid(&session_id, crx, |text| {
-                    let _ = tx.send(Frame::GridData { stream, text });
+                    let _ = tx.send(Frame::GridData { stream, text, ring_offset: None });
                 })
                 .await
                 {
@@ -344,7 +346,7 @@ fn handle(
                 let _ = tx.send(Frame::GridClose { stream, reason });
             });
         }
-        Frame::GridData { stream, text } => {
+        Frame::GridData { stream, text, .. } => {
             if let Some(s) = streams.lock().get(&stream) {
                 let _ = s.send(text);
             }

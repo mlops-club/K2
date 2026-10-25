@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use super::proto::{Frame, PROTOCOL};
+use super::proto::{negotiate, Frame, MIN_PROTOCOL, PROTOCOL};
 use crate::agent_host::remote::{GridEvent, RemoteHost};
 
 /// How long a host has to send `hello` after the upgrade.
@@ -48,26 +48,34 @@ where
         Ok(Some(Ok(Message::Text(t)))) => Frame::decode(&t),
         _ => Err("expected hello".to_string()),
     };
-    let (host_name, labels) = match hello {
-        Ok(Frame::Hello { protocol, host_name, token: presented, labels }) => {
-            if protocol != PROTOCOL {
-                return refuse(&mut ws, "protocol", &format!("controller speaks protocol {PROTOCOL}, host sent {protocol}")).await;
-            }
+    let (host_name, labels, protocol, resume) = match hello {
+        Ok(Frame::Hello { protocol, host_name, token: presented, labels, resume }) => {
+            let Some(protocol) = negotiate(protocol) else {
+                return refuse(
+                    &mut ws,
+                    "protocol",
+                    &format!("controller speaks protocols {MIN_PROTOCOL} to {PROTOCOL}, host sent {protocol}"),
+                )
+                .await;
+            };
             if token.is_empty() || !crate::routes::http::ct_eq_token(&presented, token) {
                 return refuse(&mut ws, "bad_token", "the host token doesn't match this controller's").await;
             }
             if host_name.trim().is_empty() {
                 return refuse(&mut ws, "protocol", "host_name is empty").await;
             }
-            (host_name, labels)
+            (host_name, labels, protocol, resume)
         }
         Ok(other) => return refuse(&mut ws, "protocol", &format!("expected hello, got {}", other.kind())).await,
         Err(e) => return refuse(&mut ws, "protocol", &e).await,
     };
-    let (conn, host_id, mut out) = remote.connect(&host_name);
-    log_debug!("[hosts] host {host_id} labels {labels:?}");
+    let (conn, host_id, mut out) = remote.connect(&host_name, protocol);
+    log_debug!("[hosts] host {host_id} protocol {protocol} labels {labels:?}");
+    if !resume.is_empty() {
+        remote.adopt(&host_id, &resume);
+    }
     let welcome = Frame::Welcome {
-        protocol: PROTOCOL,
+        protocol,
         host_id: host_id.clone(),
         controller: format!("k2-daemon {}", env!("CARGO_PKG_VERSION")),
     };

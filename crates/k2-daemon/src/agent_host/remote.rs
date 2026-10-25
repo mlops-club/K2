@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use super::PlacementEpoch;
-use crate::hosts::proto::Frame;
+use crate::hosts::proto::{trace_events, Frame, ResumePlacement};
 
 /// How long the controller waits for a host to answer a spawn or close.
 /// Only stops a request to a hung host; tests never depend on it.
@@ -79,7 +79,7 @@ pub struct RemoteGrid {
 impl RemoteGrid {
     /// Send one client text message to the host's grid handler.
     pub fn send(&self, text: String) -> bool {
-        self.tx.send(Frame::GridData { stream: self.stream, text }).is_ok()
+        self.tx.send(Frame::GridData { stream: self.stream, text, ring_offset: None }).is_ok()
     }
 
     /// Close the stream on the host (idempotent).
@@ -100,6 +100,9 @@ impl Drop for RemoteGrid {
 struct Link {
     conn: u64,
     host_name: String,
+    /// The protocol this link speaks (`proto::negotiate`). Protocol-2
+    /// frames (`Frame::min_protocol` 2) are never sent on a 1 link.
+    protocol: u32,
     tx: mpsc::UnboundedSender<Frame>,
     pending: HashMap<u64, oneshot::Sender<(String, String)>>,
     streams: HashMap<u64, mpsc::UnboundedSender<GridEvent>>,
@@ -121,11 +124,103 @@ fn answer(status: &str, body: Value) -> Answer {
     (status.to_string(), body.to_string())
 }
 
+/// Placement epochs (invariant I1): a monotonic counter the controller
+/// persists, so epochs only grow across controller restarts.
+///
+/// The file holds the last epoch issued, as decimal text; each [`next`]
+/// writes the new value (temp file, fsync, rename) before returning it. A
+/// missing file starts the counter at the current Unix time in ms, once:
+/// protocol-1 controllers used ms timestamps as epochs, so this stays
+/// above any epoch a protocol-1 host may still hold. An unreadable file is
+/// treated the same way (logged), never as 0.
+///
+/// [`next`]: EpochCounter::next
+pub struct EpochCounter {
+    path: Option<std::path::PathBuf>,
+    last: Mutex<u64>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
+}
+
+impl EpochCounter {
+    /// Not persisted (tests).
+    pub fn in_memory(last: u64) -> Self {
+        Self { path: None, last: Mutex::new(last) }
+    }
+
+    /// Persisted at `path`.
+    pub fn persisted(path: std::path::PathBuf) -> Self {
+        let last = match std::fs::read_to_string(&path) {
+            Ok(t) => match t.trim().parse::<u64>() {
+                Ok(n) => n,
+                Err(e) => {
+                    log_debug!("[hosts] placement epoch file {} unreadable ({e}); starting above the clock", path.display());
+                    now_ms()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => now_ms(),
+            Err(e) => {
+                log_debug!("[hosts] placement epoch file {}: {e}; starting above the clock", path.display());
+                now_ms()
+            }
+        };
+        Self { path: Some(path), last: Mutex::new(last) }
+    }
+
+    /// The controller's file: `<K2 home>/hosts/placement-epoch`.
+    pub fn default_path() -> std::path::PathBuf {
+        k2_core::paths::k2_home().join("hosts").join("placement-epoch")
+    }
+
+    /// The next epoch, persisted before it is returned.
+    pub fn next(&self) -> std::io::Result<u64> {
+        let mut last = self.last.lock();
+        let n = *last + 1;
+        if let Some(path) = &self.path {
+            let dir = path.parent().unwrap_or(std::path::Path::new("."));
+            std::fs::create_dir_all(dir)?;
+            let tmp = dir.join(format!(".placement-epoch.{}", uuid::Uuid::new_v4()));
+            let write = || -> std::io::Result<()> {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(n.to_string().as_bytes())?;
+                f.sync_all()?;
+                std::fs::rename(&tmp, path)
+            };
+            if let Err(e) = write() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+        *last = n;
+        Ok(n)
+    }
+
+    /// Never issue `epoch` or anything below it again (a resumed placement
+    /// reported it; S9). Persisted on the next [`Self::next`].
+    pub fn observe(&self, epoch: u64) {
+        let mut last = self.last.lock();
+        *last = (*last).max(epoch);
+    }
+}
+
+/// What [`RemoteHost::adopt`] decided for one resumed placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptDecision {
+    /// Stub (W0): re-adoption is S9 work; nothing is placed yet.
+    Deferred,
+}
+
 /// The controller's remote hosts and placements.
 pub struct RemoteHost {
     inner: Mutex<Inner>,
     next_id: AtomicU64,
-    next_epoch: AtomicU64,
+    epochs: EpochCounter,
     hooks: broadcast::Sender<HostHook>,
 }
 
@@ -136,17 +231,16 @@ impl Default for RemoteHost {
 }
 
 impl RemoteHost {
+    /// Epochs from an in-memory counter starting at 1 (tests).
     pub fn new() -> Self {
-        // Epochs only grow, also across controller restarts (I1): start
-        // from the clock, then count.
-        let start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(1);
+        Self::with_epochs(EpochCounter::in_memory(0))
+    }
+
+    pub fn with_epochs(epochs: EpochCounter) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             next_id: AtomicU64::new(1),
-            next_epoch: AtomicU64::new(start),
+            epochs,
             hooks: broadcast::channel(1024).0,
         }
     }
@@ -160,7 +254,7 @@ impl RemoteHost {
     /// Register a host that completed the handshake. Returns the link's
     /// connection id, the host id and the frames to write to it. A link
     /// already open under the same name is told `duplicate` and dropped.
-    pub fn connect(&self, host_name: &str) -> (u64, String, mpsc::UnboundedReceiver<Frame>) {
+    pub fn connect(&self, host_name: &str, protocol: u32) -> (u64, String, mpsc::UnboundedReceiver<Frame>) {
         let conn = self.id();
         let host_id = host_name.to_string();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -168,7 +262,7 @@ impl RemoteHost {
             let mut inner = self.inner.lock();
             inner.links.insert(
                 host_id.clone(),
-                Link { conn, host_name: host_name.to_string(), tx, pending: HashMap::new(), streams: HashMap::new() },
+                Link { conn, host_name: host_name.to_string(), protocol, tx, pending: HashMap::new(), streams: HashMap::new() },
             )
         };
         if let Some(old) = old {
@@ -222,7 +316,7 @@ impl RemoteHost {
                     let _ = waiter.send((status, body));
                 }
             }
-            Frame::GridData { stream, text } => {
+            Frame::GridData { stream, text, .. } => {
                 if let Some(s) = inner.links.get(host_id).and_then(|l| l.streams.get(&stream)) {
                     let _ = s.send(GridEvent::Data(text));
                 }
@@ -348,7 +442,19 @@ impl RemoteHost {
                         log_debug!("[hosts] spawn {agent_id} refused: no host connected");
                         return answer("503 Service Unavailable", json!({"error": NO_HOSTS}));
                     };
-                    let epoch = PlacementEpoch(self.next_epoch.fetch_add(1, Ordering::Relaxed));
+                    let epoch = match self.epochs.next() {
+                        Ok(e) => PlacementEpoch(e),
+                        Err(e) => {
+                            log_debug!("[hosts] spawn {agent_id} refused: can't persist the placement epoch: {e}");
+                            return answer(
+                                "500 Internal Server Error",
+                                json!({"error": format!("can't persist the placement epoch: {e}")}),
+                            );
+                        }
+                    };
+                    k2_core::trace::emit(|| {
+                        k2_core::trace::Event::new(trace_events::CTL_EPOCH).agent(agent_id.as_str()).attr("epoch", epoch.0)
+                    });
                     // Reserve the placement now so a concurrent spawn of the
                     // same agent lands on the same host.
                     inner.placements.insert(
@@ -454,11 +560,50 @@ impl RemoteHost {
         let (etx, erx) = mpsc::unbounded_channel();
         link.streams.insert(stream, etx);
         let tx = link.tx.clone();
-        if tx.send(Frame::GridOpen { stream, session_id: session_id.to_string(), epoch: p.epoch.0, proto, as_user }).is_err() {
+        let open = Frame::GridOpen { stream, session_id: session_id.to_string(), epoch: p.epoch.0, proto, as_user, ring_offset: None };
+        if tx.send(open).is_err() {
             link.streams.remove(&stream);
             return Err(format!("agent host {} link is closing", p.host_id));
         }
         Ok(RemoteGrid { stream, host_id: p.host_id, events: erx, tx, closed: false })
+    }
+
+    // ── protocol 2 stubs (wave 2) ──────────────────────────────────────
+
+    /// The protocol the link to `host_id` speaks, if it is linked.
+    pub fn link_protocol(&self, host_id: &str) -> Option<u32> {
+        self.inner.lock().links.get(host_id).map(|l| l.protocol)
+    }
+
+    /// Placements a host reported in `hello` (`resume`, protocol 2). STUB
+    /// (W0): logs and traces each one and returns [`AdoptDecision::Deferred`];
+    /// the table is unchanged.
+    ///
+    /// The rule S9 implements here: adopt a resumed placement when the
+    /// controller has none for the agent (or the same host at the same
+    /// epoch), refuse one whose epoch is below the agent's current
+    /// placement (I1), and call [`EpochCounter::observe`] with every
+    /// adopted epoch so new epochs stay above it.
+    pub fn adopt(&self, host_id: &str, resume: &[ResumePlacement]) -> Vec<(String, AdoptDecision)> {
+        resume
+            .iter()
+            .map(|r| {
+                log_debug!(
+                    "[hosts] host {host_id} still runs agent {} (session {}, epoch {}): adoption deferred (S9)",
+                    r.agent_id,
+                    r.session_id,
+                    r.epoch
+                );
+                k2_core::trace::emit(|| {
+                    k2_core::trace::Event::new(trace_events::CTL_ADOPT)
+                        .agent(r.agent_id.as_str())
+                        .attr("host", host_id)
+                        .attr("epoch", r.epoch)
+                        .attr("decision", "deferred")
+                });
+                (r.agent_id.clone(), AdoptDecision::Deferred)
+            })
+            .collect()
     }
 
     // ── reads ──────────────────────────────────────────────────────────
@@ -499,5 +644,5 @@ impl RemoteHost {
 /// The controller's one [`RemoteHost`].
 pub fn global() -> &'static RemoteHost {
     static REMOTE: OnceLock<RemoteHost> = OnceLock::new();
-    REMOTE.get_or_init(RemoteHost::new)
+    REMOTE.get_or_init(|| RemoteHost::with_epochs(EpochCounter::persisted(EpochCounter::default_path())))
 }

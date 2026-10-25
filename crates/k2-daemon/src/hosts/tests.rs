@@ -123,7 +123,7 @@ async fn recv(ws: &mut Ws) -> Frame {
 /// A fake host that completed the handshake as `name`.
 async fn fake_host(c: &Controller, name: &str) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.expect("dial");
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![] }).await;
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume: vec![] }).await;
     match recv(&mut ws).await {
         Frame::Welcome { host_id, protocol, .. } => {
             assert_eq!(host_id, name);
@@ -198,19 +198,19 @@ async fn fake_host_s1_spawn_attach_type_hook_open_url_close() {
     // ── attach: the host's frames reach the client, input reaches the host
     let mut client = c.attach_grid("sess-s1").await;
     let stream = match recv(&mut host).await {
-        Frame::GridOpen { stream, session_id, epoch: e, proto, as_user } => {
+        Frame::GridOpen { stream, session_id, epoch: e, proto, as_user, ring_offset: None } => {
             assert_eq!((session_id.as_str(), e, proto, as_user), ("sess-s1", epoch, None, None));
             stream
         }
         other => panic!("expected grid.open, got {other:?}"),
     };
     let snapshot = r#"{"event":"snapshot","payload":{"grid":[]}}"#;
-    send(&mut host, &Frame::GridData { stream, text: snapshot.into() }).await;
+    send(&mut host, &Frame::GridData { stream, text: snapshot.into(), ring_offset: None }).await;
     let got = within("the snapshot", client.next()).await.unwrap().unwrap();
     assert_eq!(got.to_text().unwrap(), snapshot);
     let input = r#"{"action":"input","text":"hi\r"}"#;
     client.send(Message::Text(input.into())).await.unwrap();
-    assert_eq!(recv(&mut host).await, Frame::GridData { stream, text: input.into() });
+    assert_eq!(recv(&mut host).await, Frame::GridData { stream, text: input.into(), ring_offset: None });
 
     // ── hooks: accepted for the placed session at its epoch only ───────
     let mut hooks = c.remote.hook_events();
@@ -301,8 +301,9 @@ async fn placement_spreads_and_session_gone_drops_it() {
 async fn bad_token_and_wrong_protocol_are_refused() {
     let c = Controller::start().await;
     for (hello, code) in [
-        (Frame::Hello { protocol: PROTOCOL, host_name: "x".into(), token: "wrong".into(), labels: vec![] }, "bad_token"),
-        (Frame::Hello { protocol: PROTOCOL + 1, host_name: "x".into(), token: TOKEN.into(), labels: vec![] }, "protocol"),
+        (Frame::Hello { protocol: PROTOCOL, host_name: "x".into(), token: "wrong".into(), labels: vec![], resume: vec![] }, "bad_token"),
+        (Frame::Hello { protocol: PROTOCOL + 1, host_name: "x".into(), token: TOKEN.into(), labels: vec![], resume: vec![] }, "protocol"),
+        (Frame::Hello { protocol: 0, host_name: "x".into(), token: TOKEN.into(), labels: vec![], resume: vec![] }, "protocol"),
         (Frame::OpenUrl { url: "https://x".into(), source: "shim".into() }, "protocol"),
     ] {
         let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
@@ -467,6 +468,9 @@ async fn host_reconnects_after_a_reset_a_mute_peer_and_a_silent_controller() {
         // 1: link, then reset the socket mid-session (no closing handshake).
         let (s, _) = listener.accept().await.unwrap();
         let ws = welcome(s).await;
+        // A zero linger makes the drop a RST: the "connection reset without
+        // closing handshake" kind-dist saw.
+        #[allow(deprecated)]
         ws.get_ref().set_linger(Some(Duration::ZERO)).unwrap();
         drop(ws);
         // 2: accept TCP but never answer the upgrade.
@@ -648,4 +652,70 @@ async fn app_session_token_spawns_and_attaches_through_the_controller() {
     assert_eq!(status, "200 OK", "{out}");
     assert!(crate::agent_host::host().find_agent(&agent).is_none());
     link_task.abort();
+}
+
+// ── protocol 2 contract (W0) ─────────────────────────────────────────────
+
+#[test]
+fn placement_epochs_are_persisted_and_only_grow() {
+    use crate::agent_host::remote::EpochCounter;
+    let dir = test_env::unique_temp_path("epochs");
+    let path = dir.join("hosts").join("placement-epoch");
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    // No file: starts above the clock (protocol-1 epochs were ms stamps).
+    let c = EpochCounter::persisted(path.clone());
+    let e1 = c.next().unwrap();
+    let e2 = c.next().unwrap();
+    assert!(e1 > before, "first epoch {e1} is above any protocol-1 epoch issued before {before}");
+    assert_eq!(e2, e1 + 1, "then it counts");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), e2.to_string(), "persisted before it is used");
+    // A restarted controller continues from the file, not from the clock.
+    let c = EpochCounter::persisted(path.clone());
+    assert_eq!(c.next().unwrap(), e2 + 1);
+    // A resumed placement's epoch is never issued again.
+    c.observe(e2 + 100);
+    assert_eq!(c.next().unwrap(), e2 + 101);
+    // In memory (tests): counts from what it was given.
+    let m = EpochCounter::in_memory(0);
+    assert_eq!((m.next().unwrap(), m.next().unwrap()), (1, 2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_1_hosts_are_still_accepted_and_resume_is_handed_to_adopt() {
+    let c = Controller::start().await;
+    // A protocol-1 host (the image deployed on kind before W0).
+    let (mut v1, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
+    v1.send(Message::Text(r#"{"t":"hello","protocol":1,"host_name":"old-1","token":"test-bootstrap-token","labels":[]}"#.into()))
+        .await
+        .unwrap();
+    match recv(&mut v1).await {
+        Frame::Welcome { protocol, host_id, .. } => assert_eq!((protocol, host_id.as_str()), (1, "old-1")),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+    c.wait_hosts(1).await;
+    assert_eq!(c.remote.link_protocol("old-1"), Some(1));
+
+    // A protocol-2 host that still runs a placement reports it in hello.
+    let resume = vec![super::proto::ResumePlacement {
+        agent_id: "kept".into(),
+        session_id: "s-kept".into(),
+        epoch: 7,
+        ring: Some(super::proto::RingRange { start: 0, end: 512 }),
+        child_alive: true,
+    }];
+    let (mut v2, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
+    send(&mut v2, &Frame::Hello { protocol: 2, host_name: "new-1".into(), token: TOKEN.into(), labels: vec![], resume: resume.clone() }).await;
+    match recv(&mut v2).await {
+        Frame::Welcome { protocol, .. } => assert_eq!(protocol, 2),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+    c.wait_hosts(2).await;
+    assert_eq!(c.remote.link_protocol("new-1"), Some(2));
+    // adopt is a stub in W0: every resumed placement is deferred, none placed.
+    assert_eq!(
+        c.remote.adopt("new-1", &resume),
+        vec![("kept".to_string(), crate::agent_host::remote::AdoptDecision::Deferred)]
+    );
+    assert_eq!(c.remote.placement("kept"), None);
 }

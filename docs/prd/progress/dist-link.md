@@ -209,6 +209,65 @@ frames for a session it placed on that host.
 | `resume` in `hello` (list of placements the host still runs) | S9 re-adoption | absent |
 | `sig` in `hello`/`welcome` (signed handshake like `/cli/compute/attach`) | FR2 | protocol 2 |
 
+## Protocol 2 (W0: the wave-2 contract, defined, not yet sent)
+
+Defined in `crates/k2-daemon/src/hosts/proto.rs` so the wave-2 workers
+(outbox S3, inject, re-adoption S9) build against one format. The frames
+exist, encode and round-trip (`hosts::proto::tests`); nothing sends them
+yet, and `RemoteHost::adopt` is a stub.
+
+Versions. This build speaks protocol 2 (`PROTOCOL`) and the controller
+accepts hosts speaking 1 or 2 (`MIN_PROTOCOL..=PROTOCOL`, `negotiate`):
+`welcome.protocol` is the host's version, stored per link
+(`RemoteHost::link_protocol`), and no frame whose `Frame::min_protocol()`
+is 2 may be sent on a protocol-1 link. Anything else is refused with
+`refused {code: "protocol", message: "controller speaks protocols 1 to 2,
+host sent N"}`. So protocol-1 hosts (the image on kind today) keep working
+against a new controller. The other way round does not: a protocol-1
+controller refuses a protocol-2 host, so **upgrade the controller first**.
+Every field added in protocol 2 is optional and left out when empty, so a
+protocol-1 frame encodes byte for byte as before
+(`protocol_1_frames_encode_exactly_as_protocol_1`).
+
+| Dir | Frame | Fields | For |
+|---|---|---|---|
+| host → ctl | `hello` + `resume` | list of `{agent_id, session_id, epoch, ring: {start, end}?, child_alive}`: placements the host still runs | S9: a restarted controller re-adopts them (`RemoteHost::adopt`) |
+| ctl → host | `grid.open` + `ring_offset` | replay output from this ring offset before live frames; absent = fresh snapshot | S9, FR5 |
+| host → ctl | `grid.data` + `ring_offset` | the offset this frame brings the client to | S9 reattach |
+| either | `deliver` | `msg_id`, `agent_id` (recipient), `epoch`?, `from` (`agent:…`/`user:…`), `body` (as the inbox stores it), `attempt` (default 1) | S3, FR4: at least once; the sender resends until acked |
+| either | `deliver.ack` | `msg_id`, `status` (`delivered` \| `duplicate` \| `rejected`), `reason`? | the receiver dedupes on `msg_id`; `rejected` = retrying won't help (unknown agent, stale epoch); anything retryable is simply not acked |
+| ctl → host | `inject` | `req`, `agent_id`, `epoch`, `steps` (`{op: write, text}` \| `{op: write_b64, b64}` \| `{op: sleep, ms}` \| `{op: check_alive}`), `msg_id`? | `AgentHost::inject` remote (`InjectStep::from_action` / `to_action`, lossless for any bytes) |
+| host → ctl | `inject.result` | `req`, `result` (`delivered` \| `child_gone` \| `not_placed`) | |
+| ctl → host | `release` | `req`, `agent_id`, `epoch`, `reason` (`sleep`, `move`, `drain`) | stop the child after its turn, keep the home |
+| host → ctl | `released` | `req`, `agent_id`, `epoch`, `ring_end`? | |
+
+Placement epochs (I1) now come from `EpochCounter`, a monotonic counter
+the controller persists at `<K2 home>/hosts/placement-epoch` (the last epoch
+issued, written with temp file + fsync + rename before the epoch is used).
+A missing or unreadable file starts it at the current Unix time in ms, once,
+which keeps it above every epoch a protocol-1 controller issued (those were
+ms timestamps); after that it counts by 1 across restarts. `observe(epoch)`
+keeps it above an epoch a host resumed with; S9 must call it for every
+adopted placement. If the file can't be written, the spawn answers 500
+rather than issue an unpersisted epoch.
+
+`RemoteHost::adopt(host_id, resume)` (stub): called by the hub when a
+`hello` carries `resume`; logs and traces each placement and returns
+`AdoptDecision::Deferred`; the table is unchanged. The rule for S9 is in its
+doc comment (adopt when the controller has no placement for the agent or the
+same host at the same epoch; refuse a lower epoch; `observe` adopted epochs).
+
+Trace event names (`proto::trace_events`, for the lab's flow files):
+`ctl.deliver`, `ctl.deliver_ack`, `host.deliver`, `ctl.inject`,
+`host.inject_result`, `host.resume`, `ctl.adopt`, `ctl.release`,
+`host.release`, `grid.replay`, `ctl.epoch` (the last two are emitted
+now: `ctl.epoch` per issued epoch, `ctl.adopt` per resumed placement).
+
+Ownership hint for wave 2: each worker adds its own `RemoteHost` method and
+host-side handler (`link::handle`) for its frames; `proto.rs` changes only
+by adding optional fields or new frame types, never by renaming or
+retyping, so the three branches merge mechanically.
+
 ## Env contract
 
 Names follow `deploy/README.md` and `deploy/compose/compose.yaml`. The task
@@ -383,6 +442,15 @@ Controller trace events added (`K2_TRACE_FILE`): `ctl.host_linked`,
 `ctl.host_unlinked`, `ctl.place`, `ctl.hook`, `ctl.open_url`; host:
 `host.linked`. The host keeps every existing trace event (`host.spawn`,
 `pty.*`, `cell.*`).
+
+### Known gaps on a controller (next wave)
+
+- The app's chat overlay spawn fails on a controller with
+  `K2_ROLE=controller runs no agents locally`: it spawns through a path
+  other than `POST /cli/sessions/v2/spawn` (the canonical/chat spawn in
+  `spawn.rs`), which hits the `InProcessHost::spawn` refusal instead of
+  being placed on a host. That is W1's scope (route every spawn path
+  through placement).
 
 ### Handoff notes for `kind-dist`
 
