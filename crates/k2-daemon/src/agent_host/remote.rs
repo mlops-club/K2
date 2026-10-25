@@ -442,7 +442,7 @@ impl RemoteHost {
     // ── grid ───────────────────────────────────────────────────────────
 
     /// Open a relayed grid stream on the host that runs `session_id`.
-    pub fn open_grid(&self, session_id: &str, proto: Option<String>) -> Result<RemoteGrid, String> {
+    pub fn open_grid(&self, session_id: &str, proto: Option<String>, as_user: Option<String>) -> Result<RemoteGrid, String> {
         let stream = self.id();
         let mut inner = self.inner.lock();
         let Some(p) = inner.placements.values().find(|p| p.session_id.as_deref() == Some(session_id)).cloned() else {
@@ -454,7 +454,7 @@ impl RemoteHost {
         let (etx, erx) = mpsc::unbounded_channel();
         link.streams.insert(stream, etx);
         let tx = link.tx.clone();
-        if tx.send(Frame::GridOpen { stream, session_id: session_id.to_string(), epoch: p.epoch.0, proto }).is_err() {
+        if tx.send(Frame::GridOpen { stream, session_id: session_id.to_string(), epoch: p.epoch.0, proto, as_user }).is_err() {
             link.streams.remove(&stream);
             return Err(format!("agent host {} link is closing", p.host_id));
         }

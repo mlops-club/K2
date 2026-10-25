@@ -64,6 +64,11 @@ pub enum Frame {
         epoch: u64,
         #[serde(default)]
         proto: Option<String>,
+        /// The Connect user the client signed in as; `None` for the owner
+        /// token. The controller authorised the client and enforces the
+        /// user's viewer/claimer rules; the host logs it (protocol 1).
+        #[serde(default)]
+        as_user: Option<String>,
     },
     /// One text message of the app's `/cli/sessions/grid` protocol,
     /// verbatim, in either direction.

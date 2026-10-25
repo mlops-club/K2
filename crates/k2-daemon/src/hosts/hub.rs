@@ -113,10 +113,54 @@ fn grid_error(message: &str) -> String {
     serde_json::json!({"event": "error", "payload": {"message": message}}).to_string()
 }
 
+/// Who a relayed grid client is, decided by the gate exactly as the
+/// grid handler classifies a connection under `K2_ROLE=all`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GridClient {
+    /// The daemon owner token.
+    Owner,
+    /// A Connect login (the desktop app signs in with `/cli/auth/login`).
+    /// `token` is re-validated every 5 s against `owner_token`, as the
+    /// grid handler does.
+    ConnectUser { username: String, token: String, owner_token: String },
+}
+
+/// How often a Connect user's token is re-validated (the grid handler's
+/// `auth_recheck`).
+const REAUTH_EVERY: Duration = Duration::from_secs(5);
+
+/// The set_mode the relay sends first for a Connect user, so the host's
+/// handler starts the stream as a viewer like it does for one locally.
+const START_AS_VIEWER: &str = r#"{"action":"set_mode","mode":"viewer"}"#;
+
+/// The grid handler's capability rule for a Connect user: any account
+/// that still exists (`sessions_grid_ws::connection_claimer_capable`).
+fn user_capable(username: &str) -> bool {
+    k2_core::connect_users::role_for_user(username).is_some()
+}
+
+/// A `mode` event's text with `capable` set from this controller's user
+/// store, or `None` if `text` is not a `mode` event.
+fn rewrite_mode(text: &str, capable: bool) -> Option<String> {
+    if !text.starts_with(r#"{"event":"mode""#) {
+        return None;
+    }
+    let mut v: serde_json::Value = serde_json::from_str(text).ok()?;
+    v.get_mut("payload")?.as_object_mut()?.insert("capable".into(), capable.into());
+    Some(v.to_string())
+}
+
 /// `GET /cli/sessions/grid` on a controller: upgrade, open the stream on
 /// the session's host, then relay text messages both ways. Only the JSON
 /// grid protocol (no `proto=k1` binary frames in protocol 1).
-pub async fn serve_grid<S>(stream: S, remote: &RemoteHost, session_id: &str)
+///
+/// The host's handler sees an owner connection. For a Connect user the
+/// relay keeps that user's rules from `K2_ROLE=all`: the stream starts as
+/// a viewer (`set_mode viewer` goes first and the host's initial owner
+/// `mode` frame is not passed on), `capable` in every `mode` event comes
+/// from this controller's user store, the token is re-validated every 5 s,
+/// and a removed user or revoked token ends the stream.
+pub async fn serve_grid<S>(stream: S, remote: &RemoteHost, session_id: &str, client: GridClient)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -128,7 +172,11 @@ where
         }
     };
     let (mut write, mut read) = ws.split();
-    let mut grid = match remote.open_grid(session_id, None) {
+    let as_user = match &client {
+        GridClient::Owner => None,
+        GridClient::ConnectUser { username, .. } => Some(username.clone()),
+    };
+    let mut grid = match remote.open_grid(session_id, None, as_user.clone()) {
         Ok(g) => g,
         Err(e) => {
             let _ = write.send(Message::Text(grid_error(&e))).await;
@@ -137,10 +185,26 @@ where
         }
     };
     k2_core::trace::attach(Some(session_id), "grid");
+    let mut skip_initial_mode = false;
+    if as_user.is_some() {
+        grid.send(START_AS_VIEWER.to_string());
+        skip_initial_mode = true;
+    }
+    let mut reauth = tokio::time::interval(REAUTH_EVERY);
+    reauth.tick().await;
     loop {
         tokio::select! {
             ev = grid.events.recv() => match ev {
-                Some(GridEvent::Data(text)) => {
+                Some(GridEvent::Data(mut text)) => {
+                    if let Some(user) = &as_user {
+                        if let Some(m) = rewrite_mode(&text, user_capable(user)) {
+                            if skip_initial_mode {
+                                skip_initial_mode = false;
+                                continue;
+                            }
+                            text = m;
+                        }
+                    }
                     if write.send(Message::Text(text)).await.is_err() {
                         break;
                     }
@@ -153,6 +217,10 @@ where
             },
             m = read.next() => match m {
                 Some(Ok(Message::Text(t))) => {
+                    if as_user.as_deref().is_some_and(|u| !user_capable(u)) {
+                        log_debug!("[hosts] grid stream {}: user {} is gone; closing", grid.stream, as_user.as_deref().unwrap_or(""));
+                        break;
+                    }
                     if !grid.send(t) {
                         break;
                     }
@@ -160,8 +228,31 @@ where
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
             },
+            _ = reauth.tick() => {
+                if let GridClient::ConnectUser { token, owner_token, .. } = &client {
+                    if !crate::routes::http::token_still_valid(token, owner_token) {
+                        log_debug!("[hosts] grid stream {}: token revoked mid-session; closing", grid.stream);
+                        break;
+                    }
+                }
+            }
         }
     }
     grid.close("client closed");
     let _ = write.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_events_get_the_controllers_capability() {
+        let out = rewrite_mode(r#"{"event":"mode","payload":{"mode":"viewer","capable":true}}"#, false).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!({"event": "mode", "payload": {"mode": "viewer", "capable": false}})
+        );
+        assert_eq!(rewrite_mode(r#"{"event":"delta","payload":{}}"#, false), None);
+    }
 }

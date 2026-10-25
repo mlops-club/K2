@@ -61,6 +61,47 @@ pub fn controller_route(path: &str) -> ControllerRoute {
     }
 }
 
+pub const STREAM_TOKEN_REFUSED: &str =
+    r#"{"error":"per-session stream tokens are not relayed with K2_ROLE=controller (dist-link first cut)"}"#;
+
+/// Why the controller refuses a grid connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridRefusal {
+    /// A Skin pass: never a terminal, as under `all`.
+    Skin,
+    /// A `/v1` per-session stream token (minted only for in-process
+    /// sessions; not relayed in this cut).
+    StreamToken,
+    BadToken,
+}
+
+/// The `/cli/sessions/grid` decision, in the dispatcher's order under
+/// `K2_ROLE=all`: Skin pass → 403; the owner token or a live Connect
+/// session (`token_ok`) → relayed as that client; anything else → 403.
+pub fn grid_client(query: &str, owner_token: &str) -> Result<super::hub::GridClient, GridRefusal> {
+    use super::hub::GridClient;
+    let token = http::extract_token(query).unwrap_or("");
+    if k2_core::skin::is_skin_token(token) {
+        return Err(GridRefusal::Skin);
+    }
+    if !token.is_empty() && http::ct_eq_token(token, owner_token) {
+        return Ok(GridClient::Owner);
+    }
+    if !token.is_empty() {
+        if let Some(username) = k2_core::connect_users::validate_session(token) {
+            return Ok(GridClient::ConnectUser {
+                username,
+                token: token.to_string(),
+                owner_token: owner_token.to_string(),
+            });
+        }
+    }
+    if crate::stream_token::query_authorizes(query) {
+        return Err(GridRefusal::StreamToken);
+    }
+    Err(GridRefusal::BadToken)
+}
+
 async fn reply(stream: &mut TcpStream, buf: &mut [u8], status: &str, body: &str) {
     let _ = stream.read(buf).await;
     http::send_response(stream, status, "application/json", body).await;
@@ -113,23 +154,26 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
             true
         }
         ControllerRoute::Grid => {
-            // This cut relays owner connections only: the host-side handler
-            // sees an owner, so a viewer-mode connect user or a stream token
-            // would gain input rights. Refused until the identity travels.
-            let owner = http::extract_token(query).is_some_and(|t| http::ct_eq_token(t, owner_token));
-            if !owner {
-                reply(
-                    stream,
-                    buf,
-                    "403 Forbidden",
-                    r#"{"error":"K2_ROLE=controller relays grid streams for the owner token only (dist-link first cut)"}"#,
-                )
-                .await;
-                return true;
-            }
+            let client = match grid_client(query, owner_token) {
+                Ok(c) => c,
+                Err(GridRefusal::Skin) => {
+                    let _ = stream.read(buf).await;
+                    let r = crate::skin_routes::skin_terminal_forbidden();
+                    http::send_response(stream, r.status, r.content_type, &r.body).await;
+                    return true;
+                }
+                Err(GridRefusal::StreamToken) => {
+                    reply(stream, buf, "403 Forbidden", STREAM_TOKEN_REFUSED).await;
+                    return true;
+                }
+                Err(GridRefusal::BadToken) => {
+                    reply(stream, buf, "403 Forbidden", r#"{"error":"invalid or missing token"}"#).await;
+                    return true;
+                }
+            };
             let params = http::parse_params(path, query);
             let session = params.get("session").cloned().unwrap_or_default();
-            super::hub::serve_grid(&mut *stream, remote::global(), &session).await;
+            super::hub::serve_grid(&mut *stream, remote::global(), &session, client).await;
             true
         }
     }

@@ -20,6 +20,11 @@
 #   5. open_url posted to the HOST's /cli/browser/open-url arrives on the
 #      CONTROLLER's /cli/sessions/events
 #   6. hook events reached the controller (its status counts them)
+#   7. the desktop app's way in: an Owner-role Connect user logs in
+#      (POST /cli/auth/login) and, with that session token only, spawns
+#      through the controller, attaches the grid (starts as a capable viewer,
+#      set_mode claimer as the app does), types and sees the reply, receives
+#      open_url on /cli/sessions/events, and closes
 #
 # Ports: DIST_CTL_PORT (default 17420) and DIST_HOST_PORT (17421).
 
@@ -278,6 +283,96 @@ PY
     grep -E '\[hosts\] (placed agent|hook )' "$RUN/controller.log" > "$RUN/controller-hosts.log" || true
     hooks=$(grep -c '\[hosts\] hook ' "$RUN/controller.log")
     check "hook events reached the controller" "$([ "${hooks:-0}" -gt 0 ] && echo 1)" "$hooks hook line(s) in controller.log"
+
+    # 7. the desktop app's session token, end to end through the controller
+    python3 -I - "$REPO/tests/lab" "$TP_CTL_PORT" "$ctl_token" "$TP_HOST_PORT" "$host_token" "$LAB_WORKSPACE" \
+        > "$RUN/app-session.txt" 2>&1 <<'PY'
+import json, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+sys.path.insert(0, sys.argv[1])
+from labkit import ws as wslib
+cport, owner, hport, htok, cwd = int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6]
+
+def post(port, path, token, body):
+    q = "?" + urllib.parse.urlencode({"token": token}) if token else ""
+    req = urllib.request.Request("http://127.0.0.1:%d%s%s" % (port, path, q), data=json.dumps(body).encode(),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+
+def fail(msg):
+    print("FAIL:", msg)
+    sys.exit(1)
+
+def recv_until(sock, pick, what, deadline_s=30):
+    seen = []
+    end = time.time() + deadline_s
+    while time.time() < end:
+        sock.settimeout(max(0.1, end - time.time()))
+        kind, data = sock.recv()
+        if kind == "close":
+            fail("socket closed waiting for %s; seen %s" % (what, seen[-5:]))
+        if kind != "text":
+            continue
+        msg = json.loads(data)
+        if pick(msg):
+            return msg, seen
+        seen.append(msg)
+    fail("deadline waiting for %s" % what)
+
+# The owner's account and its login, the way the app signs in.
+user, pw = "applab" + uuid.uuid4().hex[:6], "correct horse battery staple 42"
+print("users/add", post(cport, "/cli/users/add", owner, {"username": user, "password": pw}))
+print("users/set-role", post(cport, "/cli/users/set-role", owner, {"username": user, "role": "owner"}))
+st, login = post(cport, "/cli/auth/login", None, {"username": user, "password": pw})
+if st != 200 or "token" not in login:
+    fail("login: %s %s" % (st, login))
+tok = login["token"]
+print("logged in as", user, "(session token, not the owner token)")
+
+events = wslib.WebSocket("127.0.0.1", cport, "/cli/sessions/events?" + urllib.parse.urlencode({"token": tok}), timeout=10)
+agent, claude_session = "app-" + uuid.uuid4().hex[:8], str(uuid.uuid4())
+st, sp = post(cport, "/cli/sessions/v2/spawn", tok, {"agent_name": agent, "cwd": cwd, "command": "claude",
+                                                    "args": ["--session-id", claude_session], "cols": 100, "rows": 30})
+if st != 200:
+    fail("spawn with the session token: %s %s" % (st, sp))
+print("spawn ->", st, "sessionId", sp["sessionId"], "reused", sp["reused"])
+grid = wslib.WebSocket("127.0.0.1", cport, "/cli/sessions/grid?" + urllib.parse.urlencode(
+    {"session": sp["sessionId"], "token": tok}), timeout=10)
+mode, seen = recv_until(grid, lambda m: m.get("event") == "mode", "the first mode event")
+print("first mode:", json.dumps(mode["payload"]))
+if mode["payload"] != {"mode": "viewer", "capable": True}:
+    fail("a Connect user starts as a capable viewer")
+grid.send_text(json.dumps({"action": "set_mode", "mode": "claimer"}))
+mode, _ = recv_until(grid, lambda m: m.get("event") == "mode", "the claimer ack")
+print("after set_mode claimer:", json.dumps(mode["payload"]))
+text = "hello from the app session " + uuid.uuid4().hex[:6]
+recv_until(grid, lambda m: "k2-fake-agent" in json.dumps(m) and ">" in json.dumps(m), "the agent prompt")
+grid.send_text(json.dumps({"action": "input", "text": text}))
+time.sleep(0.15)
+grid.send_text(json.dumps({"action": "input", "text": "\r"}))
+recv_until(grid, lambda m: ("reply #1: " + text) in json.dumps(m), "the reply")
+print("reply seen on the grid:", "reply #1: " + text)
+grid.close()
+
+url = "https://claude.ai/oauth/authorize?app-session=" + uuid.uuid4().hex[:6]
+req = urllib.request.Request("http://127.0.0.1:%d/cli/browser/open-url?token=%s" % (hport, htok),
+                             data=json.dumps({"url": url}).encode(), method="POST",
+                             headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+ev, _ = recv_until(events, lambda m: m.get("kind") == "open_url" and m.get("url") == url, "open_url on the session's events")
+print("open_url on /cli/sessions/events (session token):", json.dumps(ev))
+st, cl = post(cport, "/cli/sessions/v2/close", tok, {"agent_name": agent, "force": True, "clear_index": True})
+print("close ->", st, cl)
+if st != 200 or not cl.get("closed"):
+    fail("close with the session token")
+print("OK")
+PY
+    rc=$?
+    check "app session token: login, spawn, attach, type, open_url, close via the controller" "$([ $rc = 0 ] && echo 1)" \
+        "$(tail -1 "$RUN/app-session.txt")"
 
     topo_metrics > "$RUN/metrics.csv"
     echo "evidence: ${RUN#$REPO/}"

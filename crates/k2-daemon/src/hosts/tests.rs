@@ -26,6 +26,8 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 const TOKEN: &str = "test-bootstrap-token";
+/// The controller daemon's owner token in these tests.
+const OWNER_TOKEN: &str = "test-controller-owner-token";
 
 /// A controller on loopback: `/cli/hosts/attach` and `/cli/sessions/grid`
 /// served by `hub` over one shared `RemoteHost`.
@@ -51,17 +53,26 @@ impl Controller {
         tokio::spawn(async move {
             while let Ok((s, _)) = grid.accept().await {
                 tokio::spawn(async move {
-                    // The relay reads `session` the way the gate does.
-                    let mut peek = [0u8; 2048];
+                    // What the gate does: the query decides the client
+                    // (`gate::grid_client`) and names the session.
+                    let mut peek = [0u8; 4096];
                     let n = s.peek(&mut peek).await.unwrap();
                     let head = String::from_utf8_lossy(&peek[..n]).to_string();
-                    let session = head
-                        .split("session=")
-                        .nth(1)
-                        .and_then(|r| r.split([' ', '&']).next())
-                        .unwrap_or("")
-                        .to_string();
-                    hub::serve_grid(s, remote, &session).await;
+                    let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("").to_string();
+                    let params = crate::routes::http::parse_params("/cli/sessions/grid", &query);
+                    let session = params.get("session").cloned().unwrap_or_default();
+                    match super::gate::grid_client(&query, OWNER_TOKEN) {
+                        Ok(client) => hub::serve_grid(s, remote, &session, client).await,
+                        Err(why) => {
+                            use tokio::io::AsyncWriteExt;
+                            let mut s = s;
+                            let body = format!("{why:?}");
+                            let _ = s
+                                .write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                                .await;
+                        }
+                    }
                 });
             }
         });
@@ -69,8 +80,12 @@ impl Controller {
     }
 
     async fn attach_grid(&self, session: &str) -> Ws {
-        let url = format!("ws://{}/cli/sessions/grid?session={session}", self.grid_addr);
-        tokio_tungstenite::connect_async(url).await.expect("grid upgrade").0
+        self.attach_grid_with(session, OWNER_TOKEN).await.expect("grid upgrade")
+    }
+
+    async fn attach_grid_with(&self, session: &str, token: &str) -> Result<Ws, String> {
+        let url = format!("ws://{}/cli/sessions/grid?session={session}&token={token}", self.grid_addr);
+        tokio_tungstenite::connect_async(url).await.map(|r| r.0).map_err(|e| e.to_string())
     }
 
     async fn wait_hosts(&self, n: usize) {
@@ -183,8 +198,8 @@ async fn fake_host_s1_spawn_attach_type_hook_open_url_close() {
     // ── attach: the host's frames reach the client, input reaches the host
     let mut client = c.attach_grid("sess-s1").await;
     let stream = match recv(&mut host).await {
-        Frame::GridOpen { stream, session_id, epoch: e, proto } => {
-            assert_eq!((session_id.as_str(), e, proto), ("sess-s1", epoch, None));
+        Frame::GridOpen { stream, session_id, epoch: e, proto, as_user } => {
+            assert_eq!((session_id.as_str(), e, proto, as_user), ("sess-s1", epoch, None, None));
             stream
         }
         other => panic!("expected grid.open, got {other:?}"),
@@ -361,7 +376,7 @@ async fn real_host_link_runs_the_agent_and_relays_its_pty() {
         host_name: "real-1".into(),
         labels: vec![],
     };
-    let link_task = tokio::spawn(async move { link::serve_once(&cfg).await });
+    let link_task = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
     c.wait_hosts(1).await;
 
     // spawn through the controller: the real host runs today's v2 spawn.
@@ -407,5 +422,230 @@ async fn real_host_link_runs_the_agent_and_relays_its_pty() {
     })
     .await;
 
+    link_task.abort();
+}
+
+// ── reconnect (kind-dist finding: a read error mid-session) ─────────────
+
+#[test]
+fn backoff_restarts_after_a_link_and_doubles_to_the_cap_while_attempts_fail() {
+    let t = link::Timings::PRODUCTION;
+    let s = Duration::from_secs;
+    // A link that was up: retry after 1 s, whatever came before.
+    assert_eq!(link::next_backoff(s(30), true, &t), (s(1), s(2)));
+    // Failed attempts: 1, 2, 4, 8, 16, 30, 30.
+    let mut prev = t.backoff_min;
+    let mut sleeps = vec![];
+    for _ in 0..7 {
+        let (sleep, next) = link::next_backoff(prev, false, &t);
+        sleeps.push(sleep.as_secs());
+        prev = next;
+    }
+    assert_eq!(sleeps, vec![1, 2, 4, 8, 16, 30, 30]);
+}
+
+/// Complete the controller's half of the handshake on `s`.
+async fn welcome(s: TcpStream) -> WebSocketStream<TcpStream> {
+    let mut ws = tokio_tungstenite::accept_async(s).await.expect("upgrade");
+    match ws.next().await {
+        Some(Ok(Message::Text(t))) => assert!(matches!(Frame::decode(&t), Ok(Frame::Hello { .. }))),
+        other => panic!("expected hello, got {other:?}"),
+    }
+    let w = Frame::Welcome { protocol: PROTOCOL, host_id: "h".into(), controller: "fake".into() };
+    ws.send(Message::Text(w.encode())).await.unwrap();
+    ws
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reconnects_after_a_reset_a_mute_peer_and_a_silent_controller() {
+    use link::LinkEvent::*;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}{ATTACH_PATH}", listener.local_addr().unwrap());
+    // Held sockets stay open until the test ends.
+    let (hold_tx, mut hold_rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn std::any::Any + Send>>();
+    tokio::spawn(async move {
+        // 1: link, then reset the socket mid-session (no closing handshake).
+        let (s, _) = listener.accept().await.unwrap();
+        let ws = welcome(s).await;
+        ws.get_ref().set_linger(Some(Duration::ZERO)).unwrap();
+        drop(ws);
+        // 2: accept TCP but never answer the upgrade.
+        let (s, _) = listener.accept().await.unwrap();
+        hold_tx.send(Box::new(s)).unwrap();
+        // 3: link, then go silent (no frames, no pings) with the socket open.
+        let (s, _) = listener.accept().await.unwrap();
+        hold_tx.send(Box::new(welcome(s).await)).unwrap();
+        // 4: link and stay.
+        let (s, _) = listener.accept().await.unwrap();
+        hold_tx.send(Box::new(welcome(s).await)).unwrap();
+    });
+    tokio::spawn(async move {
+        let mut held = vec![];
+        while let Some(s) = hold_rx.recv().await {
+            held.push(s);
+        }
+    });
+
+    let ms = Duration::from_millis;
+    // The connect and idle deadlines are the ones under test (the mute peer
+    // and the silent controller); the rest only need to never fire here,
+    // even on a loaded machine.
+    let t = link::Timings {
+        connect: ms(2000),
+        welcome: ms(5000),
+        idle: ms(2000),
+        close: ms(500),
+        backoff_min: ms(20),
+        backoff_max: ms(80),
+    };
+    let cfg = HostConfig { attach_url: url, token: TOKEN.into(), host_name: "reconnect-1".into(), labels: vec![] };
+    let (otx, mut orx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(link::run_with(cfg, t, Some(otx)));
+    // The fourth link stays up, so exactly 13 events come.
+    let mut events = vec![];
+    within("four attempts and the fourth link", async {
+        while events.len() < 13 {
+            events.push(orx.recv().await.expect("link loop alive"));
+        }
+    })
+    .await;
+    task.abort();
+
+    // Error text is the transport's; check its kind, then the decisions.
+    let err = |i: usize| match &events[i] {
+        Ended { error: Some(e), .. } => e.clone(),
+        other => panic!("event {i}: expected an end with an error, got {other:?} in {events:?}"),
+    };
+    assert!(err(2).starts_with("read: "), "{events:?}");
+    assert!(err(5).starts_with("connect: no answer within"), "{events:?}");
+    assert!(err(9).starts_with("nothing from the controller for"), "{events:?}");
+    let shape: Vec<link::LinkEvent> = events
+        .iter()
+        .map(|e| match e {
+            Ended { was_linked, .. } => Ended { was_linked: *was_linked, error: None },
+            e => e.clone(),
+        })
+        .collect();
+    let ended = |was_linked| Ended { was_linked, error: None };
+    assert_eq!(
+        shape,
+        vec![
+            // reset mid-session → retry at the minimum
+            Attempt(1), Linked, ended(true), Sleep(ms(20)),
+            // a peer that never upgrades → connect deadline, then doubled
+            Attempt(2), ended(false), Sleep(ms(40)),
+            // a silent controller → idle deadline, back to the minimum
+            Attempt(3), Linked, ended(true), Sleep(ms(20)),
+            Attempt(4), Linked,
+        ]
+    );
+}
+
+// ── the desktop app's session token (kind-dist finding) ──────────────────
+
+/// Read grid messages until one satisfies `pick`; returns it and every
+/// message before it.
+async fn grid_until(client: &mut Ws, what: &str, pick: impl Fn(&Value) -> bool) -> (Value, Vec<Value>) {
+    let mut before = vec![];
+    within(what, async {
+        loop {
+            match client.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(&t).expect("grid JSON");
+                    if pick(&v) {
+                        return (v, std::mem::take(&mut before));
+                    }
+                    before.push(v);
+                }
+                Some(Ok(_)) => {}
+                other => panic!("grid ended before {what}: {other:?}; seen {before:?}"),
+            }
+        }
+    })
+    .await
+}
+
+fn grid_text(msgs: &[Value]) -> String {
+    msgs.iter().map(Value::to_string).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_session_token_spawns_and_attaches_through_the_controller() {
+    use k2_core::connect_users::{self, Role};
+    let home = TempHome::new();
+    let _shim = AgentShim::install();
+    let _ = k2_core::db::init_for_tests();
+
+    // The desktop app signs in (POST /cli/auth/login checks the password,
+    // then issues a session): an Owner-role Connect user.
+    let user = format!("applab{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let password = "correct horse battery staple 42";
+    connect_users::add_user(&user, password).expect("add user");
+    connect_users::set_role(&user, Role::Owner).expect("owner role");
+    assert!(connect_users::verify(&user, password));
+    let session_token = connect_users::create_session(&user);
+    let query = format!("token={session_token}");
+
+    // Spawn and close take the dispatcher's own check under every role.
+    assert!(crate::routes::http::token_ok(&query, OWNER_TOKEN));
+    // The grid is relayed for that session, as that user; junk is refused.
+    assert_eq!(
+        super::gate::grid_client(&query, OWNER_TOKEN),
+        Ok(hub::GridClient::ConnectUser { username: user.clone(), token: session_token.clone(), owner_token: OWNER_TOKEN.into() })
+    );
+    assert_eq!(super::gate::grid_client("token=nope", OWNER_TOKEN), Err(super::gate::GridRefusal::BadToken));
+    assert_eq!(super::gate::grid_client("", OWNER_TOKEN), Err(super::gate::GridRefusal::BadToken));
+
+    let c = Controller::start().await;
+    let cfg = HostConfig { attach_url: c.attach_url.clone(), token: TOKEN.into(), host_name: "app-1".into(), labels: vec![] };
+    let link_task = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
+    c.wait_hosts(1).await;
+
+    let agent = format!("dist-link-app-{}", uuid::Uuid::new_v4());
+    let cwd = home.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let body = json!({"agent_name": agent, "cwd": cwd, "command": "claude", "cols": 80, "rows": 24}).to_string();
+    let (status, out) = within("the spawn", c.remote.spawn(body.as_bytes())).await;
+    assert_eq!(status, "200 OK", "{out}");
+    let session = serde_json::from_str::<Value>(&out).unwrap()["sessionId"].as_str().unwrap().to_string();
+    assert!(crate::agent_host::host().find_agent(&agent).is_some(), "runs on the host");
+
+    // Attach as the app does: the session token on the grid socket.
+    let mut client = c.attach_grid_with(&session, &session_token).await.expect("grid upgrade with the session token");
+    let (mode, before) = grid_until(&mut client, "the first mode event", |v| v["event"] == "mode").await;
+    assert!(before.iter().any(|v| v["event"] == "snapshot"), "{before:?}");
+    // A Connect user starts as a capable viewer, exactly as under K2_ROLE=all.
+    assert_eq!(mode["payload"], json!({"mode": "viewer", "capable": true}));
+
+    // As a viewer, typing is denied (once) and never reaches the PTY.
+    client.send(Message::Text(json!({"action": "input", "text": "as-viewer"}).to_string())).await.unwrap();
+    grid_until(&mut client, "input_denied", |v| v["event"] == "input_denied").await;
+    // Opting in to claimer, as the app does, then typing reaches the agent.
+    client.send(Message::Text(json!({"action": "set_mode", "mode": "claimer"}).to_string())).await.unwrap();
+    let (mode, _) = grid_until(&mut client, "the claimer ack", |v| v["event"] == "mode").await;
+    assert_eq!(mode["payload"], json!({"mode": "claimer", "capable": true}));
+    let text = format!("app-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    client.send(Message::Text(json!({"action": "input", "text": text}).to_string())).await.unwrap();
+    client.send(Message::Text(json!({"action": "input", "text": "\r"}).to_string())).await.unwrap();
+    let (_, seen) = grid_until(&mut client, "the echo", |v| v.to_string().contains(&text)).await;
+    assert!(!grid_text(&seen).contains("as-viewer"), "viewer input never reached the PTY: {seen:?}");
+
+    // A removed user stops at once: the next frame ends the stream.
+    connect_users::remove_user(&user).expect("remove user");
+    let _ = client.send(Message::Text(json!({"action": "input", "text": "after-removal"}).to_string())).await;
+    within("the stream to end", async {
+        loop {
+            match client.next().await {
+                Some(Ok(Message::Text(t))) => assert!(!t.contains("after-removal"), "removed user's input reached the PTY"),
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+
+    let (status, out) = within("the close", c.remote.close(json!({"agent_name": agent, "force": true}).to_string().as_bytes())).await;
+    assert_eq!(status, "200 OK", "{out}");
+    assert!(crate::agent_host::host().find_agent(&agent).is_none());
     link_task.abort();
 }
