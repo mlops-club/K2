@@ -349,6 +349,17 @@ class W1:
                           "HTTP %s %s" % (status, raw[:300])):
             return
         turn = self.wait_turn_done(cwd, text1)
+        if not (turn and any(REPLY_MARKER in r and text1 in r for r in turn["replies"])) and turn:
+            # The CLI that took the prompt died before answering (--chaos):
+            # the turn in progress is lost (PRD failure table); the sender's
+            # next message wakes it again. Counted in info.
+            ex = (self.fake_events("cli.exec", turn["session"]) or [{}])[-1]
+            if ex.get("pid") and not pid_alive(ex["pid"]):
+                info["resent_after_cli_death"] = info.get("resent_after_cli_death", 0) + 1
+                self.log("the CLI (pid %s) died before answering %r: sending it again" % (ex["pid"], text1))
+                text1 = "w1 wake %s" % uuid.uuid4().hex[:6]
+                self.send_msg(info, "wake1-again", cwd, text1, wake=True)
+                turn = self.wait_turn_done(cwd, text1)
         info["turn1"] = turn
         ok = bool(turn) and any(REPLY_MARKER in r and text1 in r for r in turn["replies"])
         self.check(f, "the woken agent got the message and answered (transcript)", ok,

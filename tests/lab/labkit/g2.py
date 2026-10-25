@@ -716,9 +716,24 @@ def s7(c, sc):
         sc.check("MEMORY.md holds the fact", mem_bytes is not None and fact.encode() in mem_bytes, mem_file)
 
         n2 = "s7 long %s [[turn-ms=60000]]" % uuid.uuid4().hex[:6]
-        starts = len(c.turn_events(csid, "cli.turn.start"))
-        c.type(sock, n2)
-        started = wait_until(lambda: len(c.turn_events(csid, "cli.turn.start")) > starts, 30)
+        started = False
+        for attempt in (1, 2, 3):
+            starts = len(c.turn_events(csid, "cli.turn.start"))
+            c.type(sock, n2)
+            started = wait_until(lambda: len(c.turn_events(csid, "cli.turn.start")) > starts, 30)
+            if started or c.fleet.cli_alive(host, cli_pid):
+                break
+            # --chaos killed the CLI first: reopen it (the next need), type again.
+            sc.info["retries_after_cli_death"] = sc.info.get("retries_after_cli_death", 0) + 1
+            sock.close()
+            a = open_chat(c, sc, cwd, "the next need reopens the agent before the long turn (attempt %d)" % attempt)
+            if not a:
+                return
+            sid, csid, _, sock, grid = a
+            ex = c.exec_of(csid)
+            host, cli_pid = (ex or {}).get("host"), (ex or {}).get("pid")
+            ends = c.turn_events(csid, "cli.turn.end")
+            mem_hash = (ends[-1].get("attrs") or {}).get("memory_sha256") if ends else mem_hash
         if not sc.check("a long turn started", started, n2):
             return
         with c.fleet.control():
