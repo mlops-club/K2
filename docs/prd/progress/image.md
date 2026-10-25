@@ -173,9 +173,9 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilit
   the kind-app worker and the owner. Tear down with
   `kubectl --kubeconfig … delete namespace k2-solo` and
   `docker compose -f deploy/compose/compose.solo.yaml down -v`.
-- **Docker restart (2026-10-24 19:10, coordinator):** the pending
-  `docker rm -f k2dist-image-cargo` (cleanup of a paused, test-listing
-  container) was cut off; re-check after DOCKER-OK. After the restart, check
+- **Docker restart (2026-10-24 19:10, coordinator):** `docker rm -f
+  k2dist-image-cargo` (cleanup of a paused, test-listing container) had
+  completed (rc 0) before it. After the restart, check
   that the Compose service (`restart: unless-stopped`) and `sts/k2-solo` on
   k2lab came back Ready; nothing was re-run yet.
 - **Not run here:** `cargo test -p k2-core` and `-p k2-daemon` in full (the
