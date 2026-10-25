@@ -96,6 +96,22 @@ RUSTUP_HOME_DIR=${RUSTUP_HOME:-$HOME/.rustup}
 THREAD_ARGS=()
 [ -n "${K2_GATE_THREADS:-}" ] && THREAD_ARGS=(-- "--test-threads=$K2_GATE_THREADS")
 
+# K2_GATE_TEST_USER=<user>: when the gate runs as root (a container), run
+# the build and the package tests as this unprivileged user, so tests that
+# check ownership see what they see on a developer's machine; the root-only
+# allowlisted runs below stay root. The workdir is handed to that user.
+RUN_AS=()
+TEST_USER=${K2_GATE_TEST_USER:-}
+if [ -n "$TEST_USER" ]; then
+  [ "$(id -u)" -eq 0 ] || { echo "refusing to run: K2_GATE_TEST_USER needs the gate to run as root"; exit 2; }
+  id -u "$TEST_USER" >/dev/null 2>&1 || { echo "refusing to run: no user $TEST_USER (K2_GATE_TEST_USER)"; exit 2; }
+  command -v runuser >/dev/null || { echo "refusing to run: runuser not found (util-linux)"; exit 2; }
+  # Logs are written by this (root) shell's redirects, so they stay root's.
+  chown -R "$TEST_USER" "$SRC" "$WORK/target/" || { echo "chown of the workdir for $TEST_USER failed"; exit 2; }
+  RUN_AS=(runuser -u "$TEST_USER" --)
+  echo "gate: tests run as $TEST_USER (uid $(id -u "$TEST_USER")); root-only runs as root"
+fi
+
 LOW_MEM_ENV=()
 if [ "${K2_GATE_LOW_MEMORY:-0}" = 1 ]; then
   LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256
@@ -106,14 +122,20 @@ fi
 # Run cargo in a clean environment: only what the toolchain needs, a fresh
 # HOME and TMPDIR per package, no SHELL, no K2_* / K2SO_* variables.
 # Extra VAR=value pairs for one clean_cargo call: EXTRA_ENV=(...) clean_cargo ...
+# AS=(...) clean_cargo ... runs it as someone else (default: RUN_AS).
 EXTRA_ENV=()
 clean_cargo() {
   local log=$1; shift
-  local h t rc
+  local h t rc user
+  local as=("${RUN_AS[@]+"${RUN_AS[@]}"}")
+  [ "${AS_ROOT:-0}" = 1 ] && as=()
+  user=$(id -un)
+  [ ${#as[@]} -gt 0 ] && user=$TEST_USER
   h=$(mktemp -d "${TMPDIR:-/tmp}/k2-gate-home-XXXXXX")
   t=$(mktemp -d "${TMPDIR:-/tmp}/k2-gate-tmp-XXXXXX")
-  ( cd "$SRC" && env -i \
-      HOME="$h" TMPDIR="$t" PATH="$TOOL_PATH" USER="$(id -un)" LANG=C.UTF-8 \
+  [ ${#as[@]} -gt 0 ] && chown "$user" "$h" "$t"
+  ( cd "$SRC" && ${as[@]+"${as[@]}"} env -i \
+      HOME="$h" TMPDIR="$t" PATH="$TOOL_PATH" USER="$user" LANG=C.UTF-8 \
       CARGO_HOME="$CARGO_HOME_DIR" RUSTUP_HOME="$RUSTUP_HOME_DIR" \
       CARGO_TARGET_DIR="$WORK/target" CARGO_INCREMENTAL=0 \
       CARGO_PROFILE_DEV_DEBUG="${K2_GATE_DEBUG:-0}" CARGO_PROFILE_TEST_DEBUG="${K2_GATE_DEBUG:-0}" \
@@ -146,7 +168,7 @@ if [ "$(id -u)" -eq 0 ]; then
   for entry in "${ROOT_RUNS[@]}"; do
     pkg=${entry%% *}; filter=${entry#* }
     echo "gate: root-only: $pkg $filter"
-    if ! clean_cargo "$LOGS/root-${filter//::/_}.log" test -p "$pkg" --lib -- --ignored --exact "$filter"; then
+    if ! AS_ROOT=1 clean_cargo "$LOGS/root-${filter//::/_}.log" test -p "$pkg" --lib -- --ignored --exact "$filter"; then
       STATUS=1
     fi
   done

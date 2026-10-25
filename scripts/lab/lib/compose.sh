@@ -8,7 +8,7 @@
 # 1. In a machine-wide cargo slot, take the shared Docker lock
 #    ($HOME/.cache/k2-dist-docker.lock; order: slot, then lock, never the
 #    other way round) and build Linux k2-daemon and k2-fake-agent from
-#    `git archive <sha>` in the gate's build image (k2-lab-gate:2), capped
+#    `git archive <sha>` in the gate's build image (k2-lab-gate:3), capped
 #    at --memory 10g, 3 CPUs, CARGO_BUILD_JOBS=2, with the gate's warm target
 #    volume. The slot is given back after the build; the lock is kept for
 #    the whole compose run (one Docker job at a time) and released by
@@ -49,7 +49,7 @@ compose_fleet_up() {
             -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \
             -v k2-lab-gate-target:/cache/target -v k2-lab-gate-cargo-registry:/usr/local/cargo/registry \
             -v "$out/bin:/out" \
-            k2-lab-gate:2 \
+            k2-lab-gate:3 \
             bash -c "set -e; mkdir -p /build && git archive \"\$0\" | tar -x -C /build && cd /build \
                      && cargo build --locked -p k2-daemon --bin k2-daemon \
                      && cargo build --locked -p k2-fake-agent --bins \
@@ -66,7 +66,7 @@ compose_fleet_up() {
         echo "image: $image ($(docker image inspect "$image" --format '{{.Id}}'))"
         echo "sha: $sha"
         echo "compose: deploy/compose/compose.lab-fleet.yaml, project $COMPOSE_PROJECT"
-        echo "build: k2-lab-gate:2, --memory=10g --cpus 3, CARGO_BUILD_JOBS=2; containers 3g, 2 CPUs each"
+        echo "build: k2-lab-gate:3, --memory=10g --cpus 3, CARGO_BUILD_JOBS=2; containers 3g, 2 CPUs each"
         echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
     } >"$run_dir/fleet-compose.txt"
     root=$(mktemp -d /tmp/k2lab-fleet-XXXXXX) && root=$(realpath "$root")

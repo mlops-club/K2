@@ -14,14 +14,17 @@
 # - one Docker-heavy job at a time: $HOME/.cache/k2-dist-docker.lock, taken
 #   with mkdir, released on exit, INT or TERM (never by a run still waiting);
 # - the container: a Linux k2-daemon compile needs about 5 GB, so this one
-#   runs with --memory=6g --memory-swap=6g and the gate's K2_GATE_LOW_MEMORY=1
+#   ran with --memory=6g --memory-swap=6g and the gate's K2_GATE_LOW_MEMORY=1
 #   (one cargo build job, 256 codegen units; debuginfo is already 0), 3 CPUs
 #   and the gate's own K2_GATE_THREADS (3) for the tests. The Docker lock
 #   keeps anything else out of Docker meanwhile. If it is OOM-killed, cut
 #   rustc's memory or the parallelism, never raise the cap on your own.
-#   LAB_GATE_MEMORY (default 6g) and LAB_GATE_LOW_MEMORY (default 1; 0 runs
-#   the gate's normal build) change both only when the coordinator says so
-#   (2026-10-25: Docker VM raised to 14 GB, try 10g without low memory).
+#   Since 2026-10-25 the VM is 14 GB: LAB_GATE_MEMORY defaults to 10g and
+#   LAB_GATE_LOW_MEMORY to 0 (1 sets K2_GATE_LOW_MEMORY=1); change either
+#   only when the coordinator says so.
+# - the tests run as the unprivileged user k2gate (K2_GATE_TEST_USER;
+#   created at container start, owning cargo, rustup and the target
+#   volume); the gate's root-only allowlisted run stays root.
 # - the image build only runs apt-get (no compile); BuildKit has no
 #   --memory flag, so the lock is its only limit.
 #
@@ -33,12 +36,14 @@
 # removes the link, not the cache). Nothing from $HOME is mounted.
 set -uo pipefail
 repo=$1 common=$2 sha=$3 run=$4 name=$5
-image=k2-lab-gate:2
+image=k2-lab-gate:3
 target_vol=k2-lab-gate-target
 registry_vol=k2-lab-gate-cargo-registry
 lock="$HOME/.cache/k2-dist-docker.lock"
-mem=${LAB_GATE_MEMORY:-6g}
-low=${LAB_GATE_LOW_MEMORY:-1}
+# 2026-10-25: the Docker VM is 14 GB; the coordinator caps gate containers at
+# 10g, without the low-memory build (the wave-1 gate compiled k2-daemon so).
+mem=${LAB_GATE_MEMORY:-10g}
+low=${LAB_GATE_LOW_MEMORY:-0}
 case "$mem" in [1-9]g|1[0-9]g) ;; *) echo "lab: LAB_GATE_MEMORY is <N>g, 1g..19g (got '$mem')"; exit 2 ;; esac
 case "$low" in 0|1) ;; *) echo "lab: LAB_GATE_LOW_MEMORY is 0 or 1 (got '$low')"; exit 2 ;; esac
 low_env=()
@@ -71,6 +76,7 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "sha: $sha"
     echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
     echo "limits: --memory=$mem --memory-swap=$mem --cpus 3, $low_desc, K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
+    echo "user: tests as k2gate (uid 10001, K2_GATE_TEST_USER); the root-only allowlisted runs as root"
     echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
 } >"$run/topology/linux-gate.txt"
 
@@ -88,6 +94,9 @@ docker run --rm --name "$name" \
     -v "$target_vol:/cache/target" -v "$registry_vol:/usr/local/cargo/registry" \
     -v "$run/parity/linux-gate-logs:/out/logs" \
     "$image" \
+    -e K2_GATE_TEST_USER=k2gate \
     bash -c 'rm -rf /gate/work && mkdir -p /gate/work && ln -s /cache/target /gate/work/target \
              && ln -s /out/logs /gate/work/logs \
+             && { id -u k2gate >/dev/null 2>&1 || useradd --uid 10001 --create-home k2gate; } \
+             && chown -R k2gate /usr/local/cargo /usr/local/rustup /cache/target \
              && exec bash /src/wt/scripts/test-gate-linux.sh "$0" /gate/work' "$sha"
