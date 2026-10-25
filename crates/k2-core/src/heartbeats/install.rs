@@ -266,9 +266,9 @@ pub fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents/dev.k2.heartbeat.plist")
 }
 
-/// `<home>/.k2/heartbeat.sh`.
-pub fn script_path(home: &Path) -> PathBuf {
-    home.join(".k2/heartbeat.sh")
+/// `<k2_home>/heartbeat.sh`.
+pub fn script_path(k2_home: &Path) -> PathBuf {
+    k2_home.join("heartbeat.sh")
 }
 
 /// Which OS scheduler carries the tick. Tests pass one explicitly so the
@@ -518,6 +518,7 @@ pub(crate) fn state_with(
     runner: &dyn CommandRunner,
     platform: Platform,
     home: &Path,
+    k2_home: &Path,
 ) -> TransportReport {
     match platform {
         Platform::Launchd => {
@@ -526,14 +527,14 @@ pub(crate) fn state_with(
                 Ok(o) if o.success => Some(o.stdout.as_str()),
                 _ => None,
             };
-            classify_launchd(text, plist_path(home).exists(), script_path(home).exists())
+            classify_launchd(text, plist_path(home).exists(), script_path(k2_home).exists())
         }
         Platform::Cron => {
             let crontab = runner
                 .run("crontab", &["-l"], None)
                 .map(|o| if o.success { Some(o.stdout) } else { None });
             let mut r = classify_cron(crontab);
-            if r.state == TransportState::Retired && script_path(home).exists() {
+            if r.state == TransportState::Retired && script_path(k2_home).exists() {
                 r = TransportReport::bare(
                     TransportState::Leftover,
                     "old heartbeat.sh is still on disk; it will be removed",
@@ -549,7 +550,7 @@ pub(crate) fn state_with(
 
 /// What is left of the old tick job on this machine.
 pub fn transport_state() -> TransportReport {
-    state_with(&SystemRunner, Platform::current(), &home_dir())
+    state_with(&SystemRunner, Platform::current(), &home_dir(), &crate::paths::k2_home())
 }
 
 /// Old boolean, kept for old clients' "transport installed" check. Old
@@ -579,6 +580,7 @@ pub(crate) fn retire_with(
     runner: &dyn CommandRunner,
     platform: Platform,
     home: &Path,
+    k2_home: &Path,
 ) -> Result<RetireOutcome, String> {
     let mut removed: Vec<String> = Vec::new();
     match platform {
@@ -615,12 +617,12 @@ pub(crate) fn retire_with(
         }
         Platform::Unsupported => {}
     }
-    let script = script_path(home);
+    let script = script_path(k2_home);
     if script.exists() {
         fs::remove_file(&script).map_err(|e| format!("remove {}: {e}", script.display()))?;
         removed.push("deleted heartbeat.sh".to_string());
     }
-    let _ = fs::remove_file(home.join(".k2/heartbeat-projects.txt"));
+    let _ = fs::remove_file(k2_home.join("heartbeat-projects.txt"));
     Ok(if removed.is_empty() {
         RetireOutcome { changed: false, message: "no OS tick job to remove.".to_string() }
     } else {
@@ -634,7 +636,7 @@ pub(crate) fn retire_with(
 /// HB15 — remove this machine's old tick job. Guarded (HB6).
 pub fn retire_os_tick_job() -> Result<RetireOutcome, String> {
     transport_writes_allowed()?;
-    retire_with(&SystemRunner, Platform::current(), &home_dir())
+    retire_with(&SystemRunner, Platform::current(), &home_dir(), &crate::paths::k2_home())
 }
 
 /// Called by `heartbeat add`. Heartbeat S2: adding a heartbeat no longer
@@ -691,6 +693,7 @@ pub(crate) fn repair_with(
     runner: &dyn CommandRunner,
     platform: Platform,
     home: &Path,
+    k2_home: &Path,
     before: &TransportReport,
     context: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -707,9 +710,9 @@ pub(crate) fn repair_with(
         after: None,
         detail: String::new(),
     };
-    match retire_with(runner, platform, home) {
+    match retire_with(runner, platform, home, k2_home) {
         Ok(out) => {
-            let after = state_with(runner, platform, home);
+            let after = state_with(runner, platform, home, k2_home);
             rec.after = Some(after.state);
             if after.state == TransportState::Retired {
                 rec.action = "retired".to_string();
@@ -744,7 +747,7 @@ pub fn self_check_and_repair(context: &str) -> (TransportReport, Option<RepairRe
             after: None,
             detail: e,
         }),
-        Ok(()) => repair_with(&SystemRunner, Platform::current(), &home_dir(), &before, context, now),
+        Ok(()) => repair_with(&SystemRunner, Platform::current(), &home_dir(), &crate::paths::k2_home(), &before, context, now),
     };
     if let Some(rec) = &record {
         crate::log_debug!(
@@ -1120,17 +1123,17 @@ mod transport_state_tests {
     fn state_with_reads_only() {
         let home = temp_home("read");
         let runner = FakeRunner::launchd(Some(OK.to_string()), None);
-        let r = state_with(&runner, Platform::Launchd, &home);
+        let r = state_with(&runner, Platform::Launchd, &home, &home.join(".k2"));
         assert_eq!(r.state, TransportState::Leftover, "{}", r.detail);
         assert_eq!(runner.writes(), Vec::<String>::new());
 
         let runner = FakeRunner::cron(None);
-        let r = state_with(&runner, Platform::Cron, &home);
+        let r = state_with(&runner, Platform::Cron, &home, &home.join(".k2"));
         assert_eq!(r.state, TransportState::Retired);
         assert_eq!(runner.calls(), vec!["crontab -l".to_string()]);
 
         let runner = FakeRunner::launchd(None, None);
-        let r = state_with(&runner, Platform::Unsupported, &home);
+        let r = state_with(&runner, Platform::Unsupported, &home, &home.join(".k2"));
         assert_eq!(r.state, TransportState::Retired);
         assert_eq!(runner.calls(), Vec::<String>::new());
         let _ = fs::remove_dir_all(&home);
@@ -1185,15 +1188,15 @@ mod retire_tests {
             assert!(!os_job_wanted(&ws(mode, wake)), "{mode}/{wake} must not want an OS job");
             let home = temp_home(mode);
             fs::write(plist_path(&home), "<plist/>").expect("seed plist");
-            fs::write(script_path(&home), "#!/bin/bash\n").expect("seed script");
+            fs::write(script_path(&home.join(".k2")), "#!/bin/bash\n").expect("seed script");
             let runner = FakeRunner::launchd(Some(OK.to_string()), None);
-            let out = retire_with(&runner, Platform::Launchd, &home).expect("retire");
+            let out = retire_with(&runner, Platform::Launchd, &home, &home.join(".k2")).expect("retire");
             assert!(out.changed, "{}", out.message);
             let calls = runner.calls();
             assert_eq!(calls.iter().filter(|c| c.starts_with("launchctl bootout")).count(), 1, "{calls:?}");
             assert_eq!(calls.iter().filter(|c| c.starts_with("launchctl bootstrap")).count(), 0, "{calls:?}");
             assert!(!plist_path(&home).exists(), "plist must be deleted");
-            assert!(!script_path(&home).exists(), "heartbeat.sh must be deleted");
+            assert!(!script_path(&home.join(".k2")).exists(), "heartbeat.sh must be deleted");
             let _ = fs::remove_dir_all(&home);
         }
     }
@@ -1202,7 +1205,7 @@ mod retire_tests {
     fn nothing_loaded_means_no_bootout() {
         let home = temp_home("none");
         let runner = FakeRunner::launchd(None, None);
-        let out = retire_with(&runner, Platform::Launchd, &home).expect("retire");
+        let out = retire_with(&runner, Platform::Launchd, &home, &home.join(".k2")).expect("retire");
         assert!(!out.changed, "{}", out.message);
         assert_eq!(runner.writes(), Vec::<String>::new());
         let _ = fs::remove_dir_all(&home);
@@ -1221,7 +1224,7 @@ mod retire_tests {
             }
         }
         let home = temp_home("bootout-fail");
-        let e = retire_with(&FailingBootout, Platform::Launchd, &home).expect_err("must fail loudly");
+        let e = retire_with(&FailingBootout, Platform::Launchd, &home, &home.join(".k2")).expect_err("must fail loudly");
         assert!(e.contains("bootout"), "{e}");
         let _ = fs::remove_dir_all(&home);
     }
@@ -1233,7 +1236,7 @@ mod retire_tests {
         let runner = FakeRunner::cron(Some(
             "0 1 * * * /usr/bin/backup\n* * * * * /h/.k2/heartbeat.sh # k2so-agent-heartbeat\n".into(),
         ));
-        let out = retire_with(&runner, Platform::Cron, &home).expect("retire");
+        let out = retire_with(&runner, Platform::Cron, &home, &home.join(".k2")).expect("retire");
         assert!(out.changed);
         assert_eq!(runner.crontab.borrow().as_deref(), Some("0 1 * * * /usr/bin/backup\n"));
         assert!(runner.calls().contains(&"crontab -".to_string()));
@@ -1246,7 +1249,7 @@ mod retire_tests {
         let home = temp_home("no-cron");
         let mut runner = FakeRunner::cron(None);
         runner.crontab_missing = true;
-        let out = retire_with(&runner, Platform::Cron, &home).expect("retire");
+        let out = retire_with(&runner, Platform::Cron, &home, &home.join(".k2")).expect("retire");
         assert!(!out.changed);
         let _ = fs::remove_dir_all(&home);
     }
@@ -1256,17 +1259,17 @@ mod retire_tests {
         let home = temp_home("repair");
         fs::write(plist_path(&home), "<plist/>").expect("seed plist");
         let runner = FakeRunner::launchd(Some(OK.to_string()), None);
-        let before = state_with(&runner, Platform::Launchd, &home);
+        let before = state_with(&runner, Platform::Launchd, &home, &home.join(".k2"));
         assert_eq!(before.state, TransportState::Leftover);
-        let rec = repair_with(&runner, Platform::Launchd, &home, &before, "boot", chrono::Utc::now())
+        let rec = repair_with(&runner, Platform::Launchd, &home, &home.join(".k2"), &before, "boot", chrono::Utc::now())
             .expect("a leftover job gets a record");
         assert_eq!(rec.action, "retired", "{}", rec.detail);
         assert_eq!(rec.after, Some(TransportState::Retired));
         let calls = runner.calls();
         assert_eq!(calls.iter().filter(|c| c.starts_with("launchctl bootstrap")).count(), 0);
 
-        let retired = state_with(&runner, Platform::Launchd, &home);
-        assert!(repair_with(&runner, Platform::Launchd, &home, &retired, "periodic", chrono::Utc::now()).is_none());
+        let retired = state_with(&runner, Platform::Launchd, &home, &home.join(".k2"));
+        assert!(repair_with(&runner, Platform::Launchd, &home, &home.join(".k2"), &retired, "periodic", chrono::Utc::now()).is_none());
         let _ = fs::remove_dir_all(&home);
     }
 

@@ -123,19 +123,20 @@ sequenceDiagram
 
 ## How to try it
 
-Not runnable yet (diagrams milestone). The commands the finished task gives:
-
 ```sh
-# Build (host arch; kind's nodes match it)
-packaging/oci/build.sh                        # → k2-daemon:dev
+# Build (host arch; kind's nodes match it). Default K2_BUILD_PROFILE=dev:
+# release without fat LTO, about 25 min cold, minutes warm.
+packaging/oci/build.sh                        # → k2-daemon:dev (≈290 MB)
 
 # Compose on this Mac
 docker compose -f deploy/compose/compose.solo.yaml up -d --wait \
   && curl -fsS http://127.0.0.1:7420/boot-status | jq .
-
-# Random UID
-docker run --rm -d --name k2-uid --user 54321:0 -e K2_DAEMON_PORT=7420 -e K2_LISTEN=lan \
-  -p 127.0.0.1:7430:7420 k2-daemon:dev
+# Through Docker's port mapping the daemon sees a non-loopback client and
+# answers the compat view (phase, version, features; no installKind or
+# capabilities), by design (boot_status::view_for). For the full view, send
+# the owner token:
+curl -fsS -H "Authorization: Bearer $(docker compose -f deploy/compose/compose.solo.yaml exec -T k2 cat /var/lib/k2/.k2/daemon.token)" \
+  http://127.0.0.1:7420/boot-status | jq '{phase, installKind, capabilities}'
 
 # kind k2lab, explicit kubeconfig only
 kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
@@ -143,18 +144,43 @@ kind load docker-image k2-daemon:dev --name k2lab
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f packaging/oci/kind/solo.yaml
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo rollout status sts/k2-solo
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward svc/k2-solo 7440:7420 &
-curl -fsS http://127.0.0.1:7440/boot-status | jq .
+curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilities}'   # full view: port-forward arrives on loopback
 ```
 
 ## Status
 
-- **Milestone:** settings modules, install-kind opt-outs, image, Compose and
-  kind manifest written; compiling and testing in a Linux container (no Rust
-  toolchain on this Mac, so every cargo command runs in `k2-oci-toolchain:dev`,
-  the Dockerfile's `toolchain` stage, as root with `env -i` like the gate).
-- **Next:** clippy, `cargo test -p k2-core` / `-p k2-daemon` and the
-  helper/engine/node tests; build the image; Compose, random UID, kind.
-- **Open questions:** none open. Clippy criterion changed (coordinator, 2026-10-24): see "Clippy baseline".
+- **Milestone:** done (coordinator: k2-core / k2-daemon suites go to the integrator's Linux gate, option C).
+- Verified 2026-10-24 (see Test runs for cargo):
+  - `k2-daemon:dev` built (dev profile, 293 MB).
+  - Compose: `up -d --wait` healthy; `/boot-status` phase `ready`; with the
+    owner token: `installKind` `package`, `listen.lan` true, capabilities
+    all `off` except vault `host-native (key store file)`; runs as
+    `uid=10000 gid=0`; `daemon.port` = 7420.
+  - k2lab: namespace `k2-solo` (Pod Security `restricted`, no warnings),
+    `sts/k2-solo` 1/1 Ready, PVC bound; through the port-forward:
+    `{"phase":"ready","installKind":"package","view":"full",…}`.
+  - The boot log has the one capability line.
+  - Any UID: `docker run --user 54321:0` and `--user 0:0` both reach
+    phase `ready`, `installKind` `package`.
+  - Boot refusals, each exit 2 before anything starts:
+    `K2_ROLE=controller` → `K2_ROLE=controller needs agent hosts (PRD P2); not available yet`;
+    `K2_ROLE=host` → `K2_ROLE="host" is not a role; allowed values: all, controller`;
+    `K2_CAP_FRONT=engine` → `… allowed values: host, listen, off`;
+    `K2_DAEMON_PORT=abc` → `… is not a port; use a number from 1 to 65535`.
+  - Occupied port (second daemon in the Compose container's network):
+    `K2_DAEMON_PORT=7420: can't listen on 0.0.0.0:7420: Address already in use (os error 98) (no fallback to another port)`, exit 2; the first daemon keeps serving.
+- **Left running:** `k2-solo` on k2lab and the Compose project `k2-solo`, for
+  the kind-app worker and the owner. Tear down with
+  `kubectl --kubeconfig … delete namespace k2-solo` and
+  `docker compose -f deploy/compose/compose.solo.yaml down -v`.
+- **Docker restart (2026-10-24 19:10, coordinator):** `docker rm -f
+  k2dist-image-cargo` (cleanup of a paused, test-listing container) had
+  completed (rc 0) before it. After the restart, check
+  that the Compose service (`restart: unless-stopped`) and `sts/k2-solo` on
+  k2lab came back Ready; nothing was re-run yet.
+- **Not run here:** `cargo test -p k2-core` and `-p k2-daemon` in full (the
+  k2-daemon lib needs about 4.8 GB to compile; the Docker cap is 3 GB). The
+  integrator's `scripts/test-gate-linux.sh` runs them after the wave-1 merge.
 
 ### Owner decisions (2026-10-24)
 
@@ -235,3 +261,36 @@ run: the same 390 findings (file and message, line numbers ignored). The
 `is_multiple_of` warnings in `crates/k2-node/src/node/mod.rs` (a touched file)
 are fixed. In `k2-daemon` the only finding on a changed line (a doc comment
 attached to the wrong function in `daemon_main.rs`) is fixed.
+
+### Test runs
+
+All cargo runs are in `k2-oci-toolchain:dev` under `env -i` with a temp
+`HOME`/`TMPDIR` (no `K2_*`), `--memory=3g --cpus=4`, `CARGO_BUILD_JOBS≤3`,
+`--test-threads=3`, debuginfo 0 (as the gate), holding the shared k2-dist
+Docker lock.
+
+First run (as root):
+
+| crate | result |
+|---|---|
+| k2-root-proto | ok |
+| k2-app-engine | ok |
+| k2-root-helper | 204 passed, 1 failed + `tests/binary.rs` 1 failed: both assert "run as non-root" (`geteuid() != 0`) |
+| k2-node | `tests/cli.rs` 2 failed, `tests/servers_cli.rs` 1 failed: root-only refusals asserted as non-root |
+| k2-core | lib 3644 passed, 2 failed (`daemon_pty` fd tests need `lsof`, absent in the toolchain image); `tests/ptyd_backend.rs` 8 failed (needs `k2-ptyd` built first) |
+| k2-daemon | lib test build OOM-killed (debuginfo 2 under the 3 GB cap) |
+
+Every failure is the test environment, not this change.
+
+Re-runs:
+
+- k2-root-helper and k2-node as UID 1000 (opt-level 0, debuginfo 0): **19
+  binaries, 453 passed, 0 failed, 18 ignored**, so the four root-only failures
+  above were the root user.
+- k2-daemon: the lib OOMs under 3 GB at debuginfo 0 with 2 jobs, then 1 job,
+  then opt-level 0. Per the coordinator, the full k2-core and k2-daemon suites
+  run in the integrator's Linux gate instead (option C). Not run here:
+  k2-daemon unit tests (`runtime_role`, `daemon_port`, `capabilities`,
+  `engine_install`) and the permission-off golden with `capabilities`.
+- k2-core: the lib passed 3644 of 3646 in the first run (the 2 need `lsof`);
+  `ptyd_backend` needs `k2-ptyd` built first. Both are left to the gate.

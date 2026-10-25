@@ -5,6 +5,7 @@
 #
 # Exports <sha> with `git archive` into a FRESH dir (never a copied or mixed
 # tree), builds with its own CARGO_TARGET_DIR, and runs
+#   cargo build -p k2-ptyd --bin k2-ptyd   (k2-core's ptyd_backend execs it)
 #   cargo test -p k2-core   --no-fail-fast
 #   cargo test -p k2-daemon --no-fail-fast
 # under a clean `env -i` (HOME and TMPDIR = fresh temp dirs, no SHELL, no
@@ -22,6 +23,15 @@
 #                        panics still carry file:line and messages)
 #   K2_GATE_KEEP=1       keep the workdir (logs, target) after the run
 #   K2_GATE_THREADS      --test-threads (default: libtest's choice)
+#   K2_GATE_LOW_MEMORY=1 for a memory-capped box (the lab's 6 GB Docker
+#                        container): one cargo build job, 256 codegen units
+#                        and opt-level 0 for the workspace default of dev and
+#                        test (packages with their own [profile.dev.package]
+#                        opt-level keep it), so the single rustc for
+#                        k2-daemon's lib test fits (it was SIGKILLed at 6 GB
+#                        with one job and 256 units at opt-level 1).
+#                        Debuginfo is already 0 (K2_GATE_DEBUG) and
+#                        incremental off. Unset (the default), nothing changes.
 #   K2_GATE_REALPG_PORT / K2_GATE_REALPG_SOCK / K2_GATE_REALPG_BIN
 #                        a throwaway Postgres 16 cluster (TCP port, socket dir,
 #                        bin dir with psql): set all three and the gate RUNS
@@ -86,6 +96,13 @@ RUSTUP_HOME_DIR=${RUSTUP_HOME:-$HOME/.rustup}
 THREAD_ARGS=()
 [ -n "${K2_GATE_THREADS:-}" ] && THREAD_ARGS=(-- "--test-threads=$K2_GATE_THREADS")
 
+LOW_MEM_ENV=()
+if [ "${K2_GATE_LOW_MEMORY:-0}" = 1 ]; then
+  LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256
+               CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0)
+  echo "gate: K2_GATE_LOW_MEMORY=1: ${LOW_MEM_ENV[*]}"
+fi
+
 # Run cargo in a clean environment: only what the toolchain needs, a fresh
 # HOME and TMPDIR per package, no SHELL, no K2_* / K2SO_* variables.
 # Extra VAR=value pairs for one clean_cargo call: EXTRA_ENV=(...) clean_cargo ...
@@ -100,6 +117,7 @@ clean_cargo() {
       CARGO_HOME="$CARGO_HOME_DIR" RUSTUP_HOME="$RUSTUP_HOME_DIR" \
       CARGO_TARGET_DIR="$WORK/target" CARGO_INCREMENTAL=0 \
       CARGO_PROFILE_DEV_DEBUG="${K2_GATE_DEBUG:-0}" CARGO_PROFILE_TEST_DEBUG="${K2_GATE_DEBUG:-0}" \
+      ${LOW_MEM_ENV[@]+"${LOW_MEM_ENV[@]}"} \
       ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} "$CARGO_BIN" "$@" ) > "$log" 2>&1
   rc=$?
   rm -rf "$h" "$t"
@@ -107,6 +125,15 @@ clean_cargo() {
 }
 
 STATUS=0
+# k2-core's ptyd_backend tests exec the real k2-ptyd from the target dir
+# (target/debug/k2-ptyd, next to the test binary). `cargo test -p k2-core`
+# builds k2-ptyd only as a library, so on a fresh build box the binary is
+# missing and all of ptyd_backend fails. Build it first, into the same
+# target dir, as CI does (.github/workflows/checks.yml).
+echo "gate: cargo build -p k2-ptyd --bin k2-ptyd (ptyd_backend needs the binary)"
+if ! clean_cargo "$LOGS/k2-ptyd-bin.log" build -p k2-ptyd --bin k2-ptyd; then
+  STATUS=1
+fi
 for pkg in k2-core k2-daemon; do
   echo "gate: cargo test -p $pkg --no-fail-fast"
   if ! clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --no-fail-fast "${THREAD_ARGS[@]}"; then

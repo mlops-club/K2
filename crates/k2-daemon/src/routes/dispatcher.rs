@@ -1314,6 +1314,12 @@ async fn handle_one_request(
         return DispatchOutcome::Done;
     }
 
+    // K2_ROLE=controller / host (dist-link): `/cli/hosts/*`, and on a
+    // controller the S1 relays and the 501s. Falls through under `all`.
+    if crate::hosts::gate::route(&mut *stream, &mut buf, &path, &query, state.token.as_str()).await {
+        return DispatchOutcome::Done;
+    }
+
     // A′ (app-mobile-access-v1, 0.46.3): the catalog is the wall for App
     // passes on the main port too. A live `k2skn_` pass on a route that is
     // not a catalog `app` row (or an App socket) is fenced: the one pass

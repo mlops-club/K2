@@ -697,6 +697,11 @@ pub const ROUTES: &[Route] = &[
     post("/cli/hooks/install", Admin),
     get("/cli/hooks/status", Member),
     get("/cli/host-sessions/list", Member),
+    // Agent hosts (dist-link, PRD P2): attach is the host's socket, no HTTP
+    // credential (the handler checks the bootstrap token in `hello`);
+    // status is the probe, role and link state only, no secrets.
+    get("/cli/hosts/attach", Public),
+    get("/cli/hosts/status", Public),
     get("/cli/inbox", Member),
     post("/cli/inbox/archive", Member),
     post("/cli/inbox/compose", Member),

@@ -290,7 +290,7 @@ fn spawn_wake_headless_with(
         .ok()
         .filter(|c| !c.is_empty())
         .is_some();
-    let delivery_job = match crate::v2_session_map::lookup_by_session_id(&outcome.session_id) {
+    let delivery_job = match crate::agent_host::host().find_session(&outcome.session_id) {
         Some(session) => {
             // Readiness dialect: the test override keeps the claude-shaped
             // default with a short ceiling (`cat` never advertises
@@ -316,7 +316,7 @@ fn spawn_wake_headless_with(
                 )
             };
             Some((
-                crate::session_lookup::LiveSession(session),
+                session,
                 wake_prompt.to_string(),
                 profile,
                 ceiling,

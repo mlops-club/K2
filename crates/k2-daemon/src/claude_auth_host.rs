@@ -212,7 +212,7 @@ CRED_SERVICE="Claude Code-credentials"
 CRED_ACCOUNT="Claude Code"
 TOKEN_URL="{token_url}"
 CLIENT_ID="{client_id}"
-LOG_FILE="{home}/.k2/claude-auth-refresh.log"
+LOG_FILE="{k2_home}/claude-auth-refresh.log"
 BUFFER_SECONDS=300
 
 ts() {{ date '+%Y-%m-%d %H:%M:%S'; }}
@@ -308,16 +308,13 @@ tail -100 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
         token_url = TOKEN_ENDPOINT,
         client_id = CLIENT_ID,
         home = home,
+        k2_home = k2_home_dir().display(),
     )
 }
 
 #[cfg(target_os = "macos")]
 fn generate_plist() -> String {
     let script = refresh_script_path();
-    let home = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .to_string_lossy()
-        .to_string();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -336,12 +333,12 @@ fn generate_plist() -> String {
     <key>RunAtLoad</key>
     <false/>
     <key>StandardErrorPath</key>
-    <string>{home}/.k2/claude-auth-refresh-stderr.log</string>
+    <string>{k2_home}/claude-auth-refresh-stderr.log</string>
 </dict>
 </plist>"#,
         label = PLIST_LABEL,
         script = script.to_string_lossy(),
-        home = home,
+        k2_home = k2_home_dir().display(),
     )
 }
 

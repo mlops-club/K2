@@ -26,13 +26,13 @@ use std::path::{Path, PathBuf};
 use k2_core::log_debug;
 use k2_core::session::SessionId;
 use k2_core::terminal::sandbox::WorkspaceMountSpec;
-use k2_core::terminal::{DaemonPtyConfig, DaemonPtySession, LabelSource};
+use k2_core::terminal::{DaemonPtyConfig, LabelSource};
 
+use crate::agent_host::{host, AgentSession};
 use crate::awareness_ws::HandlerResult;
 use crate::pending_live;
 use crate::signal_format;
 use crate::spawn::{canonical_spawn_lock, live_program_matches};
-use crate::v2_session_map;
 use k2_core::workspace::resume_chat::{resolve_resume_chat_args_ex, ResumeChatArgs};
 
 /// Cheap UUID-shape probe: 36 chars, hyphens at the canonical
@@ -619,6 +619,7 @@ pub fn handle_v2_spawn(body: &[u8]) -> HandlerResult {
 /// `/v1/sandboxes` calls it directly with a host-trusted request from the
 /// policy-resolver.
 pub fn spawn_session(req: SpawnRequest) -> HandlerResult {
+    let _trace = k2_core::trace::spawn_request(&req.agent_name, req.command.as_deref());
     if req.agent_name.is_empty() {
         return HandlerResult {
             status: "400 Bad Request",
@@ -750,7 +751,7 @@ fn closed_tab_gate(req: &SpawnRequest) -> Option<HandlerResult> {
         CLOSED_TABS.lock().clear(&req.agent_name);
         return None;
     }
-    let live_child = v2_session_map::lookup_by_agent_name(&req.agent_name)
+    let live_child = host().find_agent(&req.agent_name)
         .is_some_and(|s| s.is_child_alive());
     let refused = closed_tab_refuses(
         &CLOSED_TABS.lock(),
@@ -786,17 +787,13 @@ fn attach_only_session(req: &SpawnRequest) -> HandlerResult {
         body: serde_json::json!({ "error": "session_not_live", "agent_name": req.agent_name })
             .to_string(),
     };
-    let Some(existing) = v2_session_map::lookup_by_agent_name(&req.agent_name) else {
+    let Some(existing) = host().find_agent(&req.agent_name) else {
         return not_live();
     };
     if !existing.is_child_alive() {
         return not_live();
     }
-    let live_cwd = existing
-        .cwd
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let live_cwd = existing.cwd();
     if session_owned_elsewhere(&live_cwd, &req.cwd) {
         return HandlerResult {
             status: "409 Conflict",
@@ -805,7 +802,7 @@ fn attach_only_session(req: &SpawnRequest) -> HandlerResult {
     }
     let (cols, rows) = current_dims(&existing);
     let mut out = serde_json::json!({
-        "sessionId": existing.session_id.to_string(),
+        "sessionId": existing.session_id().to_string(),
         "agentName": req.agent_name,
         "cols": cols,
         "rows": rows,
@@ -817,8 +814,8 @@ fn attach_only_session(req: &SpawnRequest) -> HandlerResult {
         conversation_id_for_agent(
             &req.agent_name,
             &req.cwd,
-            existing.program.as_deref(),
-            &existing.args,
+            existing.program(),
+            existing.args_ref(),
         ),
     );
     HandlerResult {
@@ -917,7 +914,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
     // the first grid attach snapshot is already at the target size
     // (no 80×24 snap → claim-resize → reflow storm).
     let __t_lookup = std::time::Instant::now();
-    let existing = v2_session_map::lookup_by_agent_name(&req.agent_name);
+    let existing = host().find_agent(&req.agent_name);
     let lookup_ms = __t_lookup.elapsed().as_secs_f64() * 1000.0;
 
     // A stale map entry whose child already exited must NOT be reused —
@@ -931,11 +928,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
     // workspace_tab_sessions row for this agent_name.
     if let Some(existing) = existing.as_ref() {
         if existing.is_child_alive() {
-            let live_cwd = existing
-                .cwd
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let live_cwd = existing.cwd();
             if session_owned_elsewhere(&live_cwd, &req.cwd) {
                 log_debug!(
                     "[v2-spawn] refusing reuse agent={} live_cwd={} requested_cwd={} \
@@ -952,25 +945,25 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
         }
         let alive = existing.is_child_alive();
         let matches =
-            alive && live_program_matches(existing.program.as_deref(), command.as_deref());
+            alive && live_program_matches(existing.program(), command.as_deref());
         if !matches {
             log_debug!(
                 "[v2-spawn] evicting session for agent={} alive={} live_program={:?} expected={:?}",
                 req.agent_name,
                 alive,
-                existing.program,
+                existing.program(),
                 command,
             );
             // unregister runs the DB/active-session cleanup chokepoint
             // and itself calls kill(); the explicit kill() here is
             // idempotent and guarantees teardown even if the key was
             // already removed by a racing unregister.
-            v2_session_map::unregister(&req.agent_name);
-            existing.kill();
+            host().unplace(&req.agent_name);
+            host().kill(existing);
         }
     }
     let existing = existing.filter(|s| {
-        s.is_child_alive() && live_program_matches(s.program.as_deref(), command.as_deref())
+        s.is_child_alive() && live_program_matches(s.program(), command.as_deref())
     });
 
     if let Some(existing) = existing {
@@ -986,12 +979,12 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
             let seed = req.label.as_deref().unwrap_or("").trim();
             if !seed.is_empty() {
                 if !matches!(existing.label_source(), LabelSource::Locked) {
-                    existing.set_label(seed.to_string(), true);
+                    host().set_label(&existing, seed.to_string(), true);
                 }
             }
         }
         let (cols, rows) = apply_spawn_fit(&existing, req.cols, req.rows);
-        let session_id_str = existing.session_id.to_string();
+        let session_id_str = existing.session_id().to_string();
         let total_ms = __t_total.elapsed().as_secs_f64() * 1000.0;
         log_debug!(
             "[v2-perf] side=daemon SPAWN_SUMMARY session={} agent={} reused=true total_ms={:.3} lookup_ms={:.3} dpty_spawn_ms=0 cols={} rows={}",
@@ -1009,8 +1002,8 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
             conversation_id_for_agent(
                 &req.agent_name,
                 &req.cwd,
-                existing.program.as_deref(),
-                &existing.args,
+                existing.program(),
+                existing.args_ref(),
             ),
         );
         // A2/B3a — reuse-echo. Mirror the cold-spawn accept-and-mark rule:
@@ -1019,7 +1012,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
         // byte-identical to pre-seam (default-path regression guard).
         if req.sandbox.is_some() {
             out["sandbox"] =
-                serde_json::Value::String(existing.sandbox.backend().name().to_string());
+                serde_json::Value::String(existing.sandbox().backend().name().to_string());
         }
         return HandlerResult {
             status: "200 OK",
@@ -1106,14 +1099,15 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
             .and_then(|v| v.parse().ok())
             .unwrap_or(32);
         let req_cwd = std::path::PathBuf::from(&req.cwd);
-        let unwatched_bare = v2_session_map::snapshot()
+        let unwatched_bare = host()
+            .placements()
             .into_iter()
             .filter(|(key, s)| {
                 key.starts_with("tab-")
-                    && s.program.is_none()
+                    && s.program().is_none()
                     && s.is_child_alive()
-                    && !s.ever_attached.load(std::sync::atomic::Ordering::Relaxed)
-                    && s.cwd.as_ref() == Some(&req_cwd)
+                    && !s.ever_attached()
+                    && s.cwd_path() == Some(req_cwd.as_path())
             })
             .count();
         if unwatched_bare >= cap {
@@ -1458,7 +1452,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
         cfg.env.get("HOME").map(String::as_str),
     );
     let __t_spawn = std::time::Instant::now();
-    let session = match DaemonPtySession::spawn(cfg) {
+    let session = match host().spawn(cfg) {
         Ok(s) => s,
         Err(e) => {
             // P4-H6: the cell never booted → free the per-session uid + tear down
@@ -1487,15 +1481,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
     // Seed last-claimer dims at create so a grid attach before the first
     // SetActive/Resize still pre-snaps to the body fit (fresh PTY is already
     // at req.cols×rows — this only records the claimer size, no reflow).
-    {
-        use std::sync::atomic::Ordering;
-        session
-            .active_cols
-            .store(req.cols.max(1), Ordering::Relaxed);
-        session
-            .active_rows
-            .store(req.rows.max(1), Ordering::Relaxed);
-    }
+    host().set_claimed_size(&session, req.cols.max(1), req.rows.max(1));
     let dpty_spawn_ms = __t_spawn.elapsed().as_secs_f64() * 1000.0;
 
     // COMPAT-58 (#58 Phase 1 / PR-A) — per-cell UDS after PTY open.
@@ -1553,7 +1539,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
         }
     }
 
-    v2_session_map::register(req.agent_name.clone(), session.clone());
+    host().place(&req.agent_name, &session);
 
     // Stamp the agent_sessions row's `active_terminal_id` (migration
     // 0037). Best-effort: tab-keyed spawns (`tab-<id>`) won't have
@@ -1598,7 +1584,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
             // `--session-id <id>`. Without keying on the actual
             // resume target, ad-hoc tab spawns (Cmd+T, AI editor)
             // would clobber the pinned tab's stamp on every spawn.
-            let args = &session.args;
+            let args = session.args_ref();
             let mut resumed_session: Option<&str> = None;
             let mut i = 0;
             while i + 1 < args.len() {
@@ -1609,7 +1595,7 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
                 i += 1;
             }
             if let Some(claude_sid) = resumed_session {
-                let new_tid = session.session_id.to_string();
+                let new_tid = session.session_id().to_string();
 
                 // Pinned-tab pointer: workspace_sessions row whose
                 // saved claude session_id matches what this PTY is
@@ -1678,9 +1664,9 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
     let pending_drained = pending.len();
     for signal in pending {
         let bytes = signal_format::inject_bytes(&signal);
-        session.write(bytes.into_bytes());
+        let _ = host().write(&session, bytes.into_bytes());
         std::thread::sleep(std::time::Duration::from_millis(150));
-        session.write(b"\r".to_vec());
+        let _ = host().write(&session, b"\r".to_vec());
     }
 
     let total_ms = __t_total.elapsed().as_secs_f64() * 1000.0;
@@ -1855,7 +1841,7 @@ pub fn handle_v2_close(body: &[u8]) -> HandlerResult {
     // GH#22 guard: refuse to reap a session a client is attached to.
     // Look up first (without unregistering) so we can read the live
     // subscriber count from the session's own broadcast channel.
-    if let Some(session) = v2_session_map::lookup_by_agent_name(&req.agent_name) {
+    if let Some(session) = host().find_agent(&req.agent_name) {
         let subscribers = session.subscriber_count();
         if !close_allowed(subscribers, req.force) {
             log_debug!(
@@ -1875,7 +1861,7 @@ pub fn handle_v2_close(body: &[u8]) -> HandlerResult {
         }
     }
 
-    let removed = v2_session_map::unregister(&req.agent_name).is_some();
+    let removed = host().unplace(&req.agent_name).is_some();
     if req.reason.as_deref() == Some("tab_close") && req.agent_name.starts_with("tab-") {
         CLOSED_TABS
             .lock()
@@ -1952,11 +1938,11 @@ pub fn handle_v2_refresh(body: &[u8]) -> HandlerResult {
     let spawn_lock = canonical_spawn_lock(&req.agent_name);
     let _spawn_guard = spawn_lock.lock();
 
-    let existing = v2_session_map::lookup_by_agent_name(&req.agent_name);
+    let existing = host().find_agent(&req.agent_name);
     let cwd = if req.cwd.trim().is_empty() {
         existing
             .as_ref()
-            .and_then(|s| s.cwd.as_ref())
+            .and_then(|s| s.cwd_path())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     } else {
@@ -2027,11 +2013,11 @@ pub fn handle_v2_refresh(body: &[u8]) -> HandlerResult {
         log_debug!(
             "[v2-refresh] kill agent={} pty={} resume={}",
             req.agent_name,
-            session.session_id,
+            session.session_id(),
             provider_sid,
         );
-        v2_session_map::unregister(&req.agent_name);
-        session.kill();
+        host().unplace(&req.agent_name);
+        host().kill(&session);
     }
 
     // Command is set, so spawn will not call recovered_launch again and
@@ -2058,23 +2044,18 @@ pub fn handle_v2_refresh(body: &[u8]) -> HandlerResult {
     })
 }
 
-/// Read the current `{cols, rows}` from a session's alacritty Term.
+/// Read the current `{cols, rows}` from a session's terminal.
 /// Used to populate the response for a reused session so the caller
 /// knows the actual dimensions after any pre-snap resize.
-fn current_dims(session: &DaemonPtySession) -> (u16, u16) {
-    use k2_core::terminal::Dimensions;
-    let term_mutex = session.term();
-    let term = term_mutex.lock();
-    let cols = term.columns() as u16;
-    let rows = term.screen_lines() as u16;
-    (cols, rows)
+fn current_dims(session: &AgentSession) -> (u16, u16) {
+    host().size(session)
 }
 
 /// Honor a spawn body's cols/rows against a live session (reuse path).
 ///
 /// When the requested fit differs from the live PTY, store claimer
-/// dims and apply via [`DaemonPtySession::apply_resize_now`] (sync:
-/// pin clamp + same-dims skip, **no** trailing debounce) so the spawn
+/// dims and apply via [`AgentHost::resize_now`](crate::agent_host::AgentHost::resize_now)
+/// (sync: pin clamp + same-dims skip, **no** trailing debounce) so the spawn
 /// response and the next grid attach's initial snapshot are already
 /// at the target size — even if a resize landed in the last ~120ms.
 ///
@@ -2083,9 +2064,8 @@ fn current_dims(session: &DaemonPtySession) -> (u16, u16) {
 /// re-POST without cols; so a body that is exactly VT 80×24 keeps the
 /// live size when it differs. Fresh spawn still opens at 80×24 as the
 /// true last-resort. Explicit non-default body always wins.
-fn apply_spawn_fit(session: &std::sync::Arc<DaemonPtySession>, cols: u16, rows: u16) -> (u16, u16) {
-    use std::sync::atomic::Ordering;
-
+fn apply_spawn_fit(session: &AgentSession, cols: u16, rows: u16) -> (u16, u16) {
+    let host = host();
     let cols = cols.max(1);
     let rows = rows.max(1);
     let (cur_c, cur_r) = current_dims(session);
@@ -2094,15 +2074,13 @@ fn apply_spawn_fit(session: &std::sync::Arc<DaemonPtySession>, cols: u16, rows: 
     // clobber a measured pane with VT last-resort).
     let is_vt_default = cols == default_cols() && rows == default_rows();
     if is_vt_default && (cur_c, cur_r) != (cols, rows) {
-        if session.active_cols.load(Ordering::Relaxed) == 0
-            || session.active_rows.load(Ordering::Relaxed) == 0
-        {
-            session.active_cols.store(cur_c, Ordering::Relaxed);
-            session.active_rows.store(cur_r, Ordering::Relaxed);
+        let (ac, ar) = host.claimed_size(session);
+        if ac == 0 || ar == 0 {
+            host.set_claimed_size(session, cur_c, cur_r);
         }
         log_debug!(
             "[v2-spawn] reuse keep-live (body is VT default 80×24) session={} live={}x{}",
-            session.session_id,
+            session.session_id(),
             cur_c,
             cur_r,
         );
@@ -2110,17 +2088,15 @@ fn apply_spawn_fit(session: &std::sync::Arc<DaemonPtySession>, cols: u16, rows: 
     }
 
     if (cols, rows) != (cur_c, cur_r) {
-        // Intent first; apply_resize_now returns pin-clamped reality.
-        session.active_cols.store(cols, Ordering::Relaxed);
-        session.active_rows.store(rows, Ordering::Relaxed);
-        let live = DaemonPtySession::apply_resize_now(session, cols, rows);
+        // Intent first; resize_now returns pin-clamped reality.
+        host.set_claimed_size(session, cols, rows);
+        let live = host.resize_now(session, cols, rows);
         // Refresh claimer dims from post-apply reality so a later
         // attach pre-snap does not re-target a pin-blocked size.
-        session.active_cols.store(live.0, Ordering::Relaxed);
-        session.active_rows.store(live.1, Ordering::Relaxed);
+        host.set_claimed_size(session, live.0, live.1);
         log_debug!(
             "[v2-spawn] reuse pre-snap resize session={} {}x{} → {}x{} (live={}x{})",
-            session.session_id,
+            session.session_id(),
             cur_c,
             cur_r,
             cols,
@@ -2130,13 +2106,11 @@ fn apply_spawn_fit(session: &std::sync::Arc<DaemonPtySession>, cols: u16, rows: 
         );
         return live;
     }
-    if session.active_cols.load(Ordering::Relaxed) == 0
-        || session.active_rows.load(Ordering::Relaxed) == 0
-    {
+    let (ac, ar) = host.claimed_size(session);
+    if ac == 0 || ar == 0 {
         // Seed claimer dims so a subsequent grid attach pre-snap
         // has something to work with even when size was already correct.
-        session.active_cols.store(cols, Ordering::Relaxed);
-        session.active_rows.store(rows, Ordering::Relaxed);
+        host.set_claimed_size(session, cols, rows);
     }
     current_dims(session)
 }
@@ -2145,9 +2119,9 @@ fn apply_spawn_fit(session: &std::sync::Arc<DaemonPtySession>, cols: u16, rows: 
 /// A refresh reuses the name for a newer PTY; this ChildExit must not
 /// kill that process. Returns whether unregister ran.
 pub(crate) fn unregister_if_same_session(agent_name: &str, exited: SessionId) -> bool {
-    match v2_session_map::lookup_by_agent_name(agent_name) {
-        Some(current) if current.session_id == exited => {
-            v2_session_map::unregister(agent_name);
+    match host().find_agent(agent_name) {
+        Some(current) if current.session_id() == exited => {
+            host().unplace(agent_name);
             true
         }
         Some(current) => {
@@ -2155,7 +2129,7 @@ pub(crate) fn unregister_if_same_session(agent_name: &str, exited: SessionId) ->
                 "[daemon/v2-exit] ChildExit agent={} exited={} kept live session={}",
                 agent_name,
                 exited,
-                current.session_id,
+                current.session_id(),
             );
             false
         }
@@ -2185,7 +2159,7 @@ pub(crate) fn unregister_if_same_session(agent_name: &str, exited: SessionId) ->
 /// `subscribe_events()` caller) can't re-inflate the viewer signal.
 pub fn spawn_child_exit_observer(
     agent_name: String,
-    session: std::sync::Arc<DaemonPtySession>,
+    session: AgentSession,
     ephemeral_cwd: Option<PathBuf>,
     principal_key: Option<String>,
     // Workspace path when quota was acquired with a per-workspace ceiling.
@@ -2201,7 +2175,7 @@ pub fn spawn_child_exit_observer(
     // Capture the session id BEFORE downgrading so the teardown path can
     // revoke the scoped token + remove the per-cell socket even if every
     // strong ref is gone by the time ChildExit lands (#58 Phase 1).
-    let session_id = session.session_id;
+    let session_id = session.session_id();
     // A2/B3b: capture the backend tier too, so the authoritative microVM
     // cgroup/NEWROOT cleanup can run on ChildExit even if every strong ref
     // is gone by then. Inert for the default Passthrough path. The variable
@@ -2211,14 +2185,14 @@ pub fn spawn_child_exit_observer(
         not(all(target_os = "linux", feature = "sandbox-microvm")),
         allow(unused_variables)
     )]
-    let is_microvm = matches!(session.sandbox, k2_core::terminal::SandboxSpec::Microvm);
-    let weak = std::sync::Arc::downgrade(&session);
+    let is_microvm = matches!(session.sandbox(), k2_core::terminal::SandboxSpec::Microvm);
+    let weak = session.downgrade();
     drop(session);
     tokio::spawn(async move {
         // Re-acquire briefly to grab a receiver. If the session was
         // already dropped, exit — nothing to observe.
         let mut rx = match weak.upgrade() {
-            Some(s) => s.subscribe_events(),
+            Some(s) => host().events(&s),
             None => return,
         };
         // Drop the temporary strong reference so we don't keep the
@@ -2241,7 +2215,7 @@ pub fn spawn_child_exit_observer(
                     // lookup. Fix is cheap; race is rare; bug class
                     // is high-impact.
                     if let Some(s) = weak.upgrade() {
-                        s.mark_child_exited();
+                        host().mark_exited(&s);
                     }
                     // Host-session durable index: clear null-sid orphans always;
                     // clear full api-% row when Grace (--final / done) is armed
@@ -2790,7 +2764,7 @@ mod tests {
         assert_eq!(first.status, "200 OK", "body={}", first.body);
         let first_id = session_id_of(&first.body);
         let live = crate::v2_session_map::lookup_by_agent_name(&agent).expect("registered");
-        let before = current_dims(&live);
+        let before = current_dims(&AgentSession::in_process(live.clone()));
 
         // A different command and another size: attach-only still neither
         // evicts the live program nor resizes it.
@@ -2816,7 +2790,7 @@ mod tests {
         let after = crate::v2_session_map::lookup_by_agent_name(&agent).expect("still registered");
         assert!(after.is_child_alive(), "the live child must not be evicted");
         assert_eq!(after.session_id.to_string(), first_id);
-        assert_eq!(current_dims(&after), before);
+        assert_eq!(current_dims(&AgentSession::in_process(after.clone())), before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -14,10 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 
 pub fn themes_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".k2")
-        .join("themes")
+    crate::paths::k2_home().join("themes")
 }
 
 pub fn get_dir() -> Result<String, String> {

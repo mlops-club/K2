@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # K2 in a container (PRD "K2 Distributed Runtime", stage P0, "Container"
 # topology): today's daemon, controller plus in-process agent host
 # (K2_ROLE=all), as one image for Docker Compose and Kubernetes.
@@ -25,12 +24,24 @@ RUN apt-get update \
 
 # ── build: k2-ptyd first, then k2-daemon embedding it (P84) ──────────────
 FROM toolchain AS build
+# Parallel rustc jobs; keep it modest on a shared laptop (build.sh passes it).
+ARG CARGO_BUILD_JOBS=3
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+# dev (default): Cargo's release profile without LTO, 16 codegen units and no
+# debug info, so k2-daemon:dev builds in minutes. ship: Cargo.toml's release
+# profile untouched (fat LTO, one codegen unit), as release binaries are built.
+ARG K2_BUILD_PROFILE=dev
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,id=k2-oci-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=k2-oci-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=k2-oci-target,target=/src/target \
+    --mount=type=cache,id=k2-oci-target-${K2_BUILD_PROFILE},target=/src/target \
     set -eux; \
+    case "$K2_BUILD_PROFILE" in \
+      dev) export CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 CARGO_PROFILE_RELEASE_DEBUG=false ;; \
+      ship) ;; \
+      *) echo "K2_BUILD_PROFILE must be dev or ship, not $K2_BUILD_PROFILE" >&2; exit 2 ;; \
+    esac; \
     cargo build --release --locked -p k2-ptyd --bin k2-ptyd; \
     K2_PTYD_EMBED=/src/target/release/k2-ptyd K2_REQUIRE_PTYD_EMBED=1 \
       cargo build --release --locked -p k2-daemon --bin k2-daemon; \

@@ -318,6 +318,9 @@ pub fn detect_claude_session_near(
 /// the DB holds a stale session_id (workspace remove+readd,
 /// Claude-side pruning, migrations, etc.).
 pub fn claude_session_file_exists(session_id: &str, project_path: &str) -> bool {
+    if let Some(found) = crate::transcript_probe::ask("claude", session_id, project_path) {
+        return found;
+    }
     resolve_claude_session_file(session_id, project_path).is_some()
 }
 

@@ -200,6 +200,17 @@ pub struct MsgResponse {
     /// `note: <movedFrom> is now <addr>`.
     #[serde(rename = "movedFrom", default, skip_serializing_if = "Option::is_none")]
     pub moved_from: Option<String>,
+
+    /// K2_ROLE=host or controller: the message's id in the delivery
+    /// outbox (`crate::delivery_drain`). Absent under `all`.
+    #[serde(rename = "msgId", default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+
+    /// With [`Self::msg_id`]: `accepted` (the controller's outbox has it),
+    /// `queued` (durable on this host, waiting for the controller link) or
+    /// `failed`. `GET /cli/hosts/outbox?msg_id=` reports the final state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 /// serde `skip_serializing_if` helper — keep `woke: false` out of the wire.
@@ -208,6 +219,30 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl MsgResponse {
+    /// A send handed to the delivery outbox (K2_ROLE=host / controller).
+    fn from_outbox(sent: Result<crate::delivery_drain::Sent, String>) -> Self {
+        let mut r = Self::fail(MsgReason::SpawnFailed);
+        r.branch = Some("outbox".to_string());
+        match sent {
+            Ok(sent) => {
+                r.success = sent.state != "failed";
+                r.reason = sent.reason.clone().map(|why| format!("delivery_failed: {why}"));
+                r.hint = match sent.state {
+                    "queued" => Some("queued on this host; it forwards the message when the controller link is back".into()),
+                    "failed" => Some("the controller refused the message; see GET /cli/hosts/outbox".into()),
+                    _ => Some(format!("queued for delivery; GET /cli/hosts/outbox?msg_id={} shows when it lands", sent.msg_id)),
+                };
+                r.msg_id = Some(sent.msg_id);
+                r.delivery = Some(sent.state.to_string());
+            }
+            Err(e) => {
+                r.reason = Some("delivery_failed".into());
+                r.hint = Some(format!("couldn't queue the message: {e}"));
+            }
+        }
+        r
+    }
+
     fn ok(target_session_id: String, branch: &str) -> Self {
         Self {
             success: true,
@@ -220,6 +255,8 @@ impl MsgResponse {
             branch: Some(branch.to_string()),
             addr: None,
             moved_from: None,
+            msg_id: None,
+            delivery: None,
         }
     }
 
@@ -245,6 +282,8 @@ impl MsgResponse {
             branch: None,
             addr: None,
             moved_from: None,
+            msg_id: None,
+            delivery: None,
         }
     }
 }
@@ -905,6 +944,13 @@ pub(crate) fn deliver_live_with_receipt(
     via: &str,
     summary: Option<&str>,
 ) -> MsgResponse {
+    // K2_ROLE=host / controller: `k2 msg` goes to the controller's outbox,
+    // which delivers it to whichever host runs the recipient (k2-dist
+    // outbox). Under `all`, today's direct delivery, unchanged.
+    let body = serde_json::json!({"kind": "msg", "text": text, "command": command, "label": stamp_from});
+    if let Some(sent) = crate::delivery_drain::send(from, workspace_token, body) {
+        return MsgResponse::from_outbox(sent);
+    }
     deliver_live_inner(
         workspace_token,
         text,
@@ -1519,26 +1565,11 @@ fn inject_framed_locked(live: &session_lookup::LiveSession, payload: &str) -> In
         }
     };
     let actions = k2_core::inject_flow::compile_inject_flow(&flow, &body);
-    for action in actions {
-        match action {
-            k2_core::inject_flow::InjectAction::Write(bytes) => {
-                if live.write(&bytes).is_err() {
-                    return InjectOutcome::PtyDied;
-                }
-            }
-            k2_core::inject_flow::InjectAction::Sleep(ms) => {
-                if ms > 0 {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-            }
-            k2_core::inject_flow::InjectAction::CheckAlive => {
-                if !live.is_child_alive() {
-                    return InjectOutcome::PtyDied;
-                }
-            }
-        }
+    k2_core::trace::emit(|| k2_core::trace::Event::new("host.inject").pane(&live.session_id().to_string()).attr("bytes", body.len()));
+    match crate::agent_host::host().inject(live, actions) {
+        crate::agent_host::InjectResult::Delivered => InjectOutcome::Delivered,
+        crate::agent_host::InjectResult::ChildGone => InjectOutcome::PtyDied,
     }
-    InjectOutcome::Delivered
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1598,6 +1629,63 @@ pub fn send_message_to_session_with_command(
         InjectOutcome::Stalled => MsgResponse::fail(MsgReason::PtyStalled),
         InjectOutcome::GateHold => MsgResponse::fail(MsgReason::HitlGateOpen),
     })
+}
+
+/// K2_ROLE=host: deliver a message the controller sent for `agent_id`, an
+/// agent running on this host (`crate::delivery_drain`). `kind: "msg"`
+/// injects `[from <label>] text` into its live session like `k2 msg`;
+/// `kind: "inbox"` composes into the inbox of the workspace it runs in.
+/// Never spawns: an agent with no live session here is retried by the
+/// controller.
+pub(crate) fn deliver_to_local_agent(
+    agent_id: &str,
+    from: &str,
+    body: &serde_json::Value,
+) -> crate::delivery_drain::LocalDelivery {
+    use crate::delivery_drain::LocalDelivery;
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let Some(session) = crate::v2_session_map::lookup_by_agent_name(agent_id) else {
+        return LocalDelivery::Retry(format!("no live session for agent {agent_id} on this host"));
+    };
+    let label = Some(field("label")).filter(|l| !l.is_empty()).unwrap_or_else(|| {
+        from.split_once(':').map(|(_, n)| n).unwrap_or(from).to_string()
+    });
+    match field("kind").as_str() {
+        "inbox" => {
+            let Some(cwd) = session.cwd.clone() else {
+                return LocalDelivery::Rejected(format!("agent {agent_id} has no workspace on this host"));
+            };
+            let title = field("title");
+            if title.is_empty() {
+                return LocalDelivery::Rejected("inbox message without a title".into());
+            }
+            let opt = |k: &str| Some(field(k)).filter(|v| !v.is_empty());
+            match k2_core::inbox::compose(
+                &cwd,
+                &title,
+                &field("body"),
+                opt("priority").as_deref(),
+                opt("source").as_deref(),
+                Some(label.as_str()),
+            ) {
+                Ok(_) => LocalDelivery::Delivered,
+                Err(e) => LocalDelivery::Retry(format!("inbox compose: {e}")),
+            }
+        }
+        "msg" | "" => {
+            let text = field("text");
+            if text.is_empty() {
+                return LocalDelivery::Rejected("message without text".into());
+            }
+            let sid = session.session_id.to_string();
+            match send_message_to_session_with_command(&sid, &label, &text, &field("command")) {
+                Ok(r) if r.success => LocalDelivery::Delivered,
+                Ok(r) => LocalDelivery::Retry(r.reason.unwrap_or_else(|| "not delivered".into())),
+                Err(e) => LocalDelivery::Rejected(e),
+            }
+        }
+        other => LocalDelivery::Rejected(format!("unknown message kind {other:?}")),
+    }
 }
 
 /// Persist compose-bar send history. Called after a successful
@@ -3500,7 +3588,7 @@ mod tests {
             survive: false,
         };
         let s = DaemonPtySession::spawn(cfg).expect("spawn cat");
-        session_lookup::LiveSession(s)
+        session_lookup::LiveSession::in_process(s)
     }
 
     #[cfg(unix)]

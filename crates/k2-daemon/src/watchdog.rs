@@ -45,8 +45,8 @@ use k2_core::session::{
     SemanticKind, SessionEntry, SessionId, WatchdogConfig,
 };
 
+use crate::agent_host::host;
 use crate::session_lookup::{self, LiveSession};
-use crate::v2_session_map;
 
 /// Spawn the watchdog as a background tokio task. Returns the
 /// JoinHandle so the daemon can abort it on graceful shutdown (not
@@ -224,15 +224,13 @@ fn execute(
             // (claude/codex/…) ignore/outlive that SIGHUP, so a
             // watchdog "kill" that only unregistered would leave the
             // runaway child alive (the very thing the watchdog exists to
-            // stop). `DaemonPtySession::kill()` does the two-phase
-            // killpg+SIGKILL+waitpid reap. `LiveSession` is a thin
-            // newtype over `Arc<DaemonPtySession>`, so reach the inner
-            // session via `.0`. Kill first (authoritative termination),
-            // then unregister to run the DB/active-session cleanup
-            // chokepoint (its own kill() call is then an idempotent
+            // stop). The host's `kill` does the two-phase
+            // killpg+SIGKILL+waitpid reap. Kill first (authoritative
+            // termination), then unplace to run the DB/active-session
+            // cleanup chokepoint (its own kill is then an idempotent
             // no-op).
-            session.0.kill();
-            v2_session_map::unregister(agent);
+            host().kill(session);
+            host().unplace(agent);
         }
         Escalation::None => unreachable!(),
     }

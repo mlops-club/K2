@@ -113,6 +113,19 @@ fn no_new_raw_env_mutation_in_k2_daemon() {
     );
 }
 
+/// RATCHET (K2 Distributed Runtime P0): every K2-home path in k2-daemon
+/// goes through `k2_core::paths` (`K2_HOME`, else `~/.k2`). A hand-built
+/// `home_dir().join(".k2")` fails here with its file and line (see
+/// `k2_core::test_env::k2_home_path_lines`). Nothing is allowed today;
+/// keep it that way.
+#[test]
+fn no_new_k2_home_paths_outside_paths_in_k2_daemon() {
+    const ALLOW: &[(&str, usize)] = &[];
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let v = k2_core::test_env::k2_home_path_violations(&src, ALLOW);
+    assert!(v.is_empty(), "K2-home path built outside k2_core::paths:\n{}", v.join("\n"));
+}
+
 /// No temp names from a `ThreadId` (see
 /// `k2_core::test_env::thread_id_name_violations`).
 #[test]

@@ -968,7 +968,7 @@ fn run_resume_and_fire(
             // (GH #61). Claude's --print path carried the prompt
             // positionally (argv) and skips this.
             if let ResumePromptDelivery::PtyWrite(prompt) = prompt_delivery {
-                let delivered = match crate::v2_session_map::lookup_by_session_id(&out.session_id)
+                let delivered = match crate::agent_host::host().find_session(&out.session_id)
                 {
                     Some(session) => {
                         let provider =
@@ -983,7 +983,7 @@ fn run_resume_and_fire(
                                 provider,
                             );
                         crate::workspace_msg::deliver_heartbeat_wake(
-                            &session_lookup::LiveSession(session),
+                            &session,
                             &prompt,
                             Some((&profile, crate::workspace_msg::DEFAULT_WAKE_TIMEOUT)),
                         )

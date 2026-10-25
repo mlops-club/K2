@@ -527,6 +527,9 @@ pub fn strip_session_identity(command: &str, args: &[String]) -> Vec<String> {
 /// the premint harnesses, whose `--resume` fails on a missing id and whose
 /// `--session-id` fails on an existing one.
 pub fn conversation_exists(provider: &str, sid: &str, project_path: &str) -> bool {
+    if let Some(found) = crate::transcript_probe::ask(provider, sid, project_path) {
+        return found;
+    }
     match provider {
         "gemini" => crate::chat_history::gemini_session_id_exists(sid),
         "pi" => Path::new(sid).is_file(),

@@ -60,7 +60,7 @@ use k2_core::terminal::{
     TermGridSnapshot,
 };
 
-use crate::v2_session_map;
+use crate::agent_host::host;
 
 /// Outbound WS message. Tagged as `{"event":"<kind>","payload":...}`.
 /// `pub(crate)` since 0.39.46: the shared grid emitter
@@ -813,6 +813,7 @@ pub async fn serve_session_grid_connection(
     params: HashMap<String, String>,
     owner_token: String,
 ) {
+    k2_core::trace::attach(params.get("session").map(String::as_str), "grid");
     // The token that authorized this connection. Re-validated on a timer
     // inside the loop so a revoked connect-user (disabled / removed /
     // role-changed) is dropped from their LIVE socket within seconds —
@@ -832,7 +833,7 @@ pub async fn serve_session_grid_connection(
         }
     };
 
-    let session = match v2_session_map::lookup_by_session_id(&session_id) {
+    let agent = match host().find_session(&session_id) {
         Some(s) => s,
         None => {
             let msg = format!("session {session_id} not found in v2 session map");
@@ -840,6 +841,11 @@ pub async fn serve_session_grid_connection(
             return;
         }
     };
+    // The Term-reading half of this handler (snapshots, labels, viewport
+    // arbitration) is host-side grid code and reads the in-process
+    // session directly; everything that drives the session goes through
+    // `host()` with `agent`.
+    let session = std::sync::Arc::clone(agent.pty());
 
     // S5 viewer/claimer — resolve the connection's auth CLASS once at
     // accept (classification, not an auth check: the dispatcher already
@@ -918,7 +924,12 @@ pub async fn serve_session_grid_connection(
     // single-subscriber); remount-during-swap sequences that used
     // to fail with "busy" now subscribe fresh each time and
     // render from a new initial snapshot.
-    let mut events_rx = session.subscribe_events();
+    //
+    // `host().attach` takes these in this order: events, then the viewer
+    // registration below, then labels and pins. `attachment` must stay
+    // bound: its remaining field is that registration.
+    let attachment = host().attach(&agent);
+    let mut events_rx = attachment.events;
     // 2026-07-02 (PTY-leak Bug 2) — register as a REAL viewer for this
     // connection's lifetime. `subscriber_count()` counts these
     // registrations, NOT events_tx receivers (internal daemon observers
@@ -927,14 +938,15 @@ pub async fn serve_session_grid_connection(
     // RAII guard decrements on ANY exit path out of this handler. It
     // also latches `ever_attached` (v2_spawn's never-attached bare-shell
     // cap) — one write point, so the two signals can never disagree.
-    let _viewer_reg = session.attach_viewer();
+    // The registration is `attachment`'s one field not moved out above,
+    // so it lives until this handler returns.
     // Phase B: subscribe to out-of-band label updates. When the
     // CLI route or another process sets the session's label, we
     // need to push `LabelChanged` to this client.
-    let mut labels_rx = session.subscribe_labels();
+    let mut labels_rx = attachment.labels;
     // S7a: subscribe to pin-state changes (same pattern) so this
     // client's pin UI converges when any caller pins/unpins.
-    let mut pins_rx = session.subscribe_pins();
+    let mut pins_rx = attachment.pins;
 
     let pane_id = format!("kessel-{}", session.session_id);
 
@@ -950,8 +962,11 @@ pub async fn serve_session_grid_connection(
     // floor below. `_format_reg` is the RAII k1-refcount registration;
     // holding it for the connection's lifetime keeps the emitter
     // binary-encoding, and dropping it on any exit path releases that.
-    let (mut frames_rx, shared_emit_state, _format_reg) =
-        crate::grid_emitter::attach(&session, &pane_id, proto_k1);
+    let crate::agent_host::GridStream {
+        frames: mut frames_rx,
+        emit_state: shared_emit_state,
+        format_reg: _format_reg,
+    } = host().stream(&agent, &pane_id, proto_k1);
 
     // Attach-size PR2 — pre-snap resize. Order: subscribe (above) →
     // optional sync resize to last known claimer fit → ONE initial
@@ -963,13 +978,10 @@ pub async fn serve_session_grid_connection(
     // still receive the snapshot at the claimer's size (one logical
     // PTY size).
     {
-        use std::sync::atomic::Ordering;
-        let ac = session.active_cols.load(Ordering::Relaxed);
-        let ar = session.active_rows.load(Ordering::Relaxed);
+        let (ac, ar) = host().claimed_size(&agent);
         if ac > 0 && ar > 0 {
-            let live = DaemonPtySession::apply_resize_now(&session, ac, ar);
-            session.active_cols.store(live.0, Ordering::Relaxed);
-            session.active_rows.store(live.1, Ordering::Relaxed);
+            let live = host().resize_now(&agent, ac, ar);
+            host().set_claimed_size(&agent, live.0, live.1);
             log_debug!(
                 "[daemon/sessions_grid_ws] pre-snap resize session={} sub={} target={}x{} live={}x{}",
                 session.session_id,
@@ -1707,17 +1719,8 @@ pub async fn serve_session_grid_connection(
                                             my_cols,
                                             my_rows,
                                         );
-                                        session.active_cols.store(
-                                            my_cols,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        session.active_rows.store(
-                                            my_rows,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        DaemonPtySession::request_resize(
-                                            &session, my_cols, my_rows,
-                                        );
+                                        host().set_claimed_size(&agent, my_cols, my_rows);
+                                        host().resize(&agent, my_cols, my_rows);
                                         // PR3: input-steal claimer resize
                                         // can reflow — rearm settle fence.
                                         let now = std::time::Instant::now();
@@ -1751,7 +1754,7 @@ pub async fn serve_session_grid_connection(
                                     &session.session_id.to_string(),
                                     text.as_bytes(),
                                 );
-                                session.write(text.into_bytes());
+                                let _ = host().write(&agent, text.into_bytes());
                             }
                             Ok(Inbound::Resize { cols, rows }) => {
                                 // Remember our own requested dims even when the
@@ -1789,21 +1792,12 @@ pub async fn serve_session_grid_connection(
                                     .active_subscriber
                                     .load(std::sync::atomic::Ordering::Relaxed);
                                 if active == 0 || active == subscriber_id {
-                                    session.active_cols.store(
-                                        cols,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    session.active_rows.store(
-                                        rows,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    host().set_claimed_size(&agent, cols, rows);
                                     // Debounced: a flapping viewport (mobile
                                     // keyboard show/hide) coalesces to its
                                     // final geometry; the very first fit of a
                                     // fresh session still applies instantly.
-                                    DaemonPtySession::request_resize(
-                                        &session, cols, rows,
-                                    );
+                                    host().resize(&agent, cols, rows);
                                     // PR3: claimer resize can reflow for
                                     // hundreds of ms — rearm the settle
                                     // fence so pause→resync doesn't spiral.
@@ -2100,7 +2094,7 @@ pub async fn serve_session_grid_connection(
     // commandeered stayed stuck at phone dimensions). With no
     // survivor the claim clears to 0, exactly the pre-election CAS
     // behavior this replaces.
-    DaemonPtySession::detach_subscriber(&session, subscriber_id);
+    host().detach(&agent, subscriber_id);
 
     // Drop `events_rx` implicitly on return. Broadcast subscribers
     // don't need to be "restored" — the next connection just calls

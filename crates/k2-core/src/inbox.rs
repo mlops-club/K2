@@ -285,6 +285,7 @@ pub fn compose(
     );
     let path = root.join(&filename);
     atomic_write(&path, &content)?;
+    crate::trace::emit(|| crate::trace::Event::new("inbox.write").attr("item", filename.clone()).attr("from", from.clone()).attr("source", source.clone()));
 
     let id = filename.strip_suffix(".md").unwrap_or(&filename).to_string();
     Ok(InboxItem {
