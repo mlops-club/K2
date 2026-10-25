@@ -168,13 +168,25 @@ waiting request fails with 502.
 
 | Dir | Frame | Fields |
 |---|---|---|
-| ctl → host | `grid.open` | `stream`, `session_id`, `epoch`, `proto` (`null` or `"k1"`, protocol 1 sends `null`) |
+| ctl → host | `grid.open` | `stream`, `session_id`, `epoch`, `proto` (`null` or `"k1"`, protocol 1 sends `null`), `as_user` (the Connect user the client signed in as; `null` for the owner token) |
 | both | `grid.data` | `stream`, `text`: one WebSocket text message of the app's grid protocol, verbatim |
 | both | `grid.close` | `stream`, `reason` |
 
 The host serves `grid.open` with its own `/cli/sessions/grid` handler over
 a loopback socket, so snapshots and deltas are encoded once, on the host,
 next to the Term, and the controller only relays them.
+
+Who may use a relayed grid is decided on the controller, exactly as the
+grid route decides it under `K2_ROLE=all` (`gate::grid_client`): a Skin
+pass → 403; the owner token → relayed as the owner; a live Connect session
+(the desktop app's `POST /cli/auth/login` token) → relayed as that user;
+anything else → 403. The host's handler sees an owner connection, so the
+relay keeps a Connect user's rules from `all`: the stream starts as a
+viewer (`set_mode viewer` goes first and the host's initial owner `mode`
+frame is not passed on), `capable` in every `mode` event comes from the
+controller's user store, the token is re-checked every 5 s, and a removed
+user or revoked token ends the stream. Per-session `/v1` stream tokens are
+refused on a controller in this cut.
 
 ### Events (host → controller)
 
@@ -223,8 +235,14 @@ Readiness:
   host `{"role":"host","linked":true|false,"host_id":…}`. A host is ready
   for work when `linked` is true.
 
-The host reconnects with backoff (1 s doubling to 30 s) when the link
-drops. Agents keep running on the host while the link is down; the
+The host reconnects when the link ends for any reason (connect error, read
+error, close, silence): 1 s after a link that was up, then doubling to 30 s
+while attempts fail. Every wait has a deadline (`link::Timings`): connect
+plus upgrade 10 s (a SYN to a vanished pod IP otherwise waits out the
+kernel's retries, ~127 s), welcome 10 s, nothing from the controller for
+45 s (it pings every 15 s), close 2 s. Each attempt logs
+`[hosts/link] connecting to … (attempt N)` and its outcome with the delay
+chosen; `/cli/hosts/status` on the host adds `attempts` and `links`. Agents keep running on the host while the link is down; the
 controller forgets the host's placements when the link closes (re-adoption
 is S9).
 
@@ -234,7 +252,7 @@ is S9).
 |---|---|
 | `POST /cli/sessions/v2/spawn` | placed on a connected host; with none: 503 `{"error":"no agent host is connected …"}` |
 | `POST /cli/sessions/v2/close` | forwarded to the owning host; unknown agent: 200 as today (`closed:false`) |
-| `GET /cli/sessions/grid` | relayed to the owning host (owner token only in this cut; connect users and stream tokens get an error frame) |
+| `GET /cli/sessions/grid` | relayed to the owning host for the owner token and Connect sessions (the desktop app's login), with `all`'s viewer/claimer rules; `/v1` stream tokens get 403 |
 | `GET /cli/sessions/events` | served by the controller as today; host `open_url` arrives here |
 | `GET /cli/hosts/attach`, `GET /cli/hosts/status` | new |
 | every other spawn path (`spawn.rs`, heartbeats, wake, `/v1` sandboxes, sidecars, pinned chat) | `host()` is the "no local agents" host: `spawn` fails with `K2_ROLE=controller runs no agents locally`; lookups find nothing |
@@ -298,7 +316,7 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 - Milestones: diagrams written; host env contract (handed to `kind-dist`);
   first working slice; done (every acceptance criterion below holds).
 - Next (P2 follow-ups, not this task): `RemoteHost` as an `impl AgentHost`,
-  connect-user and stream-token grid relays, `proto=k1` over the link,
+  stream-token grid relays, `proto=k1` over the link,
   host re-adoption after a controller restart (S9), the outbox (S3), cwd
   mapping for pods.
 - Open: the deviation below (`RemoteHost` not yet an `impl AgentHost`).
@@ -311,7 +329,9 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 | `hosts::tests::real_host_link_runs_the_agent_and_relays_its_pty` | the real link with real PTYs: spawn placed on the host, snapshot relayed, typed text echoed back through the relay, close kills and reaps the child |
 | `hosts::tests::fake_host_s1_…` | placement and epoch, reuse goes back to the same host, grid both ways, hooks accepted only for a placed session at its epoch, `open_url` on the session events bus, close drops the placement |
 | `hosts::tests::spawn_with_no_host_connected_is_a_clear_error` | 503 with the `NO_HOSTS` message (criterion 3) |
-| `scripts/lab/topology/two-process.sh` (runs `20261025T005250Z`, `20261025T005539Z`) | all six checks PASS, below |
+| `scripts/lab/topology/two-process.sh` (runs `20261025T005250Z`, `20261025T005539Z`; with check 7: `20261025T145839Z`) | all checks PASS, below |
+| `hosts::tests::host_reconnects_after_a_reset_a_mute_peer_and_a_silent_controller` | kind-dist finding: a reset mid-session, then a peer that never upgrades, then a silent controller; the link retries after the minimum after a link, doubled after a failed attempt, and links a fourth time (asserts the decided delays, not elapsed time) |
+| `hosts::tests::app_session_token_spawns_and_attaches_through_the_controller` | an Owner-role Connect user's session token: spawn on the real host, attach, first `mode` is `{viewer, capable:true}`, viewer input → `input_denied` and never reaches the PTY, `set_mode claimer` then typing echoes, removing the user ends the stream |
 | `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME, 3 jobs | 161 test binaries: 5185 passed, 2 failed, 6 ignored. Both failures are environmental and pass on rerun: `ptyd_p76_integration` needs the `k2-ptyd` binary built (`cargo build -p k2-ptyd`; then 1/1 ok); `skin_integration::skin_sixth_login_with_forwarded_ip_is_429` got 401 instead of 429 once under heavy machine load, then passed with its whole binary (33/33). The new dispatcher hook returns early for every path but `/cli/hosts/*` under `all`. |
 
 Two-process run (controller :17420, host :17421, `k2-fake-agent` as
@@ -326,6 +346,22 @@ PASS agent is a child of the host                    agent ppid 46032 = host 460
 PASS open_url from the host reaches the controller's /cli/sessions/events
      controller event: {"kind":"open_url","url":"https://claude.ai/oauth/authorize?dist-link=8759","source":"shim"}
 PASS hook events reached the controller              3 hook lines in controller.log
+PASS app session token: login, spawn, attach, type, open_url, close via the controller
+```
+
+Check 7 (`app-session.txt`, run `20261025T145839Z`), the desktop app's way
+in with the session token only:
+
+```text
+users/add (200, {'success': True})
+users/set-role (200, {'success': True})
+logged in as applab7e5046 (session token, not the owner token)
+spawn -> 200 sessionId c0110bbe-0179-4894-9910-c2b6026590bc reused False
+first mode: {"capable": true, "mode": "viewer"}
+after set_mode claimer: {"capable": true, "mode": "claimer"}
+reply seen on the grid: reply #1: hello from the app session 4e1914
+open_url on /cli/sessions/events (session token): {"kind": "open_url", "url": "https://claude.ai/oauth/authorize?app-session=ab2046", "source": "shim"}
+close -> 200 {'closed': True, 'indexCleared': True}
 ```
 
 The controller's log for the run:
