@@ -25,6 +25,9 @@
 #      through the controller, attaches the grid (starts as a capable viewer,
 #      set_mode claimer as the app does), types and sees the reply, receives
 #      open_url on /cli/sessions/events, and closes
+#   8. W1 through the controller (tests/lab/labkit/w1.py): the chat overlay
+#      (ensure-pinned-chat), waking a sleeping agent with k2 msg (S4) and a
+#      heartbeat fire (S5), each spawned on the host
 #
 # Ports: DIST_CTL_PORT (default 17420) and DIST_HOST_PORT (17421).
 
@@ -373,6 +376,17 @@ PY
     rc=$?
     check "app session token: login, spawn, attach, type, open_url, close via the controller" "$([ $rc = 0 ] && echo 1)" \
         "$(tail -1 "$RUN/app-session.txt")"
+
+    # 8. chat overlay, wake (S4), heartbeat (S5) through the controller;
+    #    transcripts are read from the host's home (the agent's).
+    python3 -I tests/lab/labkit/w1.py --port "$TP_CTL_PORT" --token-file "$TP_ROOT/ctl-token" --home "$LAB_HOME" \
+        --workspace "$(dirname "$LAB_WORKSPACE")" --out "$RUN/w1" --fake-trace "$LAB_FAKE_TRACE" > "$RUN/w1.txt" 2>&1
+    rc=$?
+    check "W1 via the controller: chat overlay, wake (S4), heartbeat (S5) on the host" "$([ $rc = 0 ] && echo 1)" \
+        "$(grep -c '^PASS' "$RUN/w1.txt") passed, $(grep -c '^FAIL' "$RUN/w1.txt") failed (w1.txt)"
+    ps -axo pid=,ppid=,command= > "$RUN/ps-after-w1.txt"
+    pgrep -P "$TP_CTL_PID" >/dev/null && check "the controller ran no agent processes" 0 "$(pgrep -lP "$TP_CTL_PID" | tr '\n' ' ')" \
+        || check "the controller ran no agent processes" 1 "no children of $TP_CTL_PID"
 
     topo_metrics > "$RUN/metrics.csv"
     echo "evidence: ${RUN#$REPO/}"
