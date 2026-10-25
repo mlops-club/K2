@@ -10,6 +10,10 @@ resources:
 images:
   - name: k2-agents
     newTag: fake
+patches:
+  - target: {kind: Service, name: k2-controller-nodeport}
+    patch: |-
+      - {op: replace, path: /spec/ports/0/nodePort, value: 30742}
 labels:
   - pairs:
       k2.dev/deploy: kind-dist-fake

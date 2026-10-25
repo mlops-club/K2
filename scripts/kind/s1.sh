@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Scenario S1 (spawn, attach, type, see output) against K2 on kind k2lab,
-# through the port-forward, with the fake agent. TEST ONLY: needs
+# through the Mac's door (the proxy, or the fallback port-forward), with the
+# fake agent. TEST ONLY: needs
 # `scripts/kind/up.sh --fake` (or `--dist --fake`) first; never runs a real
 # agent.
 #
@@ -133,7 +134,7 @@ placement() {  # → 0 when the agent runs in the host pod and not in the contro
 
 describe() {  # describe <dir>
     {
-        echo "topology: kind k2lab, namespace $KIND_NS, via kubectl port-forward 127.0.0.1:$port -> svc/$KIND_SVC"
+        echo "topology: kind k2lab, namespace $KIND_NS, via 127.0.0.1:$port ($(docker inspect -f "proxy {{join .Args \" \"}}" "$KIND_PROXY" 2>/dev/null || echo "kubectl port-forward -> svc/$KIND_SVC"))"
         echo "agents: $KIND_IMAGE in $KIND_AGENT_POD (image id $(docker image inspect -f '{{.Id}}' "$KIND_IMAGE" 2>/dev/null))"
         for pod in $KIND_POD $([ "$KIND_AGENT_POD" != "$KIND_POD" ] && echo "$KIND_AGENT_POD"); do
             echo "pod $pod: image $(kc -n "$KIND_NS" get pod "$pod" -o jsonpath='{.spec.containers[0].image} {.status.containerStatuses[0].imageID} started {.status.startTime}')"

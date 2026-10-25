@@ -14,6 +14,7 @@ kind: Kustomization
 namespace: k2-kind
 resources:
   - ../../../packaging/oci/kind/solo.yaml
+  - nodeport.yaml                 # the Mac's door (deploy/kind/proxy)
 components:
   - ../components/no-k2dev        # nothing from k2.dev (see that file)
 images:

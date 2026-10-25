@@ -2,14 +2,16 @@
 # K2 on the kind cluster k2lab, ready for the desktop app on this Mac
 # (deploy/kind/README.md has the app steps).
 #
-#   scripts/kind/up.sh [--dist] [--fake] [--rebuild-daemon] [--reset-password]
+#   scripts/kind/up.sh [--dist] [--fake] [--rebuild-daemon] [--reset-password] [--port-forward]
 #
 # 1. builds k2-daemon:dev (packaging/oci/build.sh) when it is missing, or
 #    always with --rebuild-daemon; then k2-agents:dev (deploy/kind/
 #    Dockerfile.agents: the daemon plus the Claude Code CLI);
 # 2. loads it into k2lab and applies deploy/kind/agents (namespace k2-kind);
-# 3. waits for the pod, starts a port-forward to 127.0.0.1:7440 (kept
-#    running in the background, and restarted if the pod restarts);
+# 3. waits for the pod, then opens the Mac's door: a socat container
+#    (k2-kind-proxy, deploy/kind/proxy) from 127.0.0.1:7440 to the
+#    Service's NodePort (30740), restarted by Docker; --port-forward uses
+#    the old kubectl port-forward loop instead (scripts/kind/port-forward.sh);
 # 4. creates the K2 Connect login the app signs in with (an Owner), once,
 #    and prints the URL, the username and, when it set one, the password.
 #
@@ -32,14 +34,15 @@ set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-fake=0 dist=0 rebuild_daemon=0 reset_password=0
+fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
         --dist) dist=1 ;;
         --rebuild-daemon) rebuild_daemon=1 ;;
         --reset-password) reset_password=1 ;;
-        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --port-forward) door=port-forward ;;
+        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -58,15 +61,24 @@ DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
 mkdir -p "$HOME/.cache"
 until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
 trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
+# Builds that compile Rust also take a slot in the machine-wide cargo queue.
+slot=()
+[ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
 if [ "$rebuild_daemon" = 1 ] || ! docker image inspect k2-daemon:dev >/dev/null 2>&1; then
     say "building k2-daemon:dev (packaging/oci/build.sh; a cold build takes a while)"
-    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3} packaging/oci/build.sh k2-daemon:dev >&2
+    CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3} ${slot[@]+"${slot[@]}"} packaging/oci/build.sh k2-daemon:dev >&2
 else
     say "k2-daemon:dev exists (--rebuild-daemon to rebuild it)"
 fi
 say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
-DOCKER_BUILDKIT=1 docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" \
-    --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT" >/dev/null
+build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE"
+    --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")
+case "$KIND_DOCKERFILE" in *fake*) build=(${slot[@]+"${slot[@]}"} "${build[@]}") ;; esac   # its cargo stage
+DOCKER_BUILDKIT=1 "${build[@]}" >/dev/null
+if [ "$door" = proxy ]; then
+    say "building $KIND_PROXY_IMAGE (deploy/kind/proxy)"
+    DOCKER_BUILDKIT=1 docker build -q -t "$KIND_PROXY_IMAGE" deploy/kind/proxy >/dev/null
+fi
 
 # ── 2. load and apply ───────────────────────────────────────────────────
 for img in $KIND_LOAD; do
@@ -104,8 +116,13 @@ for pair in $KIND_ROLLOUT; do
     kc -n "$KIND_NS" rollout status "statefulset/${pair%%=*}" --timeout=600s >&2
 done
 
-# ── 3. port-forward ─────────────────────────────────────────────────────
-kind_start_forward || exit 1
+# ── 3. the Mac's door ───────────────────────────────────────────────────
+if [ "$door" = proxy ]; then
+    kind_start_proxy || exit 1
+    say "proxy $KIND_PROXY: 127.0.0.1:$KIND_PORT → $KIND_PROXY_TARGET:$KIND_NODEPORT"
+else
+    kind_start_forward || exit 1
+fi
 base="http://127.0.0.1:$KIND_PORT"
 kind_wait_ready || exit 1
 say "daemon ready at $base"
@@ -179,7 +196,7 @@ K2 is up on kind $KIND_CLUSTER (namespace $KIND_NS, agents on $KIND_IMAGE in $KI
   Password   : $password
 
 In the K2 app: Settings → Connected Servers → + Add a server
-(deploy/kind/README.md). The port-forward runs in the background
-(log: $KIND_STATE/port-forward.log); scripts/kind/forward.sh$flag restarts
-just that. Stop everything: scripts/kind/down.sh$flag
+(deploy/kind/README.md). The door is $( [ "$door" = proxy ] && echo "the Docker container $KIND_PROXY" || echo "a kubectl port-forward (log: $KIND_STATE/port-forward.log)" );
+scripts/kind/forward.sh$flag --status checks it, and scripts/kind/forward.sh$flag
+recreates it. Stop everything: scripts/kind/down.sh$flag
 EOF

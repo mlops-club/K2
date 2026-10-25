@@ -2,7 +2,7 @@
 
 Today's K2 daemon (`K2_ROLE=all`) runs as one pod on the local kind cluster
 `k2lab`, with the Claude Code CLI in its image. The K2 desktop app on this Mac
-connects to it through `kubectl port-forward`. You sign Claude in from the
+connects to it through a small proxy container on `127.0.0.1:7440`. You sign Claude in from the
 app with `/login`. There is no API key, OAuth token or credential Secret.
 Lab only: `deploy/kubernetes/` is the end state.
 
@@ -13,7 +13,9 @@ Lab only: `deploy/kubernetes/` is the end state.
 | `Dockerfile.fake`, `fake/` | TEST ONLY: `k2-agents:fake` with the lab's `k2-fake-agent` as every agent CLI, in namespace `k2-kind-fake`, for `scripts/kind/s1.sh` |
 | `components/no-k2dev` | Shared by both overlays: `K2_TUNNEL_LEASE=off`, `K2_FEDERATION=off`, relay list and DNS API pointed at a closed local port. Nothing here talks to k2.dev |
 | `agents-egress-locked/` | Opt-in: `agents` plus a NetworkPolicy allowing only DNS and TCP 443 out. Blocks frp and other non-443 ports; it can't block k2.dev, which is also 443 |
+| `proxy/Dockerfile`, `*/nodeport.yaml` | The Mac's door: `k2-kind-proxy:dev` (alpine 3.20.10 + socat) relays `127.0.0.1:7440` to the K2 Service's NodePort (30740; fake 30741, dist-fake 30742, dist 30743) on Docker's `kind` network |
 | `scripts/kind/up.sh`, `down.sh` | One command up, one command down |
+| `scripts/kind/forward.sh` | Check (`--status`) or recreate just the door; `--port-forward` for the fallback |
 
 ## 1. Bring it up
 
@@ -25,7 +27,7 @@ The script does the following:
 
 - builds `k2-daemon:dev` if it is missing, or always with `--rebuild-daemon`;
 - builds `k2-agents:dev`, runs `kind load` and applies `deploy/kind/agents`;
-- waits for the pod and keeps a port-forward to `127.0.0.1:7440` running in the background. It runs in its own session, reconnects after a pod restart, and restarts kubectl if `/boot-status` stops answering. Every start, restart and stop is appended to `$TMPDIR/k2-kind/agents/port-forward.log`.
+- waits for the pod and starts the door, the Docker container `k2-kind-proxy`: `127.0.0.1:7440` → node port 30740 → the pod. Docker restarts it (`--restart unless-stopped`), and each connection is its own socat child, so one broken stream never drops the others. `kubectl port-forward` dropped the whole forward on one bad stream (seen on 2026-10-24); it remains a fallback, `scripts/kind/up.sh --port-forward`, which runs in its own session, logs to `$TMPDIR/k2-kind/agents/port-forward.log` and reconnects by itself.
 - creates a K2 login for the app, user `owner` with the Owner role, and a random password;
 - creates a git folder `/var/lib/k2/work/demo` for your first workspace.
 
@@ -41,9 +43,10 @@ The password is shown only on the run that creates it. Re-running `up.sh` is
 safe and keeps the login. `scripts/kind/up.sh --reset-password` sets and
 shows a new password.
 
-If the app ever can't reach `http://127.0.0.1:7440`, check the forward
-with `scripts/kind/forward.sh --status`, and restart just the forward with
-`scripts/kind/forward.sh`. Neither builds nor applies anything.
+If the app ever can't reach `http://127.0.0.1:7440`, check the door with
+`scripts/kind/forward.sh --status`, and recreate just the door with
+`scripts/kind/forward.sh` (or `--port-forward` for the fallback). Neither
+builds K2 nor applies anything.
 
 Port 7440 must be free on the Mac. Use `K2_KIND_PORT=7450 scripts/kind/up.sh`
 otherwise, and also if your own local K2 daemon happens to use 7440.
@@ -150,14 +153,14 @@ kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind delete pod k2-solo-0
 kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind rollout status statefulset/k2-solo
 ```
 
-The port-forward reconnects on its own. The app reconnects. Open a new
+The proxy needs nothing: the Service's NodePort follows the new pod. The app reconnects. Open a new
 **Claude** tab: it should start signed in, with no `/login`.
 
 ## 7. Take it down
 
 ```sh
-scripts/kind/down.sh              # deletes namespace k2-kind: pod, volume, Claude login
-scripts/kind/down.sh --keep-data  # stops the port-forward, scales to 0, keeps the volume
+scripts/kind/down.sh              # removes the proxy, deletes namespace k2-kind: pod, volume, Claude login
+scripts/kind/down.sh --keep-data  # removes the proxy, scales to 0, keeps the volume
 ```
 
 Then remove **kind k2lab** in **Settings → Connected Servers**.
@@ -170,8 +173,9 @@ kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents-egre
 ```
 
 This adds a NetworkPolicy that denies the pod every egress except DNS and
-TCP 443. The port-forward goes through the kubelet, so the app's connection
-is unaffected. Verified on the fake variant: port 80 out times out, 443 out
+TCP 443. The NetworkPolicy limits only the pod's outbound traffic, so the
+app's inbound connection through the proxy is unaffected (and the fallback
+port-forward goes through the kubelet). Verified on the fake variant: port 80 out times out, 443 out
 answers, the daemon boots and S1 passes.
 
 What it shows: K2 on kind runs with frp and every other non-443 port closed.
@@ -185,7 +189,7 @@ Remove it with
 
 ```sh
 scripts/kind/up.sh --fake         # k2-agents:fake in k2-kind-fake on 127.0.0.1:7441
-scripts/kind/s1.sh                # S1 through the port-forward → lab-runs/kind/<time>/
+scripts/kind/s1.sh                # S1 through the proxy on 7441 → lab-runs/kind/<time>/
 scripts/kind/down.sh --fake
 ```
 

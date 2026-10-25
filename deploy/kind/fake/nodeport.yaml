@@ -1,0 +1,12 @@
+# TEST ONLY. The Mac's door: scripts/kind/up.sh --fake runs k2-kind-fake-proxy
+# (deploy/kind/proxy), 127.0.0.1:7441 → any node:30741 → this Service → the pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-solo-nodeport
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: k2-solo
+  ports:
+    - {port: 7420, targetPort: 7420, nodePort: 30741}

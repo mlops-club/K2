@@ -25,11 +25,16 @@ kind_variant() {
         *) echo "unknown variant $1" >&2; return 2 ;;
     esac
     case "$1" in
-        agents) KIND_NS=k2-kind KIND_OVERLAY=deploy/kind/agents KIND_PORT=${K2_KIND_PORT:-7440} KIND_FLAGS="" ;;
-        fake) KIND_NS=k2-kind-fake KIND_OVERLAY=deploy/kind/fake KIND_PORT=${K2_KIND_PORT:-7441} KIND_FLAGS=" --fake" ;;
-        dist) KIND_NS=k2-kind-dist KIND_OVERLAY=deploy/kind/dist KIND_PORT=${K2_KIND_PORT:-7443} KIND_FLAGS=" --dist" ;;
-        dist-fake) KIND_NS=k2-kind-dist-fake KIND_OVERLAY=deploy/kind/dist-fake KIND_PORT=${K2_KIND_PORT:-7442} KIND_FLAGS=" --dist --fake" ;;
+        agents) KIND_NS=k2-kind KIND_OVERLAY=deploy/kind/agents KIND_PORT=${K2_KIND_PORT:-7440} KIND_NODEPORT=30740 KIND_FLAGS="" ;;
+        fake) KIND_NS=k2-kind-fake KIND_OVERLAY=deploy/kind/fake KIND_PORT=${K2_KIND_PORT:-7441} KIND_NODEPORT=30741 KIND_FLAGS=" --fake" ;;
+        dist) KIND_NS=k2-kind-dist KIND_OVERLAY=deploy/kind/dist KIND_PORT=${K2_KIND_PORT:-7443} KIND_NODEPORT=30743 KIND_FLAGS=" --dist" ;;
+        dist-fake) KIND_NS=k2-kind-dist-fake KIND_OVERLAY=deploy/kind/dist-fake KIND_PORT=${K2_KIND_PORT:-7442} KIND_NODEPORT=30742 KIND_FLAGS=" --dist --fake" ;;
     esac
+    # The Mac's door: a socat container (deploy/kind/proxy) on Docker's kind
+    # network, 127.0.0.1:KIND_PORT → <any node>:KIND_NODEPORT. The overlays
+    # pin each variant's NodePort. port-forward.sh is the fallback.
+    KIND_PROXY=$KIND_NS-proxy KIND_PROXY_IMAGE=k2-kind-proxy:dev
+    KIND_PROXY_TARGET=$KIND_CLUSTER-control-plane
     case "$1" in
         agents|fake)
             KIND_DIST=0 KIND_SVC=k2-solo KIND_POD=k2-solo-0
@@ -86,6 +91,28 @@ kind_stop_forward() {
         pgrep -f -- "--kubeconfig $KIND_KUBECONFIG -n $KIND_NS port-forward" >/dev/null || break
         sleep 0.1
     done
+}
+
+# Start (or replace) this variant's proxy container. It restarts with
+# Docker (unless-stopped), and socat forks one child per connection, so a
+# broken stream never takes the door down. Capped: the Docker VM is shared.
+kind_start_proxy() {
+    kind_stop_forward
+    kind_stop_proxy
+    if lsof -nP -iTCP:"$KIND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "127.0.0.1:$KIND_PORT is already in use; set K2_KIND_PORT to a free port" >&2
+        return 1
+    fi
+    docker run -d --name "$KIND_PROXY" --restart unless-stopped \
+        --memory 64m --memory-swap 64m --cpus 0.5 --network kind \
+        --label "k2.dev/deploy=kind-$KIND_VARIANT" \
+        -p "127.0.0.1:$KIND_PORT:$KIND_PORT" "$KIND_PROXY_IMAGE" \
+        "TCP-LISTEN:$KIND_PORT,fork,reuseaddr" "TCP:$KIND_PROXY_TARGET:$KIND_NODEPORT" >/dev/null
+    echo "$KIND_PORT" > "$KIND_STATE/port"
+}
+
+kind_stop_proxy() {
+    docker rm -f "$KIND_PROXY" >/dev/null 2>&1 || true
 }
 
 # Start the port-forward loop (port-forward.sh) for this variant, after

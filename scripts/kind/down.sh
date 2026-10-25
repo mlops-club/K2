@@ -3,10 +3,11 @@
 #
 #   scripts/kind/down.sh [--dist] [--fake] [--keep-data]
 #
-# Stops the port-forward and deletes the namespace (k2-kind; k2-kind-fake
+# Removes the Mac's door (the proxy container, or the fallback
+# port-forward) and deletes the namespace (k2-kind; k2-kind-fake
 # with --fake; k2-kind-dist or k2-kind-dist-fake with --dist), which deletes
 # the pods and their volumes: K2's state and the Claude logins with them.
-# --keep-data stops the port-forward and scales the StatefulSets to zero
+# --keep-data removes the door and scales the StatefulSets to zero
 # instead, keeping the volumes for the next up.sh.
 # Local images (k2-daemon:dev, k2-agents:*) stay in Docker; remove them with
 # `docker image rm` if you want the space back.
@@ -20,12 +21,13 @@ for a in "$@"; do
         --fake) fake=1 ;;
         --dist) dist=1 ;;
         --keep-data) keep=1 ;;
-        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "down.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
 kind_variant_from_flags "$fake" "$dist"
 kind_stop_forward
+kind_stop_proxy
 kind_kubeconfig
 if [ "$keep" = 1 ]; then
     if kc get namespace "$KIND_NS" >/dev/null 2>&1; then
