@@ -27,7 +27,7 @@ graph TD
     %% ── MAC · the owner's machine ─────────────────────────────────
     subgraph mac [Mac · owner]
         UP[up.sh --dist / down.sh --dist / s1.sh --dist<br/><sub>scripts/kind · --fake for the test variant</sub>]:::changed
-        PF[kubectl port-forward<br/><sub>127.0.0.1:7443 (fake 7442) → svc/k2-controller:7420</sub>]:::external
+        PF[k2-kind-dist-proxy<br/><sub>socat · 127.0.0.1:7443 (fake 7442) → node:30743 (30742)</sub>]:::new
         APP[K2 desktop app<br/><sub>Connected Servers · owner + password</sub>]:::existing
         UP -- starts --> PF
         APP --> PF
@@ -45,8 +45,8 @@ graph TD
     %% ── KIND · namespace k2-kind-dist (fake: k2-kind-dist-fake) ───
     subgraph kind [kind k2lab · namespace k2-kind-dist]
         SEC([Secret k2-secrets<br/><sub>host-enroll-token · made by up.sh, never printed</sub>]):::state
-        CTL[k2-controller-0<br/><sub>k2-daemon:dev · K2_ROLE=controller · K2_HOSTS=1</sub>]:::changed
-        HOST[k2-host-0<br/><sub>k2-agents:dev · K2_ROLE=host (provisional)</sub>]:::new
+        CTL[k2-controller-0<br/><sub>k2-daemon:dist · K2_ROLE=controller · K2_HOSTS=1</sub>]:::changed
+        HOST[k2-host-0<br/><sub>k2-agents:dist · K2_ROLE=host</sub>]:::new
         CL[claude / k2-fake-agent<br/><sub>runs in k2-host-0 only</sub>]:::new
         CPVC([PVC data-k2-controller-0<br/><sub>/var/lib/k2 · k2.db, users, daemon.token</sub>]):::state
         HPVC([PVC data-k2-host-0<br/><sub>/var/lib/k2-host = HOME · .claude, .k2</sub>]):::state
@@ -89,13 +89,13 @@ sequenceDiagram
     K->>C: start (PVC /var/lib/k2)
     K->>H: start (PVC /var/lib/k2-host = HOME)
 
-    Note over C,H: Phase 2: enroll (dist-link, provisional)
+    Note over C,H: Phase 2: enroll (dist-link)
     H->>C: WS /cli/hosts/enroll + bootstrap token
     C-->>H: host identity (stored on the host's PVC)
     H->>C: WS /cli/hosts/attach (kept open, reconnects)
 
     Note over U,C: Phase 3: the app's door
-    U->>K: port-forward 127.0.0.1:7443 → svc/k2-controller
+    U->>K: proxy container 127.0.0.1:7443 → node:30743 → svc/k2-controller-nodeport
     U->>C: /cli/users/add + set-role owner (owner token from the pod, memory only)
     U-->>U: print URL, user, password
 
@@ -111,10 +111,11 @@ sequenceDiagram
 
 ## How to try it
 
-Not runnable until `dist-link` lands `K2_ROLE=host` and `/cli/hosts/*`. The
-commands the finished task gives:
+`k2-daemon:dist` comes from a dist-link checkout until dist-link is merged
+here:
 
 ```sh
+scripts/kind/build-daemon.sh ../dist-link k2-daemon:dist   # capped compile; K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1 was needed
 scripts/kind/up.sh --dist --fake     # k2-kind-dist-fake on 127.0.0.1:7442
 scripts/kind/s1.sh --dist            # S1 through 7442, plus placement and host-restart checks
 scripts/kind/down.sh --dist --fake
@@ -123,11 +124,52 @@ scripts/kind/up.sh --dist            # k2-kind-dist on 127.0.0.1:7443 (k2-agents
 scripts/kind/down.sh --dist
 ```
 
+## Evidence (2026-10-24, run at 22:25 local)
+
+`scripts/kind/s1.sh --dist` on `k2-kind-dist-fake`, through the proxy on
+127.0.0.1:7442 (`k2-kind-dist-fake-proxy` to `k2lab-control-plane:30742`).
+Evidence is in `lab-runs/kind-dist/2026-10-25T04-25-16Z/`:
+
+```text
+S1                    PASS
+placement             PASS
+S1 after host restart PASS
+```
+
+- **S1** (8/8): spawn, attach `/cli/sessions/grid` relayed by the
+  controller, banner, prompt, reply, the transcript in the host's
+  `~/.claude`, close. Spawn to banner took 79 ms and typing to the reply
+  675 ms. SessionStart, UserPromptSubmit and Stop hooks ran on the host,
+  all exit 0.
+- **Placement:** a spawn through the controller, then a /proc scan of both
+  pods:
+  - `k2-host-0`: `pid 558 comm=claude exe=/opt/k2-fake/bin/k2-fake-agent`
+  - `k2-controller-0`: none
+  - close → 200 `{"closed":true,"indexCleared":true}`
+- **Host restart:** `kubectl delete pod k2-host-0`. The new pod (uid
+  91c0015e…, started 04:25:34Z) relinked and became Ready (probe:
+  `"linked":true`). S1 passed again (8/8; spawn to banner 636 ms).
+- **Topology:**
+  - `k2-controller-0` runs `k2-daemon:dist` (dist-link a2488e783,
+    `k2-daemon 0.46.3`, protocol 1);
+  - `k2-host-0` runs `k2-agents:dist-fake`;
+  - `up.sh` reported `controller /cli/hosts/status: role=controller, 1
+    host(s): k2-host-0 (0 placements)`.
+- **The image build** (`scripts/kind/build-daemon.sh`, dist-link
+  a2488e783):
+  1. 4 GB, 3 jobs: OOM-killed (`k2-core` and `k2-daemon` together).
+  2. 4 GB, 1 job: OOM-killed (`k2-daemon` alone needs about 4.8 GB).
+  3. 6 GB, 1 job: built, under a cap the coordinator allowed for this one
+     build. The `k2-daemon` compile took 11m31s at 3–4.2 GiB.
+
+  Docker stayed responsive throughout; dependencies were cached between
+  attempts. `k2-agents:dist-fake` builds FROM it, with no daemon compile.
+
 ## Status
 
-- **Milestone:** manifests aligned with dist-link's final env contract
-  (`k2-dist/dist-link` @862b3c762). Waiting for RESUME-BUILD to build `k2-daemon:dist`
-  (capped, see below), then run.
+- **Milestone:** S1 runs distributed. Every acceptance check passes on
+  `k2-kind-dist-fake` (see Evidence). The namespace is left up for the
+  coordinator; `scripts/kind/down.sh --dist --fake` removes it.
 - **First build attempt (18:35–19:05), killed by the coordinator:**
   - `packaging/oci/build.sh` compiles inside `docker build`, where
     BuildKit can't cap memory. After 29 min the Docker API had been wedged
@@ -188,6 +230,3 @@ scripts/kind/down.sh --dist
     same limit.
   - Mac paths aren't mapped. The app must send pod paths, which the
     controller's folder picker gives it.
-- **Acceptance (pending the run):** on `k2-kind-dist-fake`, `s1.sh --dist`
-  must show S1 PASS through 7442, the fake agent in `k2-host-0` and not
-  in `k2-controller-0`, then S1 PASS again after `k2-host-0` is deleted.
