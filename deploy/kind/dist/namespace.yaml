@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k2-kind-dist
+  labels:
+    k2.dev/bootstrap: namespace                       # up.sh applies this first, then the Secret
+    pod-security.kubernetes.io/enforce: restricted    # no root helper, no added capabilities
+    pod-security.kubernetes.io/warn: restricted

@@ -1,0 +1,13 @@
+# Agent-host settings, envFrom on k2-host (the end state sets these as env;
+# a ConfigMap lets the no-k2dev component reach them too). Explicit env in
+# hosts.yaml still wins: K2_HOME, K2_CONTROLLER_URL, K2_HOST_NAME,
+# K2_HOST_ENROLL_TOKEN_FILE, K2_HOST_LABELS, K2_HOST_MAX_AWAKE.
+# Contract: docs/prd/progress/dist-link.md "Env contract" (k2-dist/dist-link).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k2-host
+data:
+  HOME: /var/lib/k2-host                  # Claude's ~/.claude (the login) on the host's own volume
+  K2_ROLE: host                           # today's daemon plus the link to the controller
+  K2_DAEMON_PORT: "7420"                  # the host's loopback API (hooks, xdg-open shim, readiness probe)

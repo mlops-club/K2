@@ -1,0 +1,73 @@
+# Agent host, kind-sized: one replica (static enrollment), k2-agents:dist
+# (the dist-link daemon with K2_ROLE=host, plus the claude CLI), HOME on its
+# own volume so Claude logins persist, and the shared workspaces.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k2-host
+spec:
+  replicas: 1
+  template:
+    spec:
+      # The end state's 600 s drain window; 60 s keeps "delete k2-host-0" quick.
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: default          # no rbac.yaml here; hosts never call the API anyway
+      # The controller's UID (the end state uses 10001): both pods write the
+      # shared workspaces, and git refuses a repo another UID owns.
+      securityContext:
+        runAsUser: 10000
+        runAsGroup: 0                      # image state is group 0 and group-writable
+        fsGroup: 10000
+      # The shared work volume is ReadWriteOnce on local-path: same node as
+      # the controller.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: k2-controller
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: k2-host
+          imagePullPolicy: Never
+          envFrom:
+            - configMapRef: {name: k2-host}
+          env:
+            # The state directory: $HOME/.k2, where earlier daemons kept it
+            # (see the controller's K2_HOME in kustomization.yaml).
+            - {name: K2_HOME, value: /var/lib/k2-host/.k2}
+          # Ready = linked to the controller: dist-link's GET /cli/hosts/status
+          # on the host's loopback API (no token) says "linked":true. Replaces
+          # the end state's `k2-host health`, a binary this image doesn't have.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -fsS --max-time 3 http://127.0.0.1:7420/cli/hosts/status | grep -q '"linked":true'
+            periodSeconds: 5
+            timeoutSeconds: 5              # above curl's 3 s; the 1 s default timed out under load
+            failureThreshold: 3
+          # The host's API listens on loopback only (hosts open no ports), so
+          # the probes run curl inside the pod rather than httpGet.
+          startupProbe:                    # first boot runs migrations
+            exec:
+              command: [sh, -c, "curl -fsS --max-time 3 http://127.0.0.1:7420/boot-status | grep -q '\"phase\":\"ready\"'"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 3Gi}            # about 400 MB per awake claude; the Docker VM is 8 GB, shared
+          volumeMounts:
+            - {name: work, mountPath: /var/lib/k2/work}   # shared with k2-controller (work-pvc.yaml)
+      volumes:
+        - name: work
+          persistentVolumeClaim: {claimName: k2-work}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 10Gi}

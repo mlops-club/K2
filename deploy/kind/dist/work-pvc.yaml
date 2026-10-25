@@ -1,0 +1,13 @@
+# The workspaces, shared: the app browses the CONTROLLER's files and sends
+# that cwd verbatim to the host (dist-link), so both pods mount this at
+# /var/lib/k2/work. ReadWriteOnce on local-path is per node, so the host
+# StatefulSet has podAffinity to the controller (host-patch.yaml). Each pod
+# keeps its own HOME volume; the host's holds the Claude login.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: k2-work
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 5Gi}

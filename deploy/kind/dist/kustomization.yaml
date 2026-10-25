@@ -1,0 +1,79 @@
+# Distributed K2 on kind k2lab: one controller (K2_ROLE=controller) and one
+# agent host (K2_ROLE=host, k2-agents:dev). An overlay over the end state,
+# deploy/kubernetes/core/{controller,hosts}.yaml, which this never edits:
+# no Postgres, mail or Gateway, and K2_PROVISIONER=static (hosts enroll
+# themselves with the bootstrap token; nothing calls the Kubernetes API).
+#
+# The Secret k2-secrets (key host-enroll-token) is NOT here: scripts/kind/
+# up.sh --dist generates it in the cluster, from stdin, once. It is never
+# printed and never in git.
+#
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/dist
+#
+# Env names: dist-link's final contract (docs/prd/progress/dist-link.md on
+# k2-dist/dist-link, "Env contract").
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k2-kind-dist
+resources:
+  - namespace.yaml
+  - ../../kubernetes/core/controller.yaml
+  - ../../kubernetes/core/hosts.yaml
+  - host-config.yaml
+  - work-pvc.yaml                 # workspaces shared by both pods
+  - nodeport.yaml                 # the Mac's door (deploy/kind/proxy)
+components:
+  - ../components/no-k2dev        # nothing from k2.dev (see that file)
+images:
+  - name: ghcr.io/alakazam-211/k2-daemon
+    newName: k2-daemon
+    newTag: dist                  # built from k2-dist/dist-link (scripts/kind/up.sh --dist)
+  - name: ghcr.io/alakazam-211/k2-host
+    newName: k2-agents
+    newTag: dist                  # deploy/kind/Dockerfile.agents FROM k2-daemon:dist
+labels:
+  - pairs:
+      k2.dev/deploy: kind-dist
+    includeSelectors: false
+patches:
+  - path: controller-patch.yaml
+  - path: host-patch.yaml
+  # The controller's settings: the end state's minus Postgres, mail, Sew,
+  # Apps, the front door and the KEK Secret; the static provisioner; HOME
+  # until K2_HOME covers every path (P0 home task). A remove of a key the
+  # end state no longer has fails the render, loudly.
+  - target: {kind: ConfigMap, name: k2-controller}
+    patch: |-
+      - {op: remove, path: /data/K2_PROVISIONER_HOST_STATEFULSET}
+      - {op: remove, path: /data/K2_KEK_FILE}
+      - {op: remove, path: /data/K2_CAP_POSTGRES}
+      - {op: remove, path: /data/K2_POSTGRES_CLUSTER}
+      - {op: remove, path: /data/K2_POSTGRES_HOST}
+      - {op: remove, path: /data/K2_POSTGRES_DB}
+      - {op: remove, path: /data/K2_POSTGRES_USER_FILE}
+      - {op: remove, path: /data/K2_POSTGRES_PASSWORD_FILE}
+      - {op: remove, path: /data/K2_CAP_MAIL}
+      - {op: remove, path: /data/K2_STALWART_URL}
+      - {op: remove, path: /data/K2_STALWART_ADMIN_FILE}
+      - {op: remove, path: /data/K2_CAP_SEW}
+      - {op: remove, path: /data/K2_SEW_MGMT_URL}
+      - {op: remove, path: /data/K2_CAP_APPS}
+      - {op: remove, path: /data/K2_CAP_FRONT}
+      - {op: replace, path: /data/K2_PROVISIONER, value: static}   # deploy/README; dist-link doesn't read it yet
+      - {op: add, path: /data/HOME, value: /var/lib/k2}
+      # K2_HOME is the state directory itself since the home task (wave1):
+      # keep it where every earlier daemon put it, $HOME/.k2. The end
+      # state's /var/lib/k2 would start empty state beside it, without the
+      # app's logins, sessions or host enrollment (seen 2026-10-25).
+      - {op: replace, path: /data/K2_HOME, value: /var/lib/k2/.k2}
+  - target: {kind: Service, name: k2-controller}
+    patch: |-
+      - op: remove
+        path: /spec/ports/1                       # "front" (443): no Gateway here
+  - target: {kind: PodDisruptionBudget, name: k2-host}
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: k2-host
