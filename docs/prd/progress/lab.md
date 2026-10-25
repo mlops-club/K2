@@ -357,3 +357,18 @@ The gate's per-package logs now stay in the bundle
 (`parity/linux-gate-logs/`, a symlink from the gate's workdir to a bind mount).
 In the gate, k2-core passes 3834/3834 (one run) and 3645/3646 (the next, the
 fork_tab_repair flake above); `ptyd_backend` passes 8/8 after the fix.
+
+### Last run (lab-runs/G0/2026-10-25T18-07-28Z, sha 45fadea9e)
+
+- S1 PASS; contract PASS; cli 3 fail, 3 NOT RUN; tier 3 and tier 1 fail
+  (pre-existing); S12 NOT RUN.
+- Linux gate NOT RUN: the gate refused, "10G free under /gate/work, need
+  20G" (Docker disk filled again since the 50 GB clean-up).
+- **I5 FAIL**, one difference: `tests/cli/changes_cli_headless` failed
+  ("FAIL: the pinned chat got no passport") where the baseline passed. Same
+  `crates/` tree as the baseline (230857a3d04e). The same message failed
+  `mail_calendar_providers` once (in a run the overnight sleep disturbed), and
+  both scripts passed in every other run: class (b), an intermittent,
+  pre-existing daemon behaviour (the pinned chat's passport is not always
+  stamped in time), not caused by the lab or wave 1. I5 did its job: it
+  flags a run that differs from the baseline instead of passing it.
