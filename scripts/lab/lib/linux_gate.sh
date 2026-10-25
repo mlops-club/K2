@@ -14,12 +14,11 @@
 # - one Docker-heavy job at a time: $HOME/.cache/k2-dist-docker.lock, taken
 #   with mkdir, released on exit, INT or TERM (never by a run still waiting);
 # - the container: a Linux k2-daemon compile needs about 5 GB, so this one
-#   runs with --memory=6g --memory-swap=6g and ONE cargo build job (a
-#   mounted CARGO_HOME/config.toml, since the gate's clean_cargo starts
-#   cargo under env -i and drops CARGO_BUILD_JOBS), 3 CPUs and the gate's own
-#   K2_GATE_THREADS (3) for the tests. The Docker lock keeps anything else
-#   out of Docker meanwhile. If it is OOM-killed, lower the parallelism,
-#   never the cap.
+#   runs with --memory=6g --memory-swap=6g and the gate's K2_GATE_LOW_MEMORY=1
+#   (one cargo build job, 256 codegen units; debuginfo is already 0), 3 CPUs
+#   and the gate's own K2_GATE_THREADS (3) for the tests. The Docker lock
+#   keeps anything else out of Docker meanwhile. If it is OOM-killed, cut
+#   rustc's memory or the parallelism, never raise the cap.
 # - the image build only runs apt-get (no compile); BuildKit has no
 #   --memory flag, so the lock is its only limit.
 #
@@ -58,19 +57,17 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "base: $(grep -m1 '^FROM' "$repo/scripts/lab/docker/gate.Dockerfile" | cut -d' ' -f2)"
     echo "sha: $sha"
     echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
-    echo "limits: --memory=6g --memory-swap=6g --cpus 3, cargo build jobs 1 (config.toml), K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
+    echo "limits: --memory=6g --memory-swap=6g --cpus 3, K2_GATE_LOW_MEMORY=1 (1 build job, 256 codegen units, debuginfo 0), K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
     echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
 } >"$run/topology/linux-gate.txt"
 
 # The gate writes its per-package logs to <workdir>/logs; a symlink into
 # this bind mount keeps them in the bundle (the container is --rm).
 mkdir -p "$run/parity/linux-gate-logs"
-cargo_cfg="$run/topology/linux-gate.cargo-config.toml"
-printf '[build]\njobs = 1\n' >"$cargo_cfg"
 
 docker run --rm --name "$name" \
     --memory=6g --memory-swap=6g --cpus 3 \
-    -v "$cargo_cfg:/usr/local/cargo/config.toml:ro" \
+    -e K2_GATE_LOW_MEMORY=1 \
     --cap-add NET_ADMIN -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
     -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
