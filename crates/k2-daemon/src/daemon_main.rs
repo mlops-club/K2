@@ -134,7 +134,7 @@ pub fn run() {
 /// `K2_ROLE`, `K2_DAEMON_PORT` and the `K2_CAP_*` overrides, validated
 /// together at boot (`runtime_role`, `daemon_port`, `capabilities`).
 fn boot_settings_check() -> Result<(), String> {
-    crate::runtime_role::from_env()?;
+    crate::runtime_role::set_current(crate::runtime_role::from_env()?);
     crate::daemon_port::from_env()?;
     crate::capabilities::overrides_from_env()?;
     Ok(())
@@ -1498,6 +1498,8 @@ async fn async_main() {
     // warm, and the lifecycle (dormant after App access is lost, deleted
     // 30 days later). Headless: runs with no client attached.
     crate::person_wallet_runtime::spawn_loop();
+    // K2_ROLE=host: dial the controller (dist-link). No-op for `all`.
+    crate::hosts::start();
 
     // Published services: boot reattach/respawn of desired=running
     // rows. Own process group / Job Object — stop_tunnel / Active

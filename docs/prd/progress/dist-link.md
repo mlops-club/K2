@@ -159,7 +159,7 @@ replaces the first (`duplicate` goes to the old one).
 |---|---|---|
 | `spawn` | `req`, `agent_id`, `epoch`, `body` (the `/cli/sessions/v2/spawn` JSON) | `v2_spawn::handle_v2_spawn(body)` |
 | `close` | `req`, `agent_id`, `epoch`, `body` (the `/cli/sessions/v2/close` JSON) | `v2_spawn::handle_v2_close(body)` |
-| `reply` (host → ctl) | `req`, `status` (HTTP code), `body` (string) | |
+| `reply` (host → ctl) | `req`, `status` (the HTTP status line, `"200 OK"`), `body` (the JSON body, as a string) | |
 
 `req` is a controller-chosen id unique on the link. If the link drops, every
 waiting request fails with 502.
@@ -244,7 +244,22 @@ The ~20 files in agenthost's "bypass" table only look up, list or unplace
 sessions in the in-process placement table. On a controller that table is
 always empty, so they find nothing; none of them can start an agent.
 
-<!-- the 501 list is filled in with the gate -->
+The 501 list (`hosts/gate.rs`, `CONTROLLER_NOT_IMPLEMENTED`): routes that
+start a PTY themselves, not through `AgentHost`, or drive one by raw bytes:
+
+| Route | Why |
+|---|---|
+| `/cli/llm/accounts/login`, `…/login/cancel`, `…/login/input`, `…/login/status` | LLM login wallet: its own login PTY (`llm_accounts_runtime`) |
+| `/cli/skin/wallet/login`, `…/cancel`, `…/input`, `…/status` | App users' wallet sign-in: its own PTY (`person_wallet_runtime`) |
+| `/cli/sessions/bytes`, `/cli/sessions/subscribe` | raw byte streams from an in-process PTY |
+| `/cli/sessions/v2/refresh` | sidecar kill-and-resume on the in-process host |
+| `/cli/terminal/*` | the terminal API (read, write, resize, label, pin, reap) on in-process sessions |
+
+Background loops that spawn (`llm_accounts_runtime::spawn`,
+`person_wallet_runtime::spawn_loop`, heartbeats, wake) hit the
+`InProcessHost::spawn` refusal and log it; they never start a process on
+the controller. `/cli/claude-auth/*` reads and refreshes credentials files
+and runs no agent, so it stays as is (on a controller it finds none).
 
 ## Merge notes
 
@@ -264,8 +279,18 @@ export PATH=$CARGO_HOME/bin:$PATH CARGO_BUILD_JOBS=3
 # loopback fake-host tests
 cargo test -p k2-daemon --lib hosts:: -- --test-threads=3
 
-# two real processes and the lab S1 client
+# two real processes and the lab S1 client (builds first; --no-build to skip).
+# Evidence under lab-runs/dist-link/<UTC>/: checks.txt, scenarios/S1.*,
+# process-tree.txt, open-url.txt, controller.log, host.log, *.trace.jsonl
 scripts/lab/topology/two-process.sh
+
+# by hand: a controller and a host on fixed ports
+tok=$(mktemp); openssl rand -hex 24 > "$tok"
+env -i PATH=/usr/bin:/bin HOME=$(mktemp -d) K2_ROLE=controller K2_HOSTS=1 \
+    K2_HOST_BOOTSTRAP_TOKEN_FILE=$tok K2_DAEMON_PORT=17420 target/debug/k2-daemon &
+env -i PATH=/usr/bin:/bin HOME=$(mktemp -d) K2_ROLE=host K2_CONTROLLER_URL=ws://127.0.0.1:17420 \
+    K2_HOST_ENROLL_TOKEN_FILE=$tok K2_HOST_NAME=host-1 K2_DAEMON_PORT=17421 target/debug/k2-daemon &
+curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts":[{"host_id":"host-1",…}]}
 ```
 
 ## Status

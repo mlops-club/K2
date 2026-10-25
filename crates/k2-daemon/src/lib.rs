@@ -22,6 +22,7 @@ pub mod boot_status;
 pub mod capabilities;
 pub mod daemon_port;
 pub mod runtime_role;
+pub mod hosts;
 pub mod ptyd_status;
 pub mod browser_routes;
 pub mod canonical_session;

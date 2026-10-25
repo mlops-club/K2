@@ -22,6 +22,10 @@ use super::{
 };
 use crate::v2_session_map;
 
+/// Why [`InProcessHost::spawn`] refuses on a `K2_ROLE=controller` daemon.
+pub(crate) const CONTROLLER_RUNS_NO_AGENTS: &str =
+    "K2_ROLE=controller runs no agents locally; agents run on agent hosts (POST /cli/sessions/v2/spawn places them)";
+
 /// Agents as child processes of this daemon (PRD topology "solo").
 pub(crate) struct InProcessHost;
 
@@ -35,6 +39,11 @@ impl AgentHost for InProcessHost {
     }
 
     fn spawn(&self, config: DaemonPtyConfig) -> io::Result<AgentSession> {
+        // A controller never runs an agent itself (dist-link); every path
+        // that would start one locally fails here with this message.
+        if crate::runtime_role::current() == crate::runtime_role::Role::Controller {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, CONTROLLER_RUNS_NO_AGENTS));
+        }
         DaemonPtySession::spawn(config).map(AgentSession::in_process)
     }
 

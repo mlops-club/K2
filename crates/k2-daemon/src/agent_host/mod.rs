@@ -26,6 +26,7 @@
 //! inside `k2-host` and the controller relays its frames.
 
 mod in_process;
+pub mod remote;
 #[cfg(test)]
 mod tests;
 
