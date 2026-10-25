@@ -424,7 +424,8 @@ PY
         || check "the controller ran no agent processes" 1 "no children of $TP_CTL_PID"
 
     # 10. S9: the controller restarts mid-turn.
-    w3() { python3 -I tests/lab/labkit/w3.py "$1" --port "$TP_CTL_PORT" --token-file "$TP_ROOT/ctl-token" \
+    # The token the controller publishes at each boot (a restart rotates it).
+    w3() { python3 -I tests/lab/labkit/w3.py "$1" --port "$TP_CTL_PORT" --token-file "$TP_ROOT/ctl/home/.k2/daemon.token" \
         --home "$LAB_HOME" --cwd "$LAB_WORKSPACE" --state "$RUN/w3-$2.json" --tag "$2" --host-name host-1 "${@:3}"; }
     agent_of() { # state file -> "pid ppid" of the fake agent with that claude session
         local cs; cs=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["claude_session"])' "$1")
@@ -438,6 +439,7 @@ PY
     w3 resume ctl >> "$RUN/w3-ctl.txt" 2>&1
     rc=$?
     after=$(agent_of "$RUN/w3-ctl.json")
+    w3 close ctl >> "$RUN/w3-ctl.txt" 2>&1 || rc=1
     check "S9: controller restart mid-turn, client sees the turn through the new controller" "$([ $rc = 0 ] && echo 1)" \
         "$(grep -c '^PASS' "$RUN/w3-ctl.txt") passed, $(grep -c '^FAIL' "$RUN/w3-ctl.txt") failed (w3-ctl.txt)"
     check "S9: the agent survived the controller restart (same pid, child of the host)" \

@@ -10,6 +10,7 @@ script runs between its kills and restarts:
           arrived, and that banner, prompt and reply are on the client's
           screen in order (no gap: the host's snapshot carries everything
           the agent printed while the controller was down).
+  close   close the agent (after the caller compared its pid).
   lost    after a host crash: the open grid ends with an error or a close
           (never a hang), the controller reports the host lost, and a spawn
           of the agent is refused with an explicit error (not placed
@@ -125,17 +126,39 @@ class Phase:
         sock.send_text(json.dumps({"action": "input", "text": text}))
         time.sleep(0.15)
         sock.send_text(json.dumps({"action": "input", "text": "\r"}))
-        # The turn runs now. Hand the open socket's fate to the caller.
+        # The turn has started once the agent recorded the prompt (it prints
+        # nothing until the reply). Only then hand over to the caller's kill.
+        deadline = time.monotonic() + DEADLINE_S
+        while text not in self.transcript_prompts(self.a.cwd, claude_session) and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.save({"agent": agent, "session": session, "claude_session": claude_session, "text": text, "banner": banner})
-        self.check("prompt typed; the turn is running", True, text)
+        self.check("prompt typed; the turn is running (the prompt is in the transcript)",
+                   text in self.transcript_prompts(self.a.cwd, claude_session), text)
         if self.a.keep_open:
             # Keep the grid open until the caller's kill ends it (lost phase
             # reads how it ended from this process's output).
             ok, how = self.wait_grid(sock, grid, "[k2-fake-agent] reply #1: " + text)
             print("GRID-END %s" % how, flush=True)
 
+    def wait_linked(self):
+        """Poll the controller's host status until a host is linked and none
+        is lost. Returns the last status."""
+        deadline = time.monotonic() + DEADLINE_S
+        status = {}
+        while time.monotonic() < deadline:
+            st, body = self.http("GET", "/cli/hosts/status")
+            status = json.loads(body) if st == 200 else {}
+            if status.get("lost") == [] and status.get("hosts"):
+                break
+            time.sleep(0.2)
+        return status
+
     def resume(self):
         s = self.load()
+        status = self.wait_linked()
+        self.check("the host relinked to the new controller and its placements were adopted",
+                   status.get("lost") == [] and any(h.get("placements", 0) > 0 for h in status.get("hosts", [])),
+                   json.dumps(status)[:200])
         sock = self.attach(s["session"])
         grid = Grid()
         reply = "[k2-fake-agent] reply #1: " + s["text"]
@@ -149,6 +172,9 @@ class Phase:
                    self.transcript_prompts(self.a.cwd, s["claude_session"]) == [s["text"]],
                    repr(self.transcript_prompts(self.a.cwd, s["claude_session"])))
         sock.close()
+
+    def close(self):
+        s = self.load()
         st, body = self.http("POST", "/cli/sessions/v2/close", {"agent_name": s["agent"], "force": True, "clear_index": True})
         self.check("close after resume", st == 200 and '"closed":true' in body, "HTTP %s %s" % (st, body[:120]))
 
@@ -169,14 +195,7 @@ class Phase:
 
     def returned(self):
         s = self.load()
-        deadline = time.monotonic() + DEADLINE_S
-        status = {}
-        while time.monotonic() < deadline:
-            st, body = self.http("GET", "/cli/hosts/status")
-            status = json.loads(body) if st == 200 else {}
-            if status.get("lost") == [] and status.get("hosts"):
-                break
-            time.sleep(0.2)
+        status = self.wait_linked()
         self.check("the host linked again and nothing is lost", status.get("lost") == [], json.dumps(status)[:200])
         st, body = self.http("POST", "/cli/sessions/v2/spawn", {
             "agent_name": s["agent"], "cwd": self.a.cwd, "command": "claude",
@@ -198,7 +217,7 @@ class Phase:
 
 def main(argv):
     p = argparse.ArgumentParser(prog="w3.py")
-    p.add_argument("phase", choices=["start", "resume", "lost", "return"])
+    p.add_argument("phase", choices=["start", "resume", "close", "lost", "return"])
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--token-file", required=True)
     p.add_argument("--home", required=True)
@@ -209,7 +228,7 @@ def main(argv):
     p.add_argument("--keep-open", action="store_true")
     a = p.parse_args(argv)
     ph = Phase(a)
-    {"start": ph.start, "resume": ph.resume, "lost": ph.lost, "return": ph.returned}[a.phase]()
+    {"start": ph.start, "resume": ph.resume, "close": ph.close, "lost": ph.lost, "return": ph.returned}[a.phase]()
     return 0 if ph.checks and all(c["ok"] for c in ph.checks) else 1
 
 
