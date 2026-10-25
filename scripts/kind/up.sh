@@ -3,6 +3,7 @@
 # (deploy/kind/README.md has the app steps).
 #
 #   scripts/kind/up.sh [--dist] [--fake] [--rebuild-daemon] [--reset-password] [--port-forward]
+#                      [--password-file=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
 #    compile, then a runtime-only image) when it is missing, or always with
@@ -19,8 +20,9 @@
 # --fake deploys the TEST variant instead (k2-agents:fake, namespace
 # k2-kind-fake, port 7441): the lab's k2-fake-agent under every agent CLI
 # name, for scripts/kind/s1.sh. --reset-password sets a new password for
-# the existing login. K2_KIND_PORT and K2_KIND_USER override the port and
-# the username (default "owner").
+# the existing login. --password-file=PATH writes a new password to PATH
+# (mode 0600) and prints only the path, never the password. K2_KIND_PORT and
+# K2_KIND_USER override the port and the username (default "owner").
 #
 # --dist deploys distributed K2 instead (deploy/kind/dist: a controller and
 # one agent host, namespace k2-kind-dist, port 7443; with --fake,
@@ -35,7 +37,7 @@ set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy
+fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -43,7 +45,8 @@ for a in "$@"; do
         --rebuild-daemon) rebuild_daemon=1 ;;
         --reset-password) reset_password=1 ;;
         --port-forward) door=port-forward ;;
-        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --password-file=*) password_file=${a#--password-file=} ;;
+        -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -191,6 +194,12 @@ kc -n "$KIND_NS" exec "$KIND_AGENT_POD" -c "$KIND_AGENT_CONTAINER" -- env D="$KI
     '[ -d "$D/.git" ] || { mkdir -p "$D" && git -C "$D" init -q; }'
 
 flag=$KIND_FLAGS
+if [ -n "$password" ] && [ -n "$password_file" ]; then
+    mkdir -p "$(dirname "$password_file")"
+    (umask 077; printf '%s\n' "$password" > "$password_file")
+    chmod 600 "$password_file"
+    password="in $password_file (mode 0600; not shown)"
+fi
 [ -n "$password" ] || password="(unchanged since it was set; scripts/kind/up.sh$flag --reset-password sets a new one)"
 
 cat <<EOF
