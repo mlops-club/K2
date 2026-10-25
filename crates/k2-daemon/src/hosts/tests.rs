@@ -538,7 +538,9 @@ async fn host_reconnects_after_a_reset_a_mute_peer_and_a_silent_controller() {
         Ended { error: Some(e), .. } => e.clone(),
         other => panic!("event {i}: expected an end with an error, got {other:?} in {events:?}"),
     };
-    assert!(err(2).starts_with("read: "), "{events:?}");
+    // The reset reaches whichever side moves next: the read, or the
+    // keepalive ping's send.
+    assert!(err(2).starts_with("read: ") || err(2).starts_with("send: "), "{events:?}");
     assert!(err(5).starts_with("connect: no answer within"), "{events:?}");
     assert!(err(9).starts_with("nothing from the controller for"), "{events:?}");
     let shape: Vec<link::LinkEvent> = events
