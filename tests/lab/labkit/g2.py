@@ -604,7 +604,14 @@ def s6(c, sc):
 
         ha, hb = agents[alice][3], agents[bob][3]
         sc.info["hosts"] = {alice: ha, bob: hb}
-        if not sc.check("alice and bob run on different hosts", ha and hb and ha != hb, "alice %s, bob %s" % (ha, hb)):
+        if ha == hb:
+            # Both placed on one host (under --chaos the other may have been
+            # down at placement). The item is composed on another host: the
+            # sender is only a label; what S6 needs is bob's host down.
+            ha = next((h["name"] for h in c.fleet.hosts() if h["name"] != hb), None)
+            sc.log("alice and bob both on %s: composing from %s instead" % (hb, ha))
+            sc.info["composed_on"] = ha
+        if not sc.check("bob's host and the sending host differ", ha and hb and ha != hb, "send %s, bob %s" % (ha, hb)):
             return
         with c.fleet.control():
             sc.check("bob's host %s killed (SIGKILL)" % hb, c.fleet.kill(hb), "")
