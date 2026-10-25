@@ -56,6 +56,19 @@ fn an_absolute_path_is_on() {
 }
 
 #[test]
+fn the_boot_check_opens_the_file_and_names_a_bad_value() {
+    assert_eq!(check_from(None), Ok(()));
+    assert!(matches!(check_from(Some(OsString::from("t.jsonl"))), Err(ConfigError::NotAbsolute(_))));
+    let path = temp_file("trace-boot-check");
+    assert_eq!(check_from(Some(path.clone().into_os_string())), Ok(()));
+    assert!(path.exists(), "the boot check creates the trace file");
+    let dir = path.parent().unwrap().to_path_buf();
+    let err = check_from(Some(dir.clone().into_os_string())).unwrap_err();
+    assert!(matches!(&err, ConfigError::Open { path, .. } if *path == dir.to_string_lossy()), "{err}");
+    assert!(err.to_string().contains("cannot be opened for append"), "{err}");
+}
+
+#[test]
 fn off_by_default_nothing_runs() {
     // The env lock holds K2_TRACE_FILE unset (no test sets it; the gate
     // runs with every K2_* cleared).

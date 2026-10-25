@@ -25,6 +25,16 @@
 #      through the controller, attaches the grid (starts as a capable viewer,
 #      set_mode claimer as the app does), types and sees the reply, receives
 #      open_url on /cli/sessions/events, and closes
+#  10. W3 / S9: kill -TERM the controller mid-turn, start it again: the
+#      agent's pid is unchanged (still the host's child), and the client,
+#      re-attaching through the new controller, sees banner, prompt and the
+#      reply the agent printed while the controller was down, in order
+#  11. W3 / S8: kill -9 the host mid-turn: the controller reports it lost,
+#      refuses to place the agent elsewhere and answers the grid with an
+#      error; when the host is back the dead placement is dropped and the
+#      agent resumes its conversation with the interrupted prompt kept
+#      (the old-epoch refusal is a unit test:
+#      hosts::tests::an_old_epoch_placement_is_released_and_a_missing_one_is_gone)
 #   8. W1 through the controller (tests/lab/labkit/w1.py): the chat overlay
 #      (ensure-pinned-chat), waking a sleeping agent with k2 msg (S4) and a
 #      heartbeat fire (S5), each spawned on the host
@@ -70,12 +80,45 @@ tp_controller_up() {
         K2_DAEMON_PORT="$TP_CTL_PORT"
         K2_TRACE_FILE="$run_dir/controller.trace.jsonl"
     )
-    env -i "${TP_CTL_ENV[@]}" "$LAB_DAEMON_BIN" >"$run_dir/controller.log" 2>&1 &
-    TP_CTL_PID=$!
-    tp_wait_ready controller "$TP_CTL_PID" "$TP_CTL_PORT" "$run_dir/controller.log" || return 1
+    tp_start_controller "$run_dir" || return 1
     LAB_PORT=$TP_CTL_PORT
     LAB_TOKEN=$(cat "$TP_ROOT/ctl/home/.k2/daemon.token")
     export LAB_PORT LAB_TOKEN
+}
+
+# (Re)start the controller with the environment tp_controller_up built
+# (same HOME, DB and port). Appends to controller.log.
+tp_start_controller() {
+    local run_dir=$1
+    env -i "${TP_CTL_ENV[@]}" "$LAB_DAEMON_BIN" >>"$run_dir/controller.log" 2>&1 &
+    TP_CTL_PID=$!
+    tp_wait_ready controller "$TP_CTL_PID" "$TP_CTL_PORT" "$run_dir/controller.log"
+}
+
+# (Re)start the host with the environment tp_host_up built, and wait until
+# it is linked.
+tp_start_host() {
+    local run_dir=$1 i linked=""
+    env -i "${TP_HOST_ENV[@]}" "$LAB_DAEMON_BIN" >>"$run_dir/host.log" 2>&1 &
+    TP_HOST_PID=$!
+    tp_wait_ready host "$TP_HOST_PID" "$TP_HOST_PORT" "$run_dir/host.log" || return 1
+    for i in $(seq 1 150); do
+        linked=$(curl -s --connect-timeout 1 "http://127.0.0.1:$TP_HOST_PORT/cli/hosts/status" 2>/dev/null \
+            | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("linked"))' 2>/dev/null || true)
+        [ "$linked" = True ] && return 0
+        sleep 0.2
+    done
+    echo "two-process: host never linked to the controller (status linked=$linked)" >&2
+    return 1
+}
+
+# Stop a process the way an orchestrator would (TERM, then KILL after 5 s).
+tp_stop() {
+    local pid=$1 sig=${2:-TERM} i
+    kill -"$sig" "$pid" 2>/dev/null || true
+    for i in $(seq 1 25); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 }
 
 # The host, linked to the controller. Exports LAB_HOME, LAB_WORKSPACE,
@@ -103,17 +146,7 @@ tp_host_up() {
         K2_FAKE_AGENT_TRACE="$LAB_FAKE_TRACE"
         K2_FAKE_AGENT_TURN_MS="${LAB_TURN_MS:-300}" K2_FAKE_AGENT_SEED="${LAB_SEED:-0}"
     )
-    env -i "${TP_HOST_ENV[@]}" "$LAB_DAEMON_BIN" >"$run_dir/host.log" 2>&1 &
-    TP_HOST_PID=$!
-    tp_wait_ready host "$TP_HOST_PID" "$TP_HOST_PORT" "$run_dir/host.log" || return 1
-    for i in $(seq 1 150); do
-        linked=$(curl -s --connect-timeout 1 "http://127.0.0.1:$TP_HOST_PORT/cli/hosts/status" 2>/dev/null \
-            | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("linked"))' 2>/dev/null || true)
-        [ "$linked" = True ] && return 0
-        sleep 0.2
-    done
-    echo "two-process: host never linked to the controller (status linked=$linked)" >&2
-    return 1
+    tp_start_host "$run_dir"
 }
 
 topo_up() {
@@ -172,6 +205,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     BUILD=1
     [ "${1:-}" = --no-build ] && BUILD=0
     export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3}
+    # Long enough for the W3 checks to kill a process mid-turn.
+    export LAB_TURN_MS=${LAB_TURN_MS:-2500}
     if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cache/k2-dist-rust/cargo/bin/cargo" ]; then
         export RUSTUP_HOME=$HOME/.cache/k2-dist-rust/rustup CARGO_HOME=$HOME/.cache/k2-dist-rust/cargo
         export PATH=$CARGO_HOME/bin:$PATH
@@ -387,6 +422,43 @@ PY
     ps -axo pid=,ppid=,command= > "$RUN/ps-after-w1.txt"
     pgrep -P "$TP_CTL_PID" >/dev/null && check "the controller ran no agent processes" 0 "$(pgrep -lP "$TP_CTL_PID" | tr '\n' ' ')" \
         || check "the controller ran no agent processes" 1 "no children of $TP_CTL_PID"
+
+    # 10. S9: the controller restarts mid-turn.
+    # The token the controller publishes at each boot (a restart rotates it).
+    w3() { python3 -I tests/lab/labkit/w3.py "$1" --port "$TP_CTL_PORT" --token-file "$TP_ROOT/ctl/home/.k2/daemon.token" \
+        --home "$LAB_HOME" --cwd "$LAB_WORKSPACE" --state "$RUN/w3-$2.json" --tag "$2" --host-name host-1 "${@:3}"; }
+    agent_of() { # state file -> "pid ppid" of the fake agent with that claude session
+        local cs; cs=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["claude_session"])' "$1")
+        ps -axo pid=,ppid=,command= | awk -v root="$TP_ROOT/shim/" -v cs="$cs" 'index($0, root) && index($0, cs) {print $1, $2; exit}'
+    }
+    w3 start ctl > "$RUN/w3-ctl.txt" 2>&1
+    before=$(agent_of "$RUN/w3-ctl.json")
+    old_ctl=$TP_CTL_PID
+    tp_stop "$TP_CTL_PID" TERM
+    tp_start_controller "$RUN" || echo "controller failed to restart" >> "$RUN/w3-ctl.txt"
+    w3 resume ctl >> "$RUN/w3-ctl.txt" 2>&1
+    rc=$?
+    after=$(agent_of "$RUN/w3-ctl.json")
+    w3 close ctl >> "$RUN/w3-ctl.txt" 2>&1 || rc=1
+    check "S9: controller restart mid-turn, client sees the turn through the new controller" "$([ $rc = 0 ] && echo 1)" \
+        "$(grep -c '^PASS' "$RUN/w3-ctl.txt") passed, $(grep -c '^FAIL' "$RUN/w3-ctl.txt") failed (w3-ctl.txt)"
+    check "S9: the agent survived the controller restart (same pid, child of the host)" \
+        "$([ -n "$before" ] && [ "$before" = "$after" ] && [ "${before#* }" = "$TP_HOST_PID" ] && echo 1)" \
+        "agent pid/ppid before '$before' after '$after'; host $TP_HOST_PID; controller $old_ctl -> $TP_CTL_PID"
+
+    # 11. S8: the host dies mid-turn.
+    w3 start host > "$RUN/w3-host.txt" 2>&1
+    tp_stop "$TP_HOST_PID" KILL
+    sleep 1
+    w3 lost host >> "$RUN/w3-host.txt" 2>&1
+    rc_lost=$?
+    tp_start_host "$RUN" || echo "host failed to restart" >> "$RUN/w3-host.txt"
+    w3 return host >> "$RUN/w3-host.txt" 2>&1
+    rc_ret=$?
+    check "S8: host crash mid-turn is reported, never silent (lost, refused, gone, resumed)" \
+        "$([ $rc_lost = 0 ] && [ $rc_ret = 0 ] && echo 1)" \
+        "$(grep -c '^PASS' "$RUN/w3-host.txt") passed, $(grep -c '^FAIL' "$RUN/w3-host.txt") failed (w3-host.txt)"
+    grep -E '\[hosts\] (host .* lost|restored|host .*: agent .* (Adopted|Gone|Released))' "$RUN/controller.log" > "$RUN/controller-w3.log" || true
 
     topo_metrics > "$RUN/metrics.csv"
     echo "evidence: ${RUN#$REPO/}"

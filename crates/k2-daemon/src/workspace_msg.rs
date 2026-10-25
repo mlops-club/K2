@@ -226,7 +226,16 @@ impl MsgResponse {
         match sent {
             Ok(sent) => {
                 r.success = sent.state != "failed";
-                r.reason = sent.reason.clone().map(|why| format!("delivery_failed: {why}"));
+                // The controller's cascade answers with today's reasons
+                // (`dormant_no_wake`, …): pass a bare one through as is.
+                r.reason = sent.reason.clone().map(|why| {
+                    let last = why.rsplit(": ").next().unwrap_or(&why);
+                    if !last.is_empty() && last.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                        last.to_string()
+                    } else {
+                        format!("delivery_failed: {why}")
+                    }
+                });
                 r.hint = match sent.state {
                     "queued" => Some("queued on this host; it forwards the message when the controller link is back".into()),
                     "failed" => Some("the controller refused the message; see GET /cli/hosts/outbox".into()),
@@ -946,8 +955,14 @@ pub(crate) fn deliver_live_with_receipt(
 ) -> MsgResponse {
     // K2_ROLE=host / controller: `k2 msg` goes to the controller's outbox,
     // which delivers it to whichever host runs the recipient (k2-dist
-    // outbox). Under `all`, today's direct delivery, unchanged.
-    let body = serde_json::json!({"kind": "msg", "text": text, "command": command, "label": stamp_from});
+    // outbox). A recipient the controller resolves itself but that isn't
+    // placed (asleep) gets the cascade below on the controller, wake rules
+    // included (`delivery_drain::Direct`). Under `all`, today's direct
+    // delivery, unchanged.
+    let body = serde_json::json!({
+        "kind": "msg", "text": text, "command": command, "label": stamp_from,
+        "wake": wake, "wake_timeout_ms": wake_timeout.as_millis() as u64,
+    });
     if let Some(sent) = crate::delivery_drain::send(from, workspace_token, body) {
         return MsgResponse::from_outbox(sent);
     }
@@ -1637,6 +1652,29 @@ pub fn send_message_to_session_with_command(
 /// `kind: "inbox"` composes into the inbox of the workspace it runs in.
 /// Never spawns: an agent with no live session here is retried by the
 /// controller.
+/// The controller's direct delivery of a `kind=msg` body a host sent up
+/// for a recipient it resolves but that isn't placed
+/// (`delivery_drain::Direct`): today's cascade, `wake` from the body.
+/// `Err` is the cascade's reason (`dormant_no_wake`, `no_agent_mode`, …).
+pub(crate) fn deliver_for_controller(recipient: &str, from: &str, body: &serde_json::Value) -> Result<(), String> {
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let label = Some(field("label")).filter(|l| !l.is_empty()).unwrap_or_else(|| {
+        from.split_once(':').map(|(_, n)| n).unwrap_or(from).to_string()
+    });
+    let wake = body.get("wake").and_then(|v| v.as_bool()).unwrap_or(false);
+    let wake_timeout = body
+        .get("wake_timeout_ms")
+        .and_then(|v| v.as_u64())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_WAKE_TIMEOUT);
+    let r = deliver_live_inner(recipient, &field("text"), &label, &field("command"), wake, wake_timeout, "msg", None);
+    if r.success {
+        Ok(())
+    } else {
+        Err(r.reason.unwrap_or_else(|| "not delivered".into()))
+    }
+}
+
 pub(crate) fn deliver_to_local_agent(
     agent_id: &str,
     from: &str,
@@ -2754,6 +2792,21 @@ fn wake_and_fire(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_outbox_failure_keeps_todays_reason_when_the_controller_gave_one() {
+        let failed = |why: &str| {
+            MsgResponse::from_outbox(Ok(crate::delivery_drain::Sent {
+                msg_id: "m_1".into(),
+                state: "failed",
+                reason: Some(why.into()),
+            }))
+        };
+        let r = failed("rejected by the controller: dormant_no_wake");
+        assert_eq!((r.success, r.reason.as_deref()), (false, Some("dormant_no_wake")));
+        let r = failed("rejected by the controller: rejected by host h: no live session");
+        assert_eq!(r.reason.as_deref(), Some("delivery_failed: rejected by the controller: rejected by host h: no live session"));
+    }
 
     // ── Bytes formatter ──────────────────────────────────────────────
 

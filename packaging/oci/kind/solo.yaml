@@ -9,8 +9,8 @@
 #   kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
 #   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" apply -f packaging/oci/kind/solo.yaml
 #   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo rollout status sts/k2-solo
-#   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward svc/k2-solo 7440:7420
-#   curl -fsS http://127.0.0.1:7440/boot-status | jq .
+#   kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-solo port-forward --address 127.0.0.1 svc/k2-solo 7461:7420
+#   curl -fsS http://127.0.0.1:7461/boot-status | jq .
 #
 # Clean up: kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" delete namespace k2-solo
 apiVersion: v1
