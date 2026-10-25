@@ -268,6 +268,61 @@ host-side handler (`link::handle`) for its frames; `proto.rs` changes only
 by adding optional fields or new frame types, never by renaming or
 retyping, so the three branches merge mechanically.
 
+## W1: `RemoteHost` is the controller's `AgentHost`
+
+`agent_host::host()` is the `RemoteHost` on `K2_ROLE=controller` and the
+in-process host otherwise. `AgentSession` wraps `SessionRef { Local, Remote }`
+(also the `.0` older call sites read: `label`, `label_source`, `set_label`,
+`kill`), so the ~15 files that read session metadata compile unchanged.
+
+| Read or call on a remote session | Answered by |
+|---|---|
+| `session_id`, `cwd`, `program`, `args`, `sandbox` | the spawn reply (cached) |
+| `label`, `label_source` | the spawn reply, refreshed by every `meta` and `set_label` |
+| `is_child_alive` | `session.gone` from the host (and link loss) |
+| `child_pid` | `None` (a host pid means nothing on the controller) |
+| `visible_text_rows`, `read_screen`, `bracketed_paste_active`, `subscriber_count`, `ever_attached`, `size`, `resize_now`, `claimed_size` | an `op` request to the host |
+| `write`, `resize`, `set_claimed_size` | an `op` without `req`: fire-and-forget, run on the host in the order sent |
+| `inject` | the protocol-2 `inject` frame (one unit on the host, under its lock) |
+| `kill`, `unplace` | `op kill` / `close` (sync) |
+| `events` | the controller's `ChildExit` (from `session.gone`) |
+| `attach` | events, labels, pins; no viewer registration (the relayed grid stream is the host's viewer) |
+| `stream` | never on a controller (the gate relays `/cli/sessions/grid`); panics with a clear message if reached |
+| `spawn(DaemonPtyConfig)` | refused: spawns are placed whole (next row) |
+| `read_home`, `write_home`, `hook_events` | not in this build (agent home is FR6; hooks arrive as `hook` frames) |
+
+The workspace spawn (`spawn::spawn_agent_session_v2_blocking`: chat overlay
+and pinned chat, heartbeats, wake, agents routes, sidecars, terminal and
+remote-session routes) is forwarded whole as `spawn.workspace`, so the
+scoped hook token, the cell socket, vault env, identity env, LLM login and
+the child-exit observer stay next to the agent. The controller resolves
+the tab label (it has the projects table) and drains its own pending-live
+signals into the new session. Sync trait calls wait under `block_in_place`
+(30 s per op, 120 s per spawn; deadlines only stop a hung host).
+
+New protocol-2 frames (additive, `proto.rs`): `spawn.workspace`,
+`op {req?, session_id, epoch, op}` / `op.result {req, value, error?}`
+(`SessionOp`: write, resize, resize_now, size, claimed_size,
+set_claimed_size, pin, set_label, kill, screen, visible_rows, meta), and
+`exit_code` on `session.gone`. A protocol-1 host gets none of them: the
+controller answers "agent host speaks protocol 1 (update k2 on the host)".
+
+Call-site edits (minimal): `spawn.rs` (the controller seam, serde on the
+request), `pinned_chat.rs` (lookups, force-respawn and the size fit through
+`host()`), `heartbeat_launch.rs` (the non-claude delivery looks the session
+up through `host()`), a test constructor in `workspace_msg.rs`. Under
+`K2_ROLE=all` each makes the same in-process call as before.
+
+W1 results:
+
+| Check | Result |
+|---|---|
+| `hosts::tests::remote_host_drives_a_workspace_spawn_through_the_agent_host_trait` | real host link, real PTY, only the trait: spawn forwarded, reuse, lookups, metadata, size/resize_now, write and screen read, inject Delivered, set_label, pin, kill → ChildExit on the controller, unplace closes on the host, low-level spawn refused |
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host:: runtime_role:: pinned_chat::` | 53 passed |
+| two-process (run `20261025T160857Z`) | checks 1–7 PASS (S1 still PASS); check 8 W1 23/25; the controller ran no agent processes |
+| W1 via the controller | chat overlay: ensure-pinned-chat spawns on the host, banner and reply on the relayed grid, reuse; wake (S4): asleep → `k2 msg --wake` wakes it on the host, message answered; close puts it back to sleep; heartbeat fire (S5): fired on the host, wakeup answered |
+| known gap | a **second** wake starts a fresh conversation instead of `--resume`: the resume resolver checks transcripts on the controller's disk (`k2_core::chat_history::*_session_file_exists`, `sidecar::conversation_exists`); they are on the host. Needs a k2-core probe hook (asked the coordinator, option A) or FR6 |
+
 ## Env contract
 
 Names follow `deploy/README.md` and `deploy/compose/compose.yaml`. The task
