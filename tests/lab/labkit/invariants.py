@@ -11,7 +11,9 @@ checks:
   outbox-final/<proc>.json     each daemon's GET /cli/hosts/outbox at the end
 
 An agent is keyed by its workspace (the CLI's cwd): every lab agent has its
-own. `check_all(run_dir, layout)` returns one result per invariant:
+own. Only agent sessions count: CLIs started in a PTY (they carry a pane,
+K2_PANE_ID). Helpers a daemon runs itself (`codex app-server`, `cursor agent
+stdio`) have none and are left out. `check_all(run_dir, layout)` returns one result per invariant:
 {"id", "status": pass|fail|not_run, "reason", "diffs": [violations]}.
 """
 
@@ -64,7 +66,7 @@ class Evidence:
         self.clis = {}
         for e in self.fake:
             pid = e.get("pid")
-            if e.get("event") == "cli.exec" and pid:
+            if e.get("event") == "cli.exec" and pid and e.get("pane"):
                 a = e.get("attrs") or {}
                 self.clis[(e["host"], pid, _ts(e))] = {
                     "host": e["host"], "pid": pid, "start": _ts(e), "end": None, "cwd": a.get("cwd"),

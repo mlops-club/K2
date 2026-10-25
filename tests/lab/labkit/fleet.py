@@ -180,15 +180,19 @@ def plan(layout, root, run_dir, daemon_bin, fake_bin):
 
 def _spawn_detached(p):
     """Start the daemon through a /bin/sh that backgrounds it and exits;
-    returns the daemon's pid."""
+    returns the daemon's pid. fd 3 carries the pid back and is closed for
+    the daemon, or the pipe would stay open as long as it runs."""
     os.makedirs(os.path.dirname(p["log"]), exist_ok=True)
     for d in (p["env"]["TMPDIR"], p["env"]["XDG_RUNTIME_DIR"], p["home"]):
         os.makedirs(d, exist_ok=True)
     with open(p["log"], "a") as log:
         log.write("\n===== lab: start %s at %s =====\n" % (p["role"], _now_iso()))
     out = subprocess.run(
-        ["/bin/sh", "-c", 'exec 3>&1; "$1" </dev/null >>"$0" 2>&1 & echo $! >&3', p["log"], p["bin"]],
-        env=p["env"], stdout=subprocess.PIPE, text=True, check=True)
+        ["/bin/sh", "-c", 'exec 3>&1; "$1" 3>&- </dev/null >>"$0" 2>&1 & echo $! >&3', p["log"], p["bin"]],
+        env=p["env"], stdout=subprocess.PIPE, text=True, check=True,
+        # Its own cwd: helper CLIs a daemon starts (codex app-server, ...)
+        # inherit it, and must not look like they share a workspace.
+        cwd=os.path.dirname(p["home"]))
     return int(out.stdout.strip())
 
 

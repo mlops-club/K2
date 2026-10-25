@@ -18,19 +18,22 @@ FLEET_STATE=""
 
 topo_up() {
     local run_dir=$1 layout=${LAB_FLEET_LAYOUT:-fleet} backend=${LAB_FLEET_BACKEND:-procs}
+    # Daemon logs and traces/ go at the top of the bundle (prove.sh exports
+    # RUN); the state file sits in <run-dir> (topology/).
+    local evidence=${RUN:-$run_dir}
     FLEET_STATE="$run_dir/fleet.json"
     LAB_FLEET_STATE=$FLEET_STATE
     export LAB_FLEET_STATE
     case "$backend" in
         procs)
-            python3 -I "$LAB_REPO/tests/lab/lab.py" fleet up --layout "$layout" --run-dir "$run_dir" \
+            python3 -I "$LAB_REPO/tests/lab/lab.py" fleet up --layout "$layout" --run-dir "$evidence" \
                 --state "$FLEET_STATE" --daemon-bin "$LAB_DAEMON_BIN" --fake-bin "$LAB_FAKE_AGENT_BIN" || return 1
             ;;
         compose)
             [ "$layout" = fleet ] || { echo "fleet: the compose backend has no solo layout" >&2; return 1; }
             # shellcheck source=../lib/compose.sh
             source "$LAB_REPO/scripts/lab/lib/compose.sh"
-            compose_fleet_up "$run_dir" "$FLEET_STATE" || return 1
+            compose_fleet_up "$evidence" "$FLEET_STATE" || return 1
             ;;
         *) echo "fleet: LAB_FLEET_BACKEND is procs or compose (got '$backend')" >&2; return 1 ;;
     esac

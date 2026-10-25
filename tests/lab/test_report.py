@@ -166,6 +166,29 @@ class Report(unittest.TestCase):
         self.assertIn("linux-gate: not in the baseline (held: disk full)", inv["reason"])
         self.assertIn("the others match", inv["reason"])
 
+    def test_g2_required_sets_and_judged_invariants(self):
+        self.r.run.update(gate="G2", topology="fleet")
+        self.r.save()
+        with open(os.path.join(self.r.d, "invariants.json"), "w") as fh:
+            json.dump([{"id": "I1", "status": "pass", "reason": "ok", "diffs": []},
+                       {"id": "I2", "status": "fail", "reason": "1 violation(s)", "diffs": ["m_1: still queued"]},
+                       {"id": "I3", "status": "not_run", "reason": "no resume", "diffs": []},
+                       {"id": "I4", "status": "pass", "reason": "ok", "diffs": []}], fh)
+        self.r.scenario("S3", True)
+        rep = report.build(self.r.d)
+        self.assertEqual([r["id"] for r in rep["required"] if r["kind"] == "scenario"],
+                         ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S12"])
+        self.assertEqual(required(rep, "S3")["status"], "pass")
+        self.assertEqual(required(rep, "S4")["reason"], "no result written")
+        self.assertIn("no S12 client", required(rep, "S12")["reason"])
+        self.assertEqual([required(rep, i)["status"] for i in ("I1", "I2", "I3", "I4")], ["pass", "fail", "not_run", "pass"])
+        self.assertEqual(next(i for i in rep["invariants"] if i["id"] == "I2")["diffs"], ["m_1: still queued"])
+        self.r.run.update(topology="solo")
+        self.r.save()
+        rep = report.build(self.r.d)
+        self.assertNotIn("S8", [r["id"] for r in rep["required"]])
+        self.assertIn("S8", [s["scenario"] for s in rep["scenarios"]])
+
     def test_write_produces_the_three_files(self):
         self.r.parity("cli", "fail", items={"a": "pass", "<b&c>": "fail"})
         self.r.scenario("S1", True)

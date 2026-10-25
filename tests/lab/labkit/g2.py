@@ -271,9 +271,15 @@ class Client:
         return True
 
     def type(self, sock, text):
-        sock.send_text(json.dumps({"action": "input", "text": text}))
-        time.sleep(0.15)
-        sock.send_text(json.dumps({"action": "input", "text": "\r"}))
+        """Paste, then Enter, as the app does. False when the stream is gone."""
+        try:
+            sock.send_text(json.dumps({"action": "input", "text": text}))
+            time.sleep(0.15)
+            sock.send_text(json.dumps({"action": "input", "text": "\r"}))
+        except (OSError, wslib.WsError) as e:
+            self.log("typing %r failed: %s" % (text, e))
+            return False
+        return True
 
     def start_agent(self, sc, name, cwd):
         """Spawn `name` in `cwd`, attach, wait for the banner. Returns
@@ -333,7 +339,8 @@ def s2(c, sc):
             def got(evs, hook):
                 return [e for e in evs if (e.get("attrs") or {}).get("event") in (hook, _snake(hook))
                         or (e.get("attrs") or {}).get("hook") == hook]
-            mine = [e for e in recorded if e.get("session_id") == sid]
+            # ctl.hook names the session in attrs.pane; host.agent_event in session_id.
+            mine = [e for e in recorded if sid in (e.get("session_id"), (e.get("attrs") or {}).get("pane"))]
             sc.info.setdefault("recorded", {})[n] = [(e.get("ts"), (e.get("attrs") or {}).get("event"), e.get("agent_id")) for e in mine]
             missing = [h for h in HOOKS if not got(mine, h)]
             sc.check("the controller recorded every hook of %s for its session" % n, not missing,
@@ -556,66 +563,96 @@ def s6(c, sc):
 
 # ── S7 ──────────────────────────────────────────────────────────────────
 
+def open_chat(c, sc, cwd, what):
+    """The app opening a workspace's agent: POST /cli/workspace/ensure-pinned-chat
+    {project}. Returns (daemon session, claude session, reused, sock, grid) or None."""
+    st, raw, resp = c.http("POST", "/cli/workspace/ensure-pinned-chat", body={"project": cwd})
+    sid, csid = resp.get("sessionId"), resp.get("claudeSessionId")
+    if not sc.check(what, st == 200 and sid and csid,
+                    "HTTP %s session %s claude %s reused %s args %s" % (st, sid, csid, resp.get("reused"),
+                                                                       json.dumps(resp.get("args")))):
+        return None
+    try:
+        sock, grid = c.attach(sid)
+    except (OSError, wslib.WsError) as e:
+        sc.check("attach the agent's grid", False, str(e))
+        return None
+    if not sc.check("its banner is on the grid", c.grid_wait(sock, grid, "session %s" % csid), csid):
+        sock.close()
+        return None
+    return sid, csid, resp.get("reused"), sock, grid
+
+
 def s7(c, sc):
     cwd = c.fleet.workspace("s7-%s" % c.tag)
     pid, why = c.register_enabled(cwd)
-    if not sc.check("workspace agent on, asleep", pid, why):
+    if not sc.check("workspace registered", pid, why):
         return
-    fact = "s7 fact %s" % uuid.uuid4().hex[:6]
-    n1 = "s7-first-%s" % uuid.uuid4().hex[:6]
-    st, raw, resp = c.msg(cwd, "%s [[remember: %s]]" % (n1, fact), wake=True)
-    if not sc.check("a message wakes it", st == 200 and resp.get("success") is True, "HTTP %s %s" % (st, raw[:300])):
+    a = open_chat(c, sc, cwd, "the app opens the agent (ensure-pinned-chat)")
+    if not a:
         return
-    wait_until(lambda: c.replied(cwd, n1))
-    seen = c.prompts_with(cwd, n1)
-    if not sc.check("it answered and remembered", seen and c.replied(cwd, n1), "%s" % [(h, s) for h, s, _ in seen]):
-        return
-    host, session = seen[0][0], seen[0][1]
-    sc.info.update(host=host, session=session, project=pid)
-    ex = c.exec_of(session)
-    cli_pid = (ex or {}).get("pid")
-    ends = c.turn_events(session, "cli.turn.end")
-    mem_hash = (ends[-1].get("attrs") or {}).get("memory_sha256") if ends else None
-    mem_file = c.memory_file(host, cwd)
-    mem_bytes = open(mem_file, "rb").read() if os.path.isfile(mem_file) else None
-    sc.check("MEMORY.md holds the fact", mem_bytes is not None and fact.encode() in mem_bytes, mem_file)
+    sid, csid, _, sock, grid = a
+    sc.info.update(session=sid, claude_session=csid, project=pid)
+    try:
+        fact = "s7 fact %s" % uuid.uuid4().hex[:6]
+        n1 = "s7 first [[remember: %s]]" % fact
+        c.type(sock, n1)
+        if not sc.check("it answered and remembered", c.grid_wait(sock, grid, "%s1: %s" % (REPLY_MARKER, n1)), n1):
+            return
+        wait_until(lambda: c.turn_events(csid, "cli.turn.end"), 30)
+        ex = c.exec_of(csid)
+        host, cli_pid = (ex or {}).get("host"), (ex or {}).get("pid")
+        sc.info.update(host=host, cli_pid=cli_pid)
+        ends = c.turn_events(csid, "cli.turn.end")
+        mem_hash = (ends[-1].get("attrs") or {}).get("memory_sha256") if ends else None
+        mem_file = c.memory_file(host, cwd) if host else ""
+        mem_bytes = open(mem_file, "rb").read() if os.path.isfile(mem_file) else None
+        sc.check("MEMORY.md holds the fact", mem_bytes is not None and fact.encode() in mem_bytes, mem_file)
 
-    n2 = "s7-long-%s" % uuid.uuid4().hex[:6]
-    turns_before = len(c.turn_events(session, "cli.turn.start"))
-    st, raw, resp = c.msg(cwd, "%s [[turn-ms=60000]]" % n2, wake=True)
-    started = wait_until(lambda: len(c.turn_events(session, "cli.turn.start")) > turns_before, 60)
-    if not sc.check("a long turn started", st == 200 and started, "HTTP %s; turn.start seen %s" % (st, bool(started))):
-        return
-    with c.fleet.control():
-        try:
-            c.fleet.kill_cli(cli_pid)
-            killed = wait_until(lambda: not fleetlib.pid_alive(cli_pid), 10)
-        except (fleetlib.FleetError, ProcessLookupError, TypeError) as e:
-            killed = False
-            c.log("kill failed: %s" % e)
-    sc.check("the CLI was SIGKILLed mid-turn", killed and len(c.turn_events(session, "cli.turn.end")) == len(ends),
-             "pid %s on %s" % (cli_pid, host))
-    # The daemon notices the child is gone; the next message is the next need.
-    time.sleep(1.0)
-    n3 = "s7-after-%s" % uuid.uuid4().hex[:6]
-    st, raw, resp = c.msg(cwd, n3, wake=True)
-    sc.check("the next message is accepted (wake on)", st == 200 and resp.get("success") is True,
-             "HTTP %s %s" % (st, raw[:300]))
-    wait_until(lambda: c.replied(cwd, n3))
-    seen3 = c.prompts_with(cwd, n3)
-    sc.check("it was answered", seen3 and c.replied(cwd, n3), "%s" % [(h, s) for h, s, _ in seen3])
-    resumed = [e for e in c.fake("cli.exec", session) if (e.get("attrs") or {}).get("resumed")]
-    sc.check("the next need resumed the same provider session (--resume, same id)",
-             bool(resumed) and seen3 and seen3[0][1] == session,
-             "resumed execs of %s: %d; answered in %s" % (session, len(resumed), seen3[0][1] if seen3 else None))
-    if resumed:
-        h = (resumed[-1].get("attrs") or {}).get("memory_sha256")
-        sc.check("I3: the resumed CLI started with the same MEMORY.md (sha256)", h == mem_hash,
-                 "before %s, at resume %s" % (mem_hash, h))
-    now_file = c.memory_file(seen3[0][0], cwd) if seen3 else mem_file
-    now_bytes = open(now_file, "rb").read() if os.path.isfile(now_file) else None
-    sc.check("MEMORY.md bytes unchanged by the crash and resume", now_bytes == mem_bytes, now_file)
-    c.close(pid)
+        n2 = "s7 long %s [[turn-ms=60000]]" % uuid.uuid4().hex[:6]
+        starts = len(c.turn_events(csid, "cli.turn.start"))
+        c.type(sock, n2)
+        started = wait_until(lambda: len(c.turn_events(csid, "cli.turn.start")) > starts, 30)
+        if not sc.check("a long turn started", started, n2):
+            return
+        with c.fleet.control():
+            try:
+                c.fleet.kill_cli(cli_pid)
+                killed = wait_until(lambda: not fleetlib.pid_alive(cli_pid), 10)
+            except (fleetlib.FleetError, ProcessLookupError, TypeError) as e:
+                killed = False
+                c.log("kill failed: %s" % e)
+        sc.check("the CLI was SIGKILLed mid-turn", killed and len(c.turn_events(csid, "cli.turn.end")) == len(ends),
+                 "pid %s on %s" % (cli_pid, host))
+        sock.close()
+        sock = None
+        # The daemon sees the child go; the next need is the app opening it again.
+        time.sleep(1.0)  # let the host report the exit
+        b = open_chat(c, sc, cwd, "the next need: the app opens the agent again")
+        if not b:
+            return
+        sid2, csid2, reused, sock, grid = b
+        sc.check("the next need resumed the same provider session", csid2 == csid,
+                 "before %s, now %s (reused=%s)" % (csid, csid2, reused))
+        resumed = [e for e in c.fake("cli.exec", csid) if (e.get("attrs") or {}).get("resumed")]
+        sc.check("a new CLI was started with --resume", bool(resumed),
+                 "argv %s" % json.dumps((resumed[-1].get("attrs") or {}).get("argv")) if resumed else "no resumed cli.exec for %s" % csid)
+        if resumed:
+            h = (resumed[-1].get("attrs") or {}).get("memory_sha256")
+            sc.check("I3: the resumed CLI started with the same MEMORY.md (sha256)", h == mem_hash,
+                     "before %s, at resume %s" % (mem_hash, h))
+            rhost = resumed[-1].get("host")
+            now_file = c.memory_file(rhost, cwd)
+            now_bytes = open(now_file, "rb").read() if os.path.isfile(now_file) else None
+            sc.check("MEMORY.md bytes unchanged by the crash and resume", now_bytes == mem_bytes,
+                     "%s (resumed on %s; the crash was on %s)" % (now_file, rhost, host))
+        n3 = "s7 after %s" % uuid.uuid4().hex[:6]
+        c.type(sock, n3)
+        sc.check("the resumed agent answers", wait_until(lambda: c.replied(cwd, n3)), n3)
+    finally:
+        if sock:
+            sock.close()
+        c.close(pid)
 
 
 # ── S8 ──────────────────────────────────────────────────────────────────
@@ -623,55 +660,63 @@ def s7(c, sc):
 def s8(c, sc):
     cwd = c.fleet.workspace("s8-%s" % c.tag)
     pid, why = c.register_enabled(cwd)
-    if not sc.check("workspace agent on, asleep", pid, why):
+    if not sc.check("workspace registered", pid, why):
         return
-    n1 = "s8-first-%s" % uuid.uuid4().hex[:6]
-    st, raw, resp = c.msg(cwd, n1, wake=True)
-    wait_until(lambda: c.replied(cwd, n1))
-    seen = c.prompts_with(cwd, n1)
-    if not sc.check("a message wakes it and it answers", st == 200 and seen and c.replied(cwd, n1),
-                    "HTTP %s; %s" % (st, [(h, s) for h, s, _ in seen])):
+    a = open_chat(c, sc, cwd, "the app opens the agent (ensure-pinned-chat)")
+    if not a:
         return
-    host, session = seen[0][0], seen[0][1]
-    sc.info.update(host=host, session=session)
-    n2 = "s8-long-%s" % uuid.uuid4().hex[:6]
-    starts = len(c.turn_events(session, "cli.turn.start"))
-    st, raw, resp = c.msg(cwd, "%s [[turn-ms=8000]]" % n2, wake=True)
-    started = wait_until(lambda: len(c.turn_events(session, "cli.turn.start")) > starts, 60)
-    if not sc.check("a long turn started on %s" % host, started, "HTTP %s" % st):
-        return
-    with c.fleet.control():
-        t_term = now_iso()
-        exited = c.fleet.kill(host, signal.SIGTERM, 120)
-        t_exit = now_iso()
-        sc.info.update(sigterm=t_term, exited=t_exit)
-        sc.check("%s exited by itself after SIGTERM (drain)" % host, exited, "SIGTERM %s, gone %s" % (t_term, t_exit))
-        if not exited:
-            c.fleet.kill(host)
-        ends = [e for e in c.turn_events(session, "cli.turn.end") if (e.get("ts") or "") >= t_term]
-        stops = [e for e in c.turn_events(session, "cli.hook.done")
-                 if (e.get("attrs") or {}).get("hook") == "Stop" and (e.get("ts") or "") >= t_term]
-        sc.check("the turn in progress finished before the host exited (turn end and Stop hook)",
-                 bool(ends) and bool(stops) and ends[0]["ts"] <= t_exit and stops[0]["ts"] <= t_exit,
-                 "turn.end %s, Stop %s, host gone %s" % ([e["ts"] for e in ends][:1], [e["ts"] for e in stops][:1], t_exit))
-        n3 = "s8-while-down-%s" % uuid.uuid4().hex[:6]
-        st, raw, resp = c.msg(cwd, n3, wake=True)
-        msg_id = resp.get("msgId")
-        sc.check("a message sent while the host is down is not lost silently (accepted, or failed with a reason)",
-                 st == 200 and (resp.get("success") is True or resp.get("reason")), "HTTP %s %s" % (st, raw[:300]))
-        t_restart = now_iso()
-        c.fleet.start(host)
-    resumed = wait_until(lambda: [e for e in c.fake("cli.exec", session)
-                                  if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], 60)
-    sc.check("the replacement host resumed the agent that was awake (same session id, no re-spawn by the lab)",
-             bool(resumed), "resumed cli.exec of %s after %s: %d" % (session, t_restart, len(resumed or [])))
-    wait_until(lambda: c.replied(cwd, n3), 60)
-    seen3 = c.prompts_with(cwd, n3)
-    state = c.wait_final(msg_id, 60) if msg_id else None
-    sc.check("the message sent while it was down was delivered exactly once",
-             len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered"),
-             "in transcripts %d time(s); outbox state %s" % (len(seen3), state))
-    c.close(pid)
+    sid, csid, _, sock, grid = a
+    try:
+        n1 = "s8 first %s" % uuid.uuid4().hex[:6]
+        c.type(sock, n1)
+        if not sc.check("it answers", c.grid_wait(sock, grid, "%s1: %s" % (REPLY_MARKER, n1)), n1):
+            return
+        ex = c.exec_of(csid)
+        host = (ex or {}).get("host")
+        sc.info.update(host=host, session=sid, claude_session=csid, cli_pid=(ex or {}).get("pid"))
+        n2 = "s8 long %s [[turn-ms=8000]]" % uuid.uuid4().hex[:6]
+        starts = len(c.turn_events(csid, "cli.turn.start"))
+        c.type(sock, n2)
+        started = wait_until(lambda: len(c.turn_events(csid, "cli.turn.start")) > starts, 30)
+        if not sc.check("a long turn started on %s" % host, started, n2):
+            return
+        sock.close()
+        sock = None
+        with c.fleet.control():
+            t_term = now_iso()
+            exited = c.fleet.kill(host, signal.SIGTERM, 120)
+            t_exit = now_iso()
+            sc.info.update(sigterm=t_term, exited=t_exit)
+            sc.check("%s exited by itself after SIGTERM (drain)" % host, exited, "SIGTERM %s, gone %s" % (t_term, t_exit))
+            if not exited:
+                c.fleet.kill(host)
+            ends = [e for e in c.turn_events(csid, "cli.turn.end") if (e.get("ts") or "") >= t_term]
+            stops = [e for e in c.turn_events(csid, "cli.hook.done")
+                     if (e.get("attrs") or {}).get("hook") == "Stop" and (e.get("ts") or "") >= t_term]
+            sc.check("the turn in progress finished before the host exited (turn end and Stop hook)",
+                     bool(ends) and bool(stops) and ends[0]["ts"] <= t_exit and stops[0]["ts"] <= t_exit,
+                     "turn.end %s, Stop %s, host gone %s" % ([e["ts"] for e in ends][:1], [e["ts"] for e in stops][:1], t_exit))
+            n3 = "s8-while-down-%s" % uuid.uuid4().hex[:6]
+            st, raw, resp = c.msg(cwd, n3, wake=False)
+            msg_id = resp.get("msgId")
+            sc.check("a message sent while the host is down is accepted (or fails with a reason), not lost silently",
+                     st == 200 and (resp.get("success") is True or resp.get("reason")), "HTTP %s %s" % (st, raw[:300]))
+            t_restart = now_iso()
+            c.fleet.start(host)
+        resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
+                                      if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], 60)
+        sc.check("the replacement host resumed the agent that was awake (same session, no re-spawn by the lab)",
+                 bool(resumed), "resumed cli.exec of %s after %s: %d" % (csid, t_restart, len(resumed or [])))
+        wait_until(lambda: c.replied(cwd, n3), 60)
+        seen3 = c.prompts_with(cwd, n3)
+        state = c.wait_final(msg_id, 60) if msg_id else None
+        sc.check("the message sent while it was down was delivered exactly once",
+                 len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered"),
+                 "in transcripts %d time(s); outbox state %s" % (len(seen3), state))
+    finally:
+        if sock:
+            sock.close()
+        c.close(pid)
 
 
 # ── S9 ──────────────────────────────────────────────────────────────────
@@ -728,8 +773,9 @@ def s9(c, sc):
                  "session %s" % sid)
         if sock:
             n2 = "s9 after %s" % uuid.uuid4().hex[:6]
-            c.type(sock, n2)
-            sc.check("typing reaches the same agent and is answered", c.grid_wait(sock, grid, "%s2: %s" % (REPLY_MARKER, n2), 30), n2)
+            typed = c.type(sock, n2)
+            sc.check("typing reaches the same agent and is answered",
+                     typed and c.grid_wait(sock, grid, "%s2: %s" % (REPLY_MARKER, n2), 30), n2 if typed else "the grid stream was closed")
         n3 = "s9-msg-%s" % uuid.uuid4().hex[:6]
         st, raw, resp = c.msg(name, n3, wake=False)
         wait_until(lambda: c.replied(cwd, n3), 60)

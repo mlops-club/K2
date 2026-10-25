@@ -181,7 +181,34 @@ tests/lab/run_tests.sh                                            # the lab's ow
 
 ## Status
 
-- Milestones: diagrams written.
-- Next: fake-agent directives and evidence fields; fleet procs; S1 to S5
-  green on fleet procs (first working slice); S6 to S9; chaos; I1 to I4;
-  solo G2; compose backend and one compose run.
+- Milestones: diagrams written; first working slice (fleet procs: S1, S2,
+  S3, S5 green; S4 red on a daemon gap, below).
+- Next: chaos runs; solo G2; compose backend and one compose run.
+
+### First working slice: `prove.sh G2 --topology fleet --parity none`
+
+Run `lab-runs/G2/2026-10-25T21-30-01Z` (sha 8971f54d2, procs backend):
+
+| Scenario | Result | Why |
+|---|---|---|
+| S1 | PASS | as at G0, through the controller |
+| S2 | PASS | each agent's SessionStart, UserPromptSubmit and Stop reached the controller (`ctl.hook`, `attrs.pane`) for its own session; agents on host-1 and host-2 |
+| S3 | PASS | real `cli/k2 msg` on host-1 → controller outbox `delivered` → bob's transcript on host-2 once |
+| S4 | **FAIL** | daemon gap: on a host or controller, `k2 msg` hands every message to the outbox and ignores `wake` (`workspace_msg.rs` `deliver_live_with_receipt`, `delivery_drain::send`); the outbox only delivers to a placed agent, so a sleeping agent is never woken and the message waits for the 7-day TTL. dist-link's W1 had S4 green before the outbox merged on top |
+| S5 | PASS | heartbeat fire spawns on a host, wakeup answered |
+| S6 | PASS | inbox item composed on host-1 while host-2 was down, controller restarted, host-2 back, bob's next spawn: item in bob's inbox once, outbox rows delivered |
+| S7 | PASS | CLI SIGKILLed mid-turn; the app's next ensure-pinned-chat resumes the same session id (`--resume`), MEMORY.md sha256 and bytes unchanged |
+| S8 | FAIL (W3) | the host exits at once on SIGTERM (no drain: the turn never ends), nothing resumes the agent, the message waits queued |
+| S9 | FAIL (W3) | the agent keeps running and finishes its turn while the controller is down (both PASS); the restarted controller does not re-adopt it, so the grid, typing and `k2 msg` can't reach it |
+| I2 | FAIL | the S4 messages and S8's message stay `queued` |
+
+I1, I3, I4 were NOT RUN in that run (the traces landed under `topology/`;
+fixed). In the scenario-level runs before it (`lab-runs/dev/r2`, `r3`): I1
+pass (502 samples, 4 placements, epochs strictly increasing), I3 pass (S7's
+resume kept the session id and MEMORY.md sha256), I4 pass.
+
+Lab fixes found by the first runs: the fleet manager's pid pipe stayed open
+for the daemon's lifetime (fd 3 now closed for the daemon); helper CLIs a
+host starts itself (`codex app-server`, `cursor agent stdio`) inherited the
+daemon's cwd and looked like one agent on two hosts (daemons now get their
+own cwd, and the checkers count only CLIs with a pane).
