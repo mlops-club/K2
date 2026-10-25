@@ -1646,12 +1646,6 @@ pub fn send_message_to_session_with_command(
     })
 }
 
-/// K2_ROLE=host: deliver a message the controller sent for `agent_id`, an
-/// agent running on this host (`crate::delivery_drain`). `kind: "msg"`
-/// injects `[from <label>] text` into its live session like `k2 msg`;
-/// `kind: "inbox"` composes into the inbox of the workspace it runs in.
-/// Never spawns: an agent with no live session here is retried by the
-/// controller.
 /// The controller's direct delivery of a `kind=msg` body a host sent up
 /// for a recipient it resolves but that isn't placed
 /// (`delivery_drain::Direct`): today's cascade, `wake` from the body.
@@ -1675,6 +1669,12 @@ pub(crate) fn deliver_for_controller(recipient: &str, from: &str, body: &serde_j
     }
 }
 
+/// K2_ROLE=host: deliver a message the controller sent for `agent_id`, an
+/// agent running on this host (`crate::delivery_drain`). `kind: "msg"`
+/// injects `[from <label>] text` into its live session like `k2 msg`;
+/// `kind: "inbox"` composes into the inbox of the workspace it runs in.
+/// Never spawns: an agent with no live session here is retried by the
+/// controller.
 pub(crate) fn deliver_to_local_agent(
     agent_id: &str,
     from: &str,
