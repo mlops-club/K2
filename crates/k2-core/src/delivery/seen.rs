@@ -13,10 +13,13 @@ pub fn status(conn: &Connection, msg_id: &str) -> rusqlite::Result<Option<String
         .optional()
 }
 
-/// Remember `msg_id` as handled with `status`, keeping at most `cap` ids.
+/// Remember `msg_id` as handled with `status` (a later call replaces the
+/// status: the controller's `handling` becomes its final answer), keeping
+/// at most `cap` ids.
 pub fn record(conn: &Connection, msg_id: &str, status: &str, now_ms: i64, cap: usize) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO delivery_seen (msg_id, seen_ms, status) VALUES (?1, ?2, ?3)",
+        "INSERT INTO delivery_seen (msg_id, seen_ms, status) VALUES (?1, ?2, ?3)
+         ON CONFLICT(msg_id) DO UPDATE SET status = excluded.status",
         params![msg_id, now_ms, status],
     )?;
     conn.execute(

@@ -75,8 +75,12 @@ struct Ctl {
 
 impl Ctl {
     async fn start(db: Db) -> Self {
+        Self::start_with(db, Direct::none()).await
+    }
+
+    async fn start_with(db: Db, direct: Direct) -> Self {
         let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-        let drain = start_controller(remote, db, FAST);
+        let drain = start_controller(remote, db, FAST, direct);
         let attach = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let attach_url = format!("ws://{}{ATTACH_PATH}", attach.local_addr().unwrap());
         tokio::spawn(async move {
@@ -372,4 +376,117 @@ fn senders_are_addressed_by_kind() {
     assert_eq!(sender_address(""), "user:owner");
     assert_eq!(sender_address("external"), "user:owner");
     assert_eq!(sender_address("user:eric"), "user:eric");
+}
+
+// ── recipients the controller delivers to itself (G2 S4: wake) ─────────
+
+/// Today's cascade, faked: `/ws/*` resolve on the controller; a message
+/// with `wake: true` wakes the agent and lands, one without is
+/// `dormant_no_wake`. `/ws/slow` holds until `release` is sent to.
+struct FakeCascade {
+    calls: Arc<Mutex<Vec<(String, String, bool)>>>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+fn fake_cascade() -> (Direct, FakeCascade) {
+    let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::default();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    let c = Arc::clone(&calls);
+    let direct = Direct {
+        resolves: Box::new(|r| r.starts_with("/ws/")),
+        deliver: Box::new(move |to: &str, from: &str, body: &Value| {
+            if to == "/ws/slow" {
+                held.lock().recv().expect("released");
+            }
+            let wake = body["wake"].as_bool() == Some(true);
+            c.lock().push((to.to_string(), from.to_string(), wake));
+            if wake { Ok(()) } else { Err("dormant_no_wake".into()) }
+        }),
+    };
+    (direct, FakeCascade { calls, release })
+}
+
+fn wake_msg(id: &str, to: &str, wake: bool) -> Frame {
+    Frame::Deliver {
+        msg_id: id.into(),
+        agent_id: to.into(),
+        epoch: None,
+        from: "agent:alice".into(),
+        body: json!({"kind": "msg", "text": "wake up", "wake": wake, "wake_timeout_ms": 20_000}),
+        attempt: 1,
+    }
+}
+
+fn ack(id: &str, status: DeliverStatus, reason: Option<&str>) -> Frame {
+    Frame::DeliverAck { msg_id: id.into(), status, reason: reason.map(str::to_string) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sleeping_recipient_is_woken_by_the_controller_once_and_without_wake_is_refused() {
+    let (direct, cascade) = fake_cascade();
+    let c = Ctl::start_with(mem_db(), direct).await;
+    let mut a = fake_host(&c, "host-a").await;
+
+    // `k2 msg --wake` from host A to a sleeping agent: the controller wakes it.
+    send(&mut a, &wake_msg("m_w", "/ws/sleepy", true)).await;
+    assert_eq!(recv(&mut a).await, ack("m_w", DeliverStatus::Delivered, None));
+    // A resend (lost ack) is a duplicate and wakes nothing again.
+    send(&mut a, &wake_msg("m_w", "/ws/sleepy", true)).await;
+    assert_eq!(recv(&mut a).await, ack("m_w", DeliverStatus::Duplicate, None));
+
+    // Without --wake: today's answer, every time it is asked.
+    send(&mut a, &wake_msg("m_n", "/ws/sleepy", false)).await;
+    assert_eq!(recv(&mut a).await, ack("m_n", DeliverStatus::Rejected, Some("dormant_no_wake")));
+    send(&mut a, &wake_msg("m_n", "/ws/sleepy", false)).await;
+    assert_eq!(recv(&mut a).await, ack("m_n", DeliverStatus::Rejected, Some("dormant_no_wake")));
+
+    assert_eq!(
+        *cascade.calls.lock(),
+        [("/ws/sleepy".to_string(), "agent:alice".to_string(), true), ("/ws/sleepy".to_string(), "agent:alice".to_string(), false)]
+    );
+    // Neither went through the outbox: nothing waits for a placement (I2).
+    assert_eq!(c.drain.get("m_w"), None);
+    assert_eq!(c.drain.get("m_n"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_during_a_wake_gets_no_ack_and_the_wake_runs_once() {
+    let (direct, cascade) = fake_cascade();
+    let c = Ctl::start_with(mem_db(), direct).await;
+    // bob first: with both linked, a tie places on host-a.
+    let mut b = fake_host(&c, "host-b").await;
+    place(&c, &mut b, "bob").await;
+    let mut a = fake_host(&c, "host-a").await;
+
+    send(&mut a, &wake_msg("m_s", "/ws/slow", true)).await;
+    // The first copy is still waking the agent; the host resends.
+    within("the wake to start", async {
+        while seen::status(&c.drain.db.lock(), "m_s").unwrap().as_deref() != Some(HANDLING) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    send(&mut a, &wake_msg("m_s", "/ws/slow", true)).await;
+    // An outbox message right after: its ack is the next frame, so the
+    // resend above got none.
+    send(&mut a, &msg("m_q", "bob", "queued")).await;
+    assert_eq!(recv(&mut a).await, ack("m_q", DeliverStatus::Delivered, None));
+    cascade.release.send(()).unwrap();
+    assert_eq!(recv(&mut a).await, ack("m_s", DeliverStatus::Delivered, None));
+    send(&mut a, &wake_msg("m_s", "/ws/slow", true)).await;
+    assert_eq!(recv(&mut a).await, ack("m_s", DeliverStatus::Duplicate, None));
+    assert_eq!(cascade.calls.lock().len(), 1, "one wake");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placed_agents_and_inbox_items_still_go_through_the_outbox() {
+    let (direct, _cascade) = fake_cascade();
+    let c = Ctl::start_with(mem_db(), Direct { resolves: Box::new(|_| true), deliver: direct.deliver }).await;
+    let mut b = fake_host(&c, "host-b").await;
+    let msg_body = json!({"kind": "msg", "text": "hi", "wake": true});
+    assert!(c.drain.is_direct("bob", &msg_body), "not placed, resolvable: today's cascade");
+    place(&c, &mut b, "bob").await;
+    assert!(!c.drain.is_direct("bob", &msg_body), "placed: the outbox");
+    assert!(!c.drain.is_direct("carol", &json!({"kind": "inbox", "title": "t"})), "inbox items always queue");
 }

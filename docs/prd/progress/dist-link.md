@@ -30,8 +30,11 @@ graph LR
         DISP[dispatcher<br/><sub>routes/dispatcher.rs · controller gate</sub>]:::changed
         GATE[controller gate<br/><sub>hosts/gate.rs · relay or 501</sub>]:::new
         HUB[host hub<br/><sub>hosts/hub.rs · /cli/hosts/attach</sub>]:::new
-        RH[RemoteHost<br/><sub>agent_host/remote.rs · placement table</sub>]:::new
-        NOLOCAL[no local agents<br/><sub>agent_host/mod.rs · host() refuses spawn</sub>]:::changed
+        RH[RemoteHost · the controller's AgentHost<br/><sub>agent_host/remote.rs · placements, sessions</sub>]:::new
+        HOSTFN[host&#40;&#41; by role<br/><sub>agent_host/mod.rs · RemoteHost on a controller</sub>]:::changed
+        SPAWN[workspace spawn<br/><sub>spawn.rs · forwarded whole as spawn.workspace</sub>]:::changed
+        HOSTFN --> RH
+        SPAWN --> RH
         BUS[session events bus<br/><sub>session_events.rs · /cli/sessions/events</sub>]:::existing
         DISP --> GATE
         GATE -- spawn, close, grid --> RH
@@ -327,6 +330,55 @@ W1 results:
 | `cargo test -p k2-core --no-fail-fast -- --test-threads=3`, throwaway HOME | 3865 passed, **1 failed**, 1 ignored: `fork_tab_repair::tests::repair_splits_a_fork_tab_off_the_source_conversation` (`repair()` sometimes returns no repair for the fork tab). Unrelated to the probe and flaky on its own: run alone (`-- fork_tab_repair`, where no probe is ever installed, so the probe lines are `None` early-outs) it failed 2 of 3 times. The test doesn't touch the transcript lookups. Not fixed here (not my file); reported to the coordinator |
 | two-process (run `20261025T170926Z`) | **all 9 checks PASS**; W1 25/25, including "the second wake resumed the same conversation (same session id, answered)" and "--resume" in the fake agent's argv (`--resume cb650df8-…`, the first wake's session id) |
 
+## W3: placements survive (S8, S9, I1)
+
+The controller keeps every placement it makes, and the epoch counter, in its
+own `k2.db`:
+
+| Table | Holds |
+|---|---|
+| `host_placements` | `agent_id` (key), `host_id`, `session_id`, `epoch`, `cwd`, `program`, `args_json`, `label`, `label_source`, `updated_at`: written on place, deleted (at that epoch) on close, `session.gone` and "gone" |
+| `host_epoch` | the last epoch issued (one row). The old `hosts-epoch` file is read once as a floor |
+
+Both are `CREATE TABLE IF NOT EXISTS`, created on the first `host()` of a
+controller; no other role touches them. `PlacementStore` has its own
+connection to the file `k2_core::db` opened (`db::shared_path()`), never the
+shared one: its lock is taken while `RemoteHost::inner` is held and inside the
+first `host()` call, and other threads (the active reaper) hold the shared
+lock while they call `host()`. On the shared connection a restarted
+controller hung at boot (`restore` waiting for the reaper's lock, the reaper
+waiting for `restore`); found by the S9 run, covered by
+`hosts::tests::the_placement_store_never_waits_on_the_shared_db_lock`.
+
+What happens when things die:
+
+| Event | Controller | Host |
+|---|---|---|
+| Link drops (protocol 2) | the host is **lost**, not forgotten: placements and sessions stay, marked lost; `/cli/hosts/status` lists it under `lost`; spawning its agent is a 502 "lost" (never placed elsewhere, I1); a grid attach answers an "is lost" error; waiting requests fail | keeps running its agents; reconnects with backoff |
+| Link drops (protocol 1) | forgets the host's placements, as before | |
+| Controller restarts | restores every row as lost until its host links | `hello.resume` lists every agent it still runs: agent, session, epoch, alive, cwd, program, args, label |
+| Host links with `resume` | per agent: same host and epoch → **Adopted** (lost cleared); a newer epoch or one it doesn't know → adopted as sent; held elsewhere or at another epoch → **Released** (the host is told to `release` it, and kills it); placed here but not resumed → **Gone** (`ChildExit`, row deleted) | on `release`: kills the session, answers `released` |
+
+Grid replay: `grid.data.ring_offset` carries the frame's version. v2 sessions
+have no byte ring yet (that needs `k2-core`), so a client that reconnects
+gets the host's snapshot of the screen, which holds everything the agent
+printed while the controller was away; the client re-attaches and loses
+nothing on screen. The old-epoch refusal is a unit test with a fake host
+(`an_old_epoch_placement_is_released_and_a_missing_one_is_gone`), since a
+real controller never issues an older epoch.
+
+W3 results:
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host::` | 39 passed: `placements_survive_a_controller_restart_and_are_adopted`, `an_old_epoch_placement_is_released_and_a_missing_one_is_gone`, `a_real_host_resumes_its_agents_after_a_link_drop`, `grid_frames_carry_their_version_as_the_ring_offset`, `link_loss_fails_waiting_requests_and_keeps_placements_as_lost` (with the protocol-1 forget), `the_placement_store_never_waits_on_the_shared_db_lock` |
+| two-process check 10, S9 (run `20261025T213031Z`) | spawn through the controller, type a prompt (the turn is running: the prompt is in the transcript), `kill -TERM` the controller, start it again: it restores 4 placements, the host relinks and all 4 are **Adopted**; the agent's pid and parent are unchanged (`12929 8664`, the host); the client re-attaches through the new controller and sees banner, prompt and reply in order (positions 0, 81, 95); the prompt is in the transcript once. 8/8 |
+| two-process check 11, S8 (same run) | `kill -9` the host mid-turn: the controller reports `lost: [host-1]`; spawning the agent → 502 "lost"; grid → "is lost" error; the host restarts and links: its dead placements are **Gone**; the agent spawns fresh on the host (`reused: false`), the interrupted prompt is in its transcript and it resumes the same conversation. 10/10 |
+| two-process, every check | **12/12 PASS** (S1, W1 25/25 and the rest unchanged) |
+| two-process on the merged tree (wave2-preview + outbox 86276d0d5 + lab's fake-agent fix 2c1bc8cb9; run `20261025T232814Z`) | **12/12 PASS**: S1, W1 25/25 (S4 wake through the outbox's controller path), S9 8/8 (same pid), S8 10/10 |
+| `K2_ROLE=all` regression after W3: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: **5204 passed, 0 failed**, 6 ignored |
+| `cargo test -p k2-core -- --test-threads=3` (W3 adds `db::shared_path`), throwaway HOME | 17 test binaries: **3866 passed, 0 failed**, 1 ignored (fork_tab_repair green since `d543108d5`) |
+
 ## Env contract
 
 Names follow `deploy/README.md` and `deploy/compose/compose.yaml`. The task
@@ -373,12 +425,16 @@ is S9).
 | `GET /cli/sessions/grid` | relayed to the owning host for the owner token and Connect sessions (the desktop app's login), with `all`'s viewer/claimer rules; `/v1` stream tokens get 403 |
 | `GET /cli/sessions/events` | served by the controller as today; host `open_url` arrives here |
 | `GET /cli/hosts/attach`, `GET /cli/hosts/status` | new |
-| every other spawn path (`spawn.rs`, heartbeats, wake, `/v1` sandboxes, sidecars, pinned chat) | `host()` is the "no local agents" host: `spawn` fails with `K2_ROLE=controller runs no agents locally`; lookups find nothing |
+| the workspace spawn (`spawn.rs`: chat overlay / pinned chat, heartbeats, wake, agents routes, sidecars, terminal and remote-session routes) | placed on a host whole (`spawn.workspace`, W1); with no host: the `NO_HOSTS` error |
+| everything that reads or drives a session through `host()` | `host()` is `RemoteHost` (W1): lookups return remote handles, writes/injects/screen reads go to the host |
+| `/v1` sandboxes (`v2_spawn::spawn_session` → `host().spawn(DaemonPtyConfig)`) | refused by `RemoteHost::spawn` ("runs no agents locally"): the low-level spawn has no remote form yet |
 | routes that spawn their own PTY without the trait (listed below) | 501 `{"error":"not available with K2_ROLE=controller (dist-link first cut)"}` |
 
-The ~20 files in agenthost's "bypass" table only look up, list or unplace
-sessions in the in-process placement table. On a controller that table is
-always empty, so they find nothing; none of them can start an agent.
+The files in agenthost's "bypass" table that still read `v2_session_map`
+directly (not `host()`) see an empty table on a controller, so they find
+nothing; none of them can start an agent. W1 moved the ones on the S1, S4,
+S5 and chat-overlay paths (`pinned_chat.rs`, `heartbeat_launch.rs`) to
+`host()`.
 
 The 501 list (`hosts/gate.rs`, `CONTROLLER_NOT_IMPLEMENTED`): routes that
 start a PTY themselves, not through `AgentHost`, or drive one by raw bytes:
@@ -391,10 +447,14 @@ start a PTY themselves, not through `AgentHost`, or drive one by raw bytes:
 | `/cli/sessions/v2/refresh` | sidecar kill-and-resume on the in-process host |
 | `/cli/terminal/*` | the terminal API (read, write, resize, label, pin, reap) on in-process sessions |
 
-Background loops that spawn (`llm_accounts_runtime::spawn`,
-`person_wallet_runtime::spawn_loop`, heartbeats, wake) hit the
-`InProcessHost::spawn` refusal and log it; they never start a process on
-the controller. `/cli/claude-auth/*` reads and refreshes credentials files
+Heartbeats and wake go through the workspace spawn and are placed on a
+host. The login-PTY loops (`llm_accounts_runtime::spawn`,
+`person_wallet_runtime::spawn_loop`) call `DaemonPtySession::spawn`
+directly and are behind the 501 routes above. Nothing reaches
+`InProcessHost` on a controller (`host()` is `RemoteHost`; the
+`InProcessHost::spawn` refusal stays as a backstop), so no agent process
+starts on the controller (two-process check "the controller ran no agent
+processes"). `/cli/claude-auth/*` reads and refreshes credentials files
 and runs no agent, so it stays as is (on a controller it finds none).
 
 ## Merge notes
@@ -433,12 +493,14 @@ curl -s http://127.0.0.1:17420/cli/hosts/status   # {"role":"controller","hosts"
 
 - Milestones: diagrams written; host env contract (handed to `kind-dist`);
   first working slice; done; host reconnect after read error; app session
-  through controller; W0 protocol 2; W1 first working slice; W1 done.
-- Next (P2 follow-ups, not this task): `RemoteHost` as an `impl AgentHost`,
-  stream-token grid relays, `proto=k1` over the link,
-  host re-adoption after a controller restart (S9), the outbox (S3), cwd
-  mapping for pods.
-- Open: the deviation below (`RemoteHost` not yet an `impl AgentHost`).
+  through controller; W0 protocol 2; W1 first working slice; W1 done;
+  W3 first working slice; W3 checks green; W3 done.
+- Next: whatever the coordinator assigns. Later: a byte ring on v2 sessions
+  (true offset replay, `k2-core`), stream-token grid relays, `proto=k1` over the link, cwd
+  mapping for pods, remote `read_home`/`write_home` (FR6), host hook
+  envelopes into the controller's activity store.
+- Open: none. (The first cut's deviation, `RemoteHost` not an
+  `impl AgentHost`, was closed by W1.)
 
 ### Results
 
@@ -503,14 +565,18 @@ Controller trace events added (`K2_TRACE_FILE`): `ctl.host_linked`,
 `host.linked`. The host keeps every existing trace event (`host.spawn`,
 `pty.*`, `cell.*`).
 
-### Known gaps on a controller (next wave)
+### Known gaps on a controller
 
-- The app's chat overlay spawn fails on a controller with
-  `K2_ROLE=controller runs no agents locally`: it spawns through a path
-  other than `POST /cli/sessions/v2/spawn` (the canonical/chat spawn in
-  `spawn.rs`), which hits the `InProcessHost::spawn` refusal instead of
-  being placed on a host. That is W1's scope (route every spawn path
-  through placement).
+- `/v1` sandboxes refuse on a controller (`RemoteHost::spawn`).
+- A Connect user's or a `/v1` stream token's grid: Connect users are
+  relayed with `all`'s rules; stream tokens are refused.
+- Agent home reads (`read_home`/`write_home`) and the activity store's hook
+  plane don't cross the link yet; transcripts are probed on the host for
+  resume decisions (`transcript.exists`).
+- Link loss forgets placements (the agents keep running on the host; a
+  re-spawn finds them). W3 replaces that with "lost" and adoption.
+- (Fixed in W1: the app's chat overlay spawn, which failed with
+  `K2_ROLE=controller runs no agents locally`, now places on a host.)
 
 ### Handoff notes for `kind-dist`
 
@@ -523,17 +589,13 @@ Controller trace events added (`K2_TRACE_FILE`): `ctl.host_linked`,
   its old link. The controller forgets a host's placements when its link
   drops (the agents keep running; a re-spawn of the same `agent_name` finds
   them again on that host).
-- Open questions: none blocking. Deviation to confirm: `RemoteHost` does not
-  implement the `AgentHost` trait yet (see below).
+- Hosts must run the W1 build (protocol 2) for the workspace spawn, ops and
+  the transcript probe; a protocol-1 host is told to update.
 
-### Why `RemoteHost` is not an `impl AgentHost` in this cut
+### `RemoteHost` and the `AgentHost` trait (history)
 
-`AgentSession` is a concrete handle over an in-process
-`Arc<DaemonPtySession>`, and ~15 files read its metadata straight from that
-memory. A remote implementation of the trait needs `AgentSession` to become
-host-polymorphic (cached metadata, remote screen reads), which edits files
-this task doesn't own and collides with the `home` worker's edits. So the
-controller relays the S1 routes to `RemoteHost` directly, and `host()` on a
-controller is a "no local agents" implementation that refuses `spawn`.
-Folding `RemoteHost` into the trait is the next P2 step; the wire protocol
-does not change when that happens.
+The first cut relayed only the S1 routes to `RemoteHost` and refused every
+other spawn on a controller, because `AgentSession` was a concrete
+in-process handle. W1 made `AgentSession` host-polymorphic (`SessionRef`)
+and `RemoteHost` an `impl AgentHost`; see "W1" above. The wire protocol of
+the first cut did not change; W1 only added protocol-2 frames.

@@ -63,7 +63,7 @@ pub mod trace_events {
 
 /// One placement a host still runs, reported in `hello` (protocol 2) so a
 /// restarted controller can re-adopt it (S9).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResumePlacement {
     pub agent_id: String,
     pub session_id: String,
@@ -74,6 +74,15 @@ pub struct ResumePlacement {
     pub ring: Option<RingRange>,
     #[serde(default)]
     pub child_alive: bool,
+    /// W3: what a controller that lost its table needs to adopt it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Offsets into a session's output ring: `start` is the oldest byte the
@@ -577,6 +586,7 @@ mod tests {
             epoch: 41,
             ring: Some(RingRange { start: 100, end: 4196 }),
             child_alive: true,
+            ..Default::default()
         };
         let cases: Vec<(Frame, serde_json::Value)> = vec![
             (
