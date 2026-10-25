@@ -32,6 +32,14 @@ target_vol=k2-lab-gate-target
 registry_vol=k2-lab-gate-cargo-registry
 lock="$HOME/.cache/k2-dist-docker.lock"
 
+# A coordinator hold on Docker (e.g. a Docker Desktop restart): while
+# lab-runs/.docker-hold exists, start nothing in Docker and give the slot
+# back at once. The first line is matched by parity.sh as "did not run".
+if [ -f "$repo/lab-runs/.docker-hold" ]; then
+    echo "refusing to run (held by the lab, before any Docker command): $(head -1 "$repo/lab-runs/.docker-hold")"
+    exit 2
+fi
+
 mkdir -p "$HOME/.cache"
 until mkdir "$lock" 2>/dev/null; do sleep 20; done
 trap 'rmdir "$lock"' EXIT
