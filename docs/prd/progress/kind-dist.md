@@ -268,3 +268,24 @@ S1 after host restart PASS
     same limit.
   - Mac paths aren't mapped. The app must send pod paths, which the
     controller's folder picker gives it.
+
+## 2026-10-25: the owner's deployment upgraded to wave2-preview @713156ea5
+
+Source: `k2-dist/wave2-preview` @713156ea5. It adds W1 remote-host (RemoteHost as AgentHost: chat overlay, wake, heartbeats, resume through the controller) and W2 outbox (`k2 msg` across hosts).
+
+1. **Images.** `k2-daemon:dist` was built with `build-daemon.sh` at 6g, 1 job, in 10m43s (peak about 3.3 GiB). Then `k2-agents:dist` (claude 2.1.308, `DISABLE_AUTOUPDATER=1`) and `k2-agents:dist-fake`.
+2. **`k2-kind-dist-fake` (7442)** was scaled back up and rolled with `up.sh --dist --fake`.
+   - `s1.sh --dist`: S1, placement and S1 after a host restart all PASS (`lab-runs/kind-dist/2026-10-25T18-31-10Z/`).
+   - `app-check.sh --dist --fake` PASS: the fake claude ran in k2-host-0, nothing ran in the controller.
+3. **`k2-kind-dist` (7443)** was rolled with `up.sh --dist`.
+   - No `--reset-password` or `--password-file`, so the password file is unchanged.
+   - The Secret and all three PVCs are the same volumes as before the roll (same `pvc-…` names).
+   - Both pods run the new image ids.
+   - The owner's Claude login on the host volume survived: `/var/lib/k2-host/.claude/.credentials.json` and `.claude.json` have the same sizes and mtimes. Only their existence was checked, never their contents.
+4. **`app-check.sh --dist` on 7443** PASS: `K2CHECK host=k2-host-0 uid=10000 cwd=/var/lib/k2/work/demo`, nothing in k2-controller-0, close 200.
+5. **`k2-kind-dist-fake`** was scaled back to 0. The namespace, PVCs and Secret are kept.
+
+Seen during the Docker Desktop restart (VM raised to 14 GB): every proxy container exited with 143 (SIGTERM at shutdown), and `--restart unless-stopped` did not bring them back.
+- `up.sh` recreates its own variant's proxy; `forward.sh [--dist] [--fake]` does it without a redeploy.
+- The owner's `k2-kind-proxy` (7440) needs `scripts/kind/forward.sh` or `docker start k2-kind-proxy`.
+- Also, `kind load` re-points a tag on the nodes, so a pod that restarts before its roll comes back on the new image. The owner's controller did this when the VM restarted.
