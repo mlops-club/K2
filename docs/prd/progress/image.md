@@ -149,7 +149,8 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilit
 
 ## Status
 
-- **Milestone:** k2lab pod Ready (critical path). Verified 2026-10-24:
+- **Milestone:** done (coordinator: k2-core / k2-daemon suites go to the integrator's Linux gate, option C).
+- Verified 2026-10-24 (see Test runs for cargo):
   - `k2-daemon:dev` built (dev profile, 293 MB).
   - Compose: `up -d --wait` healthy; `/boot-status` phase `ready`; with the
     owner token: `installKind` `package`, `listen.lan` true, capabilities
@@ -172,9 +173,9 @@ curl -fsS http://127.0.0.1:7440/boot-status | jq '{phase, installKind, capabilit
   the kind-app worker and the owner. Tear down with
   `kubectl --kubeconfig … delete namespace k2-solo` and
   `docker compose -f deploy/compose/compose.solo.yaml down -v`.
-- **Next:** the
-  test suites (`CARGO_BUILD_JOBS=4`, `--test-threads=4`, temp HOME) and head
-  clippy.
+- **Not run here:** `cargo test -p k2-core` and `-p k2-daemon` in full (the
+  k2-daemon lib needs about 4.8 GB to compile; the Docker cap is 3 GB). The
+  integrator's `scripts/test-gate-linux.sh` runs them after the wave-1 merge.
 
 ### Owner decisions (2026-10-24)
 
@@ -272,7 +273,19 @@ First run (as root):
 | k2-root-helper | 204 passed, 1 failed + `tests/binary.rs` 1 failed: both assert "run as non-root" (`geteuid() != 0`) |
 | k2-node | `tests/cli.rs` 2 failed, `tests/servers_cli.rs` 1 failed: root-only refusals asserted as non-root |
 | k2-core | lib 3644 passed, 2 failed (`daemon_pty` fd tests need `lsof`, absent in the toolchain image); `tests/ptyd_backend.rs` 8 failed (needs `k2-ptyd` built first) |
-| k2-daemon | lib test build OOM-killed (debuginfo 2 under the 3 GB cap); re-running with debuginfo 0 |
+| k2-daemon | lib test build OOM-killed (debuginfo 2 under the 3 GB cap) |
 
-Every failure is the test environment, not this change; re-runs fix the
-environment (non-root user for helper/node, `lsof` and `k2-ptyd` for k2-core).
+Every failure is the test environment, not this change.
+
+Re-runs:
+
+- k2-root-helper and k2-node as UID 1000 (opt-level 0, debuginfo 0): **19
+  binaries, 453 passed, 0 failed, 18 ignored**, so the four root-only failures
+  above were the root user.
+- k2-daemon: the lib OOMs under 3 GB at debuginfo 0 with 2 jobs, then 1 job,
+  then opt-level 0. Per the coordinator, the full k2-core and k2-daemon suites
+  run in the integrator's Linux gate instead (option C). Not run here:
+  k2-daemon unit tests (`runtime_role`, `daemon_port`, `capabilities`,
+  `engine_install`) and the permission-off golden with `capabilities`.
+- k2-core: the lib passed 3644 of 3646 in the first run (the 2 need `lsof`);
+  `ptyd_backend` needs `k2-ptyd` built first. Both are left to the gate.
