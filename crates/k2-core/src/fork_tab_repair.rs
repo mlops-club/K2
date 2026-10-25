@@ -167,6 +167,16 @@ mod tests {
         crate::db::init_for_tests()
     }
 
+    /// `repair` rewrites EVERY fork tab row in the shared test DB, so one
+    /// test's pass can take the other's row between its setup and its own
+    /// `repair` (the other then sees no repair for its project). The tests
+    /// that call `repair` hold this lock.
+    static REPAIR_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        REPAIR_TESTS.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn seed_project(handle: &str) -> String {
         let dbh = conn();
         let c = dbh.lock();
@@ -221,6 +231,7 @@ mod tests {
     /// the tab row forgets S. A's Chats name is never touched.
     #[test]
     fn repair_splits_a_fork_tab_off_the_source_conversation() {
+        let _serial = serial();
         let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let a_ws = format!("fra{tag}");
         let b_ws = format!("frb{tag}");
@@ -319,6 +330,7 @@ mod tests {
     /// A same-conversation `--resume` (no fork) is never touched.
     #[test]
     fn repair_leaves_plain_resume_tabs_alone() {
+        let _serial = serial();
         let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let a = seed_project(&format!("frc{tag}"));
         let b = seed_project(&format!("frd{tag}"));
