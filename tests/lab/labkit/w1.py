@@ -104,7 +104,10 @@ def wait_until(fn, deadline=DEADLINE_S, poll=0.1):
 class W1:
     def __init__(self, a, token):
         self.a, self.token = a, token
-        self.port, self.home, self.out = a.port, a.home, a.out
+        self.port, self.out = a.port, a.out
+        # One home (solo) or one per host (fleet): an agent's transcript is
+        # in the home of whichever host ran it.
+        self.homes = list(a.home) if isinstance(a.home, (list, tuple)) else [a.home]
         self.fake_trace = a.fake_trace
         self.checks, self.log_lines, self.flows = [], [], {}
         self.tag = uuid.uuid4().hex[:6]
@@ -175,8 +178,12 @@ class W1:
                           status == 200, "HTTP %s %s" % (status, text[:200]))
 
     def transcripts(self, cwd):
-        d = os.path.join(self.home, ".claude", "projects", s1.claude_project_slug(cwd))
-        return sorted(glob.glob(os.path.join(d, "*.jsonl")))
+        slug = s1.claude_project_slug(cwd)
+        return sorted(p for home in self.homes
+                      for p in glob.glob(os.path.join(home, ".claude", "projects", slug, "*.jsonl")))
+
+    def _home_of(self, path):
+        return next((h for h in self.homes if path.startswith(os.path.join(h, ""))), self.homes[0])
 
     def find_turn(self, cwd, needle, session=None):
         """The transcript turn whose user prompt contains `needle`:
@@ -198,7 +205,7 @@ class W1:
                             if isinstance(part, dict) and part.get("type") == "text":
                                 replies.append(part.get("text", ""))
                     return {"session": sid, "prompt": content, "replies": replies,
-                            "file": os.path.relpath(path, self.home)}
+                            "file": os.path.relpath(path, self._home_of(path))}
         return None
 
     def wait_turn_done(self, cwd, needle, session=None):
@@ -449,7 +456,8 @@ def main(argv):
     p = argparse.ArgumentParser(prog="w1.py", description=__doc__.split("\n\n")[0])
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--token-file", required=True)
-    p.add_argument("--home", required=True, help="the agents' HOME (transcripts under .claude/projects)")
+    p.add_argument("--home", required=True, action="append",
+                   help="the agents' HOME (transcripts under .claude/projects); repeat for one per host")
     p.add_argument("--workspace", required=True, help="a dir to create the flows' workspaces under")
     p.add_argument("--out", required=True)
     p.add_argument("--fake-trace", default=None, help="K2_FAKE_AGENT_TRACE file (extra evidence)")
