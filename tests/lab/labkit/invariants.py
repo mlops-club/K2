@@ -204,8 +204,21 @@ def check_i2(ev):
         if not m.get("msg_id") and r.get("success") is not False and m.get("http", 200) == 200 and m.get("rc", 0) == 0:
             diffs.append("%s %s → %s: accepted without a msg id, so it cannot be tracked" % (
                 m.get("scenario"), m.get("kind", "msg"), m.get("to")))
+    # Final states the controller traced without keeping a row (a direct
+    # delivery, `ctl.msg_accept` status delivered; a loud `delivery.failed`).
+    traced = {}
+    for proc, evs in ev.daemon.items():
+        for e in evs:
+            a = e.get("attrs") or {}
+            if e.get("msg_id") and e.get("event") == "ctl.msg_accept" and a.get("status") == "delivered":
+                traced.setdefault(e["msg_id"], "delivered (direct, traced)")
+            elif e.get("msg_id") and e.get("event") == "delivery.failed" and a.get("reason"):
+                traced[e["msg_id"]] = "failed: %s" % a["reason"]
     for mid in sorted(ids):
         seen = rows.get(mid, [])
+        down_rows = [r for p, hop, r in seen if hop == "down"]
+        if not down_rows and mid in traced:
+            continue
         if not seen:
             diffs.append("%s: in no outbox at the end (vanished)" % mid)
             continue

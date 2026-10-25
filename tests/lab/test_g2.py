@@ -131,6 +131,14 @@ class Invariants(unittest.TestCase):
         self.assertIn("m_3: controller hop down failed with no reason", diffs)
         self.assertIn("accepted without a msg id", diffs)
 
+    def test_i2_a_direct_delivery_the_controller_traced_is_final(self):
+        self.r.ledger(scenario="S3", msg_id="m_9", to="bob", http=200, response={"success": True})
+        self.r.outbox("host-1", "up", [{"msg_id": "m_9", "state": "delivered"}])
+        self.r.outbox("controller", "down", [])
+        self.assertEqual(self.check()["I2"]["status"], "fail", "no row and no trace: vanished")
+        self.r.daemon("controller", 1.0, "ctl.msg_accept", msg_id="m_9", attrs={"status": "delivered", "host": "host-1"})
+        self.assertEqual(self.check()["I2"]["status"], "pass")
+
     def test_i2_solo_needs_an_answer_for_each_message(self):
         self.r.ledger(scenario="S3", to="bob", http=200, response={"success": True})
         self.r.ledger(scenario="S7", to="x", http=200, response={"success": False, "reason": "dormant_no_wake"})

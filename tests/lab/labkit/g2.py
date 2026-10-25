@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import traceback
@@ -200,6 +201,11 @@ class Client:
             "agent_name": name, "cwd": cwd, "command": "claude", "args": args, "cols": 100, "rows": 30})
         return st, resp
 
+    def spawn_args(self, name, cwd, args):
+        st, text, resp = self.http("POST", "/cli/sessions/v2/spawn", body={
+            "agent_name": name, "cwd": cwd, "command": "claude", "args": args, "cols": 100, "rows": 30})
+        return st, resp if resp else {"_": text[:300]}
+
     def close(self, name):
         return self.http("POST", "/cli/sessions/v2/close", body={"agent_name": name, "force": True, "clear_index": True})
 
@@ -284,9 +290,25 @@ class Client:
         resp = self.outbox(proc, msg_id) or {}
         return (resp.get("message") or {}).get("state")
 
+    def traced_final(self, msg_id):
+        """A final state the controller traced without an outbox row: since
+        the S4 wake fix it delivers some messages directly
+        (`[delivery] … delivered directly`, `ctl.msg_accept` status delivered)."""
+        for e in self.fleet.daemon_events(self.fleet.st["controller"]):
+            a = e.get("attrs") or {}
+            if e.get("msg_id") == msg_id and (
+                    (e.get("event") == "ctl.msg_accept" and a.get("status") == "delivered")
+                    or e.get("event") == "delivery.failed"):
+                return "delivered" if e.get("event") == "ctl.msg_accept" else "failed"
+        return None
+
+    def final_state(self, msg_id):
+        st = self.outbox_state(msg_id)
+        return st if st in ("delivered", "failed") else (self.traced_final(msg_id) or st)
+
     def wait_final(self, msg_id, deadline=DEADLINE_S):
-        return wait_until(lambda: self.outbox_state(msg_id) in ("delivered", "failed") and self.outbox_state(msg_id),
-                          deadline, 0.3) or self.outbox_state(msg_id)
+        return wait_until(lambda: self.final_state(msg_id) in ("delivered", "failed") and self.final_state(msg_id),
+                          deadline, 0.3) or self.final_state(msg_id)
 
     # ── grid ────────────────────────────────────────────────────────────
     def attach(self, session):
@@ -328,6 +350,26 @@ class Client:
                 if msg.get("event") in ("error", "child_exit"):
                     return False
         return True
+
+    def stream_end(self, sock, deadline):
+        """How an open grid stream ends ("close", "error: …", an error event),
+        or None when it is still open at the deadline (a hang)."""
+        end = time.monotonic() + deadline
+        while time.monotonic() < end:
+            sock.settimeout(max(0.1, end - time.monotonic()))
+            try:
+                kind, data = sock.recv()
+            except socket.timeout:
+                return None
+            except (OSError, wslib.WsError) as e:
+                return "error: %s" % e
+            if kind == "close":
+                return "close"
+            if kind == "text":
+                ev = json.loads(data).get("event")
+                if ev in ("error", "child_exit"):
+                    return "event %s: %s" % (ev, data[:160])
+        return None
 
     def type(self, sock, text):
         """Paste, then Enter, as the app does. False when the stream is gone."""
@@ -483,7 +525,8 @@ def s3(c, sc):
                  "rc %s: %s" % (rc, out[:300]))
         if c.fleet.layout == "fleet":
             state = c.wait_final(msg_id) if msg_id else None
-            sc.check("the controller's outbox ends delivered", state == "delivered", "msg %s state %s" % (msg_id, state))
+            sc.check("the controller ends it delivered (outbox row, or traced direct delivery)", state == "delivered",
+                     "msg %s state %s" % (msg_id, state))
         bob_cwd = agents[bob][0]
         wait_until(lambda: c.replied(bob_cwd, nonce), DEADLINE_S)
         seen = c.prompts_with(bob_cwd, nonce)
@@ -790,18 +833,78 @@ def s7(c, sc):
 # ── S8 ──────────────────────────────────────────────────────────────────
 
 def s8(c, sc):
+    """S8 has two halves; both must pass. crash: the host is SIGKILLed mid-turn
+    (dist-link W3's definition): the controller reports it lost, refuses to
+    place the agent elsewhere (I1), the grid answers an error, and when the
+    host is back the agent spawns again resuming its conversation with the
+    interrupted prompt in its transcript. drain: the PRD failure table's row
+    for S8: SIGTERM drains (the turn's Stop before exit) and the replacement
+    resumes the agents that were awake, delivering what waited."""
+    s8_crash(c, sc)
+    s8_drain(c, sc)
+
+
+def s8_crash(c, sc):
+    name = "s8c-%s" % c.tag
+    cwd = c.fleet.workspace(name)
+    a = c.start_agent(sc, name, cwd)
+    if not a:
+        return
+    sid, csid, host, sock, grid = a
+    sc.info["crash"] = {"host": host, "claude_session": csid}
+    text = "s8 crash %s [[turn-ms=8000]]" % uuid.uuid4().hex[:6]
+    try:
+        c.type(sock, text)
+        if not sc.check("crash: a long turn started on %s" % host,
+                        wait_until(lambda: c.turn_events(csid, "cli.turn.start"), 30), text):
+            return
+        with c.fleet.control():
+            sc.check("crash: %s SIGKILLed mid-turn" % host, c.fleet.kill(host), "")
+            how = c.stream_end(sock, 30)
+            sc.check("crash: the open grid ends (error or close), never hangs", how is not None, how or "still open after 30 s")
+            status = wait_until(lambda: (lambda st: st if host in (st or {}).get("lost", []) else None)(
+                fleetlib.http_json(c.fleet.port, "/cli/hosts/status")), 30) or {}
+            sc.check("crash: the controller reports %s lost" % host, host in status.get("lost", []),
+                     json.dumps(status)[:200])
+            st, resp = c.spawn_args(name, cwd, ["--resume", csid])
+            sc.check("crash: spawning the agent while its host is lost is refused explicitly, not placed elsewhere (I1)",
+                     st == 502 and "lost" in json.dumps(resp), "HTTP %s %s" % (st, json.dumps(resp)[:200]))
+            c.fleet.start(host)
+        status = wait_until(lambda: (lambda st: st if st and st.get("lost") == [] else None)(
+            fleetlib.http_json(c.fleet.port, "/cli/hosts/status")), 60) or {}
+        sc.check("crash: the host is back and nothing is lost", status.get("lost") == [], json.dumps(status)[:200])
+        st, resp = c.spawn_args(name, cwd, ["--resume", csid])
+        sc.check("crash: the agent spawns again, fresh (the dead placement was dropped)",
+                 st == 200 and resp.get("reused") is False, "HTTP %s %s" % (st, json.dumps(resp)[:200]))
+        seen = c.prompts_with(cwd, text)
+        sc.check("crash: the interrupted prompt is in the transcript (not lost silently)", bool(seen),
+                 "%s" % [(h, s_) for h, s_, _ in seen])
+        if st == 200:
+            try:
+                sock2, grid2 = c.attach(resp["sessionId"])
+                sc.check("crash: it resumed the same conversation",
+                         c.grid_wait(sock2, grid2, "session %s · resumed" % csid, 30), csid)
+                sock2.close()
+            except (OSError, wslib.WsError) as e:
+                sc.check("crash: it resumed the same conversation", False, str(e))
+    finally:
+        sock.close()
+        c.close(name)
+
+
+def s8_drain(c, sc):
     cwd = c.fleet.workspace("s8-%s" % c.tag)
     pid, why = c.register_enabled(cwd)
-    if not sc.check("workspace registered", pid, why):
+    if not sc.check("drain: workspace registered", pid, why):
         return
-    a = open_chat(c, sc, cwd, "the app opens the agent (ensure-pinned-chat)")
+    a = open_chat(c, sc, cwd, "drain: the app opens the agent (ensure-pinned-chat)")
     if not a:
         return
     sid, csid, _, sock, grid = a
     try:
         n1 = "s8 first %s" % uuid.uuid4().hex[:6]
         c.type(sock, n1)
-        if not sc.check("it answers", c.grid_wait(sock, grid, "%s1: %s" % (REPLY_MARKER, n1)), n1):
+        if not sc.check("drain: it answers", c.grid_wait(sock, grid, "%s1: %s" % (REPLY_MARKER, n1)), n1):
             return
         ex = c.exec_of(csid)
         host = (ex or {}).get("host")
@@ -810,7 +913,7 @@ def s8(c, sc):
         starts = len(c.turn_events(csid, "cli.turn.start"))
         c.type(sock, n2)
         started = wait_until(lambda: len(c.turn_events(csid, "cli.turn.start")) > starts, 30)
-        if not sc.check("a long turn started on %s" % host, started, n2):
+        if not sc.check("drain: a long turn started on %s" % host, started, n2):
             return
         sock.close()
         sock = None
@@ -819,30 +922,30 @@ def s8(c, sc):
             exited = c.fleet.kill(host, signal.SIGTERM, 120)
             t_exit = now_iso()
             sc.info.update(sigterm=t_term, exited=t_exit)
-            sc.check("%s exited by itself after SIGTERM (drain)" % host, exited, "SIGTERM %s, gone %s" % (t_term, t_exit))
+            sc.check("drain: %s exited by itself after SIGTERM (drain)" % host, exited, "SIGTERM %s, gone %s" % (t_term, t_exit))
             if not exited:
                 c.fleet.kill(host)
             ends = [e for e in c.turn_events(csid, "cli.turn.end") if (e.get("ts") or "") >= t_term]
             stops = [e for e in c.turn_events(csid, "cli.hook.done")
                      if (e.get("attrs") or {}).get("hook") == "Stop" and (e.get("ts") or "") >= t_term]
-            sc.check("the turn in progress finished before the host exited (turn end and Stop hook)",
+            sc.check("drain: the turn in progress finished before the host exited (turn end and Stop hook)",
                      bool(ends) and bool(stops) and ends[0]["ts"] <= t_exit and stops[0]["ts"] <= t_exit,
                      "turn.end %s, Stop %s, host gone %s" % ([e["ts"] for e in ends][:1], [e["ts"] for e in stops][:1], t_exit))
             n3 = "s8-while-down-%s" % uuid.uuid4().hex[:6]
             st, raw, resp = c.msg(cwd, n3, wake=False)
             msg_id = resp.get("msgId")
-            sc.check("a message sent while the host is down is accepted (or fails with a reason), not lost silently",
+            sc.check("drain: a message sent while the host is down is accepted (or fails with a reason), not lost silently",
                      st == 200 and (resp.get("success") is True or resp.get("reason")), "HTTP %s %s" % (st, raw[:300]))
             t_restart = now_iso()
             c.fleet.start(host)
         resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
                                       if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], 60)
-        sc.check("the replacement host resumed the agent that was awake (same session, no re-spawn by the lab)",
+        sc.check("drain: the replacement host resumed the agent that was awake (same session, no re-spawn by the lab)",
                  bool(resumed), "resumed cli.exec of %s after %s: %d" % (csid, t_restart, len(resumed or [])))
         wait_until(lambda: c.replied(cwd, n3), 60)
         seen3 = c.prompts_with(cwd, n3)
         state = c.wait_final(msg_id, 60) if msg_id else None
-        sc.check("the message sent while it was down was delivered exactly once",
+        sc.check("drain: the message sent while it was down was delivered exactly once",
                  len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered"),
                  "in transcripts %d time(s); outbox state %s" % (len(seen3), state))
     finally:
