@@ -220,6 +220,7 @@ pub fn ingest_with(
             return (IngestVerdict::ParseError, None);
         }
     };
+    k2_core::trace::emit(|| trace_hook("cell.hook_received", &env));
     let pane_facts = facts(&env.pane);
     let Some(pane_facts) = pane_facts else {
         state().lock().totals.bump(IngestVerdict::UnknownPane);
@@ -251,7 +252,9 @@ pub fn ingest_with(
     }
     let mut st = state().lock();
     let entry = st.panes.entry(env.pane.clone()).or_default();
+    k2_core::trace::emit(|| trace_hook("cell.owner_walk", &env).attr("mode", mode.as_str()).attr("pid", env.agent_pid));
     let out = owner::check(&mut entry.owner, Some(&pane_facts), &Sender::of(&env), procs, mode, now);
+    k2_core::trace::emit(|| trace_hook("cell.owner_verdict", &env).attr("verdict", format!("{:?}", out.verdict)));
     let verdict = match out.verdict {
         Verdict::Owner => IngestVerdict::Accepted,
         Verdict::Descendant => {
@@ -309,7 +312,9 @@ pub fn ingest_with(
     if verdict != IngestVerdict::Accepted {
         return (verdict, None);
     }
+    k2_core::trace::emit(|| trace_hook("cell.event", &env).attr("descendant", env.from_descendant));
     let env = Arc::new(env);
+    k2_core::trace::emit(|| trace_hook("host.agent_event", &env).attr("attested", true));
     publish(IngestEvent::Envelope {
         envelope: Arc::clone(&env),
         received_at_ms: now,
@@ -317,6 +322,15 @@ pub fn ingest_with(
         conversation_changed: out.conversation_changed,
     });
     (verdict, Some(env))
+}
+
+/// A lab trace event about `env` (only built when tracing is on).
+fn trace_hook(name: &'static str, env: &HookEnvelope) -> k2_core::trace::Event {
+    k2_core::trace::Event::new(name)
+        .session(env.session_id.clone())
+        .pane(&env.pane)
+        .attr("hook", env.event.clone())
+        .attr("source", env.source.as_str())
 }
 
 fn record(event: &str, pane: &str, tool: Option<&str>, verdict: IngestVerdict) {

@@ -775,6 +775,7 @@ impl DaemonPtySession {
         // no PTY — the successor resumes the sessions (two would double-
         // resume one conversation on the same tree).
         crate::handoff_state::guard().map_err(io::Error::other)?;
+        crate::trace::pty::host_spawn(&cfg);
         let cols = cfg.cols.max(1);
         let rows = cfg.rows.max(1);
 
@@ -1030,6 +1031,7 @@ impl DaemonPtySession {
         // with a specific OS window for controlling-terminal
         // semantics. The daemon has no window, so the backend passes 0.
         let __t_pty = std::time::Instant::now();
+        crate::trace::pty::open_session(&cfg.session_id, cols, rows, "in-process");
         let SpawnedChild { pty, child_pid } = match backend.spawn(req) {
             Ok(child) => child,
             Err(e) => {
@@ -1048,6 +1050,7 @@ impl DaemonPtySession {
         if let Some(pid) = child_pid.and_then(|p| u32::try_from(p).ok()) {
             crate::agents_leaf::join(pid);
         }
+        crate::trace::pty::spawned(&cfg.session_id, child_pid);
 
         let pty_ms = __t_pty.elapsed().as_secs_f64() * 1000.0;
         log_debug!(
@@ -1061,6 +1064,7 @@ impl DaemonPtySession {
         // `subscribe_events()`; we keep a clone of the sender here
         // so they can all tap the same stream.
         let (events_tx, _initial_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        crate::trace::pty::watch(&cfg.session_id, &events_tx);
         // Drop the initial receiver — we don't keep one ourselves;
         // each subscriber calls `subscribe_events()` to get theirs.
         drop(_initial_rx);
@@ -1223,6 +1227,7 @@ impl DaemonPtySession {
             "spawned_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         });
         let events = owner.watch(&sid);
+        crate::trace::pty::open_session(&cfg.session_id, req.window_size.num_cols, req.window_size.num_lines, "ptyd");
         let pid = match owner.request(Request::Spawn {
             sid: sid.clone(),
             argv,
@@ -1256,6 +1261,7 @@ impl DaemonPtySession {
         if let Ok(p) = u32::try_from(pid) {
             crate::agents_leaf::join(p);
         }
+        crate::trace::pty::spawned(&cfg.session_id, Some(pid));
         let stream = match owner.attach(&sid, 0) {
             Ok(s) => s,
             Err(e) => {
@@ -1267,6 +1273,7 @@ impl DaemonPtySession {
         };
 
         let (events_tx, _initial_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        crate::trace::pty::watch(&cfg.session_id, &events_tx);
         drop(_initial_rx);
         let query_reply = Arc::new(std::sync::OnceLock::new());
         let listener = DaemonEventListener { tx: events_tx.clone(), reply_tx: Arc::clone(&query_reply), muted: Default::default() };
@@ -1628,6 +1635,9 @@ impl DaemonPtySession {
     /// when an `AlacEvent::ChildExit` is received. Idempotent —
     /// repeated calls are no-ops.
     pub fn mark_child_exited(&self) {
+        if crate::trace::on() && !self.child_exited.load(std::sync::atomic::Ordering::Acquire) {
+            crate::trace::pty::marked_dead(&self.session_id);
+        }
         self.child_exited
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1635,10 +1645,12 @@ impl DaemonPtySession {
     /// Write input bytes to the child's stdin. Used for user
     /// keystrokes AND heartbeat-injected signals. Non-blocking.
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
+        let bytes: Cow<'static, [u8]> = bytes.into();
+        crate::trace::pty::input(&self.session_id, bytes.len());
         match &self.pty_io {
             PtyIo::Alac(n) => n.lock().notify(bytes),
             #[cfg(unix)]
-            PtyIo::Ptyd(p) => p.io.write(bytes.into()),
+            PtyIo::Ptyd(p) => p.io.write(bytes),
         }
     }
 
@@ -2178,6 +2190,7 @@ impl DaemonPtySession {
         {
             return;
         }
+        crate::trace::pty::kill(&self.session_id, self.pid);
 
         // k2-ptyd session: ptyd is the child's parent, so it signals and
         // reaps (same SIGHUP → 100 ms → SIGKILL → reap sequence, P18). Stop

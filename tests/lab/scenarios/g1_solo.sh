@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# G1 on solo (PRD "K2 Distributed Runtime", gate G1): boot the solo daemon
+# with the fake agent and K2_TRACE_FILE, run S1 and a CLI crash (S7), and
+# print the flow checker's verdict for the spawn, hook and crash flows.
+#
+#   tests/lab/scenarios/g1_solo.sh            # the G1 trace check
+#   tests/lab/scenarios/g1_solo.sh --bench 9  # spawn latency, trace off vs on
+#   G1_BASE_DAEMON=<base k2-daemon> ... --bench 9   # and vs the base commit
+#
+# Reuses the lab unchanged: scripts/lab/lib/toolchain.sh,
+# scripts/lab/topology/solo.sh, tests/lab/labkit. solo.sh sets K2_TRACE_FILE
+# from LAB_DAEMON_TRACE (empty: trace off).
+# Output: lab-runs/G1-trace/<ts>/ (trace.jsonl, flows.json, logs).
+set -uo pipefail
+
+LAB_REPO=$(cd "$(dirname "$0")/../../.." && pwd)
+export LAB_REPO
+BENCH=0
+case "${1:-}" in
+    --bench) BENCH=${2:?--bench needs a run count} ;;
+    "") ;;
+    *) echo "usage: $0 [--bench N]" >&2; exit 2 ;;
+esac
+
+RUN="$LAB_REPO/lab-runs/G1-trace/$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+mkdir -p "$RUN/bin"
+say() { echo "g1: $*"; }
+
+# shellcheck source=../../../scripts/lab/lib/toolchain.sh
+source "$LAB_REPO/scripts/lab/lib/toolchain.sh"
+# shellcheck source=../../../scripts/lab/topology/solo.sh
+source "$LAB_REPO/scripts/lab/topology/solo.sh"
+
+say "building k2-daemon and k2-fake-agent (build.log)"
+if ! lab_toolchain "$LAB_REPO" >>"$RUN/build.log" 2>&1 \
+    || ! (cd "$LAB_REPO" && cargo build -p k2-daemon --bin k2-daemon && cargo build -p k2-fake-agent) >>"$RUN/build.log" 2>&1; then
+    say "build failed: $RUN/build.log"
+    exit 1
+fi
+cp "$LAB_REPO/target/debug/k2-daemon" "$LAB_REPO/target/debug/k2-fake-agent" "$RUN/bin/"
+LAB_FAKE_AGENT_BIN="$RUN/bin/k2-fake-agent"
+export LAB_FAKE_AGENT_BIN
+
+# One solo daemon; $1 = phase dir, $2 = trace file or "" (trace off).
+up() {
+    local dir=$1 trace=$2
+    mkdir -p "$dir"
+    LAB_DAEMON_BIN="$RUN/bin/k2-daemon" LAB_DAEMON_TRACE=$trace
+    export LAB_DAEMON_BIN LAB_DAEMON_TRACE
+    topo_up "$dir" || { say "solo did not come up ($dir/daemon.log)"; return 1; }
+    LAB_CRASH_CWD="$LAB_HOME/work/lab-crash"
+    mkdir -p "$LAB_CRASH_CWD"
+    git -C "$LAB_CRASH_CWD" init -q
+    printf '%s' "$LAB_TOKEN" > "$dir/token"
+    chmod 600 "$dir/token"
+}
+
+kit() {
+    local dir=$1
+    shift
+    python3 -I -B "$LAB_REPO/tests/lab/scenarios/g1_solo.py" --port "$LAB_PORT" --token-file "$dir/token" \
+        --home "$LAB_HOME" --cwd "$LAB_WORKSPACE" --crash-cwd "$LAB_CRASH_CWD" \
+        --daemon-trace "$dir/daemon.trace.jsonl" --fake-trace "$LAB_FAKE_TRACE" \
+        --flows-dir "$LAB_REPO/docs/prd/flows" --out "$dir/out" "$@"
+}
+
+trap 'topo_down' EXIT
+
+if [ "$BENCH" -gt 0 ]; then
+    # Phases: this build with the trace off and on, and (with
+    # G1_BASE_DAEMON=<k2-daemon built from the base commit>) the base.
+    rc=0
+    phases="off on"
+    [ -n "${G1_BASE_DAEMON:-}" ] && phases="base off on"
+    for phase in $phases; do
+        dir="$RUN/bench-$phase"
+        trace=""
+        [ "$phase" = on ] && trace="$dir/daemon.trace.jsonl"
+        if [ "$phase" = base ]; then
+            cp "$G1_BASE_DAEMON" "$RUN/bin/k2-daemon-base"
+            mkdir -p "$dir"
+            LAB_DAEMON_BIN="$RUN/bin/k2-daemon-base" LAB_DAEMON_TRACE=
+            export LAB_DAEMON_BIN LAB_DAEMON_TRACE
+            topo_up "$dir" || { say "solo did not come up ($dir/daemon.log)"; exit 1; }
+            LAB_CRASH_CWD="$LAB_HOME/work/lab-crash"
+            printf '%s' "$LAB_TOKEN" > "$dir/token"
+        else
+            up "$dir" "$trace" || exit 1
+        fi
+        say "S1 x$BENCH, $phase"
+        kit "$dir" --bench "$BENCH" | tee "$dir/bench.txt" || rc=1
+        topo_down
+    done
+    python3 -I -B - "$RUN" $phases <<'EOF2' || rc=1
+import json, os, sys
+run, phases = sys.argv[1], sys.argv[2:]
+m = {p: json.load(open(os.path.join(run, "bench-" + p, "out", "bench.json")))["median"] for p in phases}
+ref = m.get("base", m["off"])
+for p in phases:
+    print("g1: spawn_to_banner_ms median %-4s %7.1f  %+5.1f%% vs %s" % (p, m[p], (m[p] - ref) / ref * 100,
+                                                                     "base" if "base" in m else "off"))
+worst = max((m[p] - ref) / ref * 100 for p in phases)
+print("g1: NFR1 (within 5%%): %s" % ("PASS" if worst <= 5 else "FAIL"))
+sys.exit(0 if worst <= 5 else 1)
+EOF2
+    exit $rc
+fi
+
+dir="$RUN/solo"
+up "$dir" "$dir/daemon.trace.jsonl" || exit 1
+say "solo daemon on port $LAB_PORT, K2_TRACE_FILE=$dir/daemon.trace.jsonl"
+kit "$dir"
+rc=$?
+say "bundle: $dir/out (trace.jsonl, flows.json)"
+exit $rc
