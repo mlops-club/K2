@@ -88,7 +88,7 @@ sequenceDiagram
 |---|---|---|
 | 1 | NetworkPolicy is enforced on kindnet (deny probe, then allow) | **PASS** (ad28865c1, `scripts/kind/caps/netpol-check.sh`): same node and across nodes; deny, allow, and removal |
 | 2 | S12 parity: an App gives a Deployment, Service and NetworkPolicy; its database user is made through `postgresql/k2-pg` and logs in; the policy lets the controller and its database in and keeps a neighbour out; `/cli/db` lists it; deleting the App removes all four | **Needs decisions 1–3** (below). Infra checked: `pg-smoke.sh` PASS (8ab1ee4f3) |
-| 3 | Mail and Sew answer on their management APIs | **Mail: answers, but unconfigured** (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
+| 3 | Mail and Sew answer on their management APIs | **Mail: PASS** after decision 4: `mail-check.sh` (never open, 401 without credentials, 8080 for the controller only) and `mail-enable-check.sh` (the controller sets it up and leaves no recovery credential known). **Sew: no image exists**, deferred. Before decision 4, mail answered but was unconfigured (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
 | 4 | Front door through a Gateway (D7 (a): Envoy Gateway in its own namespace) | **PASS** (`scripts/kind/caps/gateway-check.sh`): `gateway.yaml`'s listener and route with TLS passthrough; the client sees the backend's own certificate, a line round-trips, an unknown SNI gets no route. The backend is a stand-in for the controller's front door until item 5 runs a controller here |
 | 5 | `/boot-status` capabilities read `delegated` for each | **PASS** (`scripts/kind/caps/controller-check.sh`, image `k2-daemon:caps` at 7720600b8). A controller shaped like `controller.yaml`, with the RBAC of `rbac.yaml`, reads `delegated` for postgres, mail, sew, apps and front. Its drivers report: postgres ok (`postgresql/k2-pg` Running, `k2` credentials readable), apps ok (may list Deployments), mail ok (`/healthz/ready` 200; still unconfigured, see decision 4), front ok. Sew is not ok, as expected with no Sew image |
 | – | k8s client (D1) and capability drivers | `crates/k2-daemon/src/k8s/` and `capabilities/kubernetes/`: every delegated feature gets a driver that checks its backend every 30 s, and `/boot-status` shows `capabilities.<f>.driver`. `cargo test -p k2-daemon --lib -- k8s:: capabilities:: boot_status`: 61 passed, twice |
@@ -132,8 +132,19 @@ sequenceDiagram
    - The volume now sits at the image's real paths: the declared `/opt/stalwart` doesn't exist in the image, so nothing used to persist.
    - The image's uid 2000 runs with `runAsNonRoot`.
    - A Role grants exactly the rights recovery-off needs.
-   - For the `deploy/kubernetes` owner: `k2-secrets/stalwart-admin` and `K2_STALWART_ADMIN_FILE` have no reader in the code; the controller reads `k2-mail-recovery` through the API.
-   - **Part 2:** the controller's mail supervisor completes setup over `K2_STALWART_URL`, then runs recovery-off.
+   - For the `deploy/kubernetes` owner (`controller.yaml`, not T3's):
+     - `k2-secrets/stalwart-admin` and `K2_STALWART_ADMIN_FILE` have no reader in the code; the controller reads `k2-mail-recovery` through the API.
+     - Add `K2_STALWART_ALLOWED_IPS` with the cluster's pod CIDR (`10.42.0.0/16` on k3s). Without it, the controller's ApiKey is accepted from any address and mail-ingress is the only boundary.
+   - **Part 2 done** (0c198cc36, 6b0fc47e7, 8cf46835b, 34150b9aa; `lab-runs/caps/mail-enable-check.log`, PASS on a fresh Stalwart and a fresh controller). `POST /cli/mail/server/enable` on the controller (`K2_CAP_MAIL=external`) sets Stalwart up over `K2_STALWART_URL` (`mail/k8s_enable.rs`), with the native machine's steps, markers and vault:
+     - bootstrap with the Secret's recovery password, then a restart into normal mode (the pod is deleted and its replacement waited for);
+     - a `k2-daemon` service account and its ApiKey, allowed only from `K2_STALWART_ALLOWED_IPS`; the host keeps its loopback-only key;
+     - recovery-off: the admin principals are rotated, the Secret is overwritten with a value nobody keeps, and Stalwart is restarted.
+     - Checked afterwards: the Stalwart pod was replaced and runs in normal mode; the original recovery password gets 401; the Secret's value changed; no credentials gets 401; the controller's health ping with the ApiKey says running.
+   - Found live and fixed on the way:
+     - the rotation can invalidate the session in use, so it retries with the ApiKey (as natively);
+     - a key pinned to 127.0.0.1 is 403 from a pod;
+     - a run that stopped mid-rotation resumes with the Secret's password;
+     - `/cli/mail/status` asked systemd about a unit that lives in a pod.
 
 ## What T3 installed on k2lab, and how to remove it
 
@@ -155,6 +166,9 @@ All of it is through `$TMPDIR/k2-kind/caps/kubeconfig` (`kind get kubeconfig --n
 - MILESTONE 1/6: NetworkPolicy enforced on kindnet (ad28865c1).
 - MILESTONE 4/6: front door through Gateway API, TLS passthrough (5d39026a9).
 - MILESTONE 5/6: a controller on Kubernetes reads every capability `delegated`, and its drivers reach what they are delegated to.
+- MILESTONE decision 4 part 1: `mail.yaml` is never open and never logs a credential (4e513f659).
+- MILESTONE decision 4 part 2: K2's controller sets Stalwart up over `K2_STALWART_URL`; no recovery credential is known afterwards.
 - Done: the Postgres operator path checked on k2lab (8ab1ee4f3); the k8s client and the drivers (7720600b8).
 - Left on k2lab, in `k2-p4-caps` only: `postgresql k2-pg` (for item 2), the namespace itself, and Envoy Gateway in `envoy-gateway-system` with GatewayClass `k2-p4-eg` (`gateway-check.sh --uninstall` removes them). The test Stalwart was deleted.
-- Waiting for decisions 1–4 before item 2 (Apps and their databases) and before the mail driver acts. Item 3 (mail and Sew) stays open until then: mail is unconfigured as declared, and Sew has no image.
+- The mail checks clean up after themselves: the controller, Stalwart, their volumes and the Secret are deleted.
+- Next: decision 1 (`/cli/db` through the operator), then 2 and 3, then item 2. Item 3 waits only on a Sew image.
