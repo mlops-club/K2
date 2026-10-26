@@ -466,12 +466,12 @@ they leave open, decided here using their recommendations:
 | T1-a | **Git travels as files under `.git`**, content-addressed like every other file, instead of the `git bundle` sketched in section 1. Not copied: `.git/hooks/*` (except `*.sample`) and `*.lock` | "Clone to" already ships `.git` this way. Loose objects and packs never change, so content addressing gives the increments a bundle would, and refs, index, stash and dirty state arrive exactly. Hooks would be code another host runs |
 | T1-b | **Transfer auth without a protocol change**: a host proves itself on `POST /cli/hosts/home/session` the way its `hello` does (the bootstrap token, or W5's signed nonce: `enroll::hello_token` / `admit_hello`). It gets a 10-minute transfer token bound to its host id | D1b's per-transfer token, without adding a field to `welcome` (adding one would change every frame match on the other branches). A revoked key gets no new token |
 | T1-c | **The fence (I4)**. While the agent is placed, a commit must come from its placement's host at its epoch. Once it isn't placed, the commit must come from the host that last ran it, at an epoch no lower than the newest snapshot's. The store assigns `seq` | The controller's `unplace` drops the placement before it sends `close`, so a strict "live placement" check would refuse the sleep's own push. A host that comes back after the agent ran elsewhere is never the last host, and is refused |
-| T1-d | **When**: every release in the table above, before the placement is given up. Turn-end snapshots (D3's third trigger, debounced to 60 s) go to T2 phase B with S10 | Drain and scale-down are what P4 waits for. Turn-end snapshots matter only for a hard crash, which is S10 |
+| T1-d | **When**: every release in the table above, before the placement is given up. Turn-end snapshots (D3's third trigger) are T2, below | Drain and scale-down are what P4 waits for. Turn-end snapshots matter only for a hard crash, which is S10 |
 | T1-e | **Scope**: only agents whose cwd is under the host's `K2_WORK_ROOT` (D2). Unset means home sync is off on that host, and the log says so once. Caps: `K2_HOME_MAX_BYTES` (default 2 GiB, D12) and 256 MiB per file; over either, the home stays where it is and the release says why | A v2 spawn with `cwd: /tmp` or `$HOME` must never be swept into the store. P4's kind and the lab set `K2_WORK_ROOT=/var/lib/k2/work` |
 | T1-f | **Restore**: the host pulls the latest snapshot before every spawn and skips it when it already holds that snapshot. A file whose bytes already match isn't fetched. Files are staged next to their targets (no cross-device rename), a journal is committed, then everything is renamed into place. Restore is an **overlay**: it deletes only files an earlier snapshot put there, so excluded files (`node_modules`, `.env`) stay | "A killed restore leaves the old tree": a kill before the commit rolls back, a kill after rolls forward before the next spawn |
 | T1-g | **Store**: `<K2_HOME>/homes/objects/ab/cdef…` plus `<K2_HOME>/homes/index.db`, its own SQLite file | Never the shared `k2.db` lock (W3's boot deadlock). The whole store is one directory, which D1's object-store backend can replace later. No garbage collection in T1 (follow-up) |
 | T1-h | **What goes in**: `clone::inventory` as is (workspace, Claude memory and sessions, other providers' session files, `carry_secrets` off). Hermes's `state.db` merge is skipped | D4. Provider files land where clone's unpack puts them, at the same path (D2) |
-| T1-i | **A push that fails** doesn't block a SIGTERM drain, which can't be stopped. It is loud: `host.home_push_failed`, and a close reply with `home: {error}`. The scaler is told not to scale down a host whose agents' homes weren't saved (the check above) | The volume still holds the home, so scaling down would orphan it |
+| T1-i | **A push that fails** doesn't block a SIGTERM drain, which can't be stopped. It is loud: `host.home_save_failed`, and a close reply with `home: {error}`. The scaler is told not to scale down a host whose agents' homes weren't saved (the check above) | The volume still holds the home, so scaling down would orphan it |
 | T1-j | **Names**: `k2_core::agent_home` (the format, store, snapshot and restore) and `k2-daemon` `hosts/home.rs` (routes, fence, host hooks) | `k2_core::homes_sync` already exists and is about the app's Home screens |
 
 ### What dist-link's code needs (one call each)
@@ -483,6 +483,22 @@ they leave open, decided here using their recommendations:
 - **kind** (`deploy/kind/dist/`, D9): set `K2_WORK_ROOT=/var/lib/k2/work` on
   the host pods. The per-host `k2-work` volumes then need no `podAffinity`.
 - **T2 phase B**: `Need.home_seq` comes from `hosts::home::latest(agent)`.
+
+## T2 turn-end snapshots and the S10 move
+
+Built on `k2-dist/p3-turn-snapshots`; design, decisions T2-a..i and results
+are in `docs/prd/progress/turn-snapshots.md` there. In short:
+
+- each turn's end (the lead's `Stop`) saves the agent's home, coalesced per
+  agent, incremental, with a stat-keyed hash cache. `K2_HOME_TURN_SECS`
+  defaults to **0, not D3's 60 s**: a 60 s floor would lose turns shorter
+  than a minute in a crash, and the bound is "at most the current turn";
+- the controller's resume loop moves a portable agent whose host has been
+  lost for `K2_HOST_MOVE_AFTER` (300 s) to the next host that can take it,
+  which restores the last turn's snapshot and resumes the conversation. A
+  pinned agent waits; a returning host's stale copy is released;
+- the save-failure event is `host.home_save_failed` (T1-i said
+  `host.home_push_failed`; the code's name wins).
 
 ## Worker tasks
 
