@@ -1,0 +1,177 @@
+//! Take a snapshot on a host and push it: [`push`].
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use super::{file_mode, now_ms, sha256_hex, Class, Entry, Manifest, Remote, MAX_OBJECT_BYTES, STAGED_PREFIX};
+use crate::clone::{inventory, CloneOptions};
+
+/// Limits and where the provider files are.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// The host's home: `~/.claude/projects/…` and the other providers.
+    pub home: PathBuf,
+    /// The whole home's cap (`K2_HOME_MAX_BYTES`, D12).
+    pub max_bytes: u64,
+    /// One file's cap.
+    pub max_object: u64,
+}
+
+impl Options {
+    pub fn new(home: &Path) -> Options {
+        Options { home: home.to_path_buf(), max_bytes: super::DEFAULT_MAX_BYTES, max_object: MAX_OBJECT_BYTES }
+    }
+}
+
+/// What a push did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pushed {
+    pub seq: u64,
+    pub manifest_sha: String,
+    pub manifest: Manifest,
+    pub files: usize,
+    pub bytes: u64,
+    /// Objects the store lacked, and their bytes: all of them the first
+    /// time, only the changed files after.
+    pub sent_objects: usize,
+    pub sent_bytes: u64,
+}
+
+/// Does a workspace file travel? Not git's hooks (code another host would
+/// run) nor its lock files (T1-a), nor a restore's staged files.
+fn travels(class: Class, rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    if name.starts_with(STAGED_PREFIX) {
+        return false;
+    }
+    if class != Class::Workspace {
+        return true;
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    let Some(git) = parts.iter().position(|p| *p == ".git") else { return true };
+    if name.ends_with(".lock") {
+        return false;
+    }
+    !(parts.get(git + 1) == Some(&"hooks") && !name.ends_with(".sample"))
+}
+
+/// The files of `project_path`'s home, each with its source path, sorted;
+/// and the files left out as secrets.
+pub fn collect(project_path: &str, opts: &Options) -> Result<(String, String, Vec<(Entry, PathBuf)>, Vec<String>), String> {
+    let inv = inventory(
+        project_path,
+        CloneOptions { include_all_history: true, carry_secrets: false, home_override: Some(opts.home.clone()) },
+    )?;
+    let mut total = 0u64;
+    let mut out = Vec::new();
+    for e in inv.entries {
+        if !travels(e.class, &e.rel_path) {
+            continue;
+        }
+        let meta = std::fs::metadata(&e.abs_path).map_err(|err| format!("{}: {err}", e.abs_path.display()))?;
+        if meta.len() > opts.max_object {
+            return Err(format!(
+                "home too large: {} is {} bytes (one file may be {} at most); the agent stays on this host",
+                e.rel_path,
+                meta.len(),
+                opts.max_object
+            ));
+        }
+        total += meta.len();
+        let entry = Entry { class: e.class, path: e.rel_path, sha256: String::new(), size: meta.len(), mode: file_mode(&meta) };
+        out.push((entry, e.abs_path));
+    }
+    if total > opts.max_bytes {
+        return Err(format!(
+            "home too large: {total} bytes after excludes ({} at most, {}); the agent stays on this host",
+            opts.max_bytes,
+            super::MAX_BYTES_VAR
+        ));
+    }
+    out.sort_by(|a, b| (class_order(a.0.class), &a.0.path).cmp(&(class_order(b.0.class), &b.0.path)));
+    Ok((inv.project_path, inv.slug, out, inv.scrubbed_secrets))
+}
+
+fn class_order(c: Class) -> u8 {
+    match c {
+        Class::Workspace => 0,
+        Class::Memory => 1,
+        Class::Session => 2,
+        Class::Provider => 3,
+    }
+}
+
+/// Snapshot `project_path`'s home and push it to `remote` as `agent`'s
+/// next snapshot from `host` at placement `epoch`.
+pub fn push(
+    remote: &dyn Remote,
+    agent: &str,
+    epoch: u64,
+    host: &str,
+    project_path: &str,
+    parent_seq: Option<u64>,
+    opts: &Options,
+) -> Result<Pushed, String> {
+    let (project, slug, mut files, scrubbed) = collect(project_path, opts)?;
+    // Hash every file; one source path per distinct content.
+    let mut by_sha: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (entry, abs) in files.iter_mut() {
+        let bytes = std::fs::read(&*abs).map_err(|e| format!("read {}: {e}", abs.display()))?;
+        entry.sha256 = sha256_hex(&bytes);
+        entry.size = bytes.len() as u64;
+        by_sha.entry(entry.sha256.clone()).or_insert_with(|| abs.clone());
+    }
+    let shas: Vec<String> = by_sha.keys().cloned().collect();
+    let missing = remote.missing(&shas)?;
+    let mut sent_bytes = 0u64;
+    for sha in &missing {
+        let abs = by_sha.get(sha).ok_or_else(|| format!("the store asked for {sha}, which this home doesn't have"))?;
+        let bytes = std::fs::read(abs).map_err(|e| format!("read {}: {e}", abs.display()))?;
+        if sha256_hex(&bytes) != *sha {
+            return Err(format!("{} changed while its snapshot was taken; try again", abs.display()));
+        }
+        remote.put_object(sha, &bytes)?;
+        sent_bytes += bytes.len() as u64;
+    }
+    let manifest = Manifest {
+        version: super::MANIFEST_VERSION,
+        agent: agent.to_string(),
+        epoch,
+        host: host.to_string(),
+        created_ms: now_ms(),
+        project_path: project,
+        slug,
+        parent_seq,
+        entries: files.into_iter().map(|(e, _)| e).collect(),
+        scrubbed,
+    };
+    let encoded = manifest.encode();
+    let committed = remote.commit(agent, epoch, &encoded)?;
+    Ok(Pushed {
+        seq: committed.seq,
+        manifest_sha: committed.manifest_sha,
+        files: manifest.entries.len(),
+        bytes: manifest.bytes(),
+        manifest,
+        sent_objects: missing.len(),
+        sent_bytes,
+    })
+}
+
+#[cfg(test)]
+mod travel_tests {
+    use super::*;
+
+    #[test]
+    fn git_hooks_and_locks_stay_behind() {
+        assert!(travels(Class::Workspace, ".git/objects/ab/cdef"));
+        assert!(travels(Class::Workspace, ".git/refs/heads/main"));
+        assert!(travels(Class::Workspace, ".git/hooks/pre-commit.sample"));
+        assert!(!travels(Class::Workspace, ".git/hooks/pre-commit"));
+        assert!(!travels(Class::Workspace, ".git/index.lock"));
+        assert!(!travels(Class::Workspace, "sub/.git/hooks/post-checkout"));
+        assert!(travels(Class::Workspace, "hooks/pre-commit"), "a workspace's own hooks dir is a file like any other");
+        assert!(!travels(Class::Workspace, &format!("src/{STAGED_PREFIX}3-a.rs")));
+        assert!(travels(Class::Memory, "MEMORY.md"));
+    }
+}

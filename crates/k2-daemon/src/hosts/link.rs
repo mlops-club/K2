@@ -165,6 +165,11 @@ fn placed() -> Arc<Mutex<Placed>> {
     Arc::clone(P.get_or_init(Arc::default))
 }
 
+/// The epoch this host runs `agent` at (the drain's home save).
+pub(crate) fn placed_epoch(agent: &str) -> Option<u64> {
+    placed().lock().epochs.get(agent).copied()
+}
+
 /// `hello.resume`: every placement this host still runs (S9). Entries
 /// whose session is gone are dropped from `placed` here.
 fn resume_list() -> Vec<super::proto::ResumePlacement> {
@@ -353,6 +358,10 @@ fn handle(
             let tx = tx.clone();
             let placed = Arc::clone(placed);
             tokio::spawn(async move {
+                if let Some(reply) = super::home::before_spawn(req, &agent_id).await {
+                    let _ = tx.send(reply);
+                    return;
+                }
                 let bytes = serde_json::to_vec(&body).unwrap_or_default();
                 let r = tokio::task::spawn_blocking(move || crate::v2_spawn::handle_v2_spawn(&bytes)).await;
                 let (status, body) = match r {
@@ -369,9 +378,10 @@ fn handle(
                 let _ = tx.send(Frame::Reply { req, status, body });
             });
         }
-        Frame::Close { req, agent_id, body, .. } => {
+        Frame::Close { req, agent_id, epoch, body } => {
             let tx = tx.clone();
             tokio::spawn(async move {
+                let home = super::home::before_close(&agent_id, epoch).await;
                 let bytes = serde_json::to_vec(&body).unwrap_or_default();
                 let r = tokio::task::spawn_blocking(move || crate::v2_spawn::handle_v2_close(&bytes)).await;
                 let (status, body) = match r {
@@ -379,6 +389,7 @@ fn handle(
                     Err(e) => ("500 Internal Server Error".to_string(), serde_json::json!({"error": format!("close: {e}")}).to_string()),
                 };
                 log_debug!("[hosts/link] close agent {agent_id}: {status}");
+                let body = super::home::with_home(body, home);
                 let _ = tx.send(Frame::Reply { req, status, body });
             });
         }
@@ -443,6 +454,10 @@ fn handle(
             let tx = tx.clone();
             let placed = Arc::clone(placed);
             tokio::spawn(async move {
+                if let Some(reply) = super::home::before_spawn(req, &agent_id).await {
+                    let _ = tx.send(reply);
+                    return;
+                }
                 let r = tokio::task::spawn_blocking(move || spawn_workspace(request)).await;
                 let (status, body) = match r {
                     Ok(Ok(spawned)) => {

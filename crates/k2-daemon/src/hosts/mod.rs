@@ -17,6 +17,7 @@ pub mod byte_ring;
 pub mod drain;
 pub mod enroll;
 pub mod gate;
+pub mod home;
 pub mod hub;
 pub mod link;
 pub mod proto;

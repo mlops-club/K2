@@ -12,7 +12,8 @@
 //!    ([`track_turns`]), or its activity row being `Working`. Up to
 //!    `K2_HOST_DRAIN_SECS` (default 600, the PRD's grace); an agent still in
 //!    its turn then is released anyway and the log says so;
-//! 4. per agent, `released {req: 0}` to the controller, then stop it;
+//! 4. per agent, save its home (P3 T1, `hosts::home`: under `K2_WORK_ROOT`
+//!    only), then `released {req: 0}` to the controller, then stop it;
 //! 5. return: the daemon's usual shutdown follows and the process exits.
 //!
 //! Controller (`agent_host::remote::RemoteHost`): a draining host gets no
@@ -175,6 +176,9 @@ pub trait DrainHost {
     fn send(&self, f: Frame) -> bool;
     /// Stop the agent's session.
     fn stop(&self, agent_id: &str);
+    /// Save the agent's home to the controller's store (P3 T1), while it is
+    /// still placed here. A failure is logged and traced; the drain goes on.
+    fn save_home(&self, agent_id: &str);
 }
 
 /// What a drain did, for the log and the tests.
@@ -201,6 +205,8 @@ pub fn drain(h: &dyn DrainHost, settle: Duration, deadline: Duration) -> Drained
     std::thread::sleep(settle.min(deadline));
     let mut out = Drained::default();
     let release = |agent: &str, session: &str, cut: bool| {
+        // Its home is in the store before the controller drops the placement.
+        h.save_home(agent);
         // The controller records the resume before it can see the session go.
         h.send(Frame::Released { req: 0, agent_id: agent.to_string(), epoch: 0, ring_end: None });
         h.stop(agent);
@@ -258,6 +264,12 @@ impl DrainHost for LiveHost {
 
     fn stop(&self, agent_id: &str) {
         crate::agent_host::host().unplace(agent_id);
+    }
+
+    fn save_home(&self, agent_id: &str) {
+        let epoch = super::link::placed_epoch(agent_id).unwrap_or(0);
+        // The drain runs on a blocking thread of the runtime.
+        let _ = tokio::runtime::Handle::current().block_on(super::home::save(agent_id, epoch));
     }
 }
 
@@ -454,6 +466,9 @@ mod tests {
         fn stop(&self, agent_id: &str) {
             self.log.lock().push(format!("stop {agent_id}"));
         }
+        fn save_home(&self, agent_id: &str) {
+            self.log.lock().push(format!("save {agent_id}"));
+        }
     }
 
     #[test]
@@ -468,10 +483,13 @@ mod tests {
             [
                 "start",
                 "refused draining",
+                "save idle",
                 "released idle req 0",
                 "stop idle",
+                "save busy",
                 "released busy req 0",
                 "stop busy",
+                "save stuck",
                 "released stuck req 0",
                 "stop stuck"
             ]

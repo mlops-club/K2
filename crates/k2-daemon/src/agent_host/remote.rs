@@ -1739,6 +1739,11 @@ impl RemoteHost {
 
     // ── reads ──────────────────────────────────────────────────────────
 
+    /// The host that last ran `agent_id` (S7's affinity), placed or not.
+    pub fn last_host_of(&self, agent_id: &str) -> Option<String> {
+        self.inner.lock().last_host_for_agent.get(agent_id).cloned()
+    }
+
     pub fn placement(&self, agent_id: &str) -> Option<RemotePlacement> {
         self.inner.lock().placements.get(agent_id).cloned()
     }

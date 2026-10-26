@@ -17,20 +17,20 @@ use super::hub;
 use super::proto::{Frame, ATTACH_PATH, PROTOCOL};
 use crate::agent_host::remote::{PlacementStore, RemoteHost};
 
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(super) type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const DEADLINE: Duration = Duration::from_secs(30);
-const TOKEN: &str = "test-bootstrap-token";
+pub(super) const TOKEN: &str = "test-bootstrap-token";
 
-async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+pub(super) async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(DEADLINE, f).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
-async fn send(ws: &mut Ws, f: &Frame) {
+pub(super) async fn send(ws: &mut Ws, f: &Frame) {
     ws.send(Message::Text(f.encode())).await.expect("send frame");
 }
 
-async fn recv(ws: &mut Ws) -> Frame {
+pub(super) async fn recv(ws: &mut Ws) -> Frame {
     within("a frame", async {
         loop {
             match ws.next().await {
@@ -45,7 +45,7 @@ async fn recv(ws: &mut Ws) -> Frame {
 }
 
 /// The hub on loopback over `remote`; returns the attach URL.
-async fn serve(remote: &'static RemoteHost) -> String {
+pub(super) async fn serve(remote: &'static RemoteHost) -> String {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}{ATTACH_PATH}", l.local_addr().unwrap());
     tokio::spawn(async move {
@@ -56,14 +56,14 @@ async fn serve(remote: &'static RemoteHost) -> String {
     url
 }
 
-async fn fake_host(url: &str, name: &str) -> Ws {
+pub(super) async fn fake_host(url: &str, name: &str) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
     send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume: vec![] }).await;
     assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
     ws
 }
 
-async fn wait_hosts(remote: &RemoteHost, n: usize) {
+pub(super) async fn wait_hosts(remote: &RemoteHost, n: usize) {
     within("hosts to link", async {
         while remote.status_json()["hosts"].as_array().map(Vec::len) != Some(n) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -75,7 +75,7 @@ async fn wait_hosts(remote: &RemoteHost, n: usize) {
 /// Spawn `agent` (cwd `cwd`) through the controller; `host` is the fake
 /// host the test expects the spawn on, which answers with `session`.
 /// Returns the controller's answer body.
-async fn spawn_on(remote: &'static RemoteHost, host: &mut Ws, agent: &str, cwd: &str, session: &str) -> Value {
+pub(super) async fn spawn_on(remote: &'static RemoteHost, host: &mut Ws, agent: &str, cwd: &str, session: &str) -> Value {
     let body = json!({"agent_name": agent, "cwd": cwd, "command": "claude"}).to_string();
     let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
     match recv(host).await {
@@ -91,11 +91,11 @@ async fn spawn_on(remote: &'static RemoteHost, host: &mut Ws, agent: &str, cwd: 
     serde_json::from_str(&body).unwrap()
 }
 
-fn sid(n: u8) -> String {
+pub(super) fn sid(n: u8) -> String {
     format!("00000000-0000-4000-8000-0000000000{n:02}")
 }
 
-async fn gone(host: &mut Ws, remote: &RemoteHost, agent: &str) {
+pub(super) async fn gone(host: &mut Ws, remote: &RemoteHost, agent: &str) {
     send(host, &Frame::SessionGone { agent_id: agent.into(), epoch: None, exit_code: Some(137) }).await;
     within("the placement to go", async {
         while remote.placement(agent).is_some() {

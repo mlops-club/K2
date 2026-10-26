@@ -707,6 +707,15 @@ pub const ROUTES: &[Route] = &[
     get("/cli/hosts/challenge", Public),
     post("/cli/hosts/enroll", Public),
     post("/cli/hosts/enroll-tokens", NoLogin),
+    // Home sync (P3 T1): a host's transfer token (from its hello credential
+    // on `session`) is the credential; status takes the owner token.
+    post("/cli/hosts/home/commit", Public),
+    get("/cli/hosts/home/fetch", Public),
+    post("/cli/hosts/home/have", Public),
+    get("/cli/hosts/home/latest", Public),
+    post("/cli/hosts/home/put", Public),
+    post("/cli/hosts/home/session", Public),
+    get("/cli/hosts/home/status", NoLogin),
     get("/cli/hosts/keys", NoLogin),
     post("/cli/hosts/keys/revoke", NoLogin),
     get("/cli/hosts/status", Public),

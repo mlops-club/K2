@@ -42,7 +42,7 @@
 mod bundle;
 mod identity;
 mod inventory;
-mod providers;
+pub(crate) mod providers;
 mod repair;
 mod scrub;
 mod settings;
