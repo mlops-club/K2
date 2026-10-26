@@ -707,14 +707,24 @@ async fn call(req: reqwest::RequestBuilder, what: &str) -> Result<Value, String>
     Err(format!("{what} refused: {code}: {msg} (HTTP {})", status.as_u16()))
 }
 
+/// A client for the controller's enroll routes. No idle connections: the
+/// controller closes each connection after one answer without saying
+/// `Connection: close`, and a pooled one reused for the next request
+/// (enroll, then challenge) fails "error sending request" (wave3-homes on
+/// kind: a host's home save and restore both failed that way).
+fn controller_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
 /// Enroll `key` (a no-op answer when it already is), then fetch a nonce
 /// and sign it: the `hello.token` for one link.
 pub async fn signed_hello(cfg: &HostConfig, key: &SigningKey) -> Result<String, String> {
     let base = http_base(&cfg.attach_url)?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
+    let client = controller_client()?;
     let req = EnrollRequest {
         token: cfg.token.clone(),
         host_name: cfg.host_name.clone(),

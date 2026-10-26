@@ -482,3 +482,32 @@ async fn an_unreadable_token_file_falls_back_to_the_boot_token() {
     let missing = k2_core::test_env::unique_temp_path("no-such-token").to_string_lossy().into_owned();
     within("enroll", enroll_hello_from(&c.host("host-1", &boot), &key, Some(missing))).await.unwrap();
 }
+
+/// The controller's routes answer once per connection and close it
+/// without `Connection: close`. Requests in a row on the enroll client
+/// (enroll, then challenge) never reuse such a dead connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_enroll_client_never_reuses_a_connection_the_controller_closed() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let body = r#"{"nonce":"n"}"#;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body.as_bytes()).await;
+                // Closed unannounced, and (as through kind's service proxy)
+                // only after the next request on it was sent: it is lost.
+                let _ = s.read(&mut buf).await;
+            });
+        }
+    });
+    let client = controller_client().unwrap();
+    for i in 0..50 {
+        let r = call(client.get(format!("{base}{CHALLENGE_PATH}")), "challenge").await;
+        assert!(r.is_ok(), "request {i}: {r:?}");
+    }
+}
