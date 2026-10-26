@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # P3 T1 home sync on three real processes: a K2_ROLE=controller, host-1 and
-# host-2 (K2_ROLE=host, each its own throwaway HOME, K2_WORK_ROOT set),
-# k2-fake-agent as `claude`. An agent's home survives a drain to another
+# host-2 (K2_ROLE=host, each its own throwaway HOME, K2_WORK_ROOT set,
+# enrolled with W5 one-time tokens, so the home transfers authenticate with
+# the hosts' signed nonces), k2-fake-agent as `claude`. An agent's home survives a drain to another
 # host, then a sleep and a move back.
 #
 # Checks:
@@ -22,7 +23,8 @@
 #      held snapshot 1 and now restores 2 over it: host-2's memory line is
 #      there
 #
-# Ports: HS_CTL_PORT (default 17460), HS_H1_PORT (17461), HS_H2_PORT (17462).
+# Ports: HS_CTL_PORT (default 17480), HS_H1_PORT (17481), HS_H2_PORT (17482);
+# the script stops if one is taken.
 # Evidence: lab-runs/home-sync/<UTC>/.
 
 set -uo pipefail
@@ -30,9 +32,15 @@ REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$REPO" || exit 1
 BUILD=1
 [ "${1:-}" = --no-build ] && BUILD=0
-CTL_PORT=${HS_CTL_PORT:-17460}
-H1_PORT=${HS_H1_PORT:-17461}
-H2_PORT=${HS_H2_PORT:-17462}
+CTL_PORT=${HS_CTL_PORT:-17480}
+H1_PORT=${HS_H1_PORT:-17481}
+H2_PORT=${HS_H2_PORT:-17482}
+for port in "$CTL_PORT" "$H1_PORT" "$H2_PORT"; do
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "home-sync: port $port is taken ($(lsof -nP -iTCP:"$port" -sTCP:LISTEN | awk 'NR==2{print $1, $2}')); set HS_CTL_PORT/HS_H1_PORT/HS_H2_PORT" >&2
+        exit 2
+    fi
+done
 
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-3}
 if ! command -v cargo >/dev/null 2>&1 && [ -x "$HOME/.cache/k2-dist-rust/cargo/bin/cargo" ]; then
@@ -57,7 +65,7 @@ FAKE="$RUN/bin/k2-fake-agent"
 ROOT=$(mktemp -d "${LAB_SHORT_TMP:-/tmp}/k2hs-XXXXXX") || exit 1
 ROOT=$(cd "$ROOT" && pwd -P)
 mkdir -p "$ROOT"/{ctl,h1,h2}/{home,tmp,run} "$ROOT/shim" "$ROOT/work"
-head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ROOT/host-token"
+head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ROOT/bootstrap-token"
 "$FAKE" --install-shims "$ROOT/shim" || exit 1
 CTL_PID="" H1_PID="" H2_PID=""
 WS="$ROOT/work/notes"
@@ -117,20 +125,24 @@ start_ctl() {
         HOME="$ROOT/ctl/home" K2_HOME="$ROOT/ctl/home/.k2" \
         TMPDIR="$ROOT/ctl/tmp" XDG_RUNTIME_DIR="$ROOT/ctl/run" K2_RUNTIME_DIR= \
         USER="$(id -un)" LANG=en_US.UTF-8 \
-        K2_ROLE=controller K2_HOSTS=1 K2_HOST_BOOTSTRAP_TOKEN_FILE="$ROOT/host-token" \
+        K2_ROLE=controller K2_HOSTS=1 K2_HOST_BOOTSTRAP_TOKEN_FILE="$ROOT/bootstrap-token" K2_HOST_AUTH=enroll \
         K2_DAEMON_PORT="$CTL_PORT" K2_TRACE_FILE="$RUN/controller.trace.jsonl" \
         "$DAEMON" >>"$RUN/controller.log" 2>&1 &
     CTL_PID=$!
     wait_ready controller "$CTL_PID" "$CTL_PORT" "$RUN/controller.log"
 }
 
-start_host() { # name dir port; prints the pid
+start_host() { # name dir port; prints the pid. A first start mints the host's one-time token.
+    if [ ! -s "$ROOT/$2-token" ]; then
+        curl -s -X POST -H 'Content-Type: application/json' "http://127.0.0.1:$CTL_PORT/cli/hosts/enroll-tokens?token=$CTL_TOKEN" \
+            -d '{"ttl_secs": 600}' | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["token"])' > "$ROOT/$2-token"
+    fi
     env -i PATH="$ROOT/shim:/usr/bin:/bin:/usr/sbin:/sbin" \
         HOME="$ROOT/$2/home" K2_HOME="$ROOT/$2/home/.k2" \
         TMPDIR="$ROOT/$2/tmp" XDG_RUNTIME_DIR="$ROOT/$2/run" K2_RUNTIME_DIR= \
         USER="$(id -un)" LANG=en_US.UTF-8 \
         K2_ROLE=host K2_CONTROLLER_URL="ws://127.0.0.1:$CTL_PORT" \
-        K2_HOST_ENROLL_TOKEN_FILE="$ROOT/host-token" K2_HOST_NAME="$1" \
+        K2_HOST_AUTH=enroll K2_HOST_ENROLL_TOKEN_FILE="$ROOT/$2-token" K2_HOST_NAME="$1" \
         K2_WORK_ROOT="$ROOT/work" K2_HOST_DRAIN_SECS=60 \
         K2_DAEMON_PORT="$3" K2_TRACE_FILE="$RUN/$1.trace.jsonl" \
         K2_TEST_AGENT_SHIM_DIR="$ROOT/shim" K2_FAKE_AGENT_TRACE="$RUN/fake-agent.trace.jsonl" \
@@ -189,6 +201,7 @@ printf 'three (dirty)\n' > "$WS/lib.txt"
 printf 'not added\n' > "$WS/untracked.md"
 
 start_ctl || exit 1
+wait_for 30 test -s "$ROOT/ctl/home/.k2/daemon.token" || { echo "home-sync: no controller token" >&2; exit 1; }
 CTL_TOKEN=$(cat "$ROOT/ctl/home/.k2/daemon.token")
 H1_PID=$(start_host host-1 h1 "$H1_PORT")
 wait_ready host-1 "$H1_PID" "$H1_PORT" "$RUN/host-1.log" && wait_linked "$H1_PORT" || exit 1
@@ -231,7 +244,7 @@ first_part=$(head -c "$(wc -c < "$M1")" "$M2" | shasum -a 256 | cut -d' ' -f1)
 resumed=$(python3 -I -c '
 import json,sys
 ev=[json.loads(l) for l in open(sys.argv[1])]
-print(sum(1 for e in ev if e.get("event")=="cli.exec" and e.get("resumed") and sys.argv[2] in json.dumps(e)))' \
+print(sum(1 for e in ev if e.get("event")=="cli.exec" and (e.get("attrs") or {}).get("resumed") and e.get("session_id")==sys.argv[2]))' \
     "$RUN/fake-agent.trace.jsonl" "$SESSION")
 check "host-2 has the workspace byte for byte (git HEAD, history, dirty, untracked), MEMORY.md and the transcript; same session resumed" \
     "$(cmp -s "$RUN/workspace-on-host-1.txt" "$RUN/workspace-on-host-2.txt" && [ "$first_part" = "$MEM1_SHA" ] && has_line "$M2" "after the move" && [ -f "$T2" ] && [ "${resumed:-0}" -ge 1 ] && echo 1)" \
