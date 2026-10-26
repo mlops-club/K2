@@ -341,6 +341,11 @@ kd exec k2-host-0 -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7
     && ok "k2-host-0 linked" || bad "k2-host-0 not linked"
 [ "$(kd exec k2-host-0 -c k2-host -- stat -c %a /var/lib/k2-host/.k2/host-key.pem 2>/dev/null)" = 600 ] \
     && ok "host key 0600 on its volume" || bad "host key missing or not 0600"
+for sts in k2-controller k2-host; do
+    id=$(kd get statefulset "$sts" -o jsonpath='{.spec.template.metadata.annotations.k2\.dev/image-id}')
+    rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$id" 2>/dev/null)
+    [ "$rev" = "$RC_COMMIT" ] && ok "$sts runs ${id:7:12}, labelled ${rev:0:9}" || bad "$sts runs ${id:7:12}, labelled '${rev:0:9}', not ${RC_COMMIT:0:9}"
+done
 [ "$(kd exec k2-host-0 -c k2-host -- printenv K2_WORK_ROOT 2>/dev/null)" = /var/lib/k2/work ] \
     && ok "k2-host-0: K2_WORK_ROOT=/var/lib/k2/work" || bad "k2-host-0: no K2_WORK_ROOT"
 "$KIND_REPO/scripts/kind/app-check.sh" --dist --password-file="$OWNER_PW" >&2 && ok "app-check --dist" || bad "app-check --dist"
