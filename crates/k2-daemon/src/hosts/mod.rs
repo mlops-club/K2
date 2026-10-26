@@ -56,7 +56,7 @@ pub struct HostConfig {
     pub labels: Vec<String>,
 }
 
-fn read_token(var: &str, path: Option<String>) -> Result<String, String> {
+pub(crate) fn read_token(var: &str, path: Option<String>) -> Result<String, String> {
     let path = path.filter(|p| !p.trim().is_empty()).ok_or_else(|| format!("{var} must name the host token file"))?;
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("{var}={path:?}: can't read the token file: {e}"))?;
     let token = raw.trim().to_string();

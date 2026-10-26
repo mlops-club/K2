@@ -738,16 +738,59 @@ pub async fn signed_hello(cfg: &HostConfig, key: &SigningKey) -> Result<String, 
 
 /// `link::serve_once`'s hook: the `hello.token` for the next link. The
 /// bootstrap token under `K2_HOST_AUTH=token`; a signed proof under
-/// `enroll`, after enrolling with the one-time token if needed.
+/// `enroll`, after enrolling with the one-time token if needed. The token
+/// file is read again on every attempt: a token the owner mints after a
+/// refusal (say after a controller DB restore forgot this host's key) is
+/// used on the next retry, with no host restart.
 pub async fn hello_token(cfg: &HostConfig) -> Result<String, String> {
+    let file = env(super::ENROLL_TOKEN_FILE_VAR);
     match auth_mode(env)? {
-        Mode::Token => Ok(cfg.token.clone()),
+        Mode::Token => Ok(current_token(cfg, file)),
         Mode::Enroll => {
             let path = key_path(env);
             let key = load_or_create_key(&path)?;
-            signed_hello(cfg, &key).await
+            enroll_hello_from(cfg, &key, file).await
         }
     }
+}
+
+/// The token as `file` holds it now, else the one read at boot.
+fn current_token(cfg: &HostConfig, file: Option<String>) -> String {
+    match super::read_token(super::ENROLL_TOKEN_FILE_VAR, file) {
+        Ok(t) => t,
+        Err(e) => {
+            log_debug!("[hosts/enroll] {e}; using the token read at boot");
+            cfg.token.clone()
+        }
+    }
+}
+
+/// A spent token was reported; reset by a link that works.
+static SPENT_TOKEN_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`signed_hello`] with the one-time token `file` holds now. Enrolling an
+/// already enrolled key is a no-op; a key the controller doesn't know
+/// (forgotten, as after a DB restore) is enrolled again with that token.
+/// `token_invalid` is logged once, until a link works; the link's backoff
+/// retries, reading the file again each time.
+pub async fn enroll_hello_from(cfg: &HostConfig, key: &SigningKey, file: Option<String>) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    let mut cfg = cfg.clone();
+    cfg.token = current_token(&cfg, file.clone());
+    let r = signed_hello(&cfg, key).await;
+    match &r {
+        Ok(_) => SPENT_TOKEN_LOGGED.store(false, Ordering::Relaxed),
+        Err(e) if e.contains("token_invalid") && !SPENT_TOKEN_LOGGED.swap(true, Ordering::Relaxed) => {
+            log_debug!(
+                "[hosts/enroll] the controller doesn't know this host's key ({}…) and the one-time token in {} is spent or unknown: \
+                 mint a new one into that file (Kubernetes: the Secret k2-host-enroll); retrying, reading it again each time",
+                short(&key.fingerprint()),
+                file.as_deref().unwrap_or(super::ENROLL_TOKEN_FILE_VAR)
+            );
+        }
+        _ => {}
+    }
+    r
 }
 
 #[cfg(test)]
