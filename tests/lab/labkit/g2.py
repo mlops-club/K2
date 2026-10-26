@@ -1331,7 +1331,9 @@ def s10_attempt(c, sc, attempt):
 
         # Turn three: a long one, by message (the outbox), so its message
         # is not acked when the host dies.
-        n3 = "s10 turn 3 %s [[turn-ms=60000]] [[remember: s10 lost turn]]" % uuid.uuid4().hex[:6]
+        # 30 s: long enough to kill it mid-turn; its redelivered copy runs
+        # the full 30 s again on the new host.
+        n3 = "s10 turn 3 %s [[turn-ms=30000]] [[remember: s10 lost turn]]" % uuid.uuid4().hex[:6]
         starts = len(c.turn_events(csid, "cli.turn.start"))
         st, raw, resp = c.msg(cwd, n3, wake=True)
         msg_id = resp.get("msgId")
@@ -1401,7 +1403,8 @@ def s10_attempt(c, sc, attempt):
                      len(mine) == 2 and all(s_ == csid for _, s_ in mine), "%s" % mine)
             # The lost turn's message is delivered again there, once, and answered.
             key3 = n3.split(" [[")[0]
-            wait_until(lambda: c.replied(cwd, key3) and [p for p in c.prompts_with(cwd, key3) if p[0] == h2], gone_wait_s())
+            wait_until(lambda: c.replied(cwd, key3) and [p for p in c.prompts_with(cwd, key3) if p[0] == h2],
+                       gone_wait_s() + 30)
             on2 = [p for p in c.prompts_with(cwd, key3) if p[0] == h2]
             state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
             sc.check("turn three's message, never acked, is delivered again on %s exactly once and answered" % h2,
@@ -1411,24 +1414,26 @@ def s10_attempt(c, sc, attempt):
             mem_bytes = open(mem_now, "rb").read() if os.path.isfile(mem_now) else b""
             sc.check("MEMORY.md on %s holds turns one and two" % h2, all(f.encode() in mem_bytes for f in facts), mem_now)
             # The dead host returns: the agent stays where it moved (I1).
+            # Still holding the fleet: what S10 checks is the lab's own host
+            # loss, not one --chaos adds on top.
             t_back = now_iso()
             c.fleet.start(h1)  # waits for its link
-        most, live = 0, []
-        end = time.monotonic() + 15
-        while time.monotonic() < end:
-            live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
-            most = max(most, len(live))
-            time.sleep(0.5)
-        sc.check("I1: once %s is back, one live CLI for the agent, on %s (not adopted back, not placed twice)" % (h1, h2),
-                 most == 1 and [e.get("host") for e in live] == [h2] and c.placed_host(pid, t_back) in (None, h2),
-                 "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
-        # And it goes on there.
-        n4 = "s10 after %s" % uuid.uuid4().hex[:6]
-        st, raw, resp = c.msg(cwd, n4, wake=False)  # it is live there: queued, with a msg id (I2)
-        wait_until(lambda: c.replied(cwd, n4), DEADLINE_S)
-        sc.check("a message after the move lands on %s and is answered" % h2,
-                 c.replied(cwd, n4) and [p[0] for p in c.prompts_with(cwd, n4)] == [h2],
-                 "HTTP %s; prompts %s" % (st, [p[0] for p in c.prompts_with(cwd, n4)]))
+            most, live = 0, []
+            end = time.monotonic() + 15
+            while time.monotonic() < end:
+                live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
+                most = max(most, len(live))
+                time.sleep(0.5)
+            sc.check("I1: once %s is back, one live CLI for the agent, on %s (not adopted back, not placed twice)" % (h1, h2),
+                     most == 1 and [e.get("host") for e in live] == [h2] and c.placed_host(pid, t_back) in (None, h2),
+                     "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
+            # And it goes on there.
+            n4 = "s10 after %s" % uuid.uuid4().hex[:6]
+            st, raw, resp = c.msg(cwd, n4, wake=False)  # it is live there: queued, with a msg id (I2)
+            wait_until(lambda: c.replied(cwd, n4), DEADLINE_S)
+            sc.check("a message after the move lands on %s and is answered" % h2,
+                     c.replied(cwd, n4) and [p[0] for p in c.prompts_with(cwd, n4)] == [h2],
+                     "HTTP %s; prompts %s" % (st, [p[0] for p in c.prompts_with(cwd, n4)]))
     finally:
         if sock:
             sock.close()
