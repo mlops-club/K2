@@ -283,6 +283,45 @@ class Plan(unittest.TestCase):
             os.environ.pop("LAB_HOST_PTYD", None)
             self.assertNotIn("K2_PTYD", fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")["procs"]["host-1"]["env"])
 
+    def test_home_sync_sets_k2_work_root_on_hosts_and_defaults_to_resume_elsewhere(self):
+        for env, on in (({"LAB_HOME_SYNC": "1"}, True), ({"LAB_S8_RESUME_ELSEWHERE": "1"}, True),
+                        ({"LAB_S8_RESUME_ELSEWHERE": "1", "LAB_HOME_SYNC": "0"}, False), ({}, False)):
+            with unittest.mock.patch.dict(os.environ, env):
+                for k in ("LAB_HOME_SYNC", "LAB_S8_RESUME_ELSEWHERE"):
+                    if k not in env:
+                        os.environ.pop(k, None)
+                st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
+            roots = {n: p["env"].get("K2_WORK_ROOT") for n, p in st["procs"].items()}
+            if on:
+                self.assertEqual(roots, {"controller": None, "host-1": "/r/work", "host-2": "/r/work"}, env)
+            else:
+                self.assertEqual(set(roots.values()), {None}, env)
+
+    def test_exec_of_is_the_newest_cli_exec_by_ts_across_hosts(self):
+        c = g2.Client.__new__(g2.Client)
+        evs = [{"event": "cli.exec", "session_id": "s", "host": "host-1", "ts": "2026-10-26T00:00:09.000Z"},
+               {"event": "cli.exec", "session_id": "s", "host": "host-2", "ts": "2026-10-26T00:00:05.000Z"}]
+        c.fleet = unittest.mock.Mock(fake_events=lambda event=None: [e for e in evs if event in (None, e["event"])])
+        self.assertEqual(c.exec_of("s")["host"], "host-1")
+        self.assertIsNone(c.exec_of("other"))
+
+    def test_a_hop_up_accept_is_final_only_for_a_direct_delivery(self):
+        acc = {"event": "ctl.msg_accept", "msg_id": "m", "attrs": {"status": "delivered"}}
+        dlv = {"event": "ctl.deliver", "msg_id": "m", "attrs": {"host": "host-1"}}
+        bad = {"event": "delivery.failed", "msg_id": "m", "attrs": {"reason": "recipient_gone: x"}}
+        c = g2.Client.__new__(g2.Client)
+        for evs, row, resp_ok, want in (
+                ([acc], None, True, "delivered"),          # direct: no row, never sent down
+                ([acc], "queued", True, "queued"),         # queued: the row decides
+                ([acc, dlv], None, True, None),            # sent down: not direct
+                ([acc], None, False, None),                # controller down: can't tell
+                ([acc, dlv, bad], "sent", True, "failed"),
+                ([acc], "delivered", True, "delivered")):
+            c.fleet = unittest.mock.Mock(st={"controller": "controller"}, daemon_events=lambda proc, event=None, evs=evs: evs)
+            resp = ({"message": {"state": row}} if row else {"message": None}) if resp_ok else None
+            c.outbox = lambda proc=None, msg_id=None, resp=resp: resp
+            self.assertEqual(c.final_state("m"), want, (evs, row, resp_ok))
+
     def test_gone_grace_reaches_every_daemon_only_when_the_lab_sets_it(self):
         with unittest.mock.patch.dict(os.environ, {"LAB_GONE_GRACE_S": "30"}):
             st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")

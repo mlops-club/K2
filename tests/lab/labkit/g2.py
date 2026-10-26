@@ -279,8 +279,10 @@ class Client:
         return [e for e in self.fleet.fake_events(event) if session is None or e.get("session_id") == session]
 
     def exec_of(self, session):
+        # The newest by ts: fake_events is in file order per host, so the
+        # last one is host-2's latest even when host-1 exec'd it since.
         evs = self.fake("cli.exec", session)
-        return evs[-1] if evs else None
+        return max(evs, key=lambda e: e.get("ts", "")) if evs else None
 
     def transcripts(self, cwd):
         slug = s1.claude_project_slug(cwd)
@@ -336,21 +338,28 @@ class Client:
         resp = self.outbox(proc, msg_id) or {}
         return (resp.get("message") or {}).get("state")
 
-    def traced_final(self, msg_id):
+    def traced_final(self, msg_id, direct=True):
         """A final state the controller traced without an outbox row: since
         the S4 wake fix it delivers some messages directly
-        (`[delivery] … delivered directly`, `ctl.msg_accept` status delivered)."""
-        for e in self.fleet.daemon_events(self.fleet.st["controller"]):
-            a = e.get("attrs") or {}
-            if e.get("msg_id") == msg_id and (
-                    (e.get("event") == "ctl.msg_accept" and a.get("status") == "delivered")
-                    or e.get("event") == "delivery.failed"):
-                return "delivered" if e.get("event") == "ctl.msg_accept" else "failed"
+        (`[delivery] … delivered directly`, `ctl.msg_accept` status delivered).
+        `ctl.msg_accept` says delivered for every message a host hands up,
+        queued ones too, so it counts only when `direct` (no outbox row) and
+        the controller never sent the message down (`ctl.deliver`)."""
+        evs = [e for e in self.fleet.daemon_events(self.fleet.st["controller"]) if e.get("msg_id") == msg_id]
+        if any(e.get("event") == "delivery.failed" for e in evs):
+            return "failed"
+        if direct and not any(e.get("event") == "ctl.deliver" for e in evs) and any(
+                e.get("event") == "ctl.msg_accept" and (e.get("attrs") or {}).get("status") == "delivered" for e in evs):
+            return "delivered"
         return None
 
     def final_state(self, msg_id):
-        st = self.outbox_state(msg_id)
-        return st if st in ("delivered", "failed") else (self.traced_final(msg_id) or st)
+        resp = self.outbox(None, msg_id)
+        st = ((resp or {}).get("message") or {}).get("state")
+        if st in ("delivered", "failed"):
+            return st
+        # Direct only when the controller answered and has no row for it.
+        return self.traced_final(msg_id, direct=resp is not None and st is None) or st
 
     def wait_final(self, msg_id, deadline=DEADLINE_S):
         return wait_until(lambda: self.final_state(msg_id) in ("delivered", "failed") and self.final_state(msg_id),
@@ -728,6 +737,7 @@ def s6(c, sc):
             sc.info["composed_on"] = ha
         if not sc.check("bob's host and the sending host differ", ha and hb and ha != hb, "send %s, bob %s" % (ha, hb)):
             return
+        t_compose = now_iso()
         with c.fleet.control():
             sc.check("bob's host %s killed (SIGKILL)" % hb, c.fleet.kill(hb), "")
             st, raw, resp = compose_inbox(c, ha, bob, title, alice)
@@ -749,10 +759,22 @@ def s6(c, sc):
         b = open_chat(c, sc, bob_cwd, "bob's next need: the app opens him again")
         if b:
             agents[bob] = (bob_cwd, agents[bob][1], b, hb)
-        state = c.wait_final(msg_id) if msg_id else None
-        files = wait_until(lambda: inbox_files(bob_cwd, title), 30)
-        sc.check("the controller's outbox ends delivered", state == "delivered", "msg %s state %s" % (msg_id, state))
-        sc.check("the item is in bob's inbox exactly once", len(files) == 1, "%s" % files)
+        state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
+        files = wait_until(lambda: inbox_files(bob_cwd, title), 30 if state != "failed" else 3)
+        # PRD failure table: when --chaos killed bob's CLI, or his host with
+        # it, before the item landed (the host answers retry while no session
+        # is live), the gone rule failing it with a reason is the right end;
+        # then it is not in bob's inbox.
+        csid = agents[bob][2][1]
+        killed = [e for x in c.fake("cli.exec", csid) if (x.get("ts") or "") >= t_compose
+                  for e in chaos_hit(x.get("host"), x.get("pid"), t_compose)]
+        sc.info["s6_chaos_kills_of_bob"] = [(e["ts"], e.get("kind"), e.get("host"), e.get("pid")) for e in killed]
+        lost_to_chaos = bool(killed) and state == "failed"
+        sc.check("the controller's outbox ends delivered (or failed with a reason after --chaos killed bob's CLI or host)",
+                 state == "delivered" or lost_to_chaos,
+                 "msg %s state %s; chaos kills of bob's CLI or host %s" % (msg_id, state, sc.info["s6_chaos_kills_of_bob"]))
+        sc.check("the item is in bob's inbox exactly once (none when it failed)",
+                 len(files) == (0 if lost_to_chaos else 1), "%s" % files)
         # Read once alice's host answers (under --chaos it may be restarting).
         up = wait_until(lambda: c.outbox(ha, msg_id), 60, 1.0) or {}
         sc.check("alice's host's outbox (hop up) ends delivered", (up.get("message") or {}).get("state") == "delivered",

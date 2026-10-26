@@ -29,7 +29,8 @@
 #   binaries need ~25 GB linked at once (ENOSPC at link on 2026-10-25), so
 #   the gate runs with K2_GATE_BATCH=${LAB_GATE_BATCH:-20} (steps of 20 test
 #   targets, linked executables removed after each step; 0 = one
-#   `cargo test -p` per package).
+#   `cargo test -p` per package). LAB_GATE_MIN_FREE_GB passes the gate's
+#   K2_GATE_MIN_FREE_GB (default 20); lower it only when the coordinator says.
 # - the image build only runs apt-get (no compile); BuildKit has no
 #   --memory flag, so the lock is its only limit.
 #
@@ -86,6 +87,7 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "user: tests as k2gate (uid 10001, K2_GATE_TEST_USER); the root-only allowlisted runs as root"
     echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
     echo "batch: K2_GATE_BATCH=$batch (integration test targets per cargo step; 0 = one cargo test -p)"
+    echo "min free: K2_GATE_MIN_FREE_GB=${LAB_GATE_MIN_FREE_GB:-20 (the default)}"
 } >"$run/topology/linux-gate.txt"
 
 # The gate writes its per-package logs to <workdir>/logs; a symlink into
@@ -97,6 +99,7 @@ docker run --rm --name "$name" \
     ${low_env[@]+"${low_env[@]}"} \
     --cap-add NET_ADMIN -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
     -e K2_GATE_BATCH="$batch" \
+    ${LAB_GATE_MIN_FREE_GB:+-e K2_GATE_MIN_FREE_GB="$LAB_GATE_MIN_FREE_GB"} \
     -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
     -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \

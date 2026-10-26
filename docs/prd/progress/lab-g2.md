@@ -361,6 +361,77 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### G2 on wave3 587c665c8 with home sync (resume elsewhere)
+
+Base: wave3 587c665c8 (21eb64ca9's P3 home sync + dist-link's chaos-fixes2
+with K2-b review fixes and K2-c + enroll-reread), merged with lab-g2 on a
+throwaway branch `k2-dist/lab-g2-wave3c-run` (deleted after). Procs,
+`LAB_S8_RESUME_ELSEWHERE=1`, so hosts get `K2_WORK_ROOT=<fleet work dir>`
+(`LAB_HOME_SYNC`, ef81edbdd; outbox's two asks, with `exec_of` = the newest
+`cli.exec` by ts).
+
+| Run | Chaos | Rounds | Result |
+|---|---|---|---|
+| `2026-10-26T11-31-39Z` | none | 1 | S1–S9 PASS, I1–I4 pass |
+| `2026-10-26T11-38-19Z` | seed 2026 | 2 | S6 r2 FAIL (lab bug, below); rest PASS, I1–I4 pass |
+| `2026-10-26T11-47-16Z` | none | 1 | S1–S9 PASS, I1–I4 pass (after 49298f286) |
+| `2026-10-26T11-48-57Z` | seed 2026 | 4 | S6 r4 FAIL (lab, below); rest PASS, I1–I4 pass |
+| `2026-10-26T11-53-45Z` | seed 2026 | 2 | S1–S9 PASS, I1–I4 pass (after d50543ed9) |
+
+- S8 resume elsewhere passes in every run: while the drained host is down,
+  the need resumes the agent on the other host with the same session
+  (home restored there), and once the host is back there is one live CLI
+  (sampled 15 s); the message sent while it was down lands exactly once.
+- K2-c did not come back: S3 is green in all 8 chaos rounds (it was S3
+  round 5 on 636391108; no run here reached a round 5).
+- Both S6 reds were the lab (class c), fixed:
+  - 49298f286: `traced_final` took the controller's `ctl.msg_accept`
+    (status delivered) as a final delivery. Every message a host hands up
+    is accepted that way; it is final only for a direct delivery (the
+    controller answers with no outbox row, and never sent it down with
+    `ctl.deliver`). I2 had the same rule and gets the same fix; I2
+    rechecked on five earlier runs, still pass. The real end: --chaos
+    SIGKILLed bob's new CLI right after the host answered `retry` (no
+    live session yet); nothing placed bob again within 30 s, so the
+    controller failed it `recipient_gone`, as the PRD failure table says.
+    S6 now accepts that (failed with a reason after --chaos killed bob's
+    CLI, and not in his inbox).
+  - d50543ed9: the same end when --chaos killed bob's host (with his CLI)
+    1.6 s after he reopened there; S6 counts that kill too.
+
+Gate follow-ups (coordinator's decisions, 705987b52): the gate runs
+`cargo test -p k2-ptyd` (ptyd's own tests; ptyd changed in W3b) and checks
+its ignored tests against the allowlist; the five ignored tests above are
+allowlisted, each with its reason (root networking or useradd, a throwaway
+systemd box or real Postgres majors, and the `apps::admission` doctest,
+which is a `text` formula block, not code). Replayed on the 88d1eddc2
+logs, every ignored test is on the list. Not yet run on Linux with
+k2-ptyd. The `k2_home` failure is outbox's (k2-core `cli_stage`).
+
+### Linux gate on wave3 88d1eddc2 (k8s, provisioner, home code)
+
+`lab-runs/gate-debug/2026-10-26T09-26-12Z`, same setup as on 3912ab2ff
+(below), from an emptied target volume at the default 20G free floor
+(22G at start, 20G at the end), the Docker lock held throughout.
+
+| Package | Test binaries | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| k2-core | 17 | 3868 | 0 | 1 (allowlisted) |
+| k2-daemon | 162 | 5311 | 1 | 9 |
+| k2-daemon root-only `cell_egress` | 1 | 1 | 0 | 0 |
+
+GATE RED, with nothing new: every failure is class (b), the same as on
+3912ab2ff.
+
+- Failed: `k2_home_integration`
+  `k2_home_holds_the_whole_k2_home_and_home_stays_empty` (`$HOME` gets
+  `.local/bin/k2`, the `cli_stage.rs` fallback; see below).
+- Ignored but not allowlisted: the same five tests listed below.
+- The 61 new k2-daemon tests and the 1 new k2-core test pass, and there are
+  no compile errors.
+- `k2-ptyd` changed (3 files), but the gate only builds its binary for
+  `ptyd_backend`; the gate doesn't run k2-ptyd's own tests.
+
 ### Linux gate on wave2-preview 3912ab2ff (W5 included)
 
 `lab-runs/gate-debug/2026-10-26T05-09-20Z`, through `scripts/lab/lib/linux_gate.sh`: slot,

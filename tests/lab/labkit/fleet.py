@@ -214,10 +214,21 @@ def plan(layout, root, run_dir, daemon_bin, fake_bin):
             # outlive its daemon; down() kills what is left of it by pid.
             extra.update({"K2_PTYD": "1", "K2_PTYD_BIN": os.environ["LAB_PTYD_BIN"]})
             st["host_ptyd"] = True
+        if home_sync_on():
+            # P3 home sync: a host saves and restores the homes of agents
+            # whose cwd is under K2_WORK_ROOT (the fleet's work dir).
+            extra["K2_WORK_ROOT"] = st["work"]
+            st["home_sync"] = True
         proc(h, "host", extra)
         st["hosts"].append({"name": h, "proc": h, "home": st["procs"][h]["home"],
                             "fake_trace": extra["K2_FAKE_AGENT_TRACE"]})
     return st
+
+
+def home_sync_on():
+    """LAB_HOME_SYNC=1; it defaults to LAB_S8_RESUME_ELSEWHERE (S8's resume
+    on the other host needs the agent's home there)."""
+    return os.environ.get("LAB_HOME_SYNC", os.environ.get("LAB_S8_RESUME_ELSEWHERE", "0")) == "1"
 
 
 # ── Process control (backend procs) ─────────────────────────────────────
@@ -472,6 +483,9 @@ def up_compose(run_dir, state_path, root, image, project, compose_file):
         "LAB_CTL_PORT": str(st["procs"]["controller"]["port"]),
         "LAB_H1_PORT": str(st["procs"]["host-1"]["port"]), "LAB_H2_PORT": str(st["procs"]["host-2"]["port"]),
         "LAB_TURN_MS": os.environ.get("LAB_TURN_MS", "300"), "LAB_SEED": os.environ.get("LAB_SEED", "0")}}
+    if home_sync_on():
+        st["compose"]["env"]["LAB_WORK_ROOT"] = st["work"]
+        st["home_sync"] = True
     os.makedirs(st["work"], exist_ok=True)
     with open(st["host_token_file"], "w") as fh:
         fh.write(os.urandom(24).hex())
