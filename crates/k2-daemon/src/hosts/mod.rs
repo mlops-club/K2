@@ -19,6 +19,8 @@ pub mod hub;
 pub mod link;
 pub mod proto;
 #[cfg(test)]
+mod placement_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::OnceLock;
