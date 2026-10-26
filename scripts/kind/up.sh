@@ -166,8 +166,14 @@ if [ -z "$render_to" ]; then
     slot=()
     [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
     say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
+    # The revision label is the K2 inside (the daemon it is built FROM), so
+    # it can be trusted for what is deployed; this tree's HEAD (the kind
+    # scripts, the Dockerfile) is k2.dev/kind-revision.
+    base_rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$KIND_BASE_IMAGE")
+    [ -n "$base_rev" ] || { echo "up.sh: $KIND_BASE_IMAGE has no revision label" >&2; exit 1; }
     build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" --build-arg "BASE_IMAGE=$KIND_BASE_IMAGE"
-        --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")
+        --label "org.opencontainers.image.revision=$base_rev" --label "k2.dev/kind-revision=$(git rev-parse HEAD)" \
+        --label "k2.dev/base-image-id=$(docker image inspect -f '{{.Id}}' "$KIND_BASE_IMAGE")" "$KIND_CONTEXT")
     case "$KIND_DOCKERFILE" in *fake*) build=(${slot[@]+"${slot[@]}"} "${build[@]}") ;; esac   # its cargo stage
     DOCKER_BUILDKIT=1 "${build[@]}" >/dev/null
     if [ "$door" = proxy ]; then
