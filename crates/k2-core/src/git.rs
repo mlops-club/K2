@@ -3,6 +3,24 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 
+static NO_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// fs-relay (N7): an agent host runs K2's own git commands for its
+/// controller without the repository's hooks (a hook is code the
+/// repository carries; the relay never runs it).
+pub fn set_no_hooks(on: bool) {
+    NO_HOOKS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `git`, with `-c core.hooksPath=/dev/null` once [`set_no_hooks`] is on.
+fn git_cli() -> Command {
+    let mut c = Command::new("git");
+    if NO_HOOKS.load(std::sync::atomic::Ordering::SeqCst) {
+        c.args(["-c", "core.hooksPath=/dev/null"]);
+    }
+    c
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -215,7 +233,7 @@ pub fn list_branches(path: &str) -> BranchList {
 
 pub fn list_worktrees(path: &str) -> Vec<WorktreeInfo> {
     // Use git CLI for worktree list since git2 worktree support is limited
-    let output = match Command::new("git")
+    let output = match git_cli()
         .args(["worktree", "list", "--porcelain"])
         .current_dir(path)
         .output()
@@ -325,7 +343,7 @@ pub fn create_worktree(
     let wt_path_str = worktree_path.to_string_lossy().to_string();
 
     // Always create a new branch from HEAD
-    let output = Command::new("git")
+    let output = git_cli()
         .args(["worktree", "add", "-b", branch_name, &wt_path_str, "HEAD"])
         .current_dir(project_path)
         .output()
@@ -397,7 +415,7 @@ pub fn checkout_worktree(
     let wt_path_str = worktree_path.to_string_lossy().to_string();
 
     // Checkout existing branch (no -b flag)
-    let output = Command::new("git")
+    let output = git_cli()
         .args(["worktree", "add", &wt_path_str, branch_name])
         .current_dir(project_path)
         .output()
@@ -436,7 +454,7 @@ pub fn remove_worktree(
 
         if std::fs::rename(wt, &temp_path).is_ok() {
             // Prune git metadata (detach the worktree ref)
-            let _ = Command::new("git")
+            let _ = git_cli()
                 .args(["worktree", "prune"])
                 .current_dir(project_path)
                 .output();
@@ -473,7 +491,7 @@ pub fn remove_worktree(
     // we surface the error and STOP — better to leave the worktree
     // in place and let the user investigate than to permanently
     // destroy their work.
-    let _ = Command::new("git")
+    let _ = git_cli()
         .args(["worktree", "prune"])
         .current_dir(project_path)
         .output();
@@ -1208,7 +1226,7 @@ pub fn gather_git_context(project_path: &str) -> serde_json::Value {
     use std::io::Read;
 
     let run = |args: &[&str]| -> String {
-        let mut child = match Command::new("git")
+        let mut child = match git_cli()
             .args(args)
             .current_dir(project_path)
             .stdout(std::process::Stdio::piped())

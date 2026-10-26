@@ -409,6 +409,24 @@ fn app_pass(query: &str) -> bool {
     http::extract_token(query).is_some_and(k2_core::skin::is_skin_token)
 }
 
+/// N6: an App pass's request goes to a host only when the pass is valid and
+/// its workspace (the `workspace` it names, jailed to the pass) is one
+/// that routes to a host. A revoked pass, or one whose workspace is the
+/// controller's own, is the local route's to answer.
+fn app_pass_to_host(remote: &RemoteHost, query: &str, body: &[u8]) -> bool {
+    let Some(pass) = http::extract_token(query).and_then(crate::apps::gateway::resolve_pass) else { return false };
+    let ws = pairs(query)
+        .into_iter()
+        .find(|(k, _)| k == "workspace")
+        .map(|(_, v)| v)
+        .or_else(|| serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("workspace").and_then(Value::as_str).map(str::to_string)));
+    let Some(ws) = ws else { return false };
+    match crate::fs_routes::resolve_skin_workspace(&pass, &ws) {
+        Ok(w) => !matches!(remote.workspace_route(&[w.path]), WorkspaceRoute::Local),
+        Err(_) => false,
+    }
+}
+
 fn app_pass_refused() -> Answer {
     Answer::json(
         "501 Not Implemented",
@@ -437,6 +455,9 @@ pub async fn route_on(
         return false;
     }
     let answer = if app_pass(query) {
+        if !app_pass_to_host(remote, query, b"") {
+            return false;
+        }
         app_pass_refused()
     } else if !http::token_ok(query, owner_token) {
         // The caller first: no work, and nothing about the hosts, before it.
@@ -475,7 +496,9 @@ pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str,
         return None;
     }
     if app_pass(query) {
-        return Some(app_pass_refused());
+        let (q, b) = (query.to_string(), body.to_vec());
+        let to_host = tokio::task::spawn_blocking(move || app_pass_to_host(remote, &q, &b)).await.unwrap_or(false);
+        return to_host.then(app_pass_refused);
     }
     if !http::token_ok(query, owner_token) {
         return None;
@@ -542,7 +565,10 @@ fn upload_chunk_split(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf
     let Some(bytes) = v.get("base64").and_then(Value::as_str).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok()) else {
         return exchange(remote, host, maps, "POST", "/cli/fs/upload-chunk", query, body);
     };
-    let offset = v.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    // N5: an explicit offset (a missing one is not the start).
+    let Some(offset) = v.get("offset").and_then(Value::as_u64) else {
+        return Answer::json("400 Bad Request", json!({"error": "an upload chunk names its offset", "code": "bad_body"}));
+    };
     let is_last = v.get("is_last").and_then(Value::as_bool).unwrap_or(false);
     let pieces: Vec<&[u8]> = if bytes.is_empty() { vec![&bytes[..]] } else { bytes.chunks(UPLOAD_PIECE).collect() };
     let n = pieces.len();
@@ -594,49 +620,51 @@ fn plain_route(method: &str, path: &str) -> bool {
     plain && relayed(method, path)
 }
 
-/// `p` with `.` and `..` resolved lexically (no filesystem).
-fn normalize(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// `p` resolved on this host's disk, one component at a time (`lstat`):
-/// every symlink is followed, a dangling one too, to where it points (a
-/// write through it would land there). `None` past 40 links.
+/// `p` resolved on this host's disk the way the kernel walks it: one
+/// component at a time (`lstat`), a symlink's target spliced in where it
+/// stands (an absolute one from `/`), `..` popping what is resolved so far
+/// (the parent of where a link really points, never of its name), a
+/// dangling link followed too (a write through it would land there).
+/// `None` past 40 links (a loop).
 fn resolve(p: &Path) -> Option<PathBuf> {
-    fn walk(p: &Path, hops: &mut u32) -> Option<PathBuf> {
-        let mut out = PathBuf::from("/");
-        let parts: Vec<_> = normalize(p).components().skip(1).map(|c| c.as_os_str().to_os_string()).collect();
-        for (i, part) in parts.iter().enumerate() {
-            let next = out.join(part);
-            match std::fs::symlink_metadata(&next) {
-                Ok(md) if md.file_type().is_symlink() => {
-                    *hops += 1;
-                    if *hops > 40 {
-                        return None;
-                    }
-                    let target = std::fs::read_link(&next).ok()?;
-                    let mut t = if target.is_absolute() { target } else { out.join(target) };
-                    for rest in &parts[i + 1..] {
-                        t.push(rest);
-                    }
-                    return walk(&t, hops);
-                }
-                _ => out = next,
-            }
-        }
-        Some(out)
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+    fn parts(p: &Path) -> Vec<OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect()
     }
-    walk(p, &mut 0)
+    let mut todo: VecDeque<OsString> = parts(p).into();
+    let mut out = PathBuf::from("/");
+    let mut hops = 0u32;
+    while let Some(part) = todo.pop_front() {
+        if part == ".." {
+            out.pop();
+            continue;
+        }
+        let next = out.join(&part);
+        match std::fs::symlink_metadata(&next) {
+            Ok(md) if md.file_type().is_symlink() => {
+                hops += 1;
+                if hops > 40 {
+                    return None;
+                }
+                let target = std::fs::read_link(&next).ok()?;
+                if target.is_absolute() {
+                    out = PathBuf::from("/");
+                }
+                for t in parts(&target).into_iter().rev() {
+                    todo.push_front(t);
+                }
+            }
+            _ => out = next,
+        }
+    }
+    Some(out)
 }
 
 /// Every path a relayed request names is under this host's work root
@@ -689,6 +717,116 @@ fn confine(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), 
     walk("", body, &check)
 }
 
+/// N6: resolve-links' candidates, one by one: a link outside the work root
+/// (absolute, `~`, or relative through a link out of the workspace) is
+/// taken out and answered `linkable: false`; the rest go on. Returns the
+/// body to send and the refused (index, input).
+fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
+    let ws = body.get("workspace").and_then(Value::as_str).map(PathBuf::from);
+    let paths: Vec<String> = body.get("paths").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let mut kept = Vec::new();
+    let mut refused = Vec::new();
+    for (i, p) in paths.into_iter().enumerate() {
+        let candidate = if p.starts_with('/') {
+            Some(PathBuf::from(&p))
+        } else if p.starts_with('~') {
+            None
+        } else {
+            ws.as_ref().map(|w| w.join(&p))
+        };
+        let inside = candidate.and_then(|c| resolve(&c)).is_some_and(|r| r.starts_with(root) && r != root);
+        if inside {
+            kept.push(Value::String(p));
+        } else {
+            refused.push((i, p));
+        }
+    }
+    let mut out = body.clone();
+    out["paths"] = Value::Array(kept);
+    (out, refused)
+}
+
+/// resolve-links' answer with the refused candidates back in their places.
+fn merge_links(answer: &str, refused: &[(usize, String)]) -> Option<String> {
+    let mut v: Value = serde_json::from_str(answer).ok()?;
+    let got = v.get("links")?.as_array()?.clone();
+    let mut got = got.into_iter();
+    let total = refused.len() + got.len();
+    let links: Vec<Value> = (0..total)
+        .map(|i| match refused.iter().find(|(j, _)| *j == i) {
+            Some((_, input)) => json!({"input": input, "linkable": false}),
+            None => got.next().unwrap_or(Value::Null),
+        })
+        .collect();
+    v["links"] = Value::Array(links);
+    Some(v.to_string())
+}
+
+/// N7: a relayed git request works on its workspace's own repository: a
+/// `.git` at the workspace root (nothing is looked for above it), whose
+/// git dir (a gitfile's target) and `core.worktree` are under the work
+/// root. K2's own git commands run without hooks here (`set_no_hooks`).
+fn git_precheck(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), String> {
+    let base = query
+        .iter()
+        .find(|(k, _)| k == "path")
+        .map(|(_, v)| v.clone())
+        .or_else(|| body.get("path").and_then(Value::as_str).map(str::to_string))
+        .ok_or("a git request names its path")?;
+    let resolved = resolve(Path::new(&base)).ok_or_else(|| format!("{base} can't be resolved"))?;
+    let first = resolved.strip_prefix(root).ok().and_then(|r| r.components().next()).ok_or_else(|| format!("{base} is not in a workspace"))?;
+    let ws = root.join(first);
+    let inside = |p: &Path| resolve(p).is_some_and(|r| r.starts_with(root));
+    let dotgit = ws.join(".git");
+    let md = std::fs::symlink_metadata(&dotgit).map_err(|_| format!("no git repository at {} (none is looked for above a workspace)", ws.display()))?;
+    let git_dir = if md.is_dir() {
+        dotgit
+    } else {
+        // A gitfile (a worktree, a submodule): `gitdir: <path>`.
+        let text = std::fs::read_to_string(&dotgit).map_err(|e| format!("{}: {e}", dotgit.display()))?;
+        let target = text.lines().find_map(|l| l.strip_prefix("gitdir:")).map(str::trim).ok_or("a .git file without gitdir")?;
+        let t = Path::new(target);
+        if t.is_absolute() { t.to_path_buf() } else { ws.join(t) }
+    };
+    if !inside(&git_dir) {
+        return Err(format!("the repository's git dir {} is outside this host's work root", git_dir.display()));
+    }
+    for config in [git_dir.join("config"), git_dir.join("commondir")] {
+        let config = if config.ends_with("commondir") {
+            match std::fs::read_to_string(&config) {
+                Ok(c) => {
+                    let common = git_dir.join(c.trim());
+                    if !inside(&common) {
+                        return Err("the repository's common dir is outside this host's work root".into());
+                    }
+                    common.join("config")
+                }
+                Err(_) => continue,
+            }
+        } else {
+            config
+        };
+        let Ok(text) = std::fs::read_to_string(&config) else { continue };
+        let mut in_core = false;
+        for line in text.lines() {
+            let l = line.trim();
+            if l.starts_with('[') {
+                in_core = l.trim_start_matches('[').trim_end_matches(']').trim().eq_ignore_ascii_case("core");
+                continue;
+            }
+            let Some((k, v)) = l.split_once('=') else { continue };
+            if in_core && k.trim().eq_ignore_ascii_case("worktree") {
+                let w = Path::new(v.trim().trim_matches('"'));
+                let w = if w.is_absolute() { w.to_path_buf() } else { git_dir.join(w) };
+                if !inside(&w) {
+                    return Err(format!("the repository's core.worktree {} is outside this host's work root", w.display()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The link's `http.relay`: run the request through this daemon's own
 /// route (its own token, its own disk) and answer `http.reply`.
 pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &str) -> Frame {
@@ -715,8 +853,21 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
     if !body.is_empty() && body_json.is_null() {
         return reply("400 Bad Request", json!({"error": "a relayed body is JSON"}));
     }
+    let mut refused_links = Vec::new();
+    let (body, body_json) = if path == "/cli/fs/resolve-links" {
+        let (b, refused) = split_links(&root, &body_json);
+        refused_links = refused;
+        (b.to_string().into_bytes(), b)
+    } else {
+        (body, body_json)
+    };
     if let Err(e) = confine(&root, &query_pairs, &body_json) {
         return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"}));
+    }
+    if path.starts_with("/cli/git/") && path != "/cli/git/init" {
+        if let Err(e) = git_precheck(&root, &query_pairs, &body_json) {
+            return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"}));
+        }
     }
     let Some((port, token)) = LOCAL.lock().clone() else {
         return reply("503 Service Unavailable", json!({"error": "this host's daemon address is not known yet"}));
@@ -757,7 +908,11 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
             let too_big = resp.content_length().is_some_and(|n| n as usize > MAX_RELAY_BODY);
             match if too_big { Ok(None) } else { resp.bytes().await.map(Some) } {
                 Ok(Some(b)) if b.len() <= MAX_RELAY_BODY => {
-                    Frame::HttpReply { req, status, content_type: ct, body: String::from_utf8_lossy(&b).into_owned() }
+                    let mut body = String::from_utf8_lossy(&b).into_owned();
+                    if !refused_links.is_empty() {
+                        body = merge_links(&body, &refused_links).unwrap_or(body);
+                    }
+                    Frame::HttpReply { req, status, content_type: ct, body }
                 }
                 Ok(_) => reply(
                     "413 Payload Too Large",

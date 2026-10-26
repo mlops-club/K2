@@ -175,6 +175,30 @@ Each is fixed, with a test:
 Not changed: the remaining lows from the first review (retries and
 idempotency, the blocking pool, worktree paths outside the workspace).
 
+## Round 3 review of 16253180b: what changed
+
+| Finding | Fix | Test |
+|---|---|---|
+| N1 `..` after a symlink (the H1 bypass) | `resolve` walks the components one at a time as the kernel does: a link's target is spliced in where it stands (an absolute one from `/`), `..` pops what is resolved so far (the parent of where a link really points), a dangling link is followed too; no lexical normalisation; a loop is refused after 40 links | `n1_dot_dot_after_a_symlink_is_the_links_parent_read_and_write_refused` (the exact `s -> …/.ssh/inner`, `d -> s/..` layout; a read and a write; a loop) |
+| N3 bindings expiring under a live agent | A binding remembers its agent and never expires while the agent is placed on that host; it is touched whenever the controller keeps a session for the agent (a spawn, a resume) and when its host adopts it again | `n3_a_binding_lives_while_its_agent_is_placed` |
+| N7 git past the root | Before a relayed git request (all but `init`), the host checks the workspace's own repository: a `.git` at the workspace root (nothing is looked for above it), its git dir (a gitfile's target, a common dir) and `core.worktree` under the work root. A host with a work root runs K2's own git commands with `-c core.hooksPath=/dev/null` (`k2_core::git::set_no_hooks`); libgit2 runs no hooks | `n7_git_never_reaches_past_the_work_root`, `n7_k2s_git_commands_run_no_hooks_on_a_host` |
+| N6 batch failure; App passes | resolve-links: a link outside the work root (absolute, `~`, or through a link out of the workspace) is answered `linkable: false` in its place, the rest resolved. An App pass is validated first (a revoked one is the local route's 403) and refused (501) only when its workspace routes to a host | `n6_resolve_links_refuses_a_bad_link_not_the_batch`, `m3_h6_…` |
+
+Accepted for now (documented, coordinator's decision):
+
+- **N2, check then use.** The host checks a path, then its daemon's route
+  opens it: a link swapped in between (by something on the host with write
+  access to the workspace, i.e. the agent itself) is not caught. On Linux,
+  `openat2(RESOLVE_BENEATH)` in the file routes would close it; a later
+  hardening.
+- **N4, workspaces outside the work root.** An agent spawned on an own-disk
+  host with a cwd outside the controller's `K2_WORK_ROOT` is not routed:
+  the controller logs a warning at that spawn, and the app sees the
+  controller's copy of that folder.
+- **N5, uploads restart.** A failed upload piece fails the chunk; the app
+  restarts the transfer. An upload chunk must carry its numeric `offset`
+  (a missing one is a 400, not taken as 0).
+
 ## Checks
 
 | Check | Result |

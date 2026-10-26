@@ -250,7 +250,7 @@ async fn the_controllers_root_matches_as_given_and_canonical() {
 
 /// H4 (re-review): the controller decides a host's work root; a hostile
 /// label (`/`) and cwds outside the controller's root capture nothing; the
-/// longest workspace wins; a binding expires.
+/// longest workspace wins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h4_a_hostile_work_root_label_and_cwd_capture_nothing() {
     let (remote, url) = controller_at(&["/ctl/work"], &[("h1", &h("/h1/work")), ("h2", &h("/h2/work"))]).await;
@@ -273,15 +273,7 @@ async fn h4_a_hostile_work_root_label_and_cwd_capture_nothing() {
     assert!(matches!(remote.workspace_route(&strs(&["/ctl/work/outer/inner/x"])), WorkspaceRoute::Relay { host, .. } if host == "h2"));
     assert!(matches!(remote.workspace_route(&strs(&["/ctl/work/outer/y"])), WorkspaceRoute::Relay { host, .. } if host == "h1"));
     drop((evil, h1, h2));
-    // A binding past its TTL routes nothing.
-    let roots = crate::agent_host::remote::HostRoots { default: pb("/h/work"), per_host: Default::default() };
-    let remote = RemoteHost::new().with_relay_roots(vec![pb("/ctl/work")], roots).with_relay_ttl(Duration::ZERO);
-    let (remote, url) = serve_controller(Box::leak(Box::new(remote))).await;
-    let mut h = host(&url, "h", &["k2.work_root=/h/work"]).await;
-    place(remote, &mut h, "notes", "/ctl/work/notes").await;
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    assert_eq!(remote.workspace_route(&strs(&["/ctl/work/notes/a"])), WorkspaceRoute::Local, "expired");
-    drop(h);
+    // Expiry (and N3: never while placed): n3_a_binding_lives_while_its_agent_is_placed.
 }
 
 /// H1 (controller): `..` is refused, and so is a second path outside the
@@ -323,10 +315,13 @@ async fn m3_h6_auth_first_and_no_silent_fallback() {
     assert_eq!(a.status, "501 Not Implemented", "{}", a.body);
     let elsewhere = json!({"paths": ["/ctl/other/a"], "destination": "/ctl/other/a.zip"}).to_string();
     assert_eq!(relay_post_on(remote, "/cli/fs/compress", "token=owner", "owner", elsewhere.as_bytes()).await, None, "not a host's: local");
-    // An App pass: refused, not run on the controller's copy.
+    // N6: an App pass that isn't valid is the local route's (its own 403), not a 501.
     let w = json!({"workspace": "notes", "path": "a.md", "content": "x"}).to_string();
-    let a = relay_post_on(remote, "/cli/fs/write-file", "token=k2skn_abc", "owner", w.as_bytes()).await.expect("answered");
-    assert_eq!((a.status.as_str(), serde_json::from_str::<Value>(&a.body).unwrap()["code"].clone()), ("501 Not Implemented", json!("not_relayed")));
+    assert_eq!(relay_post_on(remote, "/cli/fs/write-file", "token=k2skn_abc", "owner", w.as_bytes()).await, None);
+    // N5: an upload chunk without its offset is refused, not taken as 0.
+    let chunk = json!({"upload_id": "u", "dir": "/ctl/work/notes", "filename": "f", "base64": "eA==", "is_last": true}).to_string();
+    let a = relay_post_on(remote, "/cli/fs/upload-chunk", "token=owner", "owner", chunk.as_bytes()).await.expect("answered");
+    assert_eq!(a.status, "400 Bad Request", "{}", a.body);
     drop(h1);
     wait_unlinked(remote, "h1").await;
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -593,8 +588,8 @@ async fn the_file_browser_and_git_panel_through_the_controller_see_the_hosts_dis
     assert_eq!((st, injected, ct.as_str()), (200, false, "application/json"));
     let (st, ..) = get(format!("{base}/cli/fs/read-dir?path={}&token=wrong", q(&ctl_ws))).await;
     assert_eq!(st, 404, "a bad token is the local route's to answer");
-    let (st, refused, ..) = get(format!("{base}/cli/fs/read-dir?path={}&token=k2skn_pass", q(&ctl_ws))).await;
-    assert_eq!((st, refused["code"].clone()), (501, json!("not_relayed")), "an App pass");
+    let (st, ..) = get(format!("{base}/cli/fs/read-dir?path={}&token=k2skn_pass", q(&ctl_ws))).await;
+    assert_eq!(st, 404, "a pass that isn't valid: the local route's to answer");
     let (st, local, ..) = get(format!("{base}/cli/fs/read-dir?path={}&token=ctl-owner", q(&ctl_root))).await;
     assert_eq!((st, local), (404, json!({"error": "local"})));
 
@@ -648,4 +643,130 @@ async fn the_file_browser_and_git_panel_through_the_controller_see_the_hosts_dis
     ))
     .await;
     assert_eq!(st, 200, "a renamed file's diff: {diff}");
+}
+
+// ── round 3 ────────────────────────────────────────────────────────────
+
+/// N1: `..` after a symlink is the parent of where the link points, as the
+/// kernel walks it: `ws/s -> <outside>/.ssh/inner`, `ws/d -> s/..`, so
+/// `ws/d/id_ed25519` is `<outside>/.ssh/id_ed25519`, refused for a read
+/// and for a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n1_dot_dot_after_a_symlink_is_the_links_parent_read_and_write_refused() {
+    let d = host_disk();
+    let ssh = d.root.parent().unwrap().join("home-k2/.ssh");
+    std::fs::create_dir_all(ssh.join("inner")).unwrap();
+    std::fs::write(ssh.join("id_ed25519"), "PRIVATE KEY").unwrap();
+    std::os::unix::fs::symlink(ssh.join("inner"), d.ws.join("s")).unwrap();
+    std::os::unix::fs::symlink("s/..", d.ws.join("d")).unwrap();
+    assert_eq!(resolve(&d.ws.join("d/id_ed25519")), Some(ssh.join("id_ed25519")), "where the kernel opens it");
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let q = format!("path={}", encode(&d.ws.join("d/id_ed25519").to_string_lossy()));
+    assert!(refused(served("GET", "/cli/fs/read-file", &q, None).await), "read");
+    let w = json!({"path": d.ws.join("d/authorized_keys"), "content": "ssh-ed25519 AAAA attacker"});
+    assert!(refused(served("POST", "/cli/fs/write-file", "", Some(w)).await), "write");
+    assert!(!ssh.join("authorized_keys").exists());
+    // A loop is refused, not followed for ever.
+    std::os::unix::fs::symlink("loop-b", d.ws.join("loop-a")).unwrap();
+    std::os::unix::fs::symlink("loop-a", d.ws.join("loop-b")).unwrap();
+    assert_eq!(resolve(&d.ws.join("loop-a/x")), None);
+}
+
+/// N3: a binding doesn't expire while its agent is placed on its host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n3_a_binding_lives_while_its_agent_is_placed() {
+    let roots = crate::agent_host::remote::HostRoots { default: pb("/h/work"), per_host: Default::default() };
+    let remote = RemoteHost::new().with_relay_roots(vec![pb("/ctl/work")], roots).with_relay_ttl(Duration::ZERO);
+    let (remote, url) = serve_controller(Box::leak(Box::new(remote))).await;
+    let mut h = host(&url, "h", &["k2.work_root=/h/work"]).await;
+    place(remote, &mut h, "notes", "/ctl/work/notes").await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(matches!(remote.workspace_route(&strs(&["/ctl/work/notes/a"])), WorkspaceRoute::Relay { .. }), "placed: kept past the TTL");
+    send(&mut h, &Frame::SessionGone { agent_id: "notes".into(), epoch: None, exit_code: Some(0) }).await;
+    within("the placement to go", async {
+        while remote.placement("notes").is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(remote.workspace_route(&strs(&["/ctl/work/notes/a"])), WorkspaceRoute::Local, "gone and past the TTL");
+}
+
+/// N7: a relayed git request works on its workspace's own repository: not
+/// one above it, not a git dir or `core.worktree` outside the work root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n7_git_never_reaches_past_the_work_root() {
+    let d = host_disk();
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let q = |p: &Path| format!("path={}", encode(&p.to_string_lossy()));
+    // No .git in the workspace: nothing is looked for above it.
+    assert!(refused(served("GET", "/cli/git/changes", &q(&d.ws), None).await));
+    // A gitfile pointing out of the work root.
+    let elsewhere = d.root.parent().unwrap().join("elsewhere-repo");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    k2_core::git::init_repo(&elsewhere.to_string_lossy()).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", elsewhere.join(".git").display())).unwrap();
+    assert!(refused(served("GET", "/cli/git/changes", &q(&d.ws), None).await));
+    // core.worktree out of the work root.
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    {
+        use std::io::Write;
+        let mut cfg = std::fs::OpenOptions::new().append(true).open(d.ws.join(".git/config")).unwrap();
+        writeln!(cfg, "[core]\n\tworktree = {}", elsewhere.display()).unwrap();
+    }
+    assert!(refused(served("GET", "/cli/git/changes", &q(&d.ws), None).await));
+}
+
+/// N7: with hooks off (an agent host), K2's own git commands run none.
+#[test]
+fn n7_k2s_git_commands_run_no_hooks_on_a_host() {
+    let dir = k2_core::test_env::unique_temp_path("relay-hooks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = dir.to_string_lossy().into_owned();
+    k2_core::git::init_repo(&repo).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(["-c", "user.name=lab", "-c", "user.email=lab@example.invalid"])
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    };
+    std::fs::write(dir.join("a.md"), "a").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "first"]);
+    let marker = dir.join("hook-ran");
+    k2_core::test_env::write_executable(&dir.join(".git/hooks/post-checkout"), &format!("#!/bin/sh\ntouch {}\n", marker.display()));
+    k2_core::git::set_no_hooks(true);
+    let made = k2_core::git::create_worktree(&repo, "relay-branch");
+    k2_core::git::set_no_hooks(false);
+    assert!(made.is_ok(), "{made:?}");
+    assert!(!marker.exists(), "the post-checkout hook didn't run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// N6: resolve-links answers per link: one outside the work root is
+/// `linkable: false` in its place, the others are resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n6_resolve_links_refuses_a_bad_link_not_the_batch() {
+    let d = host_disk();
+    let daemon = crate::test_harness::start("host-owner").await;
+    set_local_daemon(daemon.port, "host-owner");
+    std::fs::write(d.ws.join("a.md"), "a").unwrap();
+    let outside = d.root.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, d.ws.join("out-link")).unwrap();
+    k2_core::projects_ops::projects_create("notes", &d.ws.to_string_lossy(), None).unwrap();
+    let body = json!({"workspace": d.ws, "paths": ["a.md", "/etc/passwd", "~/x", "out-link/y"]});
+    let (st, v) = served("POST", "/cli/fs/resolve-links", "", Some(body)).await;
+    assert_eq!(st, "200 OK", "{v}");
+    let links = v["links"].as_array().unwrap();
+    assert_eq!(links.len(), 4, "{v}");
+    assert_eq!(links[0]["input"], "a.md");
+    assert_eq!(links[0]["linkable"], true, "{v}");
+    for (i, input) in [(1, "/etc/passwd"), (2, "~/x"), (3, "out-link/y")] {
+        assert_eq!((links[i]["input"].as_str(), links[i]["linkable"].as_bool()), (Some(input), Some(false)), "{v}");
+    }
 }

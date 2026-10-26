@@ -344,7 +344,8 @@ impl PlacementStore {
                 CREATE TABLE IF NOT EXISTS relay_space (
                     rel TEXT PRIMARY KEY,
                     host_id TEXT NOT NULL,
-                    touched_ms INTEGER NOT NULL
+                    touched_ms INTEGER NOT NULL,
+                    agent_id TEXT NOT NULL DEFAULT ''
                 );",
             )
             .map_err(|e| format!("host placement tables: {e}"))?;
@@ -487,21 +488,21 @@ impl PlacementStore {
     }
 
     /// Every remembered (agent, host, cwd), oldest first.
-    pub fn relay_space(&self, rel: &str, host_id: &str, touched_ms: i64) -> Result<(), String> {
+    pub fn relay_space(&self, rel: &str, host_id: &str, touched_ms: i64, agent_id: &str) -> Result<(), String> {
         let c = self.db.lock();
         c.execute(
-            "INSERT INTO relay_space (rel, host_id, touched_ms) VALUES (?1, ?2, ?3)
-             ON CONFLICT(rel) DO UPDATE SET host_id = ?2, touched_ms = ?3",
-            rusqlite::params![rel, host_id, touched_ms],
+            "INSERT INTO relay_space (rel, host_id, touched_ms, agent_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(rel) DO UPDATE SET host_id = ?2, touched_ms = ?3, agent_id = ?4",
+            rusqlite::params![rel, host_id, touched_ms, agent_id],
         )
         .map(drop)
         .map_err(|e| format!("relay space {rel}: {e}"))
     }
 
-    pub fn load_relay_spaces(&self) -> Result<Vec<(String, String, i64)>, String> {
+    pub fn load_relay_spaces(&self) -> Result<Vec<(String, String, i64, String)>, String> {
         let c = self.db.lock();
-        let mut st = c.prepare("SELECT rel, host_id, touched_ms FROM relay_space").map_err(|e| e.to_string())?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|e| e.to_string())?;
+        let mut st = c.prepare("SELECT rel, host_id, touched_ms, agent_id FROM relay_space").map_err(|e| e.to_string())?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
@@ -705,7 +706,8 @@ pub struct RemoteHost {
     /// this controller last spawned an agent in them on, and when (Unix
     /// ms). Only from the cwd this controller asked for, never a host's
     /// report.
-    relay_spaces: Mutex<HashMap<PathBuf, (String, i64)>>,
+    /// Each: (host, last touched in Unix ms, the agent).
+    relay_spaces: Mutex<HashMap<PathBuf, (String, i64, String)>>,
     relay_ttl: Duration,
 }
 
@@ -855,8 +857,8 @@ impl RemoteHost {
         match store.load_relay_spaces() {
             Ok(rows) => {
                 let mut spaces = self.relay_spaces.lock();
-                for (rel, host, ms) in rows {
-                    spaces.insert(PathBuf::from(rel), (host, ms));
+                for (rel, host, ms, agent) in rows {
+                    spaces.insert(PathBuf::from(rel), (host, ms, agent));
                 }
             }
             Err(e) => log_debug!("[hosts] relay spaces unreadable: {e}"),
@@ -1318,7 +1320,7 @@ impl RemoteHost {
                 }
                 drop(inner);
                 if let Some(c) = cwd.as_deref() {
-                    self.note_relay_space(&host_id, c);
+                    self.note_relay_space(&host_id, &agent_id, c);
                 }
                 log_debug!(
                     "[hosts] placed agent {agent_id} on host {host_id} epoch {} session {}",
@@ -1410,6 +1412,7 @@ impl RemoteHost {
         sid: SessionId,
         meta: SpawnedMeta,
     ) -> Arc<RemoteSession> {
+        self.touch_relay_spaces(agent_id);
         if let Some(s) = inner.sessions.get(agent_id).filter(|s| s.session_id == sid) {
             return Arc::clone(s);
         }
@@ -1752,7 +1755,7 @@ impl RemoteHost {
             label_source: label_source_from_wire(&spawned.label_source),
         };
         // fs-relay: the workspace the controller asked for is on this host.
-        self.note_relay_space(&host_id, Path::new(&req.cwd));
+        self.note_relay_space(&host_id, &agent_id, Path::new(&req.cwd));
         let session = {
             let mut inner = self.inner.lock();
             match inner.placements.get_mut(&agent_id) {
@@ -1860,19 +1863,54 @@ impl RemoteHost {
     /// fs-relay: bind the workspace an agent was asked to run in to its
     /// host: `cwd` as this controller asked for it (strictly under its work
     /// root), on a host on its own disk. Called at each spawn.
-    fn note_relay_space(&self, host_id: &str, cwd: &Path) {
+    fn note_relay_space(&self, host_id: &str, agent_id: &str, cwd: &Path) {
         let own_disk = self.inner.lock().host_labels.get(host_id).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some());
+        if !own_disk {
+            return;
+        }
         let Some(rel) = self.work_roots.iter().find_map(|c| cwd.strip_prefix(c).ok().filter(|r| !r.as_os_str().is_empty())) else {
+            // N4: the app's file browser and git panel won't see this
+            // workspace on the host (only paths under the work root route).
+            log_debug!(
+                "[hosts] WARNING: agent {agent_id} runs in {} on host {host_id} (its own disk), outside this controller's work root {:?}: its files are not relayed",
+                cwd.display(),
+                self.work_roots
+            );
             return;
         };
-        if !own_disk || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
             return;
         }
         let now = k2_core::delivery::now_ms();
-        self.relay_spaces.lock().insert(rel.to_path_buf(), (host_id.to_string(), now));
+        self.relay_spaces.lock().insert(rel.to_path_buf(), (host_id.to_string(), now, agent_id.to_string()));
         if let Some(store) = &self.store {
-            if let Err(e) = store.relay_space(&rel.to_string_lossy(), host_id, now) {
+            if let Err(e) = store.relay_space(&rel.to_string_lossy(), host_id, now, agent_id) {
                 log_debug!("[hosts] {e}");
+            }
+        }
+    }
+
+    /// fs-relay (N3): the workspaces `agent_id` was spawned in stay bound
+    /// while it runs: touched when its session is kept (a spawn, a resume)
+    /// and when its host adopts it again.
+    fn touch_relay_spaces(&self, agent_id: &str) {
+        let now = k2_core::delivery::now_ms();
+        let touched: Vec<(PathBuf, String)> = {
+            let mut spaces = self.relay_spaces.lock();
+            spaces
+                .iter_mut()
+                .filter(|(_, (_, _, a))| a == agent_id)
+                .map(|(rel, (h, t, _))| {
+                    *t = now;
+                    (rel.clone(), h.clone())
+                })
+                .collect()
+        };
+        if let Some(store) = &self.store {
+            for (rel, host) in touched {
+                if let Err(e) = store.relay_space(&rel.to_string_lossy(), &host, now, agent_id) {
+                    log_debug!("[hosts] {e}");
+                }
             }
         }
     }
@@ -1900,11 +1938,12 @@ impl RemoteHost {
         let spaces: Vec<(PathBuf, String)> = {
             let inner = self.inner.lock();
             let mut spaces = self.relay_spaces.lock();
-            spaces.retain(|_, (_, t)| now - *t <= ttl);
+            // N3: never while its agent is placed there.
+            spaces.retain(|_, (h, t, a)| now - *t <= ttl || inner.placements.get(a.as_str()).is_some_and(|p| &p.host_id == h));
             spaces
                 .iter()
-                .filter(|(_, (h, _))| inner.host_labels.get(h).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some()))
-                .map(|(rel, (h, _))| (rel.clone(), h.clone()))
+                .filter(|(_, (h, _, _))| inner.host_labels.get(h).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some()))
+                .map(|(rel, (h, _, _))| (rel.clone(), h.clone()))
                 .collect()
         };
         let inner = self.inner.lock();
@@ -2294,6 +2333,9 @@ impl RemoteHost {
             }
         }
         for (agent, d) in &out {
+            if matches!(d, AdoptDecision::Adopted) {
+                self.touch_relay_spaces(agent);
+            }
             log_debug!("[hosts] host {host_id}: agent {agent} {d:?}");
             let decision = match d {
                 AdoptDecision::Adopted => "adopted",

@@ -162,6 +162,10 @@ pub fn start(port: u16, token: &str) {
             Ok(cfg) => {
                 // fs-relay: a relayed request runs through this daemon's own route.
                 fs_relay::set_local_daemon(port, token);
+                // fs-relay (N7): K2's own git commands run no repository hooks here.
+                if home::work_root(env).is_some() {
+                    k2_core::git::set_no_hooks(true);
+                }
                 k2_core::log_debug!("[hosts] K2_ROLE=host: linking to {} as {}", cfg.attach_url, cfg.host_name);
                 byte_ring::set(Some(host_ptyd_ring));
                 tokio::spawn(link::run(cfg));
