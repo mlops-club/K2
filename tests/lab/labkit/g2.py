@@ -275,8 +275,13 @@ class Client:
         /cli/projects/activate {projectId} stamps its need clock, so the
         active reaper leaves its chat alone for the interaction window
         (without it a chat counts as aged out and is closed ~30-60 s on,
-        even mid-turn). Logged, never fatal (an older daemon: 404)."""
+        even mid-turn). Logged, never fatal (an older daemon: 404).
+        LAB_NO_ACTIVATE=1 skips it: agents nobody opens in the app, driven
+        only by messages (K2-d: a queued delivery must count as a need)."""
         pid = self.projects.get(cwd)
+        if pid and os.environ.get("LAB_NO_ACTIVATE") == "1":
+            self.log("LAB_NO_ACTIVATE=1: %s not activated (message-only agent)" % pid)
+            return
         if pid:
             st, text, _ = self.http("POST", "/cli/projects/activate", body={"projectId": pid})
             if st != 200:
