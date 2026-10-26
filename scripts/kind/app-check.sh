@@ -122,8 +122,9 @@ py=$!
 msg=""
 read -r -t 120 msg <&3 || true
 if [ "$msg" = scan ]; then
-    if [ "$p4" = 1 ]; then
-        # Any host: the controller places it (no shared volume ties it to one).
+    if [ "$p4" = 1 ] || [ "$dist" = 1 ]; then
+        # Any host: the controller places it (a pool or no shared volume
+        # means it need not be k2-host-0).
         for h in $(kc -n "$KIND_NS" get pods -l app.kubernetes.io/name=k2-host -o jsonpath='{.items[*].metadata.name}'); do
             agents=$(proc_scan "$h" "$KIND_AGENT_CONTAINER")
             [ -n "$agents" ] && { KIND_AGENT_POD=$h; break; }
