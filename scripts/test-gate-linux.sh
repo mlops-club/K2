@@ -8,6 +8,7 @@
 #   cargo build -p k2-ptyd --bin k2-ptyd   (k2-core's ptyd_backend execs it)
 #   cargo test -p k2-core   --no-fail-fast
 #   cargo test -p k2-daemon --no-fail-fast
+#   cargo test -p k2-ptyd   --no-fail-fast  (its own tests; ptyd changed in W3b)
 # under a clean `env -i` (HOME and TMPDIR = fresh temp dirs, no SHELL, no
 # K2_*/K2SO_* vars). As root it also runs the root-only ignored tests on the
 # allowlist (live nft check).
@@ -63,6 +64,11 @@ ALLOWLIST=(
   "cell_egress::tests::refused_localhost_port_is_refused_while_a_cell_table_exists" # root + nft; run below as root
   "sql::tests::real_pg::real_pg_guest_doors_smoke"                  # needs a throwaway Postgres 16; run below when K2_GATE_REALPG_* is set
   "sql::tests::real_pg::real_pg_search_path_pin_holds"              # needs a throwaway Postgres 16; run below when K2_GATE_REALPG_* is set
+  "compute_tenant_guard::tests::a_headless_daemons_cell_socket_is_closed_to_tenants" # root networking; run by hand in the Linux container with --ignored
+  "compute_tenant_guard::tests::a_tenant_users_loopback_client_is_found" # root + useradd (tenant users); run by hand in the Linux container with --ignored
+  "crates/k2-daemon/src/apps/mod.rs - apps::admission (line 42)"    # a ```text formula in the module doc, not code (rustdoc lists it as ignored)
+  "sql::pgmove::real_move::real_move_16_to_17_rollback_forget_and_refusals" # needs a throwaway systemd box with real Postgres 16 and 17 (REALMOVE=1)
+  "sql::tests::real_pg_majors::real_pg_majors_side_by_side"         # needs real Postgres majors 16 and 17 side by side (REALPG_MAJORS=1)
 )
 
 # Root-only ignored tests the gate RUNS explicitly when it is root:
@@ -169,7 +175,7 @@ drop_linked() {
   find "$WORK/target/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete 2>/dev/null
 }
 BATCH=${K2_GATE_BATCH:-0}
-for pkg in k2-core k2-daemon; do
+for pkg in k2-core k2-daemon k2-ptyd; do
   if [ "$BATCH" -gt 0 ] 2>/dev/null; then
     echo "gate: cargo test -p $pkg --no-fail-fast, in steps of $BATCH integration tests (K2_GATE_BATCH)"
     clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --lib --bins --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
@@ -248,7 +254,7 @@ COMPILE_ERR=$(grep -h -E '^error(\[E[0-9]+\])?: ' "$LOGS"/*.log | sort -u)
 
 echo
 echo "== ignored =="
-IGNORED=$(grep -h -E '^test .* \.\.\. ignored' "$LOGS"/k2-core*.log "$LOGS"/k2-daemon*.log \
+IGNORED=$(grep -h -E '^test .* \.\.\. ignored' "$LOGS"/k2-core*.log "$LOGS"/k2-daemon*.log "$LOGS"/k2-ptyd*.log \
   | sed -E 's/^test (.*) \.\.\. ignored.*$/\1/' | sort -u)
 echo "${IGNORED:-(none)}"
 UNEXPECTED=""
