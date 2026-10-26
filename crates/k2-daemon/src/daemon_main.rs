@@ -164,6 +164,7 @@ fn early_cli_dispatch(args: &[String]) -> Option<i32> {
                 print_daemon_help();
                 return Some(0);
             }
+            crate::hosts::health::FLAG => return Some(crate::hosts::health::run()),
             _ => {}
         }
     }
@@ -177,6 +178,7 @@ fn print_daemon_help() {
            k2-daemon                 Boot the daemon (normally via systemd/launchd)\n\
            k2-daemon --version | -V  Print version and exit (does NOT boot)\n\
            k2-daemon --help | -h     Show this help and exit\n\
+           k2-daemon --host-health   Exit 0 when this agent host is linked to its controller\n\
            k2-daemon --llm-worker <payload_path>\n\
                                      Internal: one-shot LLM worker child\n\
            k2-daemon --skin-gateway --listen 127.0.0.1:N --upstream http://127.0.0.1:DAEMON [--root DIR]\n\

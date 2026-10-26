@@ -16,6 +16,7 @@
 pub mod byte_ring;
 pub mod enroll;
 pub mod gate;
+pub mod health;
 pub mod hub;
 pub mod link;
 pub mod proto;

@@ -23,6 +23,7 @@ pub mod capabilities;
 pub mod daemon_port;
 pub mod runtime_role;
 pub mod hosts;
+pub mod k8s;
 pub mod provisioner;
 pub mod ptyd_status;
 pub mod browser_routes;
