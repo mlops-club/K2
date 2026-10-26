@@ -133,6 +133,7 @@ Usable = linked, not away, not draining. Away (phase A) = a host this process sa
 | `hosts::config_tests` | `K2_HOST_MAX_AWAKE=2` → `k2.max_awake=2`; an explicit label wins; a bad number is an error |
 | `scripts/lab/topology/three-process-placement.sh` (run `20261026T041154Z`) | **6/6 PASS**: kinds and limits from labels; notes pinned to the laptop (D5); bob sleeps and wakes back on host-1 although the laptop is emptier; both hosts full → 503 naming `K2_HOST_MAX_AWAKE`; laptop stopped → `away ["laptop"]`, notes' wake refused "pinned to host laptop, which is away", not placed on host-1 (which had room); laptop back → notes placed on it |
 | `scripts/lab/topology/two-process.sh` (run `20261026T041202Z`) | **13/13 PASS**: the 12 before, plus "every placed agent has its placement policy" (8 agents, portable, last host host-1) |
+| `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 162 binaries: **5253 passed, 0 failed**, 6 ignored |
 
 ## Status
 
