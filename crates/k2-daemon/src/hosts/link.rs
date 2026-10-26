@@ -714,9 +714,22 @@ pub(crate) async fn local_grid(
 /// `spawn.workspace` on this host: today's workspace spawn, then the
 /// metadata the controller caches.
 fn spawn_workspace(request: serde_json::Value) -> Result<super::proto::SpawnedSession, String> {
+    // K2-c: the gone rule's direct path names the message it puts on argv.
+    let delivery = request.get("deliveryId").and_then(|v| v.as_str()).map(str::to_string);
     let req: crate::spawn::SpawnWorkspaceSessionRequest =
         serde_json::from_value(request).map_err(|e| format!("spawn request: {e}"))?;
-    let out = crate::spawn::spawn_agent_session_v2_blocking(req)?;
+    let (out, already_delivered) = match delivery {
+        Some(msg_id) => crate::delivery_drain::host_launch_once(&msg_id, |with_prompt| {
+            let mut req = req.clone();
+            if !with_prompt {
+                req.launch_prompt = None;
+            }
+            let out = crate::spawn::spawn_agent_session_v2_blocking(req)?;
+            let attached = out.launch_prompt_attached;
+            Ok((out, attached))
+        })?,
+        None => (crate::spawn::spawn_agent_session_v2_blocking(req)?, false),
+    };
     let s = crate::agent_host::host()
         .find_session(&out.session_id)
         .ok_or_else(|| format!("session {} vanished right after its spawn", out.session_id))?;
@@ -730,6 +743,7 @@ fn spawn_workspace(request: serde_json::Value) -> Result<super::proto::SpawnedSe
         args: s.args(),
         label: s.label(),
         label_source: crate::agent_host::remote::label_source_wire(s.label_source()).to_string(),
+        already_delivered,
     })
 }
 

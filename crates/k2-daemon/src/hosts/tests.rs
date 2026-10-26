@@ -111,6 +111,14 @@ impl Controller {
     }
 }
 
+/// One real host link (`link::serve_once`) at a time: a host's link state
+/// is process-wide (`placed`, `resume_list`), so one test's relink would
+/// drop another's spawn still in flight as dead.
+fn real_link() -> std::sync::MutexGuard<'static, ()> {
+    static REAL_LINK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    REAL_LINK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(DEADLINE, f).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
@@ -396,6 +404,7 @@ async fn wait_grid_text(client: &mut Ws, needle: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_host_link_runs_the_agent_and_relays_its_pty() {
+    let _link = real_link();
     let home = TempHome::new();
     let _shim = AgentShim::install();
     let _ = k2_core::db::init_for_tests();
@@ -608,6 +617,7 @@ fn grid_text(msgs: &[Value]) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn app_session_token_spawns_and_attaches_through_the_controller() {
+    let _link = real_link();
     use k2_core::connect_users::{self, Role};
     let home = TempHome::new();
     let _shim = AgentShim::install();
@@ -771,6 +781,7 @@ async fn until_sync<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_host_drives_a_workspace_spawn_through_the_agent_host_trait() {
+    let _link = real_link();
     use crate::agent_host::{AgentHost, InjectResult};
     use k2_core::inject_flow::InjectAction;
     use k2_core::terminal::{AlacEvent, LabelSource};
@@ -906,6 +917,7 @@ async fn workspace_spawn_with_no_host_is_the_clear_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transcript_probe_asks_the_host_that_ran_the_project() {
+    let _link = real_link();
     let home = TempHome::new();
     let _shim = AgentShim::install();
     let _ = k2_core::db::init_for_tests();
@@ -1124,6 +1136,7 @@ async fn an_old_epoch_placement_is_released_and_a_missing_one_is_gone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_host_resumes_its_agents_after_a_link_drop() {
+    let _link = real_link();
     let home = TempHome::new();
     let _shim = AgentShim::install();
     let _ = k2_core::db::init_for_tests();
@@ -1320,6 +1333,7 @@ fn ring_append(session: &str, bytes: &[u8]) {
 /// ring is the test's (the host's byte-ring source).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reconnecting_byte_client_gets_exactly_the_bytes_it_missed() {
+    let _link = real_link();
     super::byte_ring::set(Some(test_ring));
     let session = uuid::Uuid::new_v4().to_string();
     ring_append(&session, b"\x1b[2Jbanner\r\n> ");
@@ -1375,6 +1389,7 @@ async fn a_reconnecting_byte_client_gets_exactly_the_bytes_it_missed() {
 /// gap named, never skipping it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ring_overrun_ends_the_byte_stream_instead_of_skipping() {
+    let _link = real_link();
     super::byte_ring::set(Some(test_ring));
     let session = uuid::Uuid::new_v4().to_string();
     ring_append(&session, b"0123456789");
@@ -1710,6 +1725,9 @@ async fn a_need_waits_for_a_known_host_to_link_instead_of_failing() {
     drop(h); // as across a controller restart: known, not linked yet
     c.wait_hosts(0).await;
     let spawn = tokio::spawn(async move { remote.spawn(br#"{"agent_name":"early","cwd":"/w/early","command":"claude"}"#).await });
+    // It waits (not refused, not placed) before the host is back.
+    waiting_for_a_host(remote).await;
+    assert!(!spawn.is_finished(), "waiting, not answered");
     // The host links back: the waiting spawn lands on it.
     let mut h = fake_host(&c, "h-1").await;
     let req = match recv(&mut h).await {
@@ -1723,6 +1741,35 @@ async fn a_need_waits_for_a_known_host_to_link_instead_of_failing() {
     send(&mut h, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": session, "reused": false}).to_string() }).await;
     let (st, body) = within("the waiting spawn", spawn).await.unwrap();
     assert_eq!(st, "200 OK", "{body}");
+}
+
+/// Until a need waits on `remote` for a host's hello.
+async fn waiting_for_a_host(remote: &'static RemoteHost) {
+    within("a need waiting for a host", async {
+        while remote.hello_waiters() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_need_no_host_links_back_for_is_a_503_once_the_grace_is_over() {
+    let grace = Duration::from_millis(300);
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new().with_link_grace(grace)));
+    let c = Controller::start_on(remote).await;
+    let h = fake_host(&c, "h-1").await;
+    c.wait_hosts(1).await;
+    drop(h);
+    c.wait_hosts(0).await;
+    let started = std::time::Instant::now();
+    let spawn = tokio::spawn(async move { remote.spawn(br#"{"agent_name":"never","cwd":"/w/never","command":"claude"}"#).await });
+    waiting_for_a_host(remote).await;
+    let (st, body) = within("the grace running out", spawn).await.unwrap();
+    assert_eq!(st, "503 Service Unavailable", "{body}");
+    assert!(body.contains("no agent host"), "{body}");
+    assert!(started.elapsed() >= grace, "it waited the grace out first");
+    assert_eq!(remote.hello_waiters(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

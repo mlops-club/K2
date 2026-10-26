@@ -1695,6 +1695,30 @@ pub(crate) fn deliver_for_controller(recipient: &str, from: &str, body: &serde_j
     }
 }
 
+/// The `[from …]` label a host delivery stamps: the body's `label`, else
+/// the sender's name.
+fn delivery_label(from: &str, body: &serde_json::Value) -> String {
+    body.get("label")
+        .and_then(|v| v.as_str())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| from.split_once(':').map(|(_, n)| n).unwrap_or(from).to_string())
+}
+
+/// The exact prompt [`deliver_to_local_agent`] injects for a `kind=msg`
+/// body, as the agent's transcript records it; `None` for anything else.
+pub(crate) fn injected_text(from: &str, body: &serde_json::Value) -> Option<String> {
+    let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !matches!(field("kind").as_str(), "msg" | "") {
+        return None;
+    }
+    let text = field("text");
+    if text.is_empty() {
+        return None;
+    }
+    format_message_user_with_command(&delivery_label(from, body), &text, &field("command")).ok()
+}
+
 /// K2_ROLE=host: deliver a message the controller sent for `agent_id`, an
 /// agent running on this host (`crate::delivery_drain`). `kind: "msg"`
 /// injects `[from <label>] text` into its live session like `k2 msg`;
@@ -1711,9 +1735,7 @@ pub(crate) fn deliver_to_local_agent(
     let Some(session) = crate::v2_session_map::lookup_by_agent_name(agent_id) else {
         return LocalDelivery::Retry(format!("no live session for agent {agent_id} on this host"));
     };
-    let label = Some(field("label")).filter(|l| !l.is_empty()).unwrap_or_else(|| {
-        from.split_once(':').map(|(_, n)| n).unwrap_or(from).to_string()
-    });
+    let label = delivery_label(from, body);
     match field("kind").as_str() {
         "inbox" => {
             let Some(cwd) = session.cwd.clone() else {
@@ -1744,6 +1766,11 @@ pub(crate) fn deliver_to_local_agent(
             let sid = session.session_id.to_string();
             match send_message_to_session_with_command(&sid, &label, &text, &field("command")) {
                 Ok(r) if r.success => LocalDelivery::Delivered,
+                // The child died during the inject flow: the paste and the
+                // submit may have reached it (K2-c), so not a plain retry.
+                Ok(r) if r.reason.as_deref() == Some(MsgReason::PtyDied.code()) => {
+                    LocalDelivery::Interrupted(MsgReason::PtyDied.code().into())
+                }
                 Ok(r) => LocalDelivery::Retry(r.reason.unwrap_or_else(|| "not delivered".into())),
                 Err(e) => LocalDelivery::Rejected(e),
             }
@@ -2265,8 +2292,8 @@ fn wake_sidecar_and_fire(
             return MsgResponse::fail(MsgReason::SpawnFailed);
         }
     };
-    if outcome.launch_prompt_attached && !outcome.reused {
-        log_debug!("[msg/wake] launch-param attached; skipping post-spawn inject");
+    if outcome.already_delivered || (outcome.launch_prompt_attached && !outcome.reused) {
+        log_debug!("[msg/wake] launch-param attached (or delivered before); skipping post-spawn inject");
         crate::active_reaper::note_workspace_need(project_id);
         return MsgResponse::ok_woke(
             target_id,
@@ -2765,9 +2792,9 @@ fn wake_and_fire(
     // half-built): detection needs a live-grok validation pass; the
     // permission GATE (rule a, the dangerous one) is enforced above in
     // the injection chokepoint.
-    if outcome.launch_prompt_attached && !outcome.reused {
+    if outcome.already_delivered || (outcome.launch_prompt_attached && !outcome.reused) {
         let wake_ms = wake_start.elapsed().as_millis() as u64;
-        log_debug!("[msg/wake] launch-param attached; skipping post-spawn inject");
+        log_debug!("[msg/wake] launch-param attached (or delivered before); skipping post-spawn inject");
         crate::active_reaper::note_workspace_need(project_id);
         return MsgResponse::ok_woke(target_id, branch, wake_ms);
     }
@@ -2862,6 +2889,20 @@ mod tests {
         assert_eq!((r.success, r.reason.as_deref()), (false, Some("dormant_no_wake")));
         let r = failed("rejected by the controller: rejected by host h: no live session");
         assert_eq!(r.reason.as_deref(), Some("delivery_failed: rejected by the controller: rejected by host h: no live session"));
+    }
+
+    /// What a host delivery injects, as its transcript check matches it:
+    /// the body's label or the sender's name, a composer command up front;
+    /// nothing for an inbox item or a body without text.
+    #[test]
+    fn injected_text_is_the_prompt_a_host_delivery_types() {
+        let it = |from: &str, body: serde_json::Value| injected_text(from, &body);
+        assert_eq!(it("agent:alice", serde_json::json!({"kind": "msg", "text": "hi"})).as_deref(), Some("[from alice] hi"));
+        assert_eq!(it("agent:alice", serde_json::json!({"text": "hi", "label": "s3-alice"})).as_deref(), Some("[from s3-alice] hi"));
+        assert_eq!(it("agent:alice", serde_json::json!({"text": "hi", "command": "/compact"})).as_deref(), Some("/compact [from alice] hi"));
+        assert_eq!(it("agent:alice", serde_json::json!({"kind": "inbox", "title": "t"})), None);
+        assert_eq!(it("agent:alice", serde_json::json!({"kind": "msg", "text": ""})), None);
+        assert_eq!(it("agent:alice", serde_json::json!({"text": "hi", "command": "/exit"})), None, "never injected");
     }
 
     // ── Bytes formatter ──────────────────────────────────────────────

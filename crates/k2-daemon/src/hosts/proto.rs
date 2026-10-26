@@ -205,6 +205,10 @@ pub struct SpawnedSession {
     pub label: String,
     #[serde(default)]
     pub label_source: String,
+    /// K2-c: the spawn carried a message (`deliveryId`) this host's seen
+    /// table says the agent already has; it was left off argv.
+    #[serde(default)]
+    pub already_delivered: bool,
 }
 
 /// How a host answered one `deliver`.

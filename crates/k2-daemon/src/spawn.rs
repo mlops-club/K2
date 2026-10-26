@@ -153,6 +153,10 @@ pub struct SpawnWorkspaceSessionOutcome {
     /// False on reuse (session already live — caller injects) and when
     /// the provider/ARG_MAX path cannot attach (caller paste-falls-back).
     pub launch_prompt_attached: bool,
+    /// K2-c (controller): the host's seen table says the agent already has
+    /// the message this spawn was to carry, so the host left it off argv;
+    /// the caller must not deliver it again.
+    pub already_delivered: bool,
 }
 
 /// Kessel spawn helper. Takes a `SpawnWorkspaceSessionRequest`
@@ -199,6 +203,17 @@ pub(crate) fn canonical_key_for_request(req: &SpawnWorkspaceSessionRequest) -> S
     }
 }
 
+#[cfg(test)]
+pub(crate) type ControllerSpawn = fn(&SpawnWorkspaceSessionRequest) -> Result<SpawnWorkspaceSessionOutcome, String>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's spawns answer as a controller's would (the
+    /// runtime role is process-wide), so a route's mapping of a
+    /// controller's refusal is tested through the route itself.
+    pub(crate) static CONTROLLER_SPAWN: std::cell::RefCell<Option<ControllerSpawn>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Find-or-spawn under `canonical_key`. Caller MUST hold
 /// [`canonical_spawn_lock`] for that key (R17). Public helper takes
 /// the lock; `ensure_pinned_chat` forceRespawn holds it across kill +
@@ -209,6 +224,10 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
 ) -> Result<SpawnWorkspaceSessionOutcome, String> {
     if req.agent_name.is_empty() {
         return Err("agent_name required".into());
+    }
+    #[cfg(test)]
+    if let Some(answer) = CONTROLLER_SPAWN.with(|c| c.borrow().clone()) {
+        return answer(&req);
     }
     if crate::runtime_role::current() == crate::runtime_role::Role::Controller {
         return spawn_on_agent_host(req);
@@ -265,6 +284,7 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
                 pending_drained: 0,
                 reused: true,
                 launch_prompt_attached: false,
+                already_delivered: false,
             });
         }
         // Stale (child exited) OR program mismatch (shell / wrong
@@ -540,6 +560,7 @@ pub(crate) fn spawn_agent_session_v2_blocking_inner(
         pending_drained,
         reused: false,
         launch_prompt_attached: attached,
+        already_delivered: false,
     })
 }
 
@@ -581,6 +602,7 @@ fn spawn_on_agent_host(mut req: SpawnWorkspaceSessionRequest) -> Result<SpawnWor
         pending_drained,
         reused: spawned.reused,
         launch_prompt_attached: spawned.launch_prompt_attached,
+        already_delivered: spawned.already_delivered,
     })
 }
 
