@@ -72,6 +72,25 @@ fn seen_answers_a_redelivery_and_is_bounded() {
 }
 
 #[test]
+fn recent_delivered_lists_what_may_have_reached_the_agent_and_forget_drops_a_write_ahead() {
+    let c = db();
+    seen::record(&c, "old", "delivered", 10, 100).unwrap();
+    seen::record(&c, "d1", "delivered", 100, 100).unwrap();
+    seen::record(&c, "w1", "delivering", 110, 100).unwrap();
+    seen::record(&c, "r1", "rejected", 120, 100).unwrap();
+    seen::record(&c, "w2", "delivering", 130, 100).unwrap();
+    // Newest first; rejected and older than `since` left out; bounded.
+    assert_eq!(
+        seen::recent_delivered(&c, 50, 10).unwrap(),
+        vec![("w2".into(), "delivering".into()), ("w1".into(), "delivering".into()), ("d1".into(), "delivered".into())]
+    );
+    assert_eq!(seen::recent_delivered(&c, 50, 1).unwrap().len(), 1);
+    // A write-ahead whose delivery didn't happen is forgotten: a resend delivers it.
+    seen::forget(&c, "w2").unwrap();
+    assert_eq!(seen::status(&c, "w2").unwrap(), None);
+}
+
+#[test]
 fn only_the_head_of_each_pair_is_due_so_pairs_stay_in_order() {
     let c = db();
     outbox::enqueue(&c, Hop::Down, &msg("a1", "agent:alice", "bob"), 1).unwrap();

@@ -339,6 +339,9 @@ pub fn handle_agents_launch(
         label: None,
     }) {
         Ok(o) => o,
+        Err(e) if crate::agent_host::remote::is_host_unavailable(&e) => {
+            return CliResponse::unavailable(format!("spawn failed: {e}"))
+        }
         Err(e) => return CliResponse::bad_request(format!("spawn failed: {e}")),
     };
 
@@ -465,6 +468,9 @@ pub fn handle_agents_delegate(
         label: None,
     }) {
         Ok(o) => o,
+        Err(e) if crate::agent_host::remote::is_host_unavailable(&e) => {
+            return CliResponse::unavailable(format!("spawn failed: {e}"))
+        }
         Err(e) => return CliResponse::bad_request(format!("spawn failed: {e}")),
     };
 

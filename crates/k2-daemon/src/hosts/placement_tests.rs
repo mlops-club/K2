@@ -419,3 +419,86 @@ async fn a_message_for_an_agent_on_a_lost_host_keeps_waiting_and_lands_when_it_i
     }
     assert_eq!(wait_final(&outbox, &id).await.state, State::Delivered);
 }
+
+/// K2-b (G2 chaos, seed 4117 S8 r5): the controller sent the message, the
+/// host was SIGKILLed before its ack, and came back without the agent (its
+/// session ended). The host's report on relink marks the row delivered
+/// before the gone rule can fail it (or resend it: a duplicate).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_whose_ack_died_with_the_host_is_reconciled_on_relink_not_failed() {
+    use crate::delivery_drain::{start_controller, Direct};
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| panic!("a delivered message never takes the direct path again")),
+        },
+    );
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "erin", "/w/erin", &sid(1)).await;
+    let id = outbox.send("agent:alice", "erin", json!({"kind": "msg", "text": "hello", "wake": false})).unwrap();
+    match recv(&mut a).await {
+        Frame::Deliver { msg_id, .. } => assert_eq!(msg_id, id),
+        other => panic!("expected the deliver, got {other:?}"),
+    }
+    drop(a); // SIGKILL: the agent got it, the ack never left
+    // Back without erin (her CLI died with the host): her session ended.
+    let mut a = fake_host(&url, "host-a").await;
+    within("erin gone", async {
+        while remote.session_ended_at("erin").is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // What the relinked host reports once erin's transcript shows the prompt.
+    send(
+        &mut a,
+        &Frame::DeliverAck {
+            msg_id: id.clone(),
+            status: crate::hosts::proto::DeliverStatus::Delivered,
+            reason: Some("found in the agent's transcript after a host restart".into()),
+        },
+    )
+    .await;
+    // The gone rule would act at once now; the row is already final.
+    outbox.set_gone_grace(Duration::ZERO);
+    let r = wait_final(&outbox, &id).await;
+    assert_eq!((r.state, r.reason), (State::Delivered, None));
+}
+
+/// K2-b's third branch: the host can't tell (the agent's home is gone).
+/// The row ends failed with `delivery_uncertain`, visibly, not delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uncertain_delivery_fails_visibly_with_delivery_uncertain() {
+    use crate::delivery_drain::{start_controller, Direct, UNCERTAIN_REASON};
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| panic!("an uncertain delivery is never resent")),
+        },
+    );
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "fred", "/w/fred", &sid(1)).await;
+    let id = outbox.send("agent:alice", "fred", json!({"kind": "msg", "text": "hello"})).unwrap();
+    assert!(matches!(recv(&mut a).await, Frame::Deliver { .. }));
+    drop(a);
+    let mut a = fake_host(&url, "host-a").await;
+    let why = format!("{UNCERTAIN_REASON}: interrupted by a host restart and the agent's transcript can't tell (home gone)");
+    send(&mut a, &Frame::DeliverAck { msg_id: id.clone(), status: crate::hosts::proto::DeliverStatus::Rejected, reason: Some(why) }).await;
+    let r = wait_final(&outbox, &id).await;
+    assert_eq!(r.state, State::Failed);
+    assert!(r.reason.as_deref().unwrap_or("").starts_with(UNCERTAIN_REASON), "{:?}", r.reason);
+}

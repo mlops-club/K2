@@ -899,7 +899,8 @@ async fn workspace_spawn_with_no_host_is_the_clear_error() {
     let remote = c.remote;
     let req = crate::spawn::SpawnWorkspaceSessionRequest { agent_name: "x".into(), canonical_key: Some("x".into()), ..Default::default() };
     let err = tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req).map(|_| ())).await.unwrap().unwrap_err();
-    assert_eq!(err, NO_HOSTS);
+    // The same message, marked retryable (K2-a: routes answer 503).
+    assert_eq!(err, format!("{}{NO_HOSTS}", crate::agent_host::remote::HOST_UNAVAILABLE));
     assert!(c.remote.placements().is_empty());
 }
 
@@ -1696,4 +1697,61 @@ async fn a_host_that_says_it_is_draining_gets_no_new_agent() {
     // A new agent goes to h-b, never to the draining h-a.
     place(&c, &mut b, "fresh", &uuid::Uuid::new_v4().to_string()).await;
     assert_eq!(c.remote.placement("fresh").unwrap().host_id, "h-b");
+}
+
+// ── K2-a (G2 chaos): "no host linked yet" is transient ───────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_need_waits_for_a_known_host_to_link_instead_of_failing() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new().with_link_grace(DEADLINE)));
+    let c = Controller::start_on(remote).await;
+    let h = fake_host(&c, "h-1").await;
+    c.wait_hosts(1).await;
+    drop(h); // as across a controller restart: known, not linked yet
+    c.wait_hosts(0).await;
+    let spawn = tokio::spawn(async move { remote.spawn(br#"{"agent_name":"early","cwd":"/w/early","command":"claude"}"#).await });
+    // The host links back: the waiting spawn lands on it.
+    let mut h = fake_host(&c, "h-1").await;
+    let req = match recv(&mut h).await {
+        Frame::Spawn { req, agent_id, .. } => {
+            assert_eq!(agent_id, "early");
+            req
+        }
+        other => panic!("expected the waiting spawn, got {other:?}"),
+    };
+    let session = uuid::Uuid::new_v4().to_string();
+    send(&mut h, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": session, "reused": false}).to_string() }).await;
+    let (st, body) = within("the waiting spawn", spawn).await.unwrap();
+    assert_eq!(st, "200 OK", "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn past_the_link_grace_no_host_is_a_retryable_503_on_every_path() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new().with_link_grace(Duration::ZERO)));
+    let c = Controller::start_on(remote).await;
+    let h = fake_host(&c, "h-1").await;
+    c.wait_hosts(1).await;
+    drop(h);
+    c.wait_hosts(0).await;
+    let (st, body) = c.remote.spawn(br#"{"agent_name":"late","command":"claude"}"#).await;
+    assert_eq!(st, "503 Service Unavailable", "{body}");
+    assert!(body.contains("no agent host"), "{body}");
+    // The workspace spawn (ensure-pinned-chat, wake, heartbeat) says the same, marked retryable.
+    let req = crate::spawn::SpawnWorkspaceSessionRequest {
+        agent_name: "late".into(),
+        cwd: "/w/late".into(),
+        canonical_key: Some("late".into()),
+        ..Default::default()
+    };
+    let err = tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req).err()).await.unwrap().expect("refused");
+    assert!(crate::agent_host::remote::is_host_unavailable(&err), "{err}");
+    assert!(err.contains("no agent host"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_controller_that_never_knew_a_host_refuses_at_once() {
+    // A long grace: if it waited, the test's deadline would trip.
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new().with_link_grace(Duration::from_secs(600))));
+    let (st, body) = within("an immediate answer", remote.spawn(br#"{"agent_name":"x","command":"claude"}"#)).await;
+    assert_eq!(st, "503 Service Unavailable", "{body}");
 }

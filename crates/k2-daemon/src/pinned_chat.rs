@@ -556,6 +556,11 @@ pub fn handle_ensure_pinned_chat(body: &[u8]) -> HandlerResult {
             status: "200 OK",
             body: out.to_json().to_string(),
         },
+        // No host can take it right now (controller): retryable, as the v2 spawn answers.
+        Err(e) if crate::agent_host::remote::is_host_unavailable(&e) => HandlerResult {
+            status: "503 Service Unavailable",
+            body: serde_json::json!({ "error": e }).to_string(),
+        },
         Err(e) => HandlerResult {
             status: "400 Bad Request",
             body: serde_json::json!({ "error": e }).to_string(),

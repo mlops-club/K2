@@ -566,3 +566,147 @@ async fn a_workspace_address_queued_before_its_agent_is_placed_is_delivered_once
     send(&mut b, &host_b.receive(&m, 1).expect("an ack")).await;
     c.wait_state(&id, State::Delivered).await;
 }
+
+/// Transcripts in a temp dir: conversation `conv-<agent>` is the file
+/// `<dir>/conv-<agent>.jsonl`; a missing file is an agent home that's gone.
+struct TempTranscripts {
+    dir: std::path::PathBuf,
+}
+
+impl TempTranscripts {
+    fn path(&self, agent: &str) -> std::path::PathBuf {
+        self.dir.join(format!("conv-{agent}.jsonl"))
+    }
+    /// The agent's CLI recorded `text` as a prompt.
+    fn prompt(&self, agent: &str, text: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.path(agent)).unwrap();
+        writeln!(f, "{}", json!({"type": "user", "message": {"role": "user", "content": text}})).unwrap();
+    }
+}
+
+impl Transcripts for TempTranscripts {
+    fn mark(&self, agent_id: &str) -> TranscriptMark {
+        TranscriptMark {
+            provider: Some("claude".into()),
+            conversation: Some(format!("conv-{agent_id}")),
+            cwd: Some("/w".into()),
+            offset: std::fs::metadata(self.path(agent_id)).map(|m| m.len()).unwrap_or(0),
+        }
+    }
+    fn holds(&self, w: &k2_core::delivery::seen::WriteAhead) -> TranscriptCheck {
+        let path = self.dir.join(format!("{}.jsonl", w.conversation.as_deref().unwrap_or("")));
+        if !path.exists() {
+            return TranscriptCheck::Unreadable("home gone".into());
+        }
+        scan_transcript(&path, w.offset, w.needle.as_deref().unwrap_or(""))
+    }
+}
+
+/// K2-b (G2 chaos, seed 4117 S8 r5): a host killed between the inject and
+/// its ack. The id and the transcript's place are written ahead of the
+/// inject; after the restart the transcript decides, three ways.
+#[test]
+fn an_interrupted_delivery_is_settled_from_the_agents_transcript() {
+    let path = k2_core::test_env::unique_temp_path("delivery-host-wa.db");
+    let dir = k2_core::test_env::unique_temp_path("delivery-transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = Arc::new(TempTranscripts { dir: dir.clone() });
+    let open = || -> Db { Arc::new(ReentrantMutex::new(Connection::open(&path).unwrap())) };
+    let msg = |id: &str, to: &str, text: &str| Incoming { msg_id: id.into(), agent_id: to.into(), from: "agent:alice".into(), body: json!({"kind": "msg", "text": text}) };
+    // Each agent has a transcript with an older prompt (the same text, before the offset: it doesn't count).
+    for a in ["got", "lost", "gone"] {
+        t.prompt(a, "hello");
+    }
+    // Before the restart: each delivery is killed mid-inject. "got"'s CLI
+    // recorded the prompt first; "lost"'s didn't; "gone"'s home goes away.
+    {
+        let t2 = Arc::clone(&t);
+        let h = HostSide::new(
+            open(),
+            FAST,
+            Box::new(move |m: &Incoming| {
+                if m.agent_id == "got" {
+                    t2.prompt("got", "hello");
+                }
+                panic!("SIGKILL mid-inject");
+            }),
+        )
+        .with_transcripts(Arc::clone(&t) as Arc<dyn Transcripts>);
+        for (id, to) in [("m_got", "got"), ("m_lost", "lost"), ("m_gone", "gone"), ("m_rep", "got")] {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.receive(&msg(id, to, "hello"), k2_core::delivery::now_ms())));
+            assert!(r.is_err(), "killed");
+            assert_eq!(k2_core::delivery::seen::status(&open().lock(), id).unwrap().as_deref(), Some(DELIVERING), "written ahead");
+        }
+    }
+    std::fs::remove_file(t.path("gone")).unwrap();
+
+    // Restarted.
+    let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let c = Arc::clone(&calls);
+    let h = HostSide::new(
+        open(),
+        FAST,
+        Box::new(move |m: &Incoming| {
+            c.lock().push(m.msg_id.clone());
+            LocalDelivery::Delivered
+        }),
+    )
+    .with_transcripts(Arc::clone(&t) as Arc<dyn Transcripts>);
+    let reason = |f: Option<Frame>| match f {
+        Some(Frame::DeliverAck { status, reason, .. }) => (status, reason.unwrap_or_default()),
+        other => panic!("expected an ack, got {other:?}"),
+    };
+    // 1. The transcript holds it: delivered, not injected again.
+    let (st, why) = reason(h.receive(&msg("m_got", "got", "hello"), k2_core::delivery::now_ms()));
+    assert_eq!(st, DeliverStatus::Delivered);
+    assert!(why.contains("found in the agent's transcript"), "{why}");
+    // 2. It lacks it: the inject never happened; delivered now, once.
+    assert_eq!(reason(h.receive(&msg("m_lost", "lost", "hello"), k2_core::delivery::now_ms())), (DeliverStatus::Delivered, String::new()));
+    // 3. It can't be read: uncertain, a visible failure; not injected.
+    let (st, why) = reason(h.receive(&msg("m_gone", "gone", "hello"), k2_core::delivery::now_ms()));
+    assert_eq!(st, DeliverStatus::Rejected);
+    assert!(why.starts_with(UNCERTAIN_REASON), "{why}");
+    assert_eq!(*calls.lock(), ["m_lost"], "only the one that never arrived is delivered");
+    // The same rules when the host links (m_rep was never resent): reported delivered.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    h.linked(tx);
+    let mut reported = Vec::new();
+    while let Ok(Frame::DeliverAck { msg_id, status, reason }) = rx.try_recv() {
+        reported.push((msg_id, status, reason.unwrap_or_default()));
+    }
+    let find = |id: &str| reported.iter().find(|(m, _, _)| m == id).cloned();
+    assert!(matches!(find("m_rep"), Some((_, DeliverStatus::Delivered, w)) if w.contains("found in the agent's transcript")), "{reported:?}");
+    assert!(matches!(find("m_gone"), Some((_, DeliverStatus::Rejected, w)) if w.starts_with(UNCERTAIN_REASON)), "{reported:?}");
+    assert!(matches!(find("m_got"), Some((_, DeliverStatus::Delivered, _))), "{reported:?}");
+    drop(h);
+    std::fs::remove_file(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A link report for an interrupted delivery whose transcript lacks it sends
+/// nothing and forgets it: the controller delivers it again, normally.
+#[test]
+fn an_interrupted_delivery_the_transcript_lacks_is_left_to_the_controller_on_link() {
+    let path = k2_core::test_env::unique_temp_path("delivery-host-lacks.db");
+    let dir = k2_core::test_env::unique_temp_path("delivery-transcripts-lacks");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = Arc::new(TempTranscripts { dir: dir.clone() });
+    t.prompt("bob", "earlier");
+    let open = || -> Db { Arc::new(ReentrantMutex::new(Connection::open(&path).unwrap())) };
+    {
+        let h = HostSide::new(open(), FAST, Box::new(|_: &Incoming| panic!("SIGKILL mid-inject")))
+            .with_transcripts(Arc::clone(&t) as Arc<dyn Transcripts>);
+        let m = Incoming { msg_id: "m_x".into(), agent_id: "bob".into(), from: "agent:alice".into(), body: json!({"kind": "msg", "text": "new"}) };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.receive(&m, k2_core::delivery::now_ms()))).is_err());
+    }
+    let h = HostSide::new(open(), FAST, Box::new(|_: &Incoming| LocalDelivery::Delivered))
+        .with_transcripts(Arc::clone(&t) as Arc<dyn Transcripts>);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    h.linked(tx);
+    assert!(rx.try_recv().is_err(), "nothing reported");
+    assert_eq!(k2_core::delivery::seen::status(&open().lock(), "m_x").unwrap(), None, "forgotten: a resend delivers it");
+    drop(h);
+    std::fs::remove_file(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -87,6 +87,16 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             msg_id   TEXT PRIMARY KEY,
             seen_ms  INTEGER NOT NULL,
             status   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS delivery_writeahead (
+            msg_id        TEXT PRIMARY KEY,
+            agent_id      TEXT NOT NULL,
+            provider      TEXT,
+            conversation  TEXT,
+            cwd           TEXT,
+            offset_bytes  INTEGER NOT NULL DEFAULT 0,
+            needle        TEXT,
+            started_ms    INTEGER NOT NULL
         );",
     )
 }

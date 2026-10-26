@@ -425,7 +425,12 @@ impl Controller {
         let changed = match status {
             DeliverStatus::Delivered | DeliverStatus::Duplicate => outbox::mark_delivered(&conn, Hop::Down, msg_id, now),
             DeliverStatus::Rejected => {
-                let why = format!("rejected by host {host_id}: {}", reason.unwrap_or("no reason given"));
+                let why = match reason {
+                    // The host can't tell whether the agent got it (I2: a
+                    // visible failure, never silently delivered).
+                    Some(r) if r.starts_with(UNCERTAIN_REASON) => format!("{r} (host {host_id})"),
+                    _ => format!("rejected by host {host_id}: {}", reason.unwrap_or("no reason given")),
+                };
                 let r = outbox::mark_failed(&conn, Hop::Down, msg_id, &why, now);
                 if let Ok(Some(row)) = outbox::get(&conn, Hop::Down, msg_id) {
                     report_failed(Hop::Down, &[row]);
@@ -643,6 +648,131 @@ pub enum Accepted {
 
 /// The host's half: its outbox for messages going up, and the receiving
 /// side for messages coming down.
+/// A host's write-ahead `seen` status: set before the inject, replaced by
+/// `delivered` or `rejected` after it, dropped when nothing was delivered.
+pub const DELIVERING: &str = "delivering";
+/// A delivery a restart interrupted whose transcript couldn't tell.
+pub const UNCERTAIN: &str = "uncertain";
+/// The reason a controller fails such a row with (I2: loud, never silent).
+pub const UNCERTAIN_REASON: &str = "delivery_uncertain";
+const REPORTED: &str = "reported again when the host linked";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Settled {
+    Delivered(String),
+    NotDelivered,
+    Uncertain(String),
+}
+
+/// Where an agent's transcript stands before an inject.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptMark {
+    pub provider: Option<String>,
+    pub conversation: Option<String>,
+    pub cwd: Option<String>,
+    /// Its length now (0 when it doesn't exist yet).
+    pub offset: u64,
+}
+
+/// What the transcript says about a written-ahead delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptCheck {
+    /// It holds the message after the write-ahead's offset.
+    Holds,
+    /// It is there and readable, and doesn't.
+    Lacks,
+    /// It can't be read (the agent's home is gone, no conversation known).
+    Unreadable(String),
+}
+
+/// The agents' transcripts, as delivery settles an interrupted inject.
+pub trait Transcripts: Send + Sync {
+    fn mark(&self, agent_id: &str) -> TranscriptMark;
+    fn holds(&self, w: &k2_core::delivery::seen::WriteAhead) -> TranscriptCheck;
+}
+
+/// The text a `kind=msg` body shows in the agent's transcript.
+fn needle(body: &Value) -> Option<String> {
+    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("msg");
+    if kind != "msg" {
+        return None;
+    }
+    body.get("text").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+}
+
+/// Does the transcript at `path` hold `needle` in what follows `offset`?
+/// Every JSON string on each line counts (a prompt's content, whatever the
+/// provider's layout).
+pub fn scan_transcript(path: &std::path::Path, offset: u64, needle: &str) -> TranscriptCheck {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return TranscriptCheck::Unreadable(format!("{}: {e}", path.display())),
+    };
+    if (bytes.len() as u64) < offset {
+        return TranscriptCheck::Unreadable(format!("{} is shorter than before the inject (rewritten)", path.display()));
+    }
+    fn strings(v: &Value, needle: &str) -> bool {
+        match v {
+            Value::String(s) => s.contains(needle),
+            Value::Array(a) => a.iter().any(|x| strings(x, needle)),
+            Value::Object(o) => o.values().any(|x| strings(x, needle)),
+            _ => false,
+        }
+    }
+    let after = String::from_utf8_lossy(&bytes[offset as usize..]);
+    let hit = after.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).any(|v| strings(&v, needle));
+    if hit {
+        TranscriptCheck::Holds
+    } else {
+        TranscriptCheck::Lacks
+    }
+}
+
+/// The transcripts of this host's agents: the session's CLI, conversation
+/// id and cwd, found again after a restart by `locate_continue_transcript`.
+pub struct LiveTranscripts;
+
+impl Transcripts for LiveTranscripts {
+    fn mark(&self, agent_id: &str) -> TranscriptMark {
+        let Some(s) = crate::agent_host::host().find_agent(agent_id) else { return TranscriptMark::default() };
+        let program = s.command().unwrap_or_default();
+        let provider = std::path::Path::new(&program).file_name().map(|n| n.to_string_lossy().into_owned()).filter(|p| !p.is_empty());
+        let conversation = crate::activity_transcript::conversation_of(&s.session_id().to_string())
+            .map(|(c, _)| c)
+            .or_else(|| k2_core::workspace::provider_resume::session_id_from_spawn_argv(&program, &s.args()));
+        let cwd = s.cwd_path().map(|p| p.to_string_lossy().into_owned());
+        let offset = match (&provider, &conversation) {
+            (Some(p), Some(c)) => k2_core::chat_continue::locate_continue_transcript(p, c, cwd.as_deref().unwrap_or(""))
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|m| m.len())
+                .unwrap_or(0),
+            _ => 0,
+        };
+        TranscriptMark { provider, conversation, cwd, offset }
+    }
+
+    fn holds(&self, w: &k2_core::delivery::seen::WriteAhead) -> TranscriptCheck {
+        let Some(needle) = w.needle.as_deref() else {
+            return TranscriptCheck::Unreadable("not a message a transcript records".into());
+        };
+        let (Some(provider), Some(conv)) = (w.provider.as_deref(), w.conversation.as_deref()) else {
+            return TranscriptCheck::Unreadable("the agent's conversation wasn't known".into());
+        };
+        match k2_core::chat_continue::locate_continue_transcript(provider, conv, w.cwd.as_deref().unwrap_or("")) {
+            Some(path) => scan_transcript(&path, w.offset, needle),
+            // The conversation never wrote a transcript: the CLI never took
+            // the prompt, provided its home is still here.
+            None if provider == "claude" && dirs::home_dir().is_some_and(|h| h.join(".claude").join("projects").is_dir()) => {
+                TranscriptCheck::Lacks
+            }
+            None => TranscriptCheck::Unreadable(format!("no {provider} transcript for conversation {conv} (its home is gone?)")),
+        }
+    }
+}
+/// What a host reports on each link: deliveries this recent, this many.
+const RELINK_REPORT_WINDOW_MS: i64 = 10 * 60 * 1000;
+const RELINK_REPORT_MAX: usize = 256;
+
 pub struct HostSide {
     db: Db,
     policy: Policy,
@@ -653,6 +783,9 @@ pub struct HostSide {
     /// the seen check.
     receiving: Mutex<()>,
     deliver: Deliverer,
+    /// The agents' transcripts: the ground truth for a delivery a restart
+    /// interrupted.
+    transcripts: Arc<dyn Transcripts>,
 }
 
 impl HostSide {
@@ -665,7 +798,12 @@ impl HostSide {
             waiters: Mutex::default(),
             receiving: Mutex::new(()),
             deliver,
+            transcripts: Arc::new(LiveTranscripts),
         }
+    }
+
+    pub fn with_transcripts(self, transcripts: Arc<dyn Transcripts>) -> Self {
+        Self { transcripts, ..self }
     }
 
     /// A `deliver` from the controller: deliver once per `msg_id`. Returns
@@ -681,25 +819,20 @@ impl HostSide {
         let before = seen::status(&self.db.lock(), &m.msg_id);
         let out = match before {
             Ok(Some(s)) if s == "rejected" => ack(DeliverStatus::Rejected, Some("rejected before".into())),
+            // This daemon died mid-delivery: the agent's transcript says
+            // whether the message reached it.
+            Ok(Some(s)) if s == DELIVERING => match self.settle_interrupted(&m.msg_id, now) {
+                Settled::Delivered(why) => ack(DeliverStatus::Delivered, Some(why)),
+                Settled::Uncertain(why) => ack(DeliverStatus::Rejected, Some(why)),
+                Settled::NotDelivered => self.deliver_fresh(m, now),
+            },
+            Ok(Some(s)) if s == UNCERTAIN => ack(DeliverStatus::Rejected, Some(format!("{UNCERTAIN_REASON}: decided before"))),
             Ok(Some(_)) => ack(DeliverStatus::Duplicate, None),
             Err(e) => {
                 log_debug!("[delivery] ERROR: seen check {}: {e}", m.msg_id);
                 None
             }
-            Ok(None) => match (self.deliver)(m) {
-                LocalDelivery::Delivered => {
-                    self.record_seen(&m.msg_id, "delivered", now);
-                    ack(DeliverStatus::Delivered, None)
-                }
-                LocalDelivery::Rejected(why) => {
-                    self.record_seen(&m.msg_id, "rejected", now);
-                    ack(DeliverStatus::Rejected, Some(why))
-                }
-                LocalDelivery::Retry(why) => {
-                    log_debug!("[delivery] {} for {} not delivered yet: {why}", m.msg_id, m.agent_id);
-                    None
-                }
-            },
+            Ok(None) => self.deliver_fresh(m, now),
         };
         let duplicate = matches!(out, Some(Frame::DeliverAck { status: DeliverStatus::Duplicate, .. }));
         let status = match &out {
@@ -714,6 +847,82 @@ impl HostSide {
                 .attr("status", status)
         });
         out
+    }
+
+    /// Deliver a message this host has no record of: write ahead (the seen
+    /// row `delivering`, and where the agent's transcript stands), inject,
+    /// then the answer.
+    fn deliver_fresh(&self, m: &Incoming, now: i64) -> Option<Frame> {
+        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason });
+        let mark = self.transcripts.mark(&m.agent_id);
+        let w = seen::WriteAhead {
+            msg_id: m.msg_id.clone(),
+            agent_id: m.agent_id.clone(),
+            provider: mark.provider,
+            conversation: mark.conversation,
+            cwd: mark.cwd,
+            offset: mark.offset,
+            needle: needle(&m.body),
+            started_ms: now,
+        };
+        if let Err(e) = seen::write_ahead(&self.db.lock(), &w) {
+            log_debug!("[delivery] ERROR: write ahead {}: {e}", m.msg_id);
+        }
+        // From here a kill leaves the id on record, settled from the
+        // transcript on the next receive or link.
+        self.record_seen(&m.msg_id, DELIVERING, now);
+        let out = match (self.deliver)(m) {
+            LocalDelivery::Delivered => {
+                self.record_seen(&m.msg_id, "delivered", now);
+                ack(DeliverStatus::Delivered, None)
+            }
+            LocalDelivery::Rejected(why) => {
+                self.record_seen(&m.msg_id, "rejected", now);
+                ack(DeliverStatus::Rejected, Some(why))
+            }
+            LocalDelivery::Retry(why) => {
+                // Nothing reached the agent: a resend delivers it.
+                if let Err(e) = seen::forget(&self.db.lock(), &m.msg_id) {
+                    log_debug!("[delivery] ERROR: forget {}: {e}", m.msg_id);
+                }
+                log_debug!("[delivery] {} for {} not delivered yet: {why}", m.msg_id, m.agent_id);
+                None
+            }
+        };
+        let _ = seen::clear_ahead(&self.db.lock(), &m.msg_id);
+        out
+    }
+
+    /// An id a restart left `delivering`: the transcript decides. Delivered
+    /// (it holds the message): `delivered`. Not delivered (it doesn't): the
+    /// record goes, so the message is delivered normally. Can't tell (the
+    /// agent's home is gone): `uncertain`, which the controller fails with
+    /// a reason (I2: never silently either way).
+    fn settle_interrupted(&self, msg_id: &str, now: i64) -> Settled {
+        let w = seen::written_ahead(&self.db.lock(), msg_id).ok().flatten();
+        let found = match &w {
+            Some(w) => self.transcripts.holds(w),
+            None => TranscriptCheck::Unreadable("no write-ahead record".into()),
+        };
+        let settled = match found {
+            TranscriptCheck::Holds => {
+                self.record_seen(msg_id, "delivered", now);
+                Settled::Delivered("found in the agent's transcript after a host restart".into())
+            }
+            TranscriptCheck::Lacks => {
+                if let Err(e) = seen::forget(&self.db.lock(), msg_id) {
+                    log_debug!("[delivery] ERROR: forget {msg_id}: {e}");
+                }
+                Settled::NotDelivered
+            }
+            TranscriptCheck::Unreadable(why) => {
+                self.record_seen(msg_id, UNCERTAIN, now);
+                Settled::Uncertain(format!("{UNCERTAIN_REASON}: interrupted by a host restart and the agent's transcript can't tell ({why})"))
+            }
+        };
+        let _ = seen::clear_ahead(&self.db.lock(), msg_id);
+        log_debug!("[delivery] {msg_id}: interrupted delivery settled: {settled:?}");
+        settled
     }
 
     fn record_seen(&self, msg_id: &str, status: &str, now: i64) {
@@ -773,8 +982,41 @@ impl HostSide {
 
     /// The link to the controller is up and writes to `tx`.
     pub fn linked(&self, tx: mpsc::UnboundedSender<Frame>) {
+        self.report_delivered(&tx, delivery::now_ms());
         *self.link.lock() = Some(tx);
         self.nudge.notify_one();
+    }
+
+    /// On every link: ack again what this host delivered (or was
+    /// delivering when it died) lately. An ack lost to a crash or a link
+    /// drop would otherwise leave the controller's row `sent`, and the gone
+    /// rule would fail (or resend) a message the agent already has.
+    fn report_delivered(&self, tx: &mpsc::UnboundedSender<Frame>, now: i64) {
+        let rows = match seen::recent_delivered(&self.db.lock(), now - RELINK_REPORT_WINDOW_MS, RELINK_REPORT_MAX) {
+            Ok(r) => r,
+            Err(e) => {
+                log_debug!("[delivery] ERROR: recent deliveries: {e}");
+                return;
+            }
+        };
+        if !rows.is_empty() {
+            log_debug!("[delivery] link: reporting {} recent deliver(ies) to the controller", rows.len());
+        }
+        for (msg_id, status) in rows {
+            let (status, reason) = if status == DELIVERING {
+                match self.settle_interrupted(&msg_id, now) {
+                    Settled::Delivered(why) => (DeliverStatus::Delivered, Some(why)),
+                    Settled::Uncertain(why) => (DeliverStatus::Rejected, Some(why)),
+                    // The controller still has it: it delivers it again.
+                    Settled::NotDelivered => continue,
+                }
+            } else if status == UNCERTAIN {
+                (DeliverStatus::Rejected, Some(format!("{UNCERTAIN_REASON}: decided before")))
+            } else {
+                (DeliverStatus::Delivered, Some(REPORTED.to_string()))
+            };
+            let _ = tx.send(Frame::DeliverAck { msg_id, status, reason });
+        }
     }
 
     /// One pass of the up hop: dead letters, then send what is due while

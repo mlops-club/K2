@@ -612,6 +612,8 @@ pub struct RemoteHost {
     hellos: (std::sync::Mutex<u64>, std::sync::Condvar),
     /// How long a need waits for a host to come (`K2_PROVISIONER_WAIT`).
     host_wait: Duration,
+    /// How long a need waits for a known host to link (`K2_HOST_LINK_GRACE`).
+    link_grace: Duration,
 }
 
 /// Default for `K2_HOST_AWAY_FORGET`.
@@ -619,6 +621,20 @@ pub const AWAY_FORGET: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Default for `K2_PROVISIONER_WAIT`: a pod's start, enroll and hello.
 pub const HOST_WAIT: Duration = Duration::from_secs(120);
+
+/// Default for `K2_HOST_LINK_GRACE`: how long a need waits for a known
+/// host to link (after a controller restart, before any host is back).
+pub const LINK_GRACE: Duration = Duration::from_secs(30);
+
+/// The start of every workspace-spawn error that means "no host can take
+/// the agent right now" (no host linked, hosts full, its pinned host away):
+/// retryable, answered 503 by every route ([`is_host_unavailable`]).
+pub const HOST_UNAVAILABLE: &str = "agent host unavailable: ";
+
+/// A spawn error that is [`HOST_UNAVAILABLE`] (retryable, 503).
+pub fn is_host_unavailable(error: &str) -> bool {
+    error.contains(HOST_UNAVAILABLE)
+}
 
 impl Default for RemoteHost {
     fn default() -> Self {
@@ -645,7 +661,13 @@ impl RemoteHost {
             away_forget: AWAY_FORGET,
             hellos: Default::default(),
             host_wait: HOST_WAIT,
+            link_grace: LINK_GRACE,
         }
+    }
+
+    /// How long a need waits for a known host to link before "no host".
+    pub fn with_link_grace(self, link_grace: Duration) -> Self {
+        Self { link_grace, ..self }
     }
 
     /// How long a host that only linked to this process stays away after it
@@ -1290,6 +1312,27 @@ impl RemoteHost {
     fn reserve_for(&self, agent_id: &str, cwd: Option<&Path>) -> Result<(String, PlacementEpoch, Option<String>), (String, String)> {
         let unavailable = |why: String| ("503 Service Unavailable".to_string(), why);
         let deadline = Instant::now() + self.host_wait;
+        // K2-a: no host linked yet, but some are known (a controller just
+        // restarted, before its hosts are back): wait for one to link, up
+        // to the link grace, rather than fail a need that is about to work.
+        let grace_until = Instant::now() + self.link_grace;
+        loop {
+            let (none_linked, seen) = {
+                let inner = self.inner.lock();
+                if let Some(p) = inner.placements.get(agent_id) {
+                    return Ok((p.host_id.clone(), p.epoch, None));
+                }
+                let waiting = inner.links.is_empty() && self.host_views(&inner).iter().any(|v| v.away);
+                (waiting, self.hello_count())
+            };
+            if !none_linked || Instant::now() >= grace_until {
+                break;
+            }
+            log_debug!("[hosts] {agent_id} waits for a host to link (up to {:?})", self.link_grace);
+            if !self.wait_for_hello(seen, grace_until) {
+                break;
+            }
+        }
         loop {
             let (views, seen, home) = {
                 let inner = self.inner.lock();
@@ -1433,7 +1476,13 @@ impl RemoteHost {
         req: &crate::spawn::SpawnWorkspaceSessionRequest,
     ) -> Result<(SpawnedSession, AgentSession), String> {
         let agent_id = crate::spawn::canonical_key_for_request(req);
-        let (host_id, epoch, _) = self.reserve_for(&agent_id, Some(Path::new(&req.cwd))).map_err(|(_, why)| why)?;
+        let (host_id, epoch, _) = self.reserve_for(&agent_id, Some(Path::new(&req.cwd))).map_err(|(status, why)| {
+            if status.starts_with("503") {
+                format!("{HOST_UNAVAILABLE}{why}")
+            } else {
+                why
+            }
+        })?;
         let request = serde_json::to_value(req).map_err(|e| format!("encode the spawn request: {e}"))?;
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new("ctl.place").agent(agent_id.as_str()).attr("host", host_id.as_str()).attr("epoch", epoch.0)
@@ -2379,6 +2428,13 @@ pub fn global() -> &'static RemoteHost {
                 AWAY_FORGET
             }),
         };
+        let grace = match std::env::var("K2_HOST_LINK_GRACE").ok().filter(|v| !v.trim().is_empty()) {
+            None => LINK_GRACE,
+            Some(v) => v.trim().parse().map(Duration::from_secs).unwrap_or_else(|_| {
+                log_debug!("[hosts] K2_HOST_LINK_GRACE={v:?} is not a number of seconds; using {LINK_GRACE:?}");
+                LINK_GRACE
+            }),
+        };
         let wait = match std::env::var("K2_PROVISIONER_WAIT").ok().filter(|v| !v.trim().is_empty()) {
             None => HOST_WAIT,
             Some(v) => v.trim().parse().map(Duration::from_secs).unwrap_or_else(|_| {
@@ -2386,7 +2442,7 @@ pub fn global() -> &'static RemoteHost {
                 HOST_WAIT
             }),
         };
-        host.with_placement(provisioner, Arc::new(policy)).with_away_forget(forget).with_host_wait(wait)
+        host.with_placement(provisioner, Arc::new(policy)).with_away_forget(forget).with_host_wait(wait).with_link_grace(grace)
     });
     RESTORED.call_once(|| {
         r.restore();
