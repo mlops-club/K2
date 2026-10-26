@@ -15,6 +15,9 @@ pub const PROTO_MIN: u32 = 1;
 pub const MAX_FRAME: usize = 1 << 20;
 /// Max size of `meta` on `spawn` / `update_meta` (PRD §7.3).
 pub const MAX_META: usize = 64 * 1024;
+/// Most bytes one `read_ring` returns (hex-encoded it stays under
+/// [`MAX_FRAME`]).
+pub const READ_RING_MAX: usize = 256 << 10;
 
 /// ptyd's own version (independent of the K2 release).
 pub const PTYD_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -139,6 +142,15 @@ pub enum Request {
         end_sessions: bool,
     },
     Ping,
+    /// Owner only: a copy of up to `max` bytes (at most [`READ_RING_MAX`])
+    /// of the session's ring from `from` (clamped to the ring's start).
+    /// Read-only: the session's data stream and its position are untouched
+    /// (dist-link W3b: a host replays a session's output to a client).
+    ReadRing {
+        sid: String,
+        from: u64,
+        max: u32,
+    },
     /// Data connections only: after `attached` the connection is raw bytes.
     Attach {
         sid: String,
@@ -216,6 +228,13 @@ pub enum Reply {
         start: u64,
         end: u64,
     },
+    /// `read_ring`: the bytes `[start, start + len)`, hex; `end` is the
+    /// ring's end now.
+    Ring {
+        start: u64,
+        end: u64,
+        hex: String,
+    },
     // Events (no id).
     Exited {
         sid: String,
@@ -248,6 +267,33 @@ impl<T> Frame<T> {
 }
 
 /// Encode one frame (length prefix + JSON).
+/// Lowercase hex (`read_ring`'s payload; the protocol is JSON).
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(D[(b >> 4) as usize] as char);
+        s.push(D[(b & 15) as usize] as char);
+    }
+    s
+}
+
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    fn nib(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    b.chunks(2).map(|p| Some(nib(p[0])? << 4 | nib(p[1])?)).collect()
+}
+
 pub fn encode<T: Serialize>(v: &T) -> io::Result<Vec<u8>> {
     let json = serde_json::to_vec(v).map_err(io::Error::other)?;
     if json.len() > MAX_FRAME {
@@ -346,6 +392,20 @@ mod tests {
     fn unknown_t_does_not_parse_as_a_request() {
         let r: Result<Frame<Request>, _> = serde_json::from_str(r#"{"id":1,"t":"nope"}"#);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn hex_round_trips_every_byte_and_rejects_junk() {
+        let all: Vec<u8> = (0..=255).collect();
+        let h = hex_encode(&all);
+        assert_eq!(&h[..8], "00010203");
+        assert_eq!(hex_decode(&h), Some(all));
+        assert_eq!(hex_decode("0g"), None);
+        assert_eq!(hex_decode("abc"), None);
+        assert_eq!(hex_decode(""), Some(vec![]));
+        // The largest read stays under the frame cap.
+        let r = Frame::new(Some(1), Reply::Ring { start: 0, end: 0, hex: "f".repeat(READ_RING_MAX * 2) });
+        assert!(encode(&r).unwrap().len() < MAX_FRAME);
     }
 
     #[test]

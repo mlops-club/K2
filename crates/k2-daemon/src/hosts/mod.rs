@@ -13,6 +13,7 @@
 //! The wire protocol is [`proto`]; the env contract and the table of
 //! frames are in `docs/prd/progress/dist-link.md`.
 
+pub mod byte_ring;
 pub mod enroll;
 pub mod gate;
 pub mod hub;
@@ -136,6 +137,7 @@ pub fn start() {
         crate::runtime_role::Role::Host => match host_config(env) {
             Ok(cfg) => {
                 k2_core::log_debug!("[hosts] K2_ROLE=host: linking to {} as {}", cfg.attach_url, cfg.host_name);
+                byte_ring::set(Some(host_ptyd_ring));
                 tokio::spawn(link::run(cfg));
             }
             Err(e) => {
@@ -151,6 +153,24 @@ pub fn start() {
         }
         crate::runtime_role::Role::All => {}
     }
+}
+
+/// A host's [`byte_ring`] source (W3b): k2-ptyd's ring of a ptyd-backed
+/// session on this host (`K2_PTYD=1`), read without taking its data
+/// stream. Any other session has no ring ([`byte_ring::NO_RING`]: the
+/// client falls back to the grid snapshot), and ptyd is never started for
+/// one.
+fn host_ptyd_ring(session_id: &str, from: u64, max: usize) -> Result<byte_ring::RingRead, String> {
+    let id = k2_core::session::SessionId::parse(session_id).ok_or_else(|| format!("bad session id {session_id}"))?;
+    let session = crate::agent_host::host()
+        .find_session(&id)
+        .ok_or_else(|| format!("session {session_id} is not running on this host"))?;
+    if session.is_remote() || session.pty().backend_name() != "ptyd" {
+        return Err(byte_ring::NO_RING.to_string());
+    }
+    let owner = k2_core::terminal::ptyd::client::global().owner()?;
+    let (start, end, bytes) = owner.read_ring(session_id, from, max).map_err(|e| e.to_string())?;
+    Ok(byte_ring::RingRead { start, end, bytes })
 }
 
 /// The controller's `k2_core::transcript_probe`.

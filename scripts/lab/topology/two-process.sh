@@ -46,6 +46,10 @@ TP_CTL_PID=""
 TP_HOST_PID=""
 TP_CTL_ENV=()
 TP_HOST_ENV=()
+# W3b: the host runs its terminals on k2-ptyd (K2_PTYD=1) when
+# LAB_PTYD_BIN names a k2-ptyd binary; its byte ring serves
+# /cli/sessions/bytes through the controller.
+LAB_PTYD_BIN=${LAB_PTYD_BIN:-}
 TP_CTL_PORT=${DIST_CTL_PORT:-17420}
 TP_HOST_PORT=${DIST_HOST_PORT:-17421}
 
@@ -146,6 +150,7 @@ tp_host_up() {
         K2_FAKE_AGENT_TRACE="$LAB_FAKE_TRACE"
         K2_FAKE_AGENT_TURN_MS="${LAB_TURN_MS:-300}" K2_FAKE_AGENT_SEED="${LAB_SEED:-0}"
     )
+    [ -n "$LAB_PTYD_BIN" ] && TP_HOST_ENV+=(K2_PTYD=1 K2_PTYD_BIN="$LAB_PTYD_BIN")
     tp_start_host "$run_dir"
 }
 
@@ -180,6 +185,17 @@ topo_metrics() {
     echo "host_rss,${h:-NA},KiB,ps -o rss of the host pid $TP_HOST_PID"
 }
 
+# The process this run's agents are children of: the host, or the host's
+# k2-ptyd when it runs on one (ptyd forks the agents; it is the host's own
+# helper, launched detached, never the controller's).
+tp_agent_parent() {
+    if [ -n "$LAB_PTYD_BIN" ]; then
+        { pgrep -f "^$LAB_PTYD_BIN" || pgrep -f "^$TP_ROOT/.*k2-ptyd"; } 2>/dev/null | head -1
+    else
+        echo "$TP_HOST_PID"
+    fi
+}
+
 topo_down() {
     local pid i
     for pid in "$TP_HOST_PID" "$TP_CTL_PID"; do
@@ -190,6 +206,8 @@ topo_down() {
         wait "$pid" 2>/dev/null || true
     done
     TP_HOST_PID="" TP_CTL_PID=""
+    # ptyd outlives the daemon by design; this run's goes with it.
+    [ -n "$LAB_PTYD_BIN" ] && pkill -9 -f "$LAB_PTYD_BIN" 2>/dev/null
     if [ -n "$TP_ROOT" ] && [ -d "$TP_ROOT" ]; then
         pkill -9 -f "$TP_ROOT/" 2>/dev/null || true
         rm -rf "$TP_ROOT"
@@ -218,6 +236,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         # Two commands: `--bin k2-daemon` would also filter the fake agent out.
         ${slot[@]+"${slot[@]}"} cargo build -p k2-daemon --bin k2-daemon || exit 1
         ${slot[@]+"${slot[@]}"} cargo build -p k2-fake-agent || exit 1
+        [ "${LAB_HOST_PTYD:-1}" = 1 ] && { ${slot[@]+"${slot[@]}"} cargo build -p k2-ptyd --bin k2-ptyd || exit 1; }
     fi
     target=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
         | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -226,6 +245,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     cp "$target/debug/k2-daemon" "$target/debug/k2-fake-agent" "$RUN/bin/" || exit 1
     LAB_DAEMON_BIN="$RUN/bin/k2-daemon" LAB_FAKE_AGENT_BIN="$RUN/bin/k2-fake-agent"
     export LAB_DAEMON_BIN LAB_FAKE_AGENT_BIN
+    # LAB_HOST_PTYD=0: the host keeps the in-process terminals (no byte ring).
+    if [ "${LAB_HOST_PTYD:-1}" = 1 ]; then
+        cp "$target/debug/k2-ptyd" "$RUN/bin/" || exit 1
+        LAB_PTYD_BIN="$RUN/bin/k2-ptyd"
+    fi
     trap topo_down EXIT
     FAILS=0
     check() { # name ok detail
@@ -271,7 +295,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     ps -axo pid=,ppid=,command= > "$RUN/ps.txt"
     agent_ppids=$(awk -v root="$TP_ROOT/shim/" 'index($0, root) {print $2}' "$RUN/ps.txt" | sort -u | tr '\n' ' ')
     {
-        echo "controller pid $TP_CTL_PID, host pid $TP_HOST_PID"
+        echo "controller pid $TP_CTL_PID, host pid $TP_HOST_PID, agents' parent $(tp_agent_parent)"
         echo "agent processes (pid ppid command):"
         awk -v root="$TP_ROOT/shim/" 'index($0, root)' "$RUN/ps.txt"
         echo "controller children:"; pgrep -lP "$TP_CTL_PID" || echo "(none)"
@@ -279,9 +303,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     } > "$RUN/process-tree.txt"
     ok=0
     # Only this run's agents: processes whose command is under this run's
-    # throwaway shim dir. Exactly one parent, the host, never the controller.
+    # throwaway shim dir. Exactly one parent, the host (or its ptyd), never
+    # the controller.
     agent_ppids=$(echo $agent_ppids)
-    if [ "$code" = 200 ] && [ -n "$agent_ppids" ] && [ "$agent_ppids" = "$TP_HOST_PID" ] \
+    agent_parent=$(tp_agent_parent)
+    if [ "$code" = 200 ] && [ -n "$agent_ppids" ] && [ "$agent_ppids" = "$agent_parent" ] \
         && [ "$agent_ppids" != "$TP_CTL_PID" ] && ! pgrep -P "$TP_CTL_PID" >/dev/null; then ok=1; fi
     check "agent is a child of the host" "$ok" "spawn HTTP $code; agent ppid(s): $agent_ppids; host $TP_HOST_PID; controller $TP_CTL_PID"
     post "$TP_CTL_PORT" /cli/sessions/v2/close "$ctl_token" "{\"agent_name\":\"$agent\",\"force\":true,\"clear_index\":true}" >/dev/null
@@ -431,20 +457,21 @@ PY
         local cs; cs=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["claude_session"])' "$1")
         ps -axo pid=,ppid=,command= | awk -v root="$TP_ROOT/shim/" -v cs="$cs" 'index($0, root) && index($0, cs) {print $1, $2; exit}'
     }
-    w3 start ctl > "$RUN/w3-ctl.txt" 2>&1
+    w3_bytes=(); [ -n "$LAB_PTYD_BIN" ] && w3_bytes=(--bytes)
+    w3 start ctl ${w3_bytes[@]+"${w3_bytes[@]}"} > "$RUN/w3-ctl.txt" 2>&1
     before=$(agent_of "$RUN/w3-ctl.json")
     old_ctl=$TP_CTL_PID
     tp_stop "$TP_CTL_PID" TERM
     tp_start_controller "$RUN" || echo "controller failed to restart" >> "$RUN/w3-ctl.txt"
-    w3 resume ctl >> "$RUN/w3-ctl.txt" 2>&1
+    w3 resume ctl ${w3_bytes[@]+"${w3_bytes[@]}"} >> "$RUN/w3-ctl.txt" 2>&1
     rc=$?
     after=$(agent_of "$RUN/w3-ctl.json")
     w3 close ctl >> "$RUN/w3-ctl.txt" 2>&1 || rc=1
     check "S9: controller restart mid-turn, client sees the turn through the new controller" "$([ $rc = 0 ] && echo 1)" \
         "$(grep -c '^PASS' "$RUN/w3-ctl.txt") passed, $(grep -c '^FAIL' "$RUN/w3-ctl.txt") failed (w3-ctl.txt)"
     check "S9: the agent survived the controller restart (same pid, child of the host)" \
-        "$([ -n "$before" ] && [ "$before" = "$after" ] && [ "${before#* }" = "$TP_HOST_PID" ] && echo 1)" \
-        "agent pid/ppid before '$before' after '$after'; host $TP_HOST_PID; controller $old_ctl -> $TP_CTL_PID"
+        "$([ -n "$before" ] && [ "$before" = "$after" ] && [ "${before#* }" = "$(tp_agent_parent)" ] && echo 1)" \
+        "agent pid/ppid before '$before' after '$after'; host $TP_HOST_PID (agents' parent $(tp_agent_parent)); controller $old_ctl -> $TP_CTL_PID"
 
     # 11. S8: the host dies mid-turn.
     w3 start host > "$RUN/w3-host.txt" 2>&1

@@ -10,6 +10,12 @@ script runs between its kills and restarts:
           arrived, and that banner, prompt and reply are on the client's
           screen in order (no gap: the host's snapshot carries everything
           the agent printed while the controller was down).
+          With --bytes (the host runs on k2-ptyd, W3b) the client also
+          reads the session's raw bytes (/cli/sessions/bytes) up to the
+          banner before the restart, keeps its offset, and after the
+          restart reconnects from it: the ack shows no gap, the missed
+          bytes hold the prompt echo and the reply, and what it got is
+          byte for byte a fresh read from offset 0.
   close   close the agent (after the caller compared its pid).
   lost    after a host crash: the open grid ends with an error or a close
           (never a hang), the controller reports the host lost, and a spawn
@@ -65,6 +71,42 @@ class Phase:
     def attach(self, session):
         return wslib.WebSocket("127.0.0.1", self.a.port, "/cli/sessions/grid?" + urllib.parse.urlencode(
             {"session": session, "token": self.token}), timeout=DEADLINE_S)
+
+    def open_bytes(self, session, offset):
+        """A /cli/sessions/bytes client from `offset`: (socket, ack payload)
+        or (None, the error message)."""
+        try:
+            sock = wslib.WebSocket("127.0.0.1", self.a.port, "/cli/sessions/bytes?" + urllib.parse.urlencode(
+                {"session": session, "from": offset, "token": self.token}), timeout=DEADLINE_S)
+        except (OSError, wslib.WsError) as e:
+            return None, "upgrade: %s" % e
+        kind, data = sock.recv()
+        msg = json.loads(data) if kind == "text" else {}
+        if msg.get("event") != "session:ack":
+            sock.close()
+            return None, "%s %s" % (kind, str(data)[:200])
+        return sock, msg["payload"]
+
+    def read_bytes(self, sock, until=None, count=None):
+        """Binary chunks until `until` is in them or `count` bytes came.
+        Returns (bytes, how it ended)."""
+        got = b""
+        deadline = time.monotonic() + DEADLINE_S
+        while not ((until is not None and until in got) or (count is not None and len(got) >= count)):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return got, "deadline"
+            sock.settimeout(left)
+            try:
+                kind, data = sock.recv()
+            except (OSError, wslib.WsError) as e:
+                return got, "stream error: %s" % e
+            if kind == "close":
+                return got, "closed"
+            if kind == "text":
+                return got, "event: %s" % data[:200]
+            got += data
+        return got, "found"
 
     def wait_grid(self, sock, grid, needle):
         """Apply grid events until `needle` is on the client's screen. Returns
@@ -122,6 +164,15 @@ class Phase:
         ok, how = self.wait_grid(sock, grid, banner + " · new\n>")
         if not self.check("the agent shows its prompt", ok, how):
             return
+        state_bytes = {}
+        if self.a.bytes:
+            bsock, ack = self.open_bytes(session, 0)
+            ok = bsock is not None
+            if self.check("bytes: the controller relays the session's byte stream from offset 0", ok, str(ack)[:200]):
+                got, how = self.read_bytes(bsock, until=banner.encode())
+                bsock.close()
+                self.check("bytes: the banner is in the raw bytes", how == "found", "%s after %d bytes" % (how, len(got)))
+                state_bytes = {"bytes_offset": len(got), "bytes_seen": got.hex()}
         text = "w3 %s %s" % (self.a.tag, uuid.uuid4().hex[:6])
         sock.send_text(json.dumps({"action": "input", "text": text}))
         time.sleep(0.15)
@@ -131,7 +182,7 @@ class Phase:
         deadline = time.monotonic() + DEADLINE_S
         while text not in self.transcript_prompts(self.a.cwd, claude_session) and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.save({"agent": agent, "session": session, "claude_session": claude_session, "text": text, "banner": banner})
+        self.save(dict({"agent": agent, "session": session, "claude_session": claude_session, "text": text, "banner": banner}, **state_bytes))
         self.check("prompt typed; the turn is running (the prompt is in the transcript)",
                    text in self.transcript_prompts(self.a.cwd, claude_session), text)
         if self.a.keep_open:
@@ -172,6 +223,28 @@ class Phase:
                    self.transcript_prompts(self.a.cwd, s["claude_session"]) == [s["text"]],
                    repr(self.transcript_prompts(self.a.cwd, s["claude_session"])))
         sock.close()
+        if self.a.bytes and "bytes_offset" in s:
+            self.resume_bytes(s, reply)
+
+    def resume_bytes(self, s, reply):
+        off, seen = s["bytes_offset"], bytes.fromhex(s["bytes_seen"])
+        bsock, ack = self.open_bytes(s["session"], off)
+        if not self.check("bytes: after the controller restart the client reconnects from its offset", bsock is not None, str(ack)[:200]):
+            return
+        self.check("bytes: no gap (the ring still holds every byte after the offset)",
+                   ack.get("fromOffset") == off and ack.get("currentFrontOffset") == off,
+                   json.dumps(ack))
+        missed, how = self.read_bytes(bsock, until=reply.encode())
+        bsock.close()
+        self.check("bytes: the missed bytes hold the prompt echo and the reply",
+                   how == "found" and s["text"].encode() in missed, "%s, %d bytes" % (how, len(missed)))
+        fresh_sock, _ = self.open_bytes(s["session"], 0)
+        fresh, how = self.read_bytes(fresh_sock, count=len(seen) + len(missed)) if fresh_sock else (b"", "no stream")
+        if fresh_sock:
+            fresh_sock.close()
+        self.check("bytes: exactly the session's bytes, once each, in order (before + missed == a fresh read from 0)",
+                   seen + missed == fresh[:len(seen) + len(missed)],
+                   "%d + %d bytes vs %d fresh (%s)" % (len(seen), len(missed), len(fresh), how))
 
     def close(self):
         s = self.load()
@@ -226,6 +299,7 @@ def main(argv):
     p.add_argument("--tag", default="x")
     p.add_argument("--host-name", default="host-1")
     p.add_argument("--keep-open", action="store_true")
+    p.add_argument("--bytes", action="store_true", help="also check the raw byte stream (host on k2-ptyd)")
     a = p.parse_args(argv)
     ph = Phase(a)
     {"start": ph.start, "resume": ph.resume, "close": ph.close, "lost": ph.lost, "return": ph.returned}[a.phase]()

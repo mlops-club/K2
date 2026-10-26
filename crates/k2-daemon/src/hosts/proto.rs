@@ -59,6 +59,8 @@ pub mod trace_events {
     pub const GRID_REPLAY: &str = "grid.replay";
     /// Controller issued a placement epoch (attrs: agent, epoch).
     pub const CTL_EPOCH: &str = "ctl.epoch";
+    /// Host opened a byte stream (attrs: stream, from, start, end).
+    pub const BYTES_REPLAY: &str = "bytes.replay";
 }
 
 /// One placement a host still runs, reported in `hello` (protocol 2) so a
@@ -448,6 +450,43 @@ pub enum Frame {
         ring_end: Option<u64>,
     },
 
+    // ── protocol 2: raw byte streams (W3b) ─────────────────────────────
+    /// Stream `session_id`'s output bytes from absolute offset `from` (the
+    /// client's next unread byte) for `/cli/sessions/bytes`. The host
+    /// answers `bytes.ack`, then `bytes.data` from the ack's `start`.
+    #[serde(rename = "bytes.open")]
+    BytesOpen {
+        stream: u64,
+        session_id: String,
+        epoch: u64,
+        from: u64,
+    },
+    /// Bytes follow from `start` (`start > from`: the ring dropped
+    /// `[from, start)`); `end` is the ring's end now. With `error` there is
+    /// no byte stream (a `bytes.close` follows).
+    #[serde(rename = "bytes.ack")]
+    BytesAck {
+        stream: u64,
+        start: u64,
+        end: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Output bytes at absolute `offset`, base64.
+    #[serde(rename = "bytes.data")]
+    BytesData {
+        stream: u64,
+        offset: u64,
+        b64: String,
+    },
+    /// Either way: the stream ended (client gone, session gone, ring overrun).
+    #[serde(rename = "bytes.close")]
+    BytesClose {
+        stream: u64,
+        #[serde(default)]
+        reason: String,
+    },
+
     /// Any `t` this build doesn't know.
     #[serde(other)]
     Unknown,
@@ -492,6 +531,10 @@ impl Frame {
             Frame::InjectResult { .. } => "inject.result",
             Frame::Release { .. } => "release",
             Frame::Released { .. } => "released",
+            Frame::BytesOpen { .. } => "bytes.open",
+            Frame::BytesAck { .. } => "bytes.ack",
+            Frame::BytesData { .. } => "bytes.data",
+            Frame::BytesClose { .. } => "bytes.close",
             Frame::Unknown => "unknown",
         }
     }
@@ -508,7 +551,11 @@ impl Frame {
             | Frame::Inject { .. }
             | Frame::InjectResult { .. }
             | Frame::Release { .. }
-            | Frame::Released { .. } => 2,
+            | Frame::Released { .. }
+            | Frame::BytesOpen { .. }
+            | Frame::BytesAck { .. }
+            | Frame::BytesData { .. }
+            | Frame::BytesClose { .. } => 2,
             Frame::Hello { resume, .. } if !resume.is_empty() => 2,
             Frame::GridOpen { ring_offset: Some(_), .. } | Frame::GridData { ring_offset: Some(_), .. } => 2,
             _ => 1,
@@ -659,6 +706,26 @@ mod tests {
             (
                 Frame::GridData { stream: 3, text: "{}".into(), ring_offset: Some(4196) },
                 json!({"t": "grid.data", "stream": 3, "text": "{}", "ring_offset": 4196}),
+            ),
+            (
+                Frame::BytesOpen { stream: 4, session_id: "s1".into(), epoch: 41, from: 100 },
+                json!({"t": "bytes.open", "stream": 4, "session_id": "s1", "epoch": 41, "from": 100}),
+            ),
+            (
+                Frame::BytesAck { stream: 4, start: 100, end: 4196, error: None },
+                json!({"t": "bytes.ack", "stream": 4, "start": 100, "end": 4196}),
+            ),
+            (
+                Frame::BytesAck { stream: 5, start: 0, end: 0, error: Some("no ring".into()) },
+                json!({"t": "bytes.ack", "stream": 5, "start": 0, "end": 0, "error": "no ring"}),
+            ),
+            (
+                Frame::BytesData { stream: 4, offset: 100, b64: "aGk=".into() },
+                json!({"t": "bytes.data", "stream": 4, "offset": 100, "b64": "aGk="}),
+            ),
+            (
+                Frame::BytesClose { stream: 4, reason: "client gone".into() },
+                json!({"t": "bytes.close", "stream": 4, "reason": "client gone"}),
             ),
         ];
         for (f, want) in cases {

@@ -1063,6 +1063,20 @@ impl Server {
                 self.log.line(&format!("shutdown requested end_sessions={end_sessions} running={running}"));
                 self.begin_shutdown(Some((id, rid)));
             }
+            Request::ReadRing { sid, from, max } => {
+                let r = match self.sessions.get(&sid) {
+                    Some(s) => {
+                        let start = from.max(s.ring.start()).min(s.ring.end());
+                        let (a, b) = s.ring.slices_from(start);
+                        let n = (max as usize).min(proto::READ_RING_MAX);
+                        let mut bytes = Vec::with_capacity(n.min(a.len() + b.len()));
+                        bytes.extend(a.iter().chain(b).take(n));
+                        Reply::Ring { start, end: s.ring.end(), hex: proto::hex_encode(&bytes) }
+                    }
+                    None => err("unknown_session", ""),
+                };
+                self.reply(id, rid, r);
+            }
             Request::Ping => {
                 let n = self.sessions.len();
                 let since = self.owner_since;

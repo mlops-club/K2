@@ -378,6 +378,42 @@ fn input_reaches_the_master_in_order_and_a_second_attach_closes_the_first() {
     read_until(&mut b, "got:four", Duration::from_secs(10));
 }
 
+/// `read_ring` copies ring bytes on the owner connection and never takes
+/// the session's data stream (dist-link W3b): the attached stream keeps
+/// its bytes and its input before, during and after the reads.
+#[test]
+fn read_ring_copies_the_ring_without_taking_the_data_stream() {
+    let home = Home::new(false);
+    let _p = Ptyd::start(&home, &[]);
+    let mut c = owner(&home);
+    spawn_agent(&mut c, &home, "rr", &["echo"], None);
+    let mut a = c.attach("rr", 0).unwrap();
+    let mut streamed = read_until(&mut a, "READY", Duration::from_secs(10)).into_bytes();
+    a.write_all(b"one\r").unwrap();
+    streamed.extend(read_until(&mut a, "got:one", Duration::from_secs(10)).into_bytes());
+
+    let read = |c: &mut Client, from: u64, max: u32| match c.request(Request::ReadRing { sid: "rr".into(), from, max }).unwrap() {
+        Reply::Ring { start, end, hex } => (start, end, k2_ptyd::proto::hex_decode(&hex).expect("hex")),
+        other => panic!("expected ring, got {other:?}"),
+    };
+    let (start, end, all) = read(&mut c, 0, u32::MAX);
+    assert_eq!((start, end), (0, all.len() as u64));
+    assert!(all.starts_with(&streamed), "the ring holds what the stream delivered, byte for byte");
+    let (start, _, part) = read(&mut c, 3, 4);
+    assert_eq!((start, part.as_slice()), (3, &all[3..7]));
+    let (start, end2, tail) = read(&mut c, u64::MAX, 16);
+    assert_eq!((start, tail.len()), (end2, 0), "from past the end: nothing, at the end");
+
+    // The data stream is still the session's: input reaches the child and
+    // its output comes back on it.
+    a.write_all(b"two\r").unwrap();
+    read_until(&mut a, "got:two", Duration::from_secs(10));
+    assert!(matches!(
+        c.request(Request::ReadRing { sid: "nope".into(), from: 0, max: 1 }).unwrap(),
+        Reply::Error { code, .. } if code == "unknown_session"
+    ));
+}
+
 // ------------------------------------------------------------------ 4
 
 #[test]

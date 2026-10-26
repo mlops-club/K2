@@ -1,5 +1,6 @@
 //! Controller side of the host link: the `/cli/hosts/attach` socket and
-//! the relay that serves a client's `/cli/sessions/grid` from a host.
+//! the relays that serve a client's `/cli/sessions/grid` and
+//! `/cli/sessions/bytes` from a host.
 //!
 //! Both are generic over the byte stream so tests drive them on loopback
 //! sockets without the dispatcher.
@@ -222,6 +223,7 @@ where
                     log_debug!("[hosts] grid stream {} closed by host {}: {reason}", grid.stream, grid.host_id);
                     break;
                 }
+                Some(GridEvent::BytesAck { .. } | GridEvent::Bytes { .. }) => {}
                 None => break,
             },
             m = read.next() => match m {
@@ -248,6 +250,110 @@ where
         }
     }
     grid.close("client closed");
+    let _ = write.close().await;
+}
+
+/// `/cli/sessions/bytes?session&from` on a controller (W3b): the session's
+/// raw output from offset `from`, read from the byte ring on its host, in
+/// the same protocol as under `K2_ROLE=all`: a `session:ack` text event
+/// (`fromOffset`; `currentFrontOffset` = the first byte sent, above
+/// `fromOffset` when the ring had dropped some; `currentBackOffset` = the
+/// ring's end), then binary messages in offset order, then live output.
+/// A client that kept its offset reconnects after a controller restart
+/// with `from` = its next byte and gets exactly what it missed. A host with
+/// no byte ring answers an `error` event; the client falls back to
+/// `/cli/sessions/grid`, whose first message is a snapshot. Whenever the
+/// stream ends from the host's side (link lost, session gone, ring
+/// overrun) an `error` event names why and the offset reached.
+pub async fn serve_bytes<S>(mut stream: S, remote: &RemoteHost, session_id: &str, from: u64, client: GridClient)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut bytes = match remote.open_bytes(session_id, from) {
+        Ok(b) => b,
+        Err(e) => {
+            use tokio::io::AsyncWriteExt;
+            let body = serde_json::json!({ "error": e }).to_string();
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+                body.len(),
+                k2_core::frame_policy::CONNECT_HEADER_LINES,
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            return;
+        }
+    };
+    let ws = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            log_debug!("[hosts] bytes handshake failed: {e}");
+            return;
+        }
+    };
+    let (mut write, mut read) = ws.split();
+    k2_core::trace::attach(Some(session_id), "bytes");
+    // The next offset the client must get; anything else is a gap and ends
+    // the stream (the client reconnects and the ack shows the gap).
+    let mut next = None;
+    let mut reauth = tokio::time::interval(REAUTH_EVERY);
+    reauth.tick().await;
+    loop {
+        tokio::select! {
+            ev = bytes.events.recv() => match ev {
+                Some(GridEvent::BytesAck { start, end, error: None }) if next.is_none() => {
+                    let ack = serde_json::json!({"event": "session:ack", "payload": {
+                        "sessionId": session_id,
+                        "fromOffset": from,
+                        "currentFrontOffset": start,
+                        "currentBackOffset": end,
+                    }});
+                    log_debug!("[hosts] bytes stream {} session {session_id} from {from}: ring [{start}, {end}) on host {}", bytes.stream, bytes.host_id);
+                    if write.send(Message::Text(ack.to_string())).await.is_err() {
+                        break;
+                    }
+                    next = Some(start);
+                }
+                Some(GridEvent::BytesAck { error: Some(e), .. }) => {
+                    let _ = write.send(Message::Text(grid_error(&e))).await;
+                    break;
+                }
+                Some(GridEvent::Bytes { offset, data }) if next == Some(offset) => {
+                    next = Some(offset + data.len() as u64);
+                    if write.send(Message::Binary(data)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(GridEvent::Bytes { offset, .. }) => {
+                    let msg = format!("byte stream out of order: got offset {offset}, expected {next:?}; reconnect with from={}", next.unwrap_or(from));
+                    log_debug!("[hosts] bytes stream {}: {msg}", bytes.stream);
+                    let _ = write.send(Message::Text(grid_error(&msg))).await;
+                    break;
+                }
+                Some(GridEvent::Closed(reason)) => {
+                    log_debug!("[hosts] bytes stream {} closed by host {}: {reason}", bytes.stream, bytes.host_id);
+                    let at = next.unwrap_or(from);
+                    let _ = write.send(Message::Text(grid_error(&format!("byte stream ended at offset {at}: {reason}")))).await;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            },
+            m = read.next() => match m {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            },
+            _ = reauth.tick() => {
+                if let GridClient::ConnectUser { token, owner_token, .. } = &client {
+                    if !crate::routes::http::token_still_valid(token, owner_token) {
+                        log_debug!("[hosts] bytes stream {}: token revoked mid-session; closing", bytes.stream);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    bytes.close("client closed");
     let _ = write.close().await;
 }
 

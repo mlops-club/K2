@@ -131,6 +131,22 @@ impl Owner {
         lock(&self.watchers).remove(sid);
     }
 
+    /// A copy of up to `max` bytes of `sid`'s ring from `from` (clamped to
+    /// the ring's start): `(start, end, bytes)`, `bytes` beginning at
+    /// `start`, `end` the ring's end. Never takes the session's data
+    /// stream (dist-link W3b replay).
+    pub fn read_ring(&self, sid: &str, from: u64, max: usize) -> io::Result<(u64, u64, Vec<u8>)> {
+        let max = max.min(proto::READ_RING_MAX) as u32;
+        match self.request(Request::ReadRing { sid: sid.into(), from, max })? {
+            Reply::Ring { start, end, hex } => {
+                let bytes = proto::hex_decode(&hex).ok_or_else(|| io::Error::other("read_ring: bad hex from ptyd"))?;
+                Ok((start, end, bytes))
+            }
+            Reply::Error { code, .. } => Err(io::Error::other(format!("read_ring refused: {code}"))),
+            other => Err(io::Error::other(format!("expected ring, got {other:?}"))),
+        }
+    }
+
     /// Open a data stream for `sid` from `from`.
     pub fn attach(&self, sid: &str, from: u64) -> io::Result<DataStream> {
         let mut conn = Conn::connect(&self.sock)?;
