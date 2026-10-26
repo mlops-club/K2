@@ -72,6 +72,7 @@ where
     };
     let (conn, host_id, mut out) = remote.connect(&host_name, protocol);
     log_debug!("[hosts] host {host_id} protocol {protocol} labels {labels:?}");
+    remote.set_labels(&host_id, labels);
     if protocol >= 2 {
         // W3: reconcile what this host still runs with the table (S9).
         remote.adopt(&host_id, &resume);

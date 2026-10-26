@@ -35,6 +35,8 @@
 #      agent resumes its conversation with the interrupted prompt kept
 #      (the old-epoch refusal is a unit test:
 #      hosts::tests::an_old_epoch_placement_is_released_and_a_missing_one_is_gone)
+#  12. P3 placement: every agent the run placed has an agent_placement row
+#      (/cli/hosts/placements): portable (host-1 is a server), last host host-1
 #   8. W1 through the controller (tests/lab/labkit/w1.py): the chat overlay
 #      (ensure-pinned-chat), waking a sleeping agent with k2 msg (S4) and a
 #      heartbeat fire (S5), each spawned on the host
@@ -486,6 +488,18 @@ PY
         "$([ $rc_lost = 0 ] && [ $rc_ret = 0 ] && echo 1)" \
         "$(grep -c '^PASS' "$RUN/w3-host.txt") passed, $(grep -c '^FAIL' "$RUN/w3-host.txt") failed (w3-host.txt)"
     grep -E '\[hosts\] (host .* lost|restored|host .*: agent .* (Adopted|Gone|Released))' "$RUN/controller.log" > "$RUN/controller-w3.log" || true
+
+    # 12. P3: placement policy for every agent placed in this run.
+    curl -s "http://127.0.0.1:$TP_CTL_PORT/cli/hosts/placements?token=$(cat "$TP_ROOT/ctl/home/.k2/daemon.token")" > "$RUN/placements.json"
+    placed=$(grep -E '\[hosts\] placed agent ' "$RUN/controller.log" | sed -E 's/.*placed agent ([^ ]+) on host.*/\1/' | sort -u | tr '\n' ' ')
+    ok=$(python3 -I -c '
+import json,sys
+rows={a["agent"]:a for a in json.load(open(sys.argv[1]))["agents"]}
+placed=sys.argv[2].split()
+bad=[a for a in placed if rows.get(a,{}).get("mode")!="portable" or rows.get(a,{}).get("last_host")!="host-1"]
+print(1 if placed and not bad else 0, len(placed), bad)' "$RUN/placements.json" "$placed")
+    check "P3: every placed agent has its placement policy (portable, last host host-1)" "$([ "${ok%% *}" = 1 ] && echo 1)" \
+        "agents placed / missing or wrong: ${ok#* }"
 
     topo_metrics > "$RUN/metrics.csv"
     echo "evidence: ${RUN#$REPO/}"

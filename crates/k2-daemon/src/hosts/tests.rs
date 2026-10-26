@@ -1397,3 +1397,108 @@ async fn a_ring_overrun_ends_the_byte_stream_instead_of_skipping() {
     assert_eq!(bytes_until(&mut client, 4).await, b"KLMN");
     link.abort();
 }
+
+// ── P3 T2 phase A: placement through the provisioner ─────────────────────
+
+/// A fake host that said hello as `name` with `labels`.
+async fn fake_host_labeled(c: &Controller, name: &str, labels: &[&str]) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.expect("dial");
+    let labels = labels.iter().map(|l| l.to_string()).collect();
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![] }).await;
+    assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
+    ws
+}
+
+/// Close `agent` on its (fake) host, as a sleep does.
+async fn close_on(c: &Controller, host: &mut Ws, agent: &str) {
+    let remote = c.remote;
+    let body = json!({"agent_name": agent, "force": true}).to_string();
+    let close = tokio::spawn(async move { remote.close(body.as_bytes()).await });
+    let req = match recv(host).await {
+        Frame::Close { req, agent_id, .. } => {
+            assert_eq!(agent_id, agent);
+            req
+        }
+        other => panic!("expected close, got {other:?}"),
+    };
+    send(host, &Frame::Reply { req, status: "200 OK".into(), body: json!({"closed": true}).to_string() }).await;
+    within("the close answer", close).await.unwrap();
+    assert!(c.remote.placement(agent).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wake_goes_back_to_the_last_host_not_the_emptiest() {
+    let c = Controller::start().await;
+    let mut a = fake_host(&c, "h-a").await;
+    let mut b = fake_host(&c, "h-b").await;
+    c.wait_hosts(2).await;
+    // bob's first placement: both empty, by name.
+    place(&c, &mut a, "bob", &uuid::Uuid::new_v4().to_string()).await;
+    let row = c.remote.policy().get("bob").unwrap();
+    assert_eq!((row.mode, row.last_host.as_deref()), (crate::provisioner::Mode::Portable, Some("h-a")));
+    close_on(&c, &mut a, "bob").await; // asleep
+    // h-a now runs another agent; h-b is emptier.
+    place(&c, &mut a, "other", &uuid::Uuid::new_v4().to_string()).await;
+    // The wake goes back to h-a, where bob's home is.
+    place(&c, &mut a, "bob", &uuid::Uuid::new_v4().to_string()).await;
+    // A new agent still goes to the emptiest host.
+    place(&c, &mut b, "carol", &uuid::Uuid::new_v4().to_string()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_laptop_agent_is_pinned_and_waits_for_its_away_laptop() {
+    let c = Controller::start().await;
+    let mut laptop = fake_host_labeled(&c, "eric-mbp", &["k2.kind=laptop"]).await;
+    c.wait_hosts(1).await;
+    place(&c, &mut laptop, "notes", &uuid::Uuid::new_v4().to_string()).await;
+    let row = c.remote.policy().get("notes").unwrap();
+    assert_eq!(row.mode, crate::provisioner::Mode::Pinned { host: "eric-mbp".into() }, "first placed on a laptop: pinned (D5)");
+    close_on(&c, &mut laptop, "notes").await;
+    // A server host links; the laptop's lid closes (its link drops).
+    let mut server = fake_host(&c, "h-1").await;
+    c.wait_hosts(2).await;
+    drop(laptop);
+    c.wait_hosts(1).await;
+    let status = c.remote.status_json();
+    assert_eq!(status["away"], json!(["eric-mbp"]), "{status}");
+    assert_eq!(status["provisioner"], "static");
+    // A wake of notes: refused with the reason, never placed on h-1.
+    let (st, body) = c.remote.spawn(br#"{"agent_name":"notes","command":"claude"}"#).await;
+    assert_eq!(st, "503 Service Unavailable", "{body}");
+    assert!(body.contains("pinned to host eric-mbp") && body.contains("never placed elsewhere"), "{body}");
+    assert!(c.remote.placement("notes").is_none());
+    // The workspace spawn (the --wake / heartbeat / app path) is refused the same way.
+    let remote = c.remote;
+    let req = crate::spawn::SpawnWorkspaceSessionRequest {
+        agent_name: "notes".into(),
+        cwd: "/w/notes".into(),
+        canonical_key: Some("notes".into()),
+        ..Default::default()
+    };
+    let err = tokio::task::spawn_blocking(move || remote.spawn_workspace_blocking(&req).err()).await.unwrap().expect("refused");
+    assert!(err.contains("pinned to host eric-mbp"), "{err}");
+    // Another agent still goes to h-1.
+    place(&c, &mut server, "bob", &uuid::Uuid::new_v4().to_string()).await;
+    // The laptop opens: notes goes back to it.
+    let mut laptop = fake_host_labeled(&c, "eric-mbp", &["k2.kind=laptop"]).await;
+    c.wait_hosts(2).await;
+    assert_eq!(c.remote.status_json()["away"], json!([]));
+    place(&c, &mut laptop, "notes", &uuid::Uuid::new_v4().to_string()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_host_refuses_naming_k2_host_max_awake() {
+    let c = Controller::start().await;
+    let mut h = fake_host_labeled(&c, "h-small", &["k2.max_awake=1", "pool=default"]).await;
+    c.wait_hosts(1).await;
+    place(&c, &mut h, "first", &uuid::Uuid::new_v4().to_string()).await;
+    let (st, body) = c.remote.spawn(br#"{"agent_name":"second","command":"claude"}"#).await;
+    assert_eq!(st, "503 Service Unavailable", "{body}");
+    assert!(body.contains("K2_HOST_MAX_AWAKE"), "{body}");
+    let host = &c.remote.status_json()["hosts"][0];
+    assert_eq!((host["max_awake"].as_u64(), host["kind"].as_str()), (Some(1), Some("server")), "{host}");
+    assert_eq!(host["labels"], json!(["k2.max_awake=1", "pool=default"]));
+    // Sleeping the first makes room.
+    close_on(&c, &mut h, "first").await;
+    place(&c, &mut h, "second", &uuid::Uuid::new_v4().to_string()).await;
+}

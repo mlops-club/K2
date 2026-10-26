@@ -18,13 +18,15 @@
 //! the HTTP S1 routes still call [`RemoteHost::spawn`], [`RemoteHost::close`]
 //! and [`RemoteHost::open_grid`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::provisioner::policy::PolicyStore;
+use crate::provisioner::{HostView, Provisioner, Refusal};
 use k2_core::log_debug;
 use k2_core::session::SessionId;
 use k2_core::terminal::{AlacEvent, DaemonPtyConfig, LabelSource};
@@ -185,6 +187,10 @@ struct Inner {
     /// The host that last ran an agent in each cwd: where that project's
     /// transcripts are ([`RemoteHost::transcript_exists`]).
     last_host_for_cwd: HashMap<PathBuf, String>,
+    /// P3: each host's `hello` labels (kept while it is away: its kind).
+    host_labels: HashMap<String, Vec<String>>,
+    /// P3: every host that linked to this process.
+    known_hosts: BTreeSet<String>,
 }
 
 /// An HTTP-shaped answer for the controller's routes: status line and
@@ -467,6 +473,10 @@ pub struct RemoteHost {
     hooks: broadcast::Sender<HostHook>,
     /// W3: where placements survive a controller restart (`None`: memory).
     store: Option<Arc<PlacementStore>>,
+    /// P3: where a new placement goes.
+    provisioner: Box<dyn Provisioner>,
+    /// P3: each agent's placement policy (`agent_placement`).
+    policy: Arc<PolicyStore>,
 }
 
 impl Default for RemoteHost {
@@ -488,7 +498,18 @@ impl RemoteHost {
             epochs,
             hooks: broadcast::channel(1024).0,
             store: None,
+            provisioner: Box::new(crate::provisioner::static_::Static),
+            policy: Arc::new(PolicyStore::in_memory()),
         }
+    }
+
+    /// P3: place with `provisioner`, keeping policies in `policy`.
+    pub fn with_placement(self, provisioner: Box<dyn Provisioner>, policy: Arc<PolicyStore>) -> Self {
+        Self { provisioner, policy, ..self }
+    }
+
+    pub fn policy(&self) -> &PolicyStore {
+        &self.policy
     }
 
     /// Placements and epochs in `store` (W3). Call [`Self::restore`] once
@@ -591,6 +612,7 @@ impl RemoteHost {
         let (tx, rx) = mpsc::unbounded_channel();
         let old = {
             let mut inner = self.inner.lock();
+            inner.known_hosts.insert(host_id.clone());
             inner.links.insert(
                 host_id.clone(),
                 Link { conn, host_name: host_name.to_string(), protocol, tx, pending: HashMap::new(), streams: HashMap::new() },
@@ -813,16 +835,61 @@ impl RemoteHost {
         }
     }
 
-    /// The host for a new placement: the connected host with the fewest
-    /// placements (ties by name).
-    fn pick_host(inner: &Inner) -> Option<String> {
-        let mut counts: Vec<(usize, &String)> = inner
-            .links
-            .keys()
-            .map(|h| (inner.placements.values().filter(|p| &p.host_id == h).count(), h))
-            .collect();
-        counts.sort();
-        counts.first().map(|(_, h)| (*h).clone())
+    /// P3: the `hello` labels of `host_id`'s link (`k2.max_awake`,
+    /// `k2.kind`, `pool=…`). Kept after it unlinks: an away host keeps its kind.
+    pub fn set_labels(&self, host_id: &str, labels: Vec<String>) {
+        self.inner.lock().host_labels.insert(host_id.to_string(), labels);
+    }
+
+    /// Every host placement knows of: linked now, linked earlier, holding a
+    /// placement, or named in an agent's policy. Those not linked are away.
+    fn host_views(&self, inner: &Inner) -> Vec<HostView> {
+        let mut ids: BTreeSet<String> = inner.known_hosts.clone();
+        ids.extend(inner.links.keys().cloned());
+        ids.extend(inner.placements.values().map(|p| p.host_id.clone()));
+        ids.extend(self.policy.hosts());
+        ids.into_iter()
+            .map(|id| {
+                let mut v = HostView::from_labels(&id, inner.host_labels.get(&id).map(Vec::as_slice).unwrap_or_default());
+                v.linked = inner.links.contains_key(&id);
+                v.away = !v.linked;
+                v.awake = inner.placements.values().filter(|p| p.host_id == id).count() as u32;
+                v
+            })
+            .collect()
+    }
+
+    /// The host for `agent_id`'s new placement (the provisioner's `choose`
+    /// over every known host, with the agent's policy).
+    fn choose_host(&self, inner: &Inner, agent_id: &str) -> Result<String, Refusal> {
+        let need = self.policy.need(agent_id);
+        let views = self.host_views(inner);
+        match self.provisioner.choose(&need, &views) {
+            Ok(c) => {
+                k2_core::trace::emit(|| {
+                    k2_core::trace::Event::new("ctl.choose")
+                        .agent(agent_id)
+                        .attr("host", c.host.as_str())
+                        .attr("why", format!("{:?}", c.why))
+                        .attr("provisioner", self.provisioner.kind())
+                });
+                Ok(c.host)
+            }
+            Err(r) => {
+                log_debug!("[hosts] no host for {agent_id}: {}", r.message());
+                Err(r)
+            }
+        }
+    }
+
+    /// `agent_id` got a session on `host_id`: its policy's last host (and,
+    /// for a new agent, its mode from the host's kind).
+    fn record_placement(&self, inner: &Inner, agent_id: &str, host_id: &str) {
+        let kind = HostView::from_labels(host_id, inner.host_labels.get(host_id).map(Vec::as_slice).unwrap_or_default()).kind;
+        match self.policy.record_placement(agent_id, host_id, kind) {
+            Ok(p) => log_debug!("[hosts] agent {agent_id}: last host {host_id}, {:?}", p.mode),
+            Err(e) => log_debug!("[hosts] agent {agent_id}: placement policy not written: {e}"),
+        }
     }
 
     /// `POST /cli/sessions/v2/spawn` on a controller. Find-or-spawn by
@@ -848,9 +915,12 @@ impl RemoteHost {
             match inner.placements.get(&agent_id) {
                 Some(p) => (p.host_id.clone(), p.epoch),
                 None => {
-                    let Some(host_id) = Self::pick_host(&inner) else {
-                        log_debug!("[hosts] spawn {agent_id} refused: no host connected");
-                        return answer("503 Service Unavailable", json!({"error": NO_HOSTS}));
+                    let host_id = match self.choose_host(&inner, &agent_id) {
+                        Ok(h) => h,
+                        Err(r) => {
+                            log_debug!("[hosts] spawn {agent_id} refused: {}", r.message());
+                            return answer(r.status(), json!({"error": r.message()}));
+                        }
                     };
                     let epoch = match self.epochs.next() {
                         Ok(e) => PlacementEpoch(e),
@@ -904,6 +974,7 @@ impl RemoteHost {
                     if let Some(sid) = session.as_deref().and_then(SessionId::parse) {
                         self.keep_session(&mut inner, &agent_id, &host_id, epoch, sid, meta);
                     }
+                    self.record_placement(&inner, &agent_id, &host_id);
                 }
                 log_debug!(
                     "[hosts] placed agent {agent_id} on host {host_id} epoch {} session {}",
@@ -1001,13 +1072,13 @@ impl RemoteHost {
     }
 
     /// Reserve `agent_id`'s placement: its current host and epoch, or a
-    /// new placement on [`Self::pick_host`] at a new epoch.
+    /// new placement on the provisioner's choice at a new epoch.
     fn reserve(&self, agent_id: &str) -> Result<(String, PlacementEpoch), String> {
         let mut inner = self.inner.lock();
         if let Some(p) = inner.placements.get(agent_id) {
             return Ok((p.host_id.clone(), p.epoch));
         }
-        let host_id = Self::pick_host(&inner).ok_or_else(|| NO_HOSTS.to_string())?;
+        let host_id = self.choose_host(&inner, agent_id).map_err(|r| r.message())?;
         let epoch = PlacementEpoch(self.epochs.next().map_err(|e| format!("can't persist the placement epoch: {e}"))?);
         k2_core::trace::emit(|| k2_core::trace::Event::new(trace_events::CTL_EPOCH).agent(agent_id).attr("epoch", epoch.0));
         inner.placements.insert(
@@ -1085,7 +1156,9 @@ impl RemoteHost {
                 // Closed while the spawn was in flight: answer, don't place.
                 _ => return Err(format!("agent {agent_id} was unplaced while its spawn ran")),
             }
-            self.keep_session(&mut inner, &agent_id, &host_id, epoch, sid, meta)
+            let s = self.keep_session(&mut inner, &agent_id, &host_id, epoch, sid, meta);
+            self.record_placement(&inner, &agent_id, &host_id);
+            s
         };
         log_debug!(
             "[hosts] placed agent {agent_id} on host {host_id} epoch {} session {} (workspace spawn, reused={})",
@@ -1406,6 +1479,10 @@ impl RemoteHost {
         };
         let s = self.keep_session(inner, &r.agent_id, host_id, epoch, sid, meta);
         s.cached.lock().alive = r.child_alive;
+        // D5: an agent from before agent_placement is pinned where it runs.
+        if let Err(e) = self.policy.record_adopted(&r.agent_id, host_id) {
+            log_debug!("[hosts] agent {}: placement policy not written: {e}", r.agent_id);
+        }
     }
 
     // ── reads ──────────────────────────────────────────────────────────
@@ -1430,11 +1507,16 @@ impl RemoteHost {
             .iter()
             .map(|(id, l)| {
                 let placed: Vec<&RemotePlacement> = inner.placements.values().filter(|p| &p.host_id == id).collect();
+                let labels = inner.host_labels.get(id).cloned().unwrap_or_default();
+                let view = HostView::from_labels(id, &labels);
                 json!({
                     "host_id": id,
                     "host_name": l.host_name,
                     "placements": placed.len(),
                     "hooks": placed.iter().map(|p| p.hooks).sum::<u64>(),
+                    "labels": labels,
+                    "kind": format!("{:?}", view.kind).to_lowercase(),
+                    "max_awake": view.max_awake,
                 })
             })
             .collect();
@@ -1443,7 +1525,9 @@ impl RemoteHost {
             inner.placements.values().map(|p| &p.host_id).filter(|h| !inner.links.contains_key(*h)).collect();
         lost.sort();
         lost.dedup();
-        json!({"role": "controller", "hosts": hosts, "lost": lost})
+        // P3: known hosts whose link is down (placement skips them).
+        let away: Vec<String> = self.host_views(&inner).into_iter().filter(|v| v.away).map(|v| v.host_id).collect();
+        json!({"role": "controller", "provisioner": self.provisioner.kind(), "hosts": hosts, "lost": lost, "away": away})
     }
 }
 
@@ -1855,12 +1939,29 @@ pub fn global() -> &'static RemoteHost {
         let path = k2_core::db::shared_path().ok_or_else(|| "the daemon database is not open".to_string())?;
         PlacementStore::open_file(&path)
     };
-    let r = REMOTE.get_or_init(|| match store() {
-        Ok(store) => RemoteHost::with_store(Arc::new(store), Some(&EpochCounter::default_path())),
-        Err(e) => {
-            log_debug!("[hosts] placement store unavailable ({e}); placements won't survive a restart");
-            RemoteHost::with_epochs(EpochCounter::persisted(EpochCounter::default_path()))
-        }
+    let r = REMOTE.get_or_init(|| {
+        let host = match store() {
+            Ok(store) => RemoteHost::with_store(Arc::new(store), Some(&EpochCounter::default_path())),
+            Err(e) => {
+                log_debug!("[hosts] placement store unavailable ({e}); placements won't survive a restart");
+                RemoteHost::with_epochs(EpochCounter::persisted(EpochCounter::default_path()))
+            }
+        };
+        // P3: the provisioner K2_PROVISIONER names (checked at boot) and
+        // agent_placement on its own connection, like the placement store.
+        let provisioner = crate::provisioner::select(crate::runtime_role::Role::Controller, std::env::var(crate::provisioner::PROVISIONER_VAR).ok().as_deref())
+            .unwrap_or_else(|e| {
+                log_debug!("[provisioner] {e}; using static");
+                Box::new(crate::provisioner::static_::Static)
+            });
+        let policy = match k2_core::db::shared_path().ok_or_else(|| "the daemon database is not open".to_string()).and_then(|p| PolicyStore::open_file(&p)) {
+            Ok(p) => p,
+            Err(e) => {
+                log_debug!("[provisioner] agent_placement unavailable ({e}); policies won't survive a restart");
+                PolicyStore::in_memory()
+            }
+        };
+        host.with_placement(provisioner, Arc::new(policy))
     });
     RESTORED.call_once(|| {
         r.restore();

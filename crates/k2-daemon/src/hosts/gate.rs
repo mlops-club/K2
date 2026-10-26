@@ -13,6 +13,25 @@ use crate::routes::http;
 use crate::runtime_role::Role;
 
 pub const STATUS_PATH: &str = "/cli/hosts/status";
+/// P3: every agent's placement policy (owner token).
+pub const PLACEMENTS_PATH: &str = "/cli/hosts/placements";
+
+/// `GET /cli/hosts/placements`: `agent_placement`, one row per agent.
+pub fn placements_json(remote: &remote::RemoteHost) -> serde_json::Value {
+    let agents: Vec<serde_json::Value> = remote
+        .policy()
+        .list()
+        .into_iter()
+        .map(|p| {
+            let (mode, pinned) = match p.mode {
+                crate::provisioner::Mode::Pinned { host } => ("pinned", Some(host)),
+                crate::provisioner::Mode::Portable => ("portable", None),
+            };
+            serde_json::json!({"agent": p.agent, "mode": mode, "pinned_host": pinned, "last_host": p.last_host, "home_seq": p.home_seq})
+        })
+        .collect();
+    serde_json::json!({"agents": agents})
+}
 
 /// Routes a controller refuses because they start a PTY of their own,
 /// without the `AgentHost` interface (login PTYs, raw byte streams, the
@@ -116,6 +135,14 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
     if path == STATUS_PATH {
         let Some(body) = super::status_json() else { return false };
         reply(stream, buf, "200 OK", &body.to_string()).await;
+        return true;
+    }
+    if path == PLACEMENTS_PATH && role == Role::Controller {
+        if !http::token_ok(query, owner_token) {
+            reply(stream, buf, "403 Forbidden", r#"{"error":"invalid or missing token"}"#).await;
+            return true;
+        }
+        reply(stream, buf, "200 OK", &placements_json(remote::global()).to_string()).await;
         return true;
     }
     if path == super::proto::ATTACH_PATH {
