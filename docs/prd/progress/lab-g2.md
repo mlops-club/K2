@@ -390,6 +390,16 @@ The new S8 variant (outbox's suggestion, 1d3b21ff7) checks the following:
 3. That message is delivered once.
 4. Only then does the host come back, and one CLI stays live for the agent.
 
+Seed matrix on wave3 1816d189f (lab-g2 c68a368c2 merged), on the throwaway
+branch `k2-dist/lab-g2-wave3f-run` (deleted after). All runs used `LAB_S10=1`
+and `LAB_S8_RESUME_ELSEWHERE=1`.
+
+| Run | `lab-runs/G2/` | Result |
+|---|---|---|
+| Procs, chaos seed 7 | `2026-10-26T22-17-04Z` | S1–S10 PASS, with S3–S10 over 2 rounds; I1 (627 samples, 38 CLIs, 40 placements), I2 (13 messages), I3 (10 resumes), I4 pass |
+| Procs, chaos seed 2026 | `2026-10-26T22-23-36Z` | S1–S10 PASS, with S3–S10 over 1 round; I1–I4 pass |
+| Compose (`k2-lab-fleet:1816d189fca4`), `LAB_NO_ACTIVATE=1`, no chaos | `2026-10-26T22-27-15Z` | S1–S10 PASS; I1–I4 pass; no `projects/activate` calls |
+
 With K2-d in, S10 without app activation is green. Before drain-move, the
 reaper closed those chats mid-turn.
 
