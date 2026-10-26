@@ -208,3 +208,49 @@ The owner decided on 2026-10-26: switch, but only in the next owner roll, after 
 4. Check 7443 (`/boot-status` 200) and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
 
 The backup PVC is kept in `k2-kind-dist`. Nothing of it left the cluster.
+
+## Owner roll #2: k2-kind-dist onto rc1 (2026-10-26, applied)
+
+The coordinator's go: `k2-dist/wave3` c59acf7e0 (`k2-daemon:rc1`, verified
+by dist-link), pool MIN = MAX = 1 until `k2-dist/drain-move` lands,
+`K2_WORK_ROOT=/var/lib/k2/work` on the host, `data-k2-host-0` kept.
+`POOL_MAX=1 scripts/kind/owner-roll-rc1.sh --go`; evidence in the run's
+`$TMPDIR/k2-kind/dist/owner-roll-rc1/` (before.txt, after.txt, diff.txt,
+owner-proof.txt, go.log). **ROLLED**, no check failed, no password in the log.
+
+- **Dry run:** login present, onboarding done; k2-host-0 reuses
+  `data-k2-host-0`; MIN=MAX=1, 1 replica; NodePort 30743 and the
+  controller's claim unchanged; `K2_WORK_ROOT` on k2-host; `login-seed`
+  read-only on its own mount; `k2-daemon:rc1` is c59acf7e0's build.
+- **Rollback images:** `k2-daemon:dist-wave3` = 4352788a3c46,
+  `k2-agents:dist-wave3` = db44e263047e (what the pods ran, by id).
+- **Rehearsal on k2-kind-dist-fake, PASS:** rolled; a fresh k2-host-1
+  (new volume, old key revoked, `--renew` token) got k2-host-0's dummy
+  login through `login-seed` (0600, onboarding done) and linked;
+  enroll-check, app-check, reconnect-check.
+- **Backup:** `k2-backup-controller-20261026-134916` (in the cluster, kept).
+- **After:**
+  - the PVCs from before keep their uids;
+  - k2-host-0's login file is unchanged;
+  - 1 replica, k2-host-0 linked by its 0600 key, `K2_WORK_ROOT` set;
+  - `app-check.sh --dist` and `reconnect-check.sh --dist --restart-live` pass;
+  - **owner-proof PASS through 7443**: Claude Code answered on k2-host-0
+    (session 3d441929…); a **turn-end home snapshot** of the proof agent was
+    in the controller's store before any sleep (seq 1, 23 files, 261086
+    bytes, from k2-host-0); slept, woken, answered again in the same session.
+
+Fixed on the way (each caught before anything changed, or by the rehearsal):
+- step 6 read the rollback image ids from the whole snapshot (9cc4202ad);
+- the rehearsal could print a new test login's password (it now uses its
+  0600 file);
+- `login-seed` didn't carry the onboarding flag onto a used volume (a
+  `.claude.json` without it); it now takes the source's and keeps the old
+  one as `.claude.json.k2-prev`.
+
+**To go back to wave3:**
+1. `docker tag k2-daemon:dist-wave3 k2-daemon:dist && docker tag k2-agents:dist-wave3 k2-agents:dist`;
+2. `scripts/kind/backup-controller.sh --restore=k2-backup-controller-20261026-134916`
+   (checks the sha256, restores, re-mints the host's token and restarts it);
+3. `scripts/kind/up.sh --dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes`
+   (wave3's flags);
+4. check 7443 and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
