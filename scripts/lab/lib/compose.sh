@@ -45,7 +45,7 @@ compose_fleet_up() {
         docker build -q -t k2-lab-gate:3 -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo/scripts/lab/docker" >&2 || exit 3
         docker run --rm --name "$name" \
             --memory=10g --memory-swap=10g --cpus 3 \
-            -e CARGO_BUILD_JOBS=2 -e CARGO_TARGET_DIR=/cache/target \
+            -e CARGO_BUILD_JOBS=2 -e CARGO_TARGET_DIR=/cache/target -e CARGO_INCREMENTAL=0 \
             -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
             -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0="*" \
             -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \
@@ -55,7 +55,9 @@ compose_fleet_up() {
             bash -c "set -e; mkdir -p /build && git archive \"\$0\" | tar -x -C /build && cd /build \
                      && cargo build --locked -p k2-daemon --bin k2-daemon \
                      && cargo build --locked -p k2-fake-agent --bins \
-                     && cp /cache/target/debug/k2-daemon /cache/target/debug/k2-fake-agent /out/" "$sha"
+                     && cp /cache/target/debug/k2-daemon /cache/target/debug/k2-fake-agent /out/ \
+                     && rm -rf /cache/target/debug/incremental \
+                     && find /cache/target/debug/deps -maxdepth 1 -type f -perm -u+x ! -name \"*.so\" -delete" "$sha"
     ' _ "$COMPOSE_LOCK" "$LAB_REPO" "$(git -C "$LAB_REPO" rev-parse --git-common-dir | (cd "$LAB_REPO" && xargs realpath))" \
         "$sha" "$out" "k2-lab-fleet-build-$$" >"$run_dir/fleet-build.log" 2>&1; then
         echo "fleet compose: the Linux build failed (fleet-build.log): $(tail -3 "$run_dir/fleet-build.log" | tr '\n' ' ')" >&2

@@ -228,6 +228,16 @@ fi
 
 echo
 if [ $STATUS -eq 0 ]; then echo "GATE GREEN ($FULL_SHA)"; else echo "GATE RED ($FULL_SHA)"; fi
+# Keep a reused target dir bounded (the lab's Docker run links target/ to a
+# volume that outlives the run, so the removal below only drops the link):
+# drop incremental state and the linked test and bin executables; the
+# compiled libraries stay, so the next run relinks instead of rebuilding.
+if [ -d "$WORK/target/debug" ]; then
+  before=$(du -sh "$WORK/target/" 2>/dev/null | cut -f1)
+  rm -rf "$WORK/target/debug/incremental"
+  find "$WORK/target/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete 2>/dev/null
+  echo "(target trimmed: $before -> $(du -sh "$WORK/target/" 2>/dev/null | cut -f1): incremental and linked executables removed)"
+fi
 if [ "${K2_GATE_KEEP:-0}" != "1" ]; then
   rm -rf "$WORK/target" "$SRC"
   echo "(target + src removed; logs kept in $LOGS)"
