@@ -87,7 +87,7 @@ sequenceDiagram
 | # | item | status |
 |---|---|---|
 | 1 | NetworkPolicy is enforced on kindnet (deny probe, then allow) | **PASS** (ad28865c1, `scripts/kind/caps/netpol-check.sh`): same node and across nodes; deny, allow, and removal |
-| 2 | S12 parity: an App gives a Deployment, Service and NetworkPolicy; its database user is made through `postgresql/k2-pg` and logs in; the policy lets the controller and its database in and keeps a neighbour out; `/cli/db` lists it; deleting the App removes all four | **Needs decisions 1–3** (below). Infra checked: `pg-smoke.sh` PASS (8ab1ee4f3) |
+| 2 | S12 parity: an App gives a Deployment, Service and NetworkPolicy; its database user is made through `postgresql/k2-pg` and logs in; the policy lets the controller and its database in and keeps a neighbour out; `/cli/db` lists it; deleting the App removes all four | **Decisions 1–3 are implemented, unit-tested and the check is written; the kind run is pending.** `scripts/kind/caps/apps-check.sh` runs after lab's Linux gate frees Docker. The database is the App's workspace database, made through `postgresql/k2-pg` (decision 1; per-App databases are S21). Uninstalling the App removes its three objects; the database is the workspace's and stays (its drop is `db-check.sh`'s) |
 | 3 | Mail and Sew answer on their management APIs | **Mail: PASS** after decision 4: `mail-check.sh` (never open, 401 without credentials, 8080 for the controller only) and `mail-enable-check.sh` (the controller sets it up and leaves no recovery credential known). **Sew: no image exists**, deferred. Before decision 4, mail answered but was unconfigured (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
 | 4 | Front door through a Gateway (D7 (a): Envoy Gateway in its own namespace) | **PASS** (`scripts/kind/caps/gateway-check.sh`): `gateway.yaml`'s listener and route with TLS passthrough; the client sees the backend's own certificate, a line round-trips, an unknown SNI gets no route. The backend is a stand-in for the controller's front door until item 5 runs a controller here |
 | 5 | `/boot-status` capabilities read `delegated` for each | **PASS** (`scripts/kind/caps/controller-check.sh`, image `k2-daemon:caps` at 7720600b8). A controller shaped like `controller.yaml`, with the RBAC of `rbac.yaml`, reads `delegated` for postgres, mail, sew, apps and front. Its drivers report: postgres ok (`postgresql/k2-pg` Running, `k2` credentials readable), apps ok (may list Deployments), mail ok (`/healthz/ready` 200; still unconfigured, see decision 4), front ok. Sew is not ok, as expected with no Sew image |
@@ -145,7 +145,23 @@ sequenceDiagram
          - `real_pg_connect_is_the_databases_own`, for a throwaway Postgres 16: B refused, A's logins in, grant then revoke, and an old database locked by the boot pass;
          - `db-check.sh` on kind: B's agent is refused at connect, and `PUBLIC` still has no `CONNECT` after the operator's syncs.
 2. **App code:** the App's Deployment fetches its code archive (the Seed) from the controller with a per-App token. **This revises D6: no registry** (recorded in `p4-plan.md`).
+   - **Done (code: 570a81d69, c20ee52e0; unit tests).** `K2_CAP_APPS=kubernetes` selects `apps/k8s_engine.rs`, a `RuntimeEngine`. It is chosen by `engine_for_app`, `engine_of` and adopt at boot.
+     - Each instance is a Deployment, a Service and a NetworkPolicy named `app-<app>-<deployment>`. The Service and policy are owned by the Deployment, so stop deletes all three.
+     - The pod runs the guarded engine's pinned base image: `node24`, or `node24-full` for the open path.
+     - An init container fetches the Seed from `GET /cli/apps/k8s-seed/<app>/<hash>` with a per-App token, checks its sha256 from the pod spec, and unpacks it into `/app`. The App mounts `/app` read-only and runs as uid 20001.
+     - The token is an HMAC of App and Seed under a controller key, so it is stateless. It sits in the init container's env, not a Secret: it opens only this App's code, and the controller needs no right to create Secrets.
+     - The policy lets the controller in on the instance's port. It lets the App out to the controller, the operator's Postgres, DNS and HTTPS (as `examples/app.yaml`).
+     - **Not yet on Kubernetes:**
+       - the App gateway link (`K2_GATEWAY_URL`, S14);
+       - `k2 app exec` and shell;
+       - data that outlives an instance (`/data` and `$HOME` are emptyDirs);
+       - the egress gate (the policy is the boundary).
 3. **Routing:** minimal edits in `apps/router.rs` and `tunnel_tls_listener.rs`: an optional upstream host, default unchanged, with tests proving `K2_ROLE=all` and local are byte for byte the same.
+   - **Done (570a81d69).**
+     - `router::Backend` has `host` (`None` = `127.0.0.1`) and `switch_to`. `switch` and `switch_with`, and every local engine, are unchanged.
+     - k2-core `health` gains `probe_*_at` and `wait_*_at`, which take a host. The existing probes delegate with `None` and send the same bytes; a test checks the request line.
+     - The supervisor's four switches and two probes pass `k8s_engine::upstream_host`, which is `None` for every local engine.
+     - `tunnel_tls_listener.rs` changed only its log line: Apps already went through `router::splice`.
 4. **Mail, a security fix, first:** T3 now owns `deploy/kubernetes/core/mail.yaml`. A config Secret with a generated admin credential, never in git; no bootstrap or open admin; K2's mail code wired to `K2_STALWART_URL` and those credentials.
    - **Part 1 done** (4e513f659): `STALWART_RECOVERY_ADMIN` comes from the generated Secret `k2-mail-recovery`, so Stalwart never invents or logs an admin and answers 401 without credentials.
    - The volume now sits at the image's real paths: the declared `/opt/stalwart` doesn't exist in the image, so nothing used to persist.
@@ -192,4 +208,6 @@ All of it is through `$TMPDIR/k2-kind/caps/kubeconfig` (`kind get kubeconfig --n
 - Left on k2lab, in `k2-p4-caps` only: `postgresql k2-pg` (for item 2), the namespace itself, and Envoy Gateway in `envoy-gateway-system` with GatewayClass `k2-p4-eg` (`gateway-check.sh --uninstall` removes them). The test Stalwart was deleted.
 - The mail checks clean up after themselves: the controller, Stalwart, their volumes and the Secret are deleted.
 - MILESTONE decision 1: `/cli/db` through the operator's `preparedDatabases` (`db-check.sh` PASS).
-- Next: decisions 2 and 3, then item 2. Item 3 waits only on a Sew image.
+- MILESTONE CONNECT hardening (0951429dd).
+- Decisions 2 and 3: code done, tests pass (full `k2-daemon` lib: 4484 passed, 0 failed).
+- Next: the item 2 run on kind, after lab's gate. Item 3 waits only on a Sew image.
