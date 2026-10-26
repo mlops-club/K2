@@ -1,0 +1,43 @@
+# The host pool's rights (K2_PROVISIONER=kubernetes, wave3 P4 T1): the
+# controller scales StatefulSet k2-host and puts each new host's one-time
+# enroll token in the Secret k2-host-enroll. Only these, in this namespace
+# (deploy/kubernetes/core/rbac.yaml's pool part, without the App, mail and
+# Postgres rights this deployment has no use for). Added by
+# `scripts/kind/up.sh --provisioner=kubernetes`, not by the overlay itself.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k2-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k2-controller-pool
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: ["k2-host"]
+    verbs: ["get", "watch", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    resourceNames: ["k2-host"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k2-host-enroll"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k2-controller-pool
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k2-controller-pool
+subjects:
+  - kind: ServiceAccount
+    name: k2-controller

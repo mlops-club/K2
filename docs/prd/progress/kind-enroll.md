@@ -148,3 +148,24 @@ The owner decided on 2026-10-26: switch, but only in the next owner roll, after 
 - The owner's `k2-kind-dist` is untouched: token mode, `k2-daemon:dist` 6e24dd5be.
 - Decided: `k2-kind-dist` switches to enroll mode in the next owner roll (steps above).
 - Later: the `k2` CLI verbs for mint, list and revoke (W5 has none yet).
+
+## The owner's end-state roll onto wave3 (prepared 2026-10-26, not applied)
+
+`scripts/kind/owner-roll-wave3.sh` folds the enroll switch above into the roll onto `k2-dist/wave3`: the host pool (`K2_PROVISIONER=kubernetes`), enroll, `K2_PTYD=1` and the real agents image. `--dry-run` (the default) changes nothing. `--go` waits for the coordinator.
+
+- **Dry run, 2026-10-26: OK.**
+  - (a) `k2-host` keeps its name, its `serviceName` and its claim template (`data`, 10Gi, RWO), so `k2-host-0` mounts `data-k2-host-0` again at `/var/lib/k2-host`. The Claude login lives there and is never copied.
+  - (b) The pool's floor and ceiling are both 1 (`K2_PROVISIONER_MIN_HOSTS` = `_MAX_HOSTS` = `--hosts`). The pool never drops to zero hosts, and no second host can appear whose idle scale-down would strand agent homes before home sync (P3 T1) lands.
+  - (c) NodePort 30743 and the controller's claim are unchanged, and the proxy answers on 7443.
+  - The `kubectl diff` is limited to:
+    - the controller's ServiceAccount and token;
+    - the enroll and pool env;
+    - the host's enroll token file and `K2_PTYD`;
+    - the new Role `k2-controller-pool`, its RoleBinding, and ServiceAccount `k2-controller`.
+- **`up.sh`:**
+  - `--provisioner=kubernetes` (needs `--host-auth=enroll`) adds `deploy/kind/dist/pool-rbac.yaml`: scale `k2-host`, patch only the Secret `k2-host-enroll`.
+  - `--render-only=PATH` renders without building or applying.
+  - The enroll guard for the owner's variant is gone, per the owner's decision above.
+- **Risks to watch in `--go`:**
+  - Rollback to the older daemon after wave3 migrated the controller's database is untested.
+  - At boot the pool may raise `k2-host` before `enroll.py` has created `k2-host-enroll`. The host then waits for its optional token file. The rehearsal on `k2-kind-dist-fake` runs exactly this path first.

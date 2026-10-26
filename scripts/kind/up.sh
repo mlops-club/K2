@@ -2,8 +2,9 @@
 # K2 on the kind cluster k2lab, ready for the desktop app on this Mac
 # (deploy/kind/README.md has the app steps).
 #
-#   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]] [--fake] [--rebuild-daemon]
-#                      [--reset-password] [--port-forward] [--password-file=PATH]
+#   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]
+#                             [--provisioner=static|kubernetes]] [--fake] [--rebuild-daemon]
+#                      [--reset-password] [--port-forward] [--password-file=PATH] [--render-only=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
 #    compile, then a runtime-only image) when it is missing, or always with
@@ -35,11 +36,22 @@
 # CPU and memory. Scaling down keeps the removed hosts' volumes.
 # --ptyd=0|1 sets K2_PTYD on the hosts (default KIND_PTYD_DEFAULT in
 # lib.sh, else K2_KIND_PTYD): agent PTYs in k2-ptyd. Changing it rolls them.
-# --host-auth=enroll (test variant only, for now) turns on signed host
-# enrollment (K2_HOST_AUTH=enroll): up.sh mints a one-time token per new
+# --host-auth=enroll turns on signed host enrollment (K2_HOST_AUTH=enroll;
+# the owner's k2-kind-dist too since the owner's decision of 2026-10-26,
+# docs/prd/progress/kind-enroll.md): up.sh mints a one-time token per new
 # host into the Secret k2-host-enroll (scripts/kind/enroll.py; never
 # printed); each host keeps its key on its own volume and relinks by it.
 # Without the flag a run goes back to the bootstrap token (token).
+# --provisioner=kubernetes (needs --host-auth=enroll; a daemon with the P4
+# host pool, wave3) lets the controller run StatefulSet k2-host itself
+# (K2_PROVISIONER=kubernetes, the rights in deploy/kind/dist/pool-rbac.yaml).
+# Its floor and ceiling are both --hosts (K2_PROVISIONER_MIN_HOSTS and
+# _MAX_HOSTS): never fewer hosts than that, and never a host added that a
+# later idle scale-down could take away with its agents' homes on it
+# (home sync, P3 T1, is not in yet). static (the default) is as before.
+# --render-only=PATH builds nothing and applies nothing: it writes the
+# manifests a --dist run would apply, at its final host count, to PATH
+# (for `kubectl diff`), and exits.
 #
 # Uses only k2lab, through an explicit kubeconfig; never the current kube
 # context. No credential goes into git, an image or a log: the owner signs
@@ -50,6 +62,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
+provisioner=static render_to=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -61,7 +74,9 @@ for a in "$@"; do
         --hosts=*) hosts=${a#--hosts=} ;;
         --ptyd=0|--ptyd=1) ptyd=${a#--ptyd=} ;;
         --host-auth=token|--host-auth=enroll) host_auth=${a#--host-auth=} ;;
-        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --provisioner=static|--provisioner=kubernetes) provisioner=${a#--provisioner=} ;;
+        --render-only=*) render_to=${a#--render-only=} ;;
+        -h|--help) sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -72,9 +87,15 @@ fi
 if [ -n "$ptyd" ] && [ "$dist" = 0 ]; then
     echo "up.sh: --ptyd needs --dist" >&2; exit 2
 fi
-if [ "$host_auth" = enroll ] && { [ "$dist" = 0 ] || [ "$fake" = 0 ]; }; then
-    # Not on the owner's k2-kind-dist until the owner says so.
-    echo "up.sh: --host-auth=enroll is for the test variant only for now (--dist --fake)" >&2; exit 2
+if [ "$host_auth" = enroll ] && [ "$dist" = 0 ]; then
+    echo "up.sh: --host-auth=enroll needs --dist" >&2; exit 2
+fi
+if [ "$provisioner" = kubernetes ] && { [ "$dist" = 0 ] || [ "$host_auth" != enroll ]; }; then
+    # The pool mints each new host's enroll token itself.
+    echo "up.sh: --provisioner=kubernetes needs --dist --host-auth=enroll" >&2; exit 2
+fi
+if [ -n "$render_to" ] && [ "$dist" = 0 ]; then
+    echo "up.sh: --render-only needs --dist" >&2; exit 2
 fi
 kind_variant_from_flags "$fake" "$dist"
 ptyd=${ptyd:-${K2_KIND_PTYD:-$KIND_PTYD_DEFAULT}}
@@ -92,7 +113,9 @@ cd "$KIND_REPO"
 # compiled by scripts/kind/build-daemon.sh in a memory-capped container,
 # which takes the Docker lock and a cargo slot itself.
 daemon_src=${K2_KIND_DAEMON_SRC:-$KIND_REPO}
-if [ "$rebuild_daemon" = 1 ] || ! docker image inspect "$KIND_BASE_IMAGE" >/dev/null 2>&1; then
+if [ -n "$render_to" ]; then
+    say "render only: no image is built or loaded"
+elif [ "$rebuild_daemon" = 1 ] || ! docker image inspect "$KIND_BASE_IMAGE" >/dev/null 2>&1; then
     if [ "$KIND_DIST" = 1 ] && ! [ -d "$daemon_src/crates/k2-daemon/src/hosts" ]; then
         echo "up.sh: $daemon_src has no dist-link (crates/k2-daemon/src/hosts); set K2_KIND_DAEMON_SRC to a checkout of k2-dist/dist-link" >&2
         exit 1
@@ -101,31 +124,33 @@ if [ "$rebuild_daemon" = 1 ] || ! docker image inspect "$KIND_BASE_IMAGE" >/dev/
 else
     say "$KIND_BASE_IMAGE exists (--rebuild-daemon to rebuild it)"
 fi
-# The rest (no Rust compile except the fake agent's small cargo stage, which
-# also takes a cargo slot) holds the machine-wide Docker lock the k2-dist
-# workers share, so only one Docker-heavy job runs at a time.
-DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
-mkdir -p "$HOME/.cache"
-until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
-trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
-slot=()
-[ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
-say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
-build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" --build-arg "BASE_IMAGE=$KIND_BASE_IMAGE"
-    --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")
-case "$KIND_DOCKERFILE" in *fake*) build=(${slot[@]+"${slot[@]}"} "${build[@]}") ;; esac   # its cargo stage
-DOCKER_BUILDKIT=1 "${build[@]}" >/dev/null
-if [ "$door" = proxy ]; then
-    say "building $KIND_PROXY_IMAGE (deploy/kind/proxy)"
-    DOCKER_BUILDKIT=1 docker build -q -t "$KIND_PROXY_IMAGE" deploy/kind/proxy >/dev/null
-fi
+if [ -z "$render_to" ]; then
+    # The rest (no Rust compile except the fake agent's small cargo stage, which
+    # also takes a cargo slot) holds the machine-wide Docker lock the k2-dist
+    # workers share, so only one Docker-heavy job runs at a time.
+    DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
+    mkdir -p "$HOME/.cache"
+    until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
+    trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
+    slot=()
+    [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
+    say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
+    build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" --build-arg "BASE_IMAGE=$KIND_BASE_IMAGE"
+        --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")
+    case "$KIND_DOCKERFILE" in *fake*) build=(${slot[@]+"${slot[@]}"} "${build[@]}") ;; esac   # its cargo stage
+    DOCKER_BUILDKIT=1 "${build[@]}" >/dev/null
+    if [ "$door" = proxy ]; then
+        say "building $KIND_PROXY_IMAGE (deploy/kind/proxy)"
+        DOCKER_BUILDKIT=1 docker build -q -t "$KIND_PROXY_IMAGE" deploy/kind/proxy >/dev/null
+    fi
 
-# ── 2. load and apply ───────────────────────────────────────────────────
-for img in $KIND_LOAD; do
-    say "loading $img into kind cluster $KIND_CLUSTER"
-    kind load docker-image "$img" --name "$KIND_CLUSTER" >&2
-done
-rmdir "$DOCKER_LOCK"; trap - EXIT
+    # ── 2. load and apply ───────────────────────────────────────────────────
+    for img in $KIND_LOAD; do
+        say "loading $img into kind cluster $KIND_CLUSTER"
+        kind load docker-image "$img" --name "$KIND_CLUSTER" >&2
+    done
+    rmdir "$DOCKER_LOCK"; trap - EXIT
+fi
 rendered="$KIND_STATE/rendered.yaml"
 # The overlay to apply: for --dist, a throwaway kustomization in the state
 # dir over the overlay in git (which keeps 1 host, token auth, no K2_PTYD),
@@ -142,6 +167,7 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - $(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/$KIND_OVERLAY" "$overlay")
+$([ "$provisioner" = kubernetes ] && printf '  - %s\n' "$(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/deploy/kind/dist/pool-rbac.yaml" "$overlay")")
 replicas:
   - {name: k2-host, count: $1}
 EOF
@@ -182,6 +208,21 @@ EOF
               - name: k2-daemon
                 env:
                   - {name: K2_HOST_AUTH, value: enroll}
+EOF
+            if [ "$provisioner" = kubernetes ]; then
+                # The pool talks to the API server: its own ServiceAccount
+                # (pool-rbac.yaml) and token. The pod env wins over the
+                # ConfigMap's K2_PROVISIONER=static.
+                cat <<EOF
+                  - {name: K2_PROVISIONER, value: kubernetes}
+                  - {name: K2_PROVISIONER_HOST_STATEFULSET, value: k2-host}
+                  - {name: K2_PROVISIONER_MIN_HOSTS, value: "$hosts"}
+                  - {name: K2_PROVISIONER_MAX_HOSTS, value: "$hosts"}
+            serviceAccountName: k2-controller
+            automountServiceAccountToken: true
+EOF
+            fi
+            cat <<EOF
   - target: {kind: StatefulSet, name: k2-host}
     patch: |-
       apiVersion: apps/v1
@@ -235,6 +276,12 @@ if [ "$host_auth" = enroll ]; then
     for h in $(host_names); do
         case "$have" in *"\"$h\""*) ;; *) first_hosts=0 ;; esac
     done
+fi
+if [ -n "$render_to" ]; then
+    write_overlay "$hosts"
+    cp "$rendered" "$render_to"
+    say "rendered $KIND_OVERLAY (${hosts} host(s), K2_PTYD=$ptyd, K2_HOST_AUTH=$host_auth, K2_PROVISIONER=$provisioner) to $render_to"
+    exit 0
 fi
 if [ "$KIND_DIST" = 1 ]; then
     write_overlay "$first_hosts"
