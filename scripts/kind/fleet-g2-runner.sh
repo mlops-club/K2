@@ -72,7 +72,11 @@ if has S1; then
     # on the first.
     first=${HOSTS%%,*}
     others=$(echo "$HOSTS" | tr ',' '\n' | tail -n +2)
-    for h in $others; do "${LAB[@]}" fleet kill --state "$STATE" "$h" | tee -a "$RUN/fleet-g2.log"; done
+    # (lab.py's `fleet` takes the proc right after the action.)
+    for h in $others; do
+        "${LAB[@]}" fleet kill "$h" --state "$STATE" 2>&1 | tee -a "$RUN/fleet-g2.log"
+        [ "${PIPESTATUS[0]}" = 0 ] || { say "could not hold $h for S1"; exit 1; }
+    done
     eval "$(python3 -I - "$STATE" "$first" <<'PY'
 import json, shlex, sys
 st, first = json.load(open(sys.argv[1])), sys.argv[2]
@@ -88,7 +92,10 @@ PY
     "${LAB[@]}" s1 --port "$S1_PORT" --token-file "$S1_TOKEN_FILE" --home "$S1_HOME" --cwd "$S1_CWD" \
         --out "$RUN/scenarios/S1" --fake-trace "$S1_TRACE" 2>&1 | tee -a "$RUN/fleet-g2.log"
     [ "${PIPESTATUS[0]}" = 0 ] || rc=1
-    for h in $others; do "${LAB[@]}" fleet start --state "$STATE" "$h" | tee -a "$RUN/fleet-g2.log"; done
+    for h in $others; do
+        "${LAB[@]}" fleet start "$h" --state "$STATE" 2>&1 | tee -a "$RUN/fleet-g2.log"
+        [ "${PIPESTATUS[0]}" = 0 ] || { say "could not start $h again after S1"; exit 1; }
+    done
 fi
 
 if has S2; then

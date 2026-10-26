@@ -4,8 +4,15 @@
 #
 #   scripts/kind/up.sh --dist --fake --hosts=2          # first, once
 #   scripts/kind/fleet-g2.sh [--only S1,S2,...] [--chaos seed=N] [--kill=process|pod]
-#                            [--lab-src=REF|DIR] [--out=DIR] [--keep-runner]
+#                            [--lab-src=REF|DIR] [--out=DIR] [--keep-runner] [--keep-state]
 #
+# 0. a fresh fleet, as the lab's own fleet starts from empty homes: both
+#    StatefulSets scaled to 0, the controller's and hosts' data-* volumes
+#    deleted (k2-work and the Secret stay), scaled back up; hosts enroll
+#    again with the bootstrap token. Placements, outbox rows and agents
+#    left by earlier runs would otherwise steer placement and the
+#    invariants. The dist-fake app login goes too: `up.sh --dist --fake`
+#    makes it again. --keep-state skips this step;
 # 1. builds k2-lab-runner:dist-fake (deploy/kind/Dockerfile.lab-runner: the
 #    fake host image plus python3 and kubectl) when missing or when the
 #    host image changed, and loads it into k2lab (Docker lock held);
@@ -28,7 +35,7 @@
 set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
-only=S1,S2,S3,S4,S5,S6,S7 chaos="" kill_mode=process lab_src=k2-dist/lab-g2 out="" keep=0
+only=S1,S2,S3,S4,S5,S6,S7 chaos="" kill_mode=process lab_src=k2-dist/lab-g2 out="" keep=0 fresh=1
 for a in "$@"; do
     case "$a" in
         --only=*) only=${a#--only=} ;;
@@ -37,7 +44,8 @@ for a in "$@"; do
         --lab-src=*) lab_src=${a#--lab-src=} ;;
         --out=*) out=${a#--out=} ;;
         --keep-runner) keep=1 ;;
-        -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --keep-state) fresh=0 ;;
+        -h|--help) sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "fleet-g2.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -58,6 +66,19 @@ replicas=$(kc -n "$KIND_NS" get statefulset k2-host -o jsonpath='{.spec.replicas
     || { echo "fleet-g2.sh: k2-host has $replicas replica(s) but pods '$hosts': run scripts/kind/up.sh --dist --fake --hosts=N first" >&2; exit 1; }
 kc -n "$KIND_NS" get configmap k2-lab-supervise >/dev/null 2>&1 \
     || { echo "fleet-g2.sh: $KIND_NS has no lab supervisor (deploy/kind/dist-fake/lab.yaml): run scripts/kind/up.sh --dist --fake --hosts=N" >&2; exit 1; }
+# ── 0. a fresh fleet ────────────────────────────────────────────────────
+if [ "$fresh" = 1 ]; then
+    say "fresh fleet: deleting the controller's and hosts' state volumes in $KIND_NS (--keep-state keeps them)"
+    kc -n "$KIND_NS" delete pod k2-lab-runner --ignore-not-found --wait=true >&2
+    kc -n "$KIND_NS" scale statefulset k2-controller k2-host --replicas=0 >&2
+    kc -n "$KIND_NS" wait --for=delete pod -l 'app.kubernetes.io/name in (k2-controller,k2-host)' --timeout=180s >&2 || true
+    pvcs="data-k2-controller-0"
+    for h in ${hosts//,/ }; do pvcs="$pvcs data-$h"; done
+    # shellcheck disable=SC2086
+    kc -n "$KIND_NS" delete pvc $pvcs --ignore-not-found --wait=true >&2
+    kc -n "$KIND_NS" scale statefulset k2-controller --replicas=1 >&2
+    kc -n "$KIND_NS" scale statefulset k2-host --replicas="$replicas" >&2
+fi
 kc -n "$KIND_NS" rollout status statefulset/k2-controller --timeout=300s >&2
 kc -n "$KIND_NS" rollout status statefulset/k2-host --timeout=300s >&2
 say "fleet: controller k2-controller-0, hosts $hosts"

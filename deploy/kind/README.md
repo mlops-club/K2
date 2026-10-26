@@ -306,6 +306,12 @@ volume. Neither applies to the owner's `k2-kind-dist`. The test variant
 has its own daemon tag, `k2-daemon:dist-fake`, so a test build never
 reaches the owner's pods.
 
+Each run starts on a fresh fleet, as the lab's own fleet does. The
+controller's and the hosts' state volumes in `k2-kind-dist-fake` are
+deleted and made again; `k2-work` and the Secret stay. This removes the
+test variant's app login too: `up.sh --dist --fake` makes it again.
+`--keep-state` skips this step.
+
 S1 is a one-host scenario: `fleet-g2.sh` holds the other hosts down while
 it runs. The evidence (scenario results and logs, traces, `samples.jsonl`,
 `chaos.log`, `invariants.json`, `/cli/hosts/status` at the start and the
