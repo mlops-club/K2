@@ -1,6 +1,33 @@
 # Stalwart, K2's mail server, driven by the controller over its management
-# API exactly as the daemon's mail supervisor does today. Replaces the root
-# helper's `mail` verbs (useradd, unit files, binary install).
+# API exactly as the daemon's mail supervisor does on a host
+# (crates/k2-daemon/src/mail/supervisor.rs). Replaces the root helper's
+# `mail` verbs (useradd, unit files, binary install).
+#
+# Never open, never a logged password. Stalwart 0.16 with no config file
+# starts in bootstrap mode; without a recovery credential it would invent a
+# temporary admin and print it to its log. Here:
+#
+#   - STALWART_RECOVERY_ADMIN comes from the Secret k2-mail-recovery (key
+#     `password`, 64 lowercase hex), generated at install and never in git:
+#
+#       python3 -c 'import secrets; print(secrets.token_hex(32), end="")' > pw
+#       kubectl -n k2 create secret generic k2-mail-recovery --from-file=password=pw && rm pw
+#
+#     so no temporary admin exists. Without credentials, the management
+#     API answers 401 to every call (the session document only lists
+#     capabilities).
+#   - Port 8080 (management) is reachable from the controller only
+#     (network-policies.yaml, mail-ingress).
+#   - The controller completes setup at once (x:Bootstrap/set: config.json
+#     on this volume, a provisioned admin it keeps in its vault), then
+#     `recovery-off`: it rotates the bootstrap and provisioned admins and
+#     overwrites k2-mail-recovery with a random value it discards, then
+#     restarts the pod. From then on nobody knows a recovery credential.
+#     The Role below is exactly what that needs.
+#
+# The image runs as uid 2000 with `--config /etc/stalwart/config.json`; its
+# data store goes under /var/lib/stalwart (K2's STALWART_DATA_DIR). Both
+# live on the one volume, so setup survives restarts.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -17,23 +44,40 @@ spec:
         app.kubernetes.io/name: k2-mail
         k2.dev/role: mail
     spec:
+      automountServiceAccountToken: false
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 2000                              # the image's stalwart user
+        runAsGroup: 2000
+        fsGroup: 2000                                # the volume is writable by it
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: stalwart
           image: stalwartlabs/stalwart:v0.16.25          # K2's pinned version
+          env:
+            - name: K2_STALWART_RECOVERY_PASSWORD
+              valueFrom: {secretKeyRef: {name: k2-mail-recovery, key: password}}
+            - name: STALWART_RECOVERY_ADMIN
+              value: "admin:$(K2_STALWART_RECOVERY_PASSWORD)"
           ports:
             - {name: smtp, containerPort: 25}
             - {name: submissions, containerPort: 465}
             - {name: imaps, containerPort: 993}
             - {name: mgmt, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz/ready, port: mgmt}
+            periodSeconds: 10
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {memory: 1Gi}
           securityContext:
             allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]                # 25, 465 and 993 as uid 2000
           volumeMounts:
-            - {name: data, mountPath: /opt/stalwart}
+            - {name: data, mountPath: /etc/stalwart, subPath: etc}
+            - {name: data, mountPath: /var/lib/stalwart, subPath: data}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -67,3 +111,32 @@ spec:
     app.kubernetes.io/name: k2-mail
   ports:
     - {name: mgmt, port: 8080, targetPort: mgmt}
+---
+# What the controller's mail supervisor needs beyond rbac.yaml: read the
+# recovery Secret (rbac.yaml's "get secrets" covers it), overwrite it at
+# recovery-off, and restart Stalwart so the old credential is gone.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k2-controller-mail
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["k2-mail-recovery"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: ["k2-mail-0"]
+    verbs: ["get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k2-controller-mail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k2-controller-mail
+subjects:
+  - kind: ServiceAccount
+    name: k2-controller
