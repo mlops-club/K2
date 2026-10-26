@@ -269,7 +269,8 @@ done
 if [ "$rehearse" = 1 ]; then
     echo "== 7. rehearse on k2-kind-dist-fake"
     docker tag "$RC_DAEMON" k2-daemon:dist-fake
-    "$KIND_REPO/scripts/kind/up.sh" --fake "${ROLL_FLAGS[@]}" >&2 && ok "rehearsal: rolled" || bad "rehearsal: up.sh"
+    # The test login's password, if up.sh makes one, goes to FAKE_PW (0600), never the log.
+    "$KIND_REPO/scripts/kind/up.sh" --fake "${ROLL_FLAGS[@]}" --password-file="$FAKE_PW" >&2 && ok "rehearsal: rolled" || bad "rehearsal: up.sh"
     # A dummy login on the test host-0 when it has none: not a credential.
     kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake exec k2-host-0 -c k2-host -- sh -c '
         [ -e /var/lib/k2-host/.claude/.credentials.json ] && exit 0
