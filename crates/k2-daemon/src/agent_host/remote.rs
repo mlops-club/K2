@@ -1237,6 +1237,7 @@ impl RemoteHost {
                     epoch.0,
                     session.as_deref().unwrap_or("?")
                 );
+                crate::delivery_drain::spawned(self);
                 // Say so in the answer when the agent's home host was away.
                 let body = match (placement_note, serde_json::from_str::<Value>(&body)) {
                     (Some(note), Ok(Value::Object(mut m))) => {
@@ -1684,6 +1685,7 @@ impl RemoteHost {
             spawned.session_id,
             spawned.reused
         );
+        crate::delivery_drain::spawned(self);
         Ok((spawned, AgentSession::remote(session)))
     }
 

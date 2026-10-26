@@ -20,8 +20,9 @@
 #      (fetched > 0) and resumes the same session (--resume)
 #   4. host-2 has notes' memory from host-1, and answers the message: its
 #      turn runs to its end (the idle reaper, ticking every second, never
-#      cuts it: K2-d), and the message is delivered once (one delivered
-#      ack, once as a prompt in the transcript)
+#      cuts it: K2-d), and the message is delivered once, on its first send
+#      (it waits for the resume's spawn to answer: no "not yet" and backoff),
+#      once as a prompt in the transcript
 #
 # Ports: DM_CTL_PORT (default 17486), DM_H1_PORT (17487), DM_H2_PORT (17488).
 # Evidence: lab-runs/drain-move/<UTC>/.
@@ -315,8 +316,8 @@ prompts=$(grep '"role":"user"' "$T2" 2>/dev/null | grep -c "after the drain" || 
 acks=$(grep -c "$MSG_ID Delivered by host" "$RUN/controller.log" 2>/dev/null || true)
 cut=$(grep -c "firing close for project=$AGENT" "$RUN/controller.log" 2>/dev/null || true)
 check "host-2 has notes' memory from host-1 and answers: the turn ends (never reaped mid-turn), and the message is delivered once" \
-    "$(has_line "$M2" "turn one" && has_line "$M2" "after the drain" && [ "$st" = delivered ] && [ "$acks" = 1 ] && [ "$prompts" = 1 ] && [ "$cut" = 0 ] && echo 1)" \
-    "memory $(tr '\n' '|' < "$M2" 2>/dev/null); outbox $st after $attempts send(s) (a send before the resumed session is live is answered 'not yet', nothing written), $acks delivered ack(s); prompt in the transcript $prompts time(s); reaper closes of notes $cut"
+    "$(has_line "$M2" "turn one" && has_line "$M2" "after the drain" && [ "$st" = delivered ] && [ "$attempts" = 1 ] && [ "$acks" = 1 ] && [ "$prompts" = 1 ] && [ "$cut" = 0 ] && echo 1)" \
+    "memory $(tr '\n' '|' < "$M2" 2>/dev/null); outbox $st after $attempts send(s) (the first: it waits for the resume's spawn to answer), $acks delivered ack(s); prompt in the transcript $prompts time(s); reaper closes of notes $cut"
 
 ctl_get /cli/hosts/home/status > "$RUN/home-status-final.json"
 grep -hE '\[hosts\] .*(drained|resumes on|placed agent|move)' "$RUN/controller.log" > "$RUN/move.log" 2>/dev/null || true

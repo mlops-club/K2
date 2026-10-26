@@ -890,3 +890,49 @@ async fn the_controller_follows_turns_and_a_close_mid_turn_fails_the_unanswered_
     assert!(row.reason.as_deref().unwrap_or_default().contains("interrupted: eve was closed mid-turn"), "{row:?}");
     assert!(!remote.in_turn("eve"), "no placement, no turn");
 }
+
+/// A message waiting for an agent that is being placed (a resume after a
+/// drain) is not sent while the spawn runs, where the host would answer
+/// "not yet" and the outbox back off: it goes out once the spawn answers,
+/// on its first attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_waits_for_the_spawn_to_answer_and_goes_out_on_its_first_attempt() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    super::drain::ensure_controller_resumes_with(remote, Arc::new(super::drain::resume_v2));
+    let mut a = fake_host(&url, "host-a").await;
+    let mut b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+    drained_for_good(remote, &mut a, "ann").await;
+    drop(a);
+    wait_hosts(remote, 1).await;
+
+    let id = outbox.send("agent:alice", "ann", json!({"kind": "msg", "text": "hello again"})).unwrap();
+    let (req, epoch) = match recv(&mut b).await {
+        Frame::Spawn { req, agent_id, epoch, .. } => {
+            assert_eq!(agent_id, "ann");
+            (req, epoch)
+        }
+        other => panic!("expected ann's resume, got {other:?}"),
+    };
+    // Reserved on host-b, its spawn not answered: nothing is sent.
+    assert_eq!(remote.placement("ann").map(|p| (p.host_id, p.epoch.0, p.session_id)), Some(("host-b".into(), epoch, None)));
+    for _ in 0..3 {
+        outbox.pass(k2_core::delivery::now_ms());
+    }
+    let row = outbox.get(&id).unwrap();
+    assert_eq!((row.state, row.attempts), (State::Queued, 0), "no attempt spent while the spawn runs");
+
+    send(&mut b, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": sid(2), "reused": false}).to_string() }).await;
+    match recv(&mut b).await {
+        Frame::Deliver { msg_id, attempt, .. } => {
+            assert_eq!((msg_id.as_str(), attempt), (id.as_str(), 1), "its first attempt");
+            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the message after the spawn, got {other:?}"),
+    }
+    let row = wait_final(&outbox, &id).await;
+    assert_eq!((row.state, row.attempts), (State::Delivered, 1));
+}
