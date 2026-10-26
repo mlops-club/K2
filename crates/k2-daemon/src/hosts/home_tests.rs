@@ -263,3 +263,16 @@ fn a_new_agents_cwd_is_created_under_the_work_root_only() {
     assert!(!outside.exists(), "never created outside the work root");
     assert_eq!(prepare_cwd(&work, &work), Ok(false));
 }
+
+#[test]
+fn a_spawn_resumes_a_conversation_the_restored_home_holds() {
+    let mut args = vec![json!("--dangerously-skip-permissions"), json!("--session-id"), json!("abc")];
+    assert_eq!(resume_held(&mut args, &|id| id == "abc"), Some("abc".into()));
+    assert_eq!(args, [json!("--dangerously-skip-permissions"), json!("--resume"), json!("abc")]);
+    let mut fresh = vec![json!("--session-id"), json!("new")];
+    assert_eq!(resume_held(&mut fresh, &|_| false), None, "not held: a new conversation");
+    assert_eq!(fresh, [json!("--session-id"), json!("new")]);
+    let mut resumed = vec![json!("--resume"), json!("abc")];
+    assert_eq!(resume_held(&mut resumed, &|_| true), None, "already a resume");
+    assert_eq!(resume_held(&mut [json!("--session-id")], &|_| true), None, "no id");
+}

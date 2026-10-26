@@ -15,7 +15,10 @@
 //! (D2); a spawn whose cwd names it under another root runs it under this
 //! one. One cwd per agent: a second agent in a cwd another placed agent
 //! owns is warned about, and its home is neither saved nor restored there.
-//! A new agent's cwd is created under the work root before its spawn.
+//! A new agent's cwd is created under the work root before its spawn. A
+//! spawn that would start a conversation this host now holds (the
+//! controller decided before the restore: `--session-id <id>`) resumes it
+//! instead (`--resume <id>`).
 //! - every release saves the home first: a `close` from the controller
 //!   (sleep, a pool's scale-down, the v2 close) is answered after the push
 //!   ([`before_close`], [`with_home`]); the SIGTERM drain pushes before its
@@ -63,6 +66,8 @@ pub mod events {
     pub const HOST_HOME_SAVE_FAILED: &str = "host.home_save_failed";
     pub const HOST_HOME_RESTORED: &str = "host.home_restored";
     pub const HOST_HOME_RESTORE_FAILED: &str = "host.home_restore_failed";
+    /// A spawn's `--session-id` became `--resume`: the home here holds it.
+    pub const HOST_HOME_RESUME: &str = "host.home_resume";
     pub const CTL_HOME_COMMIT: &str = "ctl.home_commit";
     pub const CTL_HOME_REFUSED: &str = "ctl.home_refused";
 }
@@ -384,6 +389,19 @@ pub(crate) fn map_cwd(requested: &Path, here: Option<(PathBuf, Option<String>)>)
     (requested != local && requested.ends_with(&rel)).then_some(local)
 }
 
+/// `--session-id <id>` → `--resume <id>` in `args` when `holds(id)`: the
+/// restored home has that conversation, so starting it again would fail or
+/// fork it. The id, when changed.
+pub(crate) fn resume_held(args: &mut [Value], holds: &dyn Fn(&str) -> bool) -> Option<String> {
+    let i = args.iter().position(|a| a.as_str() == Some("--session-id"))?;
+    let id = args.get(i + 1)?.as_str()?.to_string();
+    if !holds(&id) {
+        return None;
+    }
+    args[i] = json!("--resume");
+    Some(id)
+}
+
 /// Create a new agent's cwd before its spawn, under the work root only.
 /// `Ok(true)` when it was created.
 pub(crate) fn prepare_cwd(root: &Path, cwd: &Path) -> Result<bool, String> {
@@ -626,6 +644,14 @@ pub async fn before_spawn(req: u64, agent: &str, body: &mut Value) -> Option<Fra
         Ok(false) => {}
         Err(e) => {
             return Some(Frame::Reply { req, status: "500 Internal Server Error".into(), body: json!({"error": e}).to_string() })
+        }
+    }
+    if shared.is_none() && in_scope(&root, &cwd) {
+        let project = cwd.to_string_lossy().into_owned();
+        let holds = |id: &str| k2_core::sidecar::conversation_exists("claude", id, &project);
+        if let Some(id) = body.get_mut("args").and_then(Value::as_array_mut).and_then(|a| resume_held(a, &holds)) {
+            log_debug!("[hosts/home] {agent}: this host holds conversation {id}: --resume, not --session-id");
+            k2_core::trace::emit(|| k2_core::trace::Event::new(events::HOST_HOME_RESUME).agent(agent).attr("session", id.as_str()));
         }
     }
     None
