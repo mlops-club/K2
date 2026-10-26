@@ -110,7 +110,9 @@ kind_stop_forward() {
     rm -f "$KIND_STATE/port-forward.pid"
     # Any kubectl port-forward left on this variant's own kubeconfig (an
     # interrupted up.sh can orphan one); nothing else uses that path.
-    pkill -f -- "--kubeconfig $KIND_KUBECONFIG -n $KIND_NS port-forward" 2>/dev/null || true
+    # Never a pattern built from empty variables (cf. the lab's pkill of a bare "/").
+    [ -n "${KIND_KUBECONFIG:-}" ] && [ -n "${KIND_NS:-}" ] \
+        && { pkill -f -- "--kubeconfig $KIND_KUBECONFIG -n $KIND_NS port-forward" 2>/dev/null || true; }
     for _ in $(seq 1 50); do
         pgrep -f -- "--kubeconfig $KIND_KUBECONFIG -n $KIND_NS port-forward" >/dev/null || break
         sleep 0.1

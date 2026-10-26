@@ -196,7 +196,7 @@ rendered="$KIND_STATE/rendered.yaml"
 # it adds nothing, so the render is what it was before the switch existed.
 write_overlay() {  # write_overlay <k2-host replicas>
     overlay="$KIND_STATE/overlay"
-    rm -rf "$KIND_STATE"/hosts-*
+    rm -rf "${KIND_STATE:?}"/hosts-*
     mkdir -p "$overlay"
     {
         cat <<EOF
