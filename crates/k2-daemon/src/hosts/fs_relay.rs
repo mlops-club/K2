@@ -254,6 +254,36 @@ pub fn named_paths(query: &str, body: &[u8]) -> Vec<String> {
     out
 }
 
+/// Every (key, value) under a path key in a request, relative ones too.
+fn path_values(query: &str, body: &[u8]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = pairs(query).into_iter().filter(|(k, _)| PATH_KEYS.contains(&k.as_str())).collect();
+    if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        fn walk(v: &Value, out: &mut Vec<(String, String)>) {
+            match v {
+                Value::Object(o) => {
+                    for (k, x) in o {
+                        if PATH_KEYS.contains(&k.as_str()) {
+                            match x {
+                                Value::String(s) => out.push((k.clone(), s.clone())),
+                                Value::Array(a) => a.iter().filter_map(Value::as_str).for_each(|s| out.push((k.clone(), s.to_string()))),
+                                other => walk(other, out),
+                            }
+                        } else {
+                            walk(x, out);
+                        }
+                    }
+                }
+                Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        walk(&v, &mut out);
+    } else if let Ok(form) = std::str::from_utf8(body) {
+        out.extend(pairs(form).into_iter().filter(|(k, _)| PATH_KEYS.contains(&k.as_str())));
+    }
+    out
+}
+
 /// A body with its path strings mapped (JSON or a form; anything else as is).
 fn map_body(body: &[u8], maps: &[(PathBuf, PathBuf)]) -> Vec<u8> {
     if body.is_empty() {
@@ -314,7 +344,7 @@ pub enum Decision {
 /// Where a request goes, from the paths it names: refused when it names a
 /// `..`, a path outside the workspace it would be relayed to, workspaces on
 /// two hosts, or one on a host that is away.
-pub fn decide(remote: &RemoteHost, query: &str, body: &[u8]) -> Decision {
+pub fn decide(remote: &RemoteHost, route: &str, query: &str, body: &[u8]) -> Decision {
     let paths = named_paths(query, body);
     if paths.iter().any(|p| has_dot_dot(p)) {
         return Decision::Refuse(Answer::json(
@@ -327,6 +357,14 @@ pub fn decide(remote: &RemoteHost, query: &str, body: &[u8]) -> Decision {
         WorkspaceRoute::Relay { host, maps } => {
             // Every path must be in the workspace it goes to: a second path
             // (a copy's destination) elsewhere would be served unmapped.
+            // R5-1: a relayed request names absolute paths (but a route's
+            // repo-relative names); nothing relative goes to a host.
+            if let Some((k, v)) = path_values(query, body).into_iter().find(|(k, v)| stray_relative(route, k, v)) {
+                return Decision::Refuse(Answer::json(
+                    "400 Bad Request",
+                    json!({"error": format!("{k}={v} is relative; give the absolute path"), "code": "relative_path"}),
+                ));
+            }
             if let Some(out) = paths.iter().find(|p| !maps.iter().any(|(from, _)| map_path(p, from, from).is_some())) {
                 return Decision::Refuse(Answer::json(
                     "400 Bad Request",
@@ -464,7 +502,7 @@ pub async fn route_on(
         // The caller first: no work, and nothing about the hosts, before it.
         return false;
     } else {
-        match decide(remote, query, b"") {
+        match decide(remote, path, query, b"") {
             Decision::Local => return false,
             Decision::Refuse(a) => a,
             Decision::Relay { host, maps } => {
@@ -525,7 +563,7 @@ fn post_blocking(remote: &RemoteHost, path: &str, query: &str, body: &[u8], not_
     } else {
         body
     };
-    match decide(remote, query, body) {
+    match decide(remote, path, query, body) {
         Decision::Local => None,
         Decision::Refuse(a) => Some(a),
         Decision::Relay { host, .. } if not_relayed => Some(Answer::json(
@@ -668,17 +706,44 @@ fn resolve(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// R5-1: the keys whose relative values a route's handler joins to an
+/// absolute base it opens (and which key holds that base). Anywhere else a
+/// relative value under a path key is refused: a handler would take it
+/// against the daemon's own working directory.
+fn relative_keys(route: &str) -> Option<(&'static str, &'static [&'static str])> {
+    if route.starts_with("/cli/git/") {
+        Some(("path", &["file_path", "filePath", "old_path", "oldPath", "files"]))
+    } else if route == "/cli/fs/resolve-links" {
+        Some(("workspace", &["paths"]))
+    } else {
+        None
+    }
+}
+
+/// A relative value under a path key that `route` doesn't join to a base.
+fn stray_relative(route: &str, key: &str, v: &str) -> bool {
+    !v.is_empty()
+        && !v.starts_with('/')
+        && PATH_KEYS.contains(&key)
+        && !relative_keys(route).is_some_and(|(_, keys)| keys.contains(&key))
+}
+
 /// Every path a relayed request names is under this host's work root
-/// (strictly: a workspace, never the root itself), after every symlink,
-/// dangling ones included; a relative name is resolved against the
-/// request's base path (`path`) and confined the same way. Absolute
-/// strings under any key but the text keys count as paths.
-fn confine(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), String> {
-    let base = query
-        .iter()
-        .find(|(k, v)| k == "path" && v.starts_with('/'))
-        .map(|(_, v)| v.clone())
-        .or_else(|| body.get("path").and_then(Value::as_str).filter(|v| v.starts_with('/')).map(str::to_string));
+/// (strictly: a workspace, never the root itself), after every symlink.
+/// Values under path keys are absolute (R5-1), but for a route's
+/// repo-relative keys, confined as `base.join(v)` against the absolute
+/// base its handler joins them to; a name (`new_name`, `filename`) is one
+/// plain component. Absolute strings under any key but the text keys count
+/// as paths.
+fn confine(root: &Path, route: &str, query: &[(String, String)], body: &Value) -> Result<(), String> {
+    let rel = relative_keys(route);
+    let base = rel.and_then(|(bk, _)| {
+        query
+            .iter()
+            .find(|(k, v)| k == bk && v.starts_with('/'))
+            .map(|(_, v)| v.clone())
+            .or_else(|| body.get(bk).and_then(Value::as_str).filter(|v| v.starts_with('/')).map(str::to_string))
+    });
     let inside = |v: &str, p: &Path| -> Result<(), String> {
         let r = resolve(p).ok_or_else(|| format!("{v} can't be resolved"))?;
         if r == root || !r.starts_with(root) {
@@ -690,17 +755,25 @@ fn confine(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), 
         if TEXT_KEYS.contains(&key) || v.is_empty() {
             return Ok(());
         }
-        let named = NAME_KEYS.contains(&key) || PATH_KEYS.contains(&key);
-        if (named || v.starts_with('/')) && has_dot_dot(v) {
+        if NAME_KEYS.contains(&key) && !PATH_KEYS.contains(&key) && !rel.is_some_and(|(_, keys)| keys.contains(&key)) {
+            let plain = Path::new(v).components().count() == 1 && matches!(Path::new(v).components().next(), Some(Component::Normal(_)));
+            if !plain {
+                return Err(format!("{key} is not one plain name"));
+            }
+            return Ok(());
+        }
+        if (PATH_KEYS.contains(&key) || NAME_KEYS.contains(&key) || v.starts_with('/')) && has_dot_dot(v) {
             return Err(format!("{key} has '..'"));
         }
         if v.starts_with('/') {
             return inside(v, Path::new(v));
         }
-        if named {
-            if let Some(b) = &base {
-                return inside(v, &Path::new(b).join(v));
-            }
+        if stray_relative(route, key, v) {
+            return Err(format!("{key} is relative; a relayed request names absolute paths"));
+        }
+        if rel.is_some_and(|(_, keys)| keys.contains(&key)) {
+            let b = base.as_ref().ok_or_else(|| format!("{key} is relative and the request has no absolute base"))?;
+            return inside(v, &Path::new(b).join(v));
         }
         Ok(())
     };
@@ -845,7 +918,7 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
     } else {
         (body, body_json)
     };
-    if let Err(e) = confine(&root, &query_pairs, &body_json) {
+    if let Err(e) = confine(&root, path, &query_pairs, &body_json) {
         return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"}));
     }
     if path.starts_with("/cli/git/") && path != "/cli/git/init" {

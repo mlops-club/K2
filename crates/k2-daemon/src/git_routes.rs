@@ -616,7 +616,8 @@ pub fn handle_git_prune_worktrees(body: &[u8]) -> CliResponse {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let _ = std::process::Command::new("git")
+    // K2's git command (hardened on an agent host: fs-relay R5-2).
+    let _ = k2_core::git::git_command()
         .args(["worktree", "prune"])
         .current_dir(&b.project_path)
         .output();

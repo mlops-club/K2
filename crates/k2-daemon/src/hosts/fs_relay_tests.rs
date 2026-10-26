@@ -288,13 +288,13 @@ async fn h1_traversal_and_an_unmapped_second_path_are_refused_on_the_controller(
         other => panic!("expected a refusal, got {other:?}"),
     };
     let q = format!("path={}", encode("/ctl/work/notes/../../../home/k2/.ssh/id_ed25519"));
-    assert_eq!(refused(decide(remote, &q, b"")), ("400 Bad Request".into(), json!("bad_path")));
+    assert_eq!(refused(decide(remote, "/cli/fs/read-file", &q, b"")), ("400 Bad Request".into(), json!("bad_path")));
     let copy = json!({"sources": ["/ctl/work/notes/x"], "destination": "/home/k2/.bashrc"}).to_string();
-    assert_eq!(refused(decide(remote, "", copy.as_bytes())), ("400 Bad Request".into(), json!("outside_workspace")));
+    assert_eq!(refused(decide(remote, "/cli/fs/copy", "", copy.as_bytes())), ("400 Bad Request".into(), json!("outside_workspace")));
     let inside = json!({"sources": ["/ctl/work/notes/x"], "destination": "/ctl/work/notes/y"}).to_string();
-    assert!(matches!(decide(remote, "", inside.as_bytes()), Decision::Relay { .. }));
+    assert!(matches!(decide(remote, "/cli/fs/copy", "", inside.as_bytes()), Decision::Relay { .. }));
     // A repo-relative name (a renamed file's old path) doesn't route.
-    assert!(matches!(decide(remote, "path=%2Fctl%2Fwork%2Fnotes&old_path=old.md", b""), Decision::Relay { .. }));
+    assert!(matches!(decide(remote, "/cli/git/diff-file", "path=%2Fctl%2Fwork%2Fnotes&old_path=old.md", b""), Decision::Relay { .. }));
     drop(h1);
 }
 
@@ -743,9 +743,9 @@ fn n7_k2s_git_commands_run_no_hooks_on_a_host() {
     git(&["commit", "-qm", "first"]);
     let marker = dir.join("hook-ran");
     k2_core::test_env::write_executable(&dir.join(".git/hooks/post-checkout"), &format!("#!/bin/sh\ntouch {}\n", marker.display()));
-    k2_core::git::set_no_hooks(true);
+    let _hardened = Hardened::on();
     let made = k2_core::git::create_worktree(&repo, "relay-branch");
-    k2_core::git::set_no_hooks(false);
+    drop(_hardened);
     assert!(made.is_ok(), "{made:?}");
     assert!(!marker.exists(), "the post-checkout hook didn't run");
     let _ = std::fs::remove_dir_all(&dir);
@@ -853,4 +853,111 @@ fn n3_an_older_relay_space_table_gets_its_agent_column() {
     assert!(rows.contains(&("notes".into(), "h1".into(), 1, String::new())), "{rows:?}");
     assert!(rows.contains(&("tasks".into(), "h2".into(), 2, "agent-t".into())), "{rows:?}");
     let _ = std::fs::remove_file(&path);
+}
+
+// ── round 5 ────────────────────────────────────────────────────────────
+
+/// K2's git hardening is process-wide: one test at a time turns it on.
+struct Hardened(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Hardened {
+    fn on() -> Hardened {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        k2_core::git::set_no_hooks(true);
+        Hardened(g)
+    }
+}
+
+impl Drop for Hardened {
+    fn drop(&mut self) {
+        k2_core::git::set_no_hooks(false);
+    }
+}
+
+/// R5-1: a relative value under a path key, with an absolute key beside it
+/// to route the request: refused on the controller and on the host (a
+/// handler would take it against the daemon's working directory), for a
+/// read and for a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_a_relative_path_beside_an_absolute_key_is_refused_read_and_write() {
+    let (remote, url) = controller_at(&["/ctl/work"], &[("h1", &h("/h1/work"))]).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    place(remote, &mut h1, "notes", "/ctl/work/notes").await;
+    let code = |d: Decision| match d {
+        Decision::Refuse(a) => serde_json::from_str::<Value>(&a.body).unwrap()["code"].clone(),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(code(decide(remote, "/cli/fs/read-file", "path=.k2%2Fdaemon.token&dir=%2Fctl%2Fwork%2Fnotes", b"")), json!("relative_path"));
+    let w = json!({"path": ".k2/evil", "dir": "/ctl/work/notes", "content": "x"}).to_string();
+    assert_eq!(code(decide(remote, "/cli/fs/write-file", "", w.as_bytes())), json!("relative_path"));
+    drop(h1);
+    // The host refuses the same, on its own.
+    let d = host_disk();
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let q = format!("path=.k2%2Fdaemon.token&dir={}", encode(&d.ws.to_string_lossy()));
+    assert!(refused(served("GET", "/cli/fs/read-file", &q, None).await), "read");
+    let w = json!({"path": ".k2/evil", "dir": d.ws, "content": "x"});
+    assert!(refused(served("POST", "/cli/fs/write-file", "", Some(w)).await), "write");
+    // A repo-relative name on a git route is fine, against its absolute path.
+    let ok = json!({"path": d.ws, "file_path": "a.md"});
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    set_local_daemon(closed, "unused");
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    let (st, _) = served("POST", "/cli/git/stage", "", Some(ok)).await;
+    assert_eq!(st, "502 Bad Gateway", "passes the checks (the daemon isn't there)");
+}
+
+/// R5-1: a relative repository path (a nested repo with its work tree
+/// outside), beside an absolute `projectPath`: refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_a_relative_nested_repo_is_refused() {
+    let d = host_disk();
+    let outside = d.root.parent().unwrap().join("home-k2");
+    std::fs::create_dir_all(&outside).unwrap();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    let sub = d.ws.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    k2_core::git::init_repo(&sub.to_string_lossy()).unwrap();
+    host_git(&sub, &["config", "core.worktree", &outside.to_string_lossy()]);
+    let rel = sub.strip_prefix("/").unwrap().to_string_lossy().into_owned();
+    let q = format!("path={}&file_path=id_ed25519&sides=1&projectPath={}", encode(&rel), encode(&d.ws.to_string_lossy()));
+    let (st, v) = served("GET", "/cli/git/diff-file", &q, None).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "{v}");
+}
+
+/// R5-2: creating a worktree runs none of the repository's own commands:
+/// not a smudge filter (`.gitattributes` + `filter.<x>.smudge`), not
+/// `core.fsmonitor`; the worktree still has its files (libgit2 checkout).
+#[test]
+fn r5_create_worktree_runs_no_smudge_filter_or_fsmonitor() {
+    let dir = k2_core::test_env::unique_temp_path("relay-filters");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = dir.to_string_lossy().into_owned();
+    k2_core::git::init_repo(&repo).unwrap();
+    std::fs::write(dir.join("a.md"), "content a\n").unwrap();
+    std::fs::write(dir.join(".gitattributes"), "*.md filter=evil\n").unwrap();
+    host_git(&dir, &["add", "-A"]);
+    host_git(&dir, &["commit", "-qm", "first"]);
+    let smudged = dir.join("smudge-ran");
+    let monitored = dir.join("fsmonitor-ran");
+    host_git(&dir, &["config", "filter.evil.smudge", &format!("touch {}; cat", smudged.display())]);
+    host_git(&dir, &["config", "core.fsmonitor", &format!("touch {}; true", monitored.display())]);
+    let made = {
+        let _hardened = Hardened::on();
+        k2_core::git::create_worktree(&repo, "relay-filters")
+    };
+    let made = made.expect("created");
+    assert!(!smudged.exists(), "the smudge filter didn't run");
+    assert!(!monitored.exists(), "the fsmonitor didn't run");
+    let wt = std::path::PathBuf::from(made.path);
+    assert_eq!(std::fs::read_to_string(wt.join("a.md")).unwrap(), "content a\n", "checked out by libgit2");
+    // The control: K2's git unhardened (a local daemon) does run the filter,
+    // so the test above would have caught it.
+    let _serial = Hardened::on();
+    k2_core::git::set_no_hooks(false);
+    k2_core::git::create_worktree(&repo, "control").expect("created");
+    assert!(smudged.exists(), "unhardened, git runs the repository's filter");
+    drop(_serial);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -5,11 +5,44 @@ use std::process::Command;
 
 static NO_HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// fs-relay (N7): an agent host runs K2's own git commands for its
-/// controller without the repository's hooks (a hook is code the
-/// repository carries; the relay never runs it).
+/// fs-relay (N7, R5-2): an agent host runs K2's own git commands for its
+/// controller hardened: none of the repository's own commands (hooks, an
+/// fsmonitor, filter drivers) and no inherited git environment. A
+/// repository's config is code it carries; the relay never runs it.
 pub fn set_no_hooks(on: bool) {
     NO_HOOKS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn hardened() -> bool {
+    NO_HOOKS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The `git` command K2 runs (hardened on an agent host, [`set_no_hooks`]).
+pub fn git_command() -> Command {
+    git_cli()
+}
+
+/// `git worktree add` with `rest`: on an agent host, without checking out
+/// (a checkout runs the repository's filter drivers), then checked out by
+/// libgit2, which runs none.
+fn worktree_add(project_path: &str, rest: &[&str], worktree_path: &str) -> Result<std::process::Output, String> {
+    let mut args = vec!["worktree", "add"];
+    if hardened() {
+        args.push("--no-checkout");
+    }
+    args.extend_from_slice(rest);
+    let output = git_cli()
+        .args(&args)
+        .current_dir(project_path)
+        .output()
+        .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
+    if output.status.success() && hardened() {
+        let repo = Repository::open(worktree_path).map_err(|e| format!("open the new worktree: {e}"))?;
+        let mut co = git2::build::CheckoutBuilder::new();
+        co.force();
+        repo.checkout_head(Some(&mut co)).map_err(|e| format!("check out the new worktree: {e}"))?;
+    }
+    Ok(output)
 }
 
 /// fs-relay (N7): the repository K2's git code opens for `path` (as
@@ -33,8 +66,14 @@ pub fn repo_dirs(path: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, 
 /// `git`, with `-c core.hooksPath=/dev/null` once [`set_no_hooks`] is on.
 fn git_cli() -> Command {
     let mut c = Command::new("git");
-    if NO_HOOKS.load(std::sync::atomic::Ordering::SeqCst) {
-        c.args(["-c", "core.hooksPath=/dev/null"]);
+    if hardened() {
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                c.env_remove(k);
+            }
+        }
+        c.env("GIT_CONFIG_NOSYSTEM", "1");
+        c.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]);
     }
     c
 }
@@ -361,11 +400,7 @@ pub fn create_worktree(
     let wt_path_str = worktree_path.to_string_lossy().to_string();
 
     // Always create a new branch from HEAD
-    let output = git_cli()
-        .args(["worktree", "add", "-b", branch_name, &wt_path_str, "HEAD"])
-        .current_dir(project_path)
-        .output()
-        .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
+    let output = worktree_add(project_path, &["-b", branch_name, &wt_path_str, "HEAD"], &wt_path_str)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -433,11 +468,7 @@ pub fn checkout_worktree(
     let wt_path_str = worktree_path.to_string_lossy().to_string();
 
     // Checkout existing branch (no -b flag)
-    let output = git_cli()
-        .args(["worktree", "add", &wt_path_str, branch_name])
-        .current_dir(project_path)
-        .output()
-        .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
+    let output = worktree_add(project_path, &[&wt_path_str, branch_name], &wt_path_str)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

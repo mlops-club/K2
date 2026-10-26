@@ -212,6 +212,13 @@ attack refused). N7 was partial:
 | N6 nit: `resolve_pass` on an async worker | The App-pass check runs on the blocking pool at the gate too | |
 | N3: `agent_id` on dev databases | `PlacementStore::open` adds the column to a `relay_space` made without it | `n3_an_older_relay_space_table_gets_its_agent_column` |
 
+## Round 5 review of a07f81ada: what changed
+
+| Finding | Fix | Test |
+|---|---|---|
+| R5-1 relative paths (high) | **Coordinator's decision.** The host refuses any relative value under a path key, except a route's repo-relative keys that its handler joins to an absolute base (`file_path`, `old_path`, `files` against `path` on the git routes; resolve-links' `paths` against `workspace`), which are confined as `base.join(v)`; a name (`new_name`, `filename`) is one plain component. The controller refuses to relay a request with any other relative path-key value (400 `relative_path`): only absolute paths go to a host. With no relative repository path left, `git_precheck` checks the exact repositories the handler opens | `r5_a_relative_path_beside_an_absolute_key_is_refused_read_and_write` (controller and host, read and write; a repo-relative stage passes), `r5_a_relative_nested_repo_is_refused` |
+| R5-2 the repository's own commands in create-worktree | One hardened `git` on an agent host (`k2_core::git::git_command`, every K2 git CLI call): every inherited `GIT_*` removed, `GIT_CONFIG_NOSYSTEM=1`, `-c core.hooksPath=/dev/null -c core.fsmonitor=false`; `worktree add --no-checkout`, then a libgit2 checkout (libgit2 runs no external filter drivers); prune-worktrees through it too | `r5_create_worktree_runs_no_smudge_filter_or_fsmonitor` (with a control: unhardened, git does run the filter) |
+
 ## Checks
 
 | Check | Result |
