@@ -2,8 +2,11 @@
 
 Design for PRD stage P3, written on `k2-dist/p3-plan` from
 `k2-dist/wave2-preview` @13e5a5939 (wave 1, W1, W2 outbox with its two fixes,
-W3). W5 host enrollment (`k2-dist/host-enroll`) is being verified and is not in
-that tree yet; this plan assumes it lands.
+W3). Rebased on 2026-10-26 onto `k2-dist/wave2-preview` @18a13dbda, which adds
+W5 host enrollment and g2-fixes (S7 affinity, the S8 SIGTERM drain, the I2
+gone rule). T2 phase A is on `k2-dist/p3-provisioner` and P4's pool on
+`k2-dist/k8s-provisioner`. Section [T1 in detail](#t1-in-detail-home-sync)
+gives T1's final design, fitted to their drain and release hooks.
 
 P3 builds three things (PRD section 4, "P3 → G3"):
 
@@ -177,7 +180,8 @@ snapshot {agent, seq, epoch, host, created, parent_seq,
 - **Git**: `.git` isn't copied as files. The repo travels as a `git bundle`
   holding only the commits the previous snapshot lacked (its refs are the
   bundle's prerequisites). Tracked changes and untracked files go in as file
-  entries. This reuses the k2-node hardened git runner.
+  entries. This reuses the k2-node hardened git runner. (Superseded by
+  T1-a: `.git` travels as content-addressed files.)
 - **Content addressing**: every file and every bundle is an object named by
   its sha256 and stored once on the controller (`<K2_HOME>/homes/objects/ab/cdef…`).
   The manifest is an object too. A push uploads only objects the store lacks
@@ -195,7 +199,8 @@ snapshot {agent, seq, epoch, host, created, parent_seq,
 - **Transport**: HTTP between host and controller, not frames on the host link
   (decision D1b), so a 200 MB first push never stalls terminal streams. Auth is
   the host's link identity: a per-transfer token the controller puts in the
-  `release` and spawn bodies, scoped to one agent and one epoch.
+  `release` and spawn bodies, scoped to one agent and one epoch. (T1-b: the
+  host gets the token over HTTP with its hello credential instead.)
 - **When to snapshot** (decision D3): on sleep (before the reaper's
   unplace), on a host drain (SIGTERM), and after a turn ends (the Stop hook,
   debounced to one per 60 s per agent). What a hard crash can lose is
@@ -395,6 +400,90 @@ stateDiagram-v2
 | D11 | Naming | | "pin" already means `manually_active` (keep awake) and the terminal size pin. Call this **placement: pinned to <host> or portable** everywhere |
 | D12 | Very large homes | | **Over 2 GiB** after excludes (setting): the agent stays pinned and the app says why |
 
+## T1 in detail: home sync
+
+Written when T1 started (2026-10-26), after reading dist-link's provisioner
+(`k2-dist/p3-provisioner` 04780d6fd, dc02d79cc) and P4's pool
+(`k2-dist/k8s-provisioner` 3d9ff1709). T1 is the priority, because P4's kind
+acceptance reports `homes snapshotted: FAIL` until a host that is drained or
+scaled down saves each agent's home before releasing it, and the agent's
+next host restores it.
+
+### Every way a host lets an agent go
+
+| Release | Who starts it | Path on the host | What T1 adds |
+|---|---|---|---|
+| Sleep (active reaper) | controller | `unplace` → `close` frame → `handle_v2_close` | push, then close, then reply |
+| Pool scale-down (P4 `IdleStep::Drain`, `RemoteHost::idle_tick`) | controller | the same `close` frame, per agent of the draining host | the same; the reply carries `home: {seq}` |
+| `POST /cli/sessions/v2/close` | the app, a script | `RemoteHost::close` → `close` frame | the same |
+| SIGTERM drain (S8: pod stop, node drain, `kill -TERM`) | the host | `hosts::drain::drain`, per agent after its turn | push, then `released {req: 0}`, then stop |
+| Hard crash (`kill -9`, node lost) | nobody | nothing runs | nothing new: the last snapshot is what moves (S10, T2 phase B adds turn-end snapshots) |
+
+Each of these ends in one call, `hosts::home::save(agent, epoch)`, made
+**before** the placement is given up. So once the controller sees the agent
+released, its home is in the store. The scaler can check that before it
+scales down: `hosts::home::latest(agent)` returns the newest snapshot's seq
+and epoch.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as pool / reaper<br/>(controller)
+    participant C as RemoteHost<br/>(controller)
+    participant S as home store<br/>(controller, K2_HOME/homes)
+    participant H1 as k2-host-1<br/>(draining)
+    participant H0 as k2-host-0<br/>(next host)
+
+    Note over P,H1: Release (sleep, scale-down; SIGTERM is the same from step 3)
+    P->>C: idle tick: Drain(k2-host-1) → unplace(agent)
+    C->>H1: close {agent, epoch e}
+    H1->>S: POST home/session (hello token: bootstrap or W5 signature)
+    S-->>H1: transfer token (10 min, this host only)
+    H1->>H1: inventory (clone's rules), sha256 per file
+    H1->>S: have? [shas] → missing; POST each missing object
+    H1->>S: commit manifest {agent, epoch e}
+    S->>S: fence (I4): live placement, or the last host at an epoch ≥ the last snapshot's
+    S-->>H1: seq n
+    H1->>H1: close the CLI
+    H1-->>C: reply {closed: true, home: {seq: n}}
+    P->>P: next tick: no agents left, home saved → scale down
+    Note over C,H0: Wake on another host
+    C->>H0: spawn.workspace {agent, epoch e+1}
+    H0->>S: GET home/latest (only the agent's placed host may read it)
+    S-->>H0: seq n, manifest
+    H0->>S: GET the objects whose bytes it lacks (hash checked)
+    H0->>H0: stage next to each target, journal, rename into place
+    H0->>H0: spawn claude --resume <id> (same session, same MEMORY.md)
+```
+
+### Decisions (T1)
+
+The PRD and this plan's D1–D12 decide most of T1. These are the details
+they leave open, decided here using their recommendations:
+
+| # | Decision | Why |
+|---|---|---|
+| T1-a | **Git travels as files under `.git`**, content-addressed like every other file, instead of the `git bundle` sketched in section 1. Not copied: `.git/hooks/*` (except `*.sample`) and `*.lock` | "Clone to" already ships `.git` this way. Loose objects and packs never change, so content addressing gives the increments a bundle would, and refs, index, stash and dirty state arrive exactly. Hooks would be code another host runs |
+| T1-b | **Transfer auth without a protocol change**: a host proves itself on `POST /cli/hosts/home/session` the way its `hello` does (the bootstrap token, or W5's signed nonce: `enroll::hello_token` / `admit_hello`). It gets a 10-minute transfer token bound to its host id | D1b's per-transfer token, without adding a field to `welcome` (adding one would change every frame match on the other branches). A revoked key gets no new token |
+| T1-c | **The fence (I4)**. While the agent is placed, a commit must come from its placement's host at its epoch. Once it isn't placed, the commit must come from the host that last ran it, at an epoch no lower than the newest snapshot's. The store assigns `seq` | The controller's `unplace` drops the placement before it sends `close`, so a strict "live placement" check would refuse the sleep's own push. A host that comes back after the agent ran elsewhere is never the last host, and is refused |
+| T1-d | **When**: every release in the table above, before the placement is given up. Turn-end snapshots (D3's third trigger, debounced to 60 s) go to T2 phase B with S10 | Drain and scale-down are what P4 waits for. Turn-end snapshots matter only for a hard crash, which is S10 |
+| T1-e | **Scope**: only agents whose cwd is under the host's `K2_WORK_ROOT` (D2). Unset means home sync is off on that host, and the log says so once. Caps: `K2_HOME_MAX_BYTES` (default 2 GiB, D12) and 256 MiB per file; over either, the home stays where it is and the release says why | A v2 spawn with `cwd: /tmp` or `$HOME` must never be swept into the store. P4's kind and the lab set `K2_WORK_ROOT=/var/lib/k2/work` |
+| T1-f | **Restore**: the host pulls the latest snapshot before every spawn and skips it when it already holds that snapshot. A file whose bytes already match isn't fetched. Files are staged next to their targets (no cross-device rename), a journal is committed, then everything is renamed into place. Restore is an **overlay**: it deletes only files an earlier snapshot put there, so excluded files (`node_modules`, `.env`) stay | "A killed restore leaves the old tree": a kill before the commit rolls back, a kill after rolls forward before the next spawn |
+| T1-g | **Store**: `<K2_HOME>/homes/objects/ab/cdef…` plus `<K2_HOME>/homes/index.db`, its own SQLite file | Never the shared `k2.db` lock (W3's boot deadlock). The whole store is one directory, which D1's object-store backend can replace later. No garbage collection in T1 (follow-up) |
+| T1-h | **What goes in**: `clone::inventory` as is (workspace, Claude memory and sessions, other providers' session files, `carry_secrets` off). Hermes's `state.db` merge is skipped | D4. Provider files land where clone's unpack puts them, at the same path (D2) |
+| T1-i | **A push that fails** doesn't block a SIGTERM drain, which can't be stopped. It is loud: `host.home_push_failed`, and a close reply with `home: {error}`. The scaler is told not to scale down a host whose agents' homes weren't saved (the check above) | The volume still holds the home, so scaling down would orphan it |
+| T1-j | **Names**: `k2_core::agent_home` (the format, store, snapshot and restore) and `k2-daemon` `hosts/home.rs` (routes, fence, host hooks) | `k2_core::homes_sync` already exists and is about the app's Home screens |
+
+### What dist-link's code needs (one call each)
+
+- **P4 pool** (`provisioner/kubernetes.rs`, `RemoteHost::idle_tick`): before
+  `ScaledDown`, check that each agent released by `Drain(host)` has
+  `hosts::home::latest(agent)` at its last epoch. If not, stay at `Drain` and
+  log it. Nothing else changes: the close already carries the push.
+- **kind** (`deploy/kind/dist/`, D9): set `K2_WORK_ROOT=/var/lib/k2/work` on
+  the host pods. The per-host `k2-work` volumes then need no `podAffinity`.
+- **T2 phase B**: `Need.home_seq` comes from `hosts::home::latest(agent)`.
+
 ## Worker tasks
 
 ```mermaid
@@ -434,15 +523,15 @@ another worker's files are one call each, listed in the task's progress file.
 
 ### T1 `home-sync`: portable home (FR6)
 
-- **Owns**: new `crates/k2-core/src/home/` (`mod.rs`, `store.rs` content
-  store, `snapshot.rs` manifest built from `clone::inventory`, `gitpack.rs`
-  bundles through k2-node's hardened git, `restore.rs` staging and swap,
-  `tests.rs`); new `crates/k2-daemon/src/home_sync.rs` plus tests (controller
-  object routes, the `home_snapshots` table, the host client);
-  `docs/prd/progress/home-sync.md`.
-- **Hooks**: `hosts/gate.rs` (the object routes), `routes/route_policy.rs`
-  (rows), `hosts/link.rs` (release pushes, spawn fetches). `spawn.workspace`
-  and `release` bodies get optional fields, so `proto.rs` doesn't change.
+- **Owns** (as built, T1-j): new `crates/k2-core/src/agent_home/` (the
+  manifest, the object store and its index, snapshot from `clone::inventory`,
+  journaled restore, tests); new `crates/k2-daemon/src/hosts/home.rs` plus
+  tests (the routes, the fence, the transfer tokens, the host client and
+  hooks); `docs/prd/progress/home-sync.md`.
+- **Hooks**: `hosts/gate.rs` (the routes), `routes/route_policy.rs` (rows),
+  `hosts/link.rs` (a close pushes first, a spawn restores first),
+  `hosts/drain.rs` (a drain pushes before `released`). `proto.rs` doesn't
+  change.
 - **Depends on**: nothing (W5 for the transfer auth in enroll mode; a
   bootstrap-token fallback until then).
 - **Acceptance**:
