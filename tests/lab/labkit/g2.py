@@ -859,8 +859,13 @@ def s8_crash(c, sc):
     text = "s8 crash %s [[turn-ms=8000]]" % uuid.uuid4().hex[:6]
     try:
         c.type(sock, text)
-        if not sc.check("crash: a long turn started on %s" % host,
-                        wait_until(lambda: c.turn_events(csid, "cli.turn.start"), 30), text):
+        # Crash once the agent has the prompt: the turn started AND the
+        # prompt is in its transcript (the CLI records it after its
+        # UserPromptSubmit hook returns, which is slower while chaos restarts
+        # the controller). What never reached the agent can't be "lost by it".
+        if not sc.check("crash: a long turn started on %s and the agent recorded the prompt" % host,
+                        wait_until(lambda: c.turn_events(csid, "cli.turn.start") and c.prompts_with(cwd, text), 30),
+                        text):
             return
         with c.fleet.control():
             sc.check("crash: %s SIGKILLed mid-turn" % host, c.fleet.kill(host), "")
