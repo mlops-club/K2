@@ -563,12 +563,6 @@ fn handle(
                 let _ = tx.send(Frame::Released { req, agent_id, epoch, ring_end: None });
             });
         }
-        Frame::HttpRelay { req, method, path, query, body_b64 } => {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(super::fs_relay::serve(req, &method, &path, &query, &body_b64).await);
-            });
-        }
         Frame::TranscriptExists { req, provider, session_id, project_path } => {
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || {

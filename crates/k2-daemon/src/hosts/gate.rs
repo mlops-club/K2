@@ -130,7 +130,7 @@ async fn reply(stream: &mut TcpStream, buf: &mut [u8], status: &str, body: &str)
 
 /// Serve `path` if it is this module's. `true` = answered (the connection
 /// is done); `false` = the dispatcher carries on as usual.
-pub async fn route(stream: &mut TcpStream, buf: &mut [u8], method: &str, path: &str, query: &str, owner_token: &str) -> bool {
+pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &str, owner_token: &str) -> bool {
     let role = crate::runtime_role::current();
     if path == STATUS_PATH {
         let Some(body) = super::status_json() else { return false };
@@ -177,10 +177,6 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], method: &str, path: &
     }
     if role != Role::Controller {
         return false;
-    }
-    // fs-relay: a workspace on a host's own disk is served by that host.
-    if super::fs_relay::route(stream, buf, method, path, query, owner_token).await {
-        return true;
     }
     match controller_route(path) {
         ControllerRoute::Local => false,
