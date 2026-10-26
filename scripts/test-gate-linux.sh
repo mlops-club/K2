@@ -23,13 +23,12 @@
 #                        panics still carry file:line and messages)
 #   K2_GATE_KEEP=1       keep the workdir (logs, target) after the run
 #   K2_GATE_THREADS      --test-threads (default: libtest's choice)
-#   K2_GATE_LOW_MEMORY=1 for a memory-capped box (the lab's 6 GB Docker
-#                        container): one cargo build job, 256 codegen units
-#                        and opt-level 0 for the workspace default of dev and
-#                        test (packages with their own [profile.dev.package]
-#                        opt-level keep it), so the single rustc for
-#                        k2-daemon's lib test fits (it was SIGKILLed at 6 GB
-#                        with one job and 256 units at opt-level 1).
+#   K2_GATE_LOW_MEMORY=1 for a memory-capped box (the lab's 10 GB Docker
+#                        container): one cargo build job and 256 codegen
+#                        units. The profile's opt-level stays: at opt-level 0
+#                        k2-daemon's async stacks overflow (115 test binaries
+#                        and every spawned test daemon aborted on 3912ab2ff),
+#                        so a cheaper build would not be the same tests.
 #                        Debuginfo is already 0 (K2_GATE_DEBUG) and
 #                        incremental off. Unset (the default), nothing changes.
 #   K2_GATE_BATCH=N      for a box with little disk (the lab's Docker VM):
@@ -123,8 +122,7 @@ fi
 
 LOW_MEM_ENV=()
 if [ "${K2_GATE_LOW_MEMORY:-0}" = 1 ]; then
-  LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256
-               CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0)
+  LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256)
   echo "gate: K2_GATE_LOW_MEMORY=1: ${LOW_MEM_ENV[*]}"
 fi
 

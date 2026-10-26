@@ -57,7 +57,7 @@ case "$batch" in ''|*[!0-9]*) echo "lab: LAB_GATE_BATCH is a number (got '$batch
 low_desc="normal build (K2_GATE_LOW_MEMORY unset)"
 if [ "$low" = 1 ]; then
     low_env=(-e K2_GATE_LOW_MEMORY=1)
-    low_desc="K2_GATE_LOW_MEMORY=1 (1 build job, 256 codegen units, opt-level 0, debuginfo 0)"
+    low_desc="K2_GATE_LOW_MEMORY=1 (1 build job, 256 codegen units, the profile's opt-level, debuginfo 0)"
 fi
 
 # A coordinator hold on Docker (e.g. a Docker Desktop restart): while
