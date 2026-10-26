@@ -214,12 +214,16 @@ def check_i2(ev):
             diffs.append("%s %s → %s: accepted without a msg id, so it cannot be tracked" % (
                 m.get("scenario"), m.get("kind", "msg"), m.get("to")))
     # Final states the controller traced without keeping a row (a direct
-    # delivery, `ctl.msg_accept` status delivered; a loud `delivery.failed`).
+    # delivery, `ctl.msg_accept` status delivered and never sent down by
+    # `ctl.deliver`: every handed-up message is accepted that way; a loud
+    # `delivery.failed`).
     traced = {}
+    sent_down = {e.get("msg_id") for evs in ev.daemon.values() for e in evs if e.get("event") == "ctl.deliver"}
     for proc, evs in ev.daemon.items():
         for e in evs:
             a = e.get("attrs") or {}
-            if e.get("msg_id") and e.get("event") == "ctl.msg_accept" and a.get("status") == "delivered":
+            if (e.get("msg_id") and e.get("event") == "ctl.msg_accept" and a.get("status") == "delivered"
+                    and e["msg_id"] not in sent_down):
                 traced.setdefault(e["msg_id"], "delivered (direct, traced)")
             elif e.get("msg_id") and e.get("event") == "delivery.failed" and a.get("reason"):
                 traced[e["msg_id"]] = "failed: %s" % a["reason"]

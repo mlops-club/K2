@@ -305,6 +305,23 @@ class Plan(unittest.TestCase):
         self.assertEqual(c.exec_of("s")["host"], "host-1")
         self.assertIsNone(c.exec_of("other"))
 
+    def test_a_hop_up_accept_is_final_only_for_a_direct_delivery(self):
+        acc = {"event": "ctl.msg_accept", "msg_id": "m", "attrs": {"status": "delivered"}}
+        dlv = {"event": "ctl.deliver", "msg_id": "m", "attrs": {"host": "host-1"}}
+        bad = {"event": "delivery.failed", "msg_id": "m", "attrs": {"reason": "recipient_gone: x"}}
+        c = g2.Client.__new__(g2.Client)
+        for evs, row, resp_ok, want in (
+                ([acc], None, True, "delivered"),          # direct: no row, never sent down
+                ([acc], "queued", True, "queued"),         # queued: the row decides
+                ([acc, dlv], None, True, None),            # sent down: not direct
+                ([acc], None, False, None),                # controller down: can't tell
+                ([acc, dlv, bad], "sent", True, "failed"),
+                ([acc], "delivered", True, "delivered")):
+            c.fleet = unittest.mock.Mock(st={"controller": "controller"}, daemon_events=lambda proc, event=None, evs=evs: evs)
+            resp = ({"message": {"state": row}} if row else {"message": None}) if resp_ok else None
+            c.outbox = lambda proc=None, msg_id=None, resp=resp: resp
+            self.assertEqual(c.final_state("m"), want, (evs, row, resp_ok))
+
     def test_gone_grace_reaches_every_daemon_only_when_the_lab_sets_it(self):
         with unittest.mock.patch.dict(os.environ, {"LAB_GONE_GRACE_S": "30"}):
             st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
