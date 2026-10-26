@@ -182,7 +182,8 @@ tests/lab/run_tests.sh                                            # the lab's ow
 ## Status
 
 - Milestones: diagrams written; first working slice (fleet procs: S1, S2,
-  S3, S5 green; S4 red on a daemon gap); chaos runs classified; G2 on solo.
+  S3, S5 green; S4 red on a daemon gap); chaos runs classified; G2 on solo;
+  G2 on wave2-preview 13e5a5939 (procs, chaos, compose).
 - Next: the compose run (Docker lock), then a Linux gate run to prove the
   gate fixes below.
 
@@ -238,6 +239,23 @@ delivery (`ctl.msg_accept` delivered, no outbox row, since the S4 fix) as
 final (e74d18e1f); I1 treats the same placement traced again (a spawn
 refused while its host is lost) as one placement (aaec7c10b); a spawn
 refused because no host is linked is asked again once one is (b6f1177b8).
+
+### Compose run (final evidence, LAB_FLEET_BACKEND=compose)
+
+`lab-runs/G2/2026-10-26T01-11-23Z` (sha 0d825db09; `fleet-compose.txt` in
+the bundle): Linux k2-daemon and k2-fake-agent built from `git archive` in
+`k2-lab-gate:3` capped at 10g, 3 CPUs, 2 jobs (slot, then the Docker lock,
+held for the whole run); image `k2-lab-fleet:<sha12>`; three containers
+from `deploy/compose/compose.lab-fleet.yaml`, 3g and 2 CPUs each.
+
+| S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | I1 | I2 | I3 | I4 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| PASS | PASS | PASS | PASS | PASS | PASS | PASS | FAIL (drain) | PASS | pass | fail (S8's message) | pass | pass |
+
+The same as procs without chaos: the only red is S8's drain half and the
+message it leaves queued. The first compose try (`00-53-09Z`) found one lab
+bug: S3 read the sending daemon's TMPDIR from the state file, which compose
+keeps in the compose file (0d825db09).
 
 ### Daemon gaps the lab found (for the owners)
 
