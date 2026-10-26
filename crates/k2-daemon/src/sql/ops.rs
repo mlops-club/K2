@@ -172,6 +172,28 @@ pub(crate) fn pin_search_path(sql: &[u8]) -> Vec<u8> {
 /// the separate search_path hotfix, which this pin replaces).
 pub(crate) const PIN_SEARCH_PATH: &str = "SET ROLE NONE;\nSET search_path = pg_catalog, pg_temp;\n";
 
+/// The database's migrator login (it owns the database and its objects):
+/// `{db}_migrator`; on Kubernetes the operator's `{db}_owner_user`
+/// (P4 T3 decision 1, [`super::k8s`]).
+pub fn migrator_role(db_name: &str) -> String {
+    if super::k8s::kubernetes() {
+        format!("{db_name}_owner_user")
+    } else {
+        format!("{db_name}_migrator")
+    }
+}
+
+/// The database's agent login: `{db}_agent`; on Kubernetes the operator's
+/// `{db}_writer_user`. For a workspace's default database this is also
+/// its grantee login on other workspaces' databases.
+pub fn agent_role(db_name: &str) -> String {
+    if super::k8s::kubernetes() {
+        format!("{db_name}_writer_user")
+    } else {
+        format!("{db_name}_agent")
+    }
+}
+
 /// Sanitize a project UUID into a Postgres identifier fragment.
 pub fn pg_ident_for_project(project_id: &str) -> String {
     let sanitized: String = project_id
@@ -316,7 +338,7 @@ pub(crate) fn ensure_k2_helpers_sql() -> String {
 /// superuser that installs them. `CREATE OR REPLACE` keeps the owner, so
 /// every install runs this after the helpers.
 pub(crate) fn k2_helper_owner_sql(db_name: &str) -> String {
-    let migrator = pg_quote_ident(&format!("{db_name}_migrator"));
+    let migrator = pg_quote_ident(&migrator_role(db_name));
     format!(
         "ALTER FUNCTION k2.skin_uid() OWNER TO {migrator};\n\
          ALTER FUNCTION k2.actor_info() OWNER TO {migrator};"
@@ -385,8 +407,8 @@ pub(crate) struct SyncGrant {
 /// roles that have no relation rows. A listed grantee is revoked down
 /// to those relations (no ALL TABLES, no default privileges).
 pub(crate) fn privilege_sync_sql(db_name: &str, extra_grants: &[SyncGrant]) -> String {
-    let agent = format!("{db_name}_agent");
-    let migrator = format!("{db_name}_migrator");
+    let agent = agent_role(db_name);
+    let migrator = migrator_role(db_name);
     let mut broad: Vec<(String, bool)> = vec![(agent, true)];
     let mut listed: Vec<(SyncGrant, bool)> = Vec::new();
     for grant in extra_grants {
@@ -551,7 +573,7 @@ fn ensure_k2_helpers_db(ops: &dyn SystemOps, db_name: &str) -> Result<(), OpsErr
     // functions there (AX41: permission denied for schema k2).
     let cl = cluster_of(db_name)?;
     su_psql(ops, &cl, db_name, &["-v", "ON_ERROR_STOP=1"], Some(sql.as_bytes()))?;
-    let migrator = pg_quote_ident(&format!("{db_name}_migrator"));
+    let migrator = pg_quote_ident(&migrator_role(db_name));
     let owner = format!("ALTER SCHEMA k2 OWNER TO {migrator};");
     let _ = su_psql(ops, &cl, db_name, &["-v", "ON_ERROR_STOP=1"], Some(owner.as_bytes()));
     // ALTER SCHEMA does not change function owners. SECURITY DEFINER must
@@ -573,7 +595,7 @@ pub(crate) const K2_INTERNAL_TABLES: [&str; 2] = ["_k2_migrations", "_k2_store"]
 /// (no principal) and the migrator (owner) are unaffected. Idempotent;
 /// skips tables that do not exist yet. Needs the k2 helpers first.
 pub(crate) fn seal_k2_internal_tables_sql(db_name: &str) -> String {
-    let migrator = format!("{db_name}_migrator");
+    let migrator = migrator_role(db_name);
     let tables = K2_INTERNAL_TABLES
         .iter()
         .map(|t| pg_quote_literal(t))
@@ -662,7 +684,7 @@ pub fn seal_existing_databases(ops: &dyn SystemOps) -> Vec<String> {
 }
 
 fn agent_login_for(row: &DbRow) -> String {
-    format!("{}_agent", row.name)
+    agent_role(&row.name)
 }
 
 fn connect_user(row: &DbRow, via: ResolvedVia, caller_project_id: &str) -> String {
@@ -894,6 +916,14 @@ fn dsn_for(name: &str, user: &str, password: &str) -> Result<String, OpsError> {
 }
 
 fn dsn_on(cl: &Cluster, name: &str, user: &str, password: &str) -> String {
+    if super::k8s::kubernetes() {
+        // The operator's Service, from any pod; TLS as Spilo requires.
+        return format!(
+            "postgres://{user}:{password}@{host}:{port}/{name}?sslmode=require",
+            host = super::k8s::host(),
+            port = super::k8s::PG_PORT
+        );
+    }
     format!("postgres://{user}:{password}@127.0.0.1:{port}/{name}", port = cl.port)
 }
 
@@ -1006,6 +1036,22 @@ fn target_cluster(
     test: bool,
     explicit: Option<u32>,
 ) -> Result<(Cluster, Option<String>), OpsError> {
+    if super::k8s::kubernetes() {
+        // One cluster: the operator's, recorded at enable. Its major is
+        // its spec's (`postgresql.spec.postgresql.version`), not K2's.
+        let p = cluster::primary();
+        if let Some(m) = explicit.filter(|m| p.major > 0 && *m != p.major) {
+            return Err(OpsError::Refused(
+                "major_is_the_operators",
+                format!(
+                    "on Kubernetes every database is on postgresql/{} (Postgres {}); --major {m} is its spec's to change",
+                    super::k8s::cluster_name(),
+                    p.major
+                ),
+            ));
+        }
+        return Ok((p, None));
+    }
     if test && explicit.is_none() {
         let live = {
             let db = k2_core::db::shared();
@@ -1171,47 +1217,52 @@ fn create_database_inner(
     // The cluster it goes on (records + helper; may create the cluster).
     let (cl, major_note) = target_cluster(ops, project_id, test, major)?;
 
-    let migrator = format!("{name}_migrator");
-    let agent = format!("{name}_agent");
-    let migrator_pw = generate_secret().map_err(OpsError::Engine)?;
-    // R2: one cluster password per LOGIN. A prior grant may have vaulted
-    // `{name}_agent` (default db name = ws_<id>). Reuse; do not ALTER.
-    let reused_agent = {
-        let db = k2_core::db::shared();
-        let conn = db.lock();
-        vaulted_secret_for_role(&conn, secrets, &agent)?
-    };
-    let (agent_pw, existing_agent_ref, alter_agent) = match reused_agent {
-        Some((sref, pw)) => (pw, Some(sref), false),
-        None => {
-            let pw = generate_secret().map_err(OpsError::Engine)?;
-            (pw, None, true)
+    let migrator = migrator_role(&name);
+    let agent = agent_role(&name);
+    let (migrator_pw, agent_pw, existing_agent_ref) = if super::k8s::kubernetes() {
+        create_on_operator(ops, &cl, &name, &migrator, &agent)?
+    } else {
+        let migrator_pw = generate_secret().map_err(OpsError::Engine)?;
+        // R2: one cluster password per LOGIN. A prior grant may have vaulted
+        // `{name}_agent` (default db name = ws_<id>). Reuse; do not ALTER.
+        let reused_agent = {
+            let db = k2_core::db::shared();
+            let conn = db.lock();
+            vaulted_secret_for_role(&conn, secrets, &agent)?
+        };
+        let (agent_pw, existing_agent_ref, alter_agent) = match reused_agent {
+            Some((sref, pw)) => (pw, Some(sref), false),
+            None => {
+                let pw = generate_secret().map_err(OpsError::Engine)?;
+                (pw, None, true)
+            }
+        };
+
+        let mut role_sql = format!(
+            "{}\n{}\n{}",
+            ensure_role_sql(&migrator, &migrator_pw),
+            alter_role_password_sql(&migrator, &migrator_pw),
+            ensure_role_sql(&agent, &agent_pw),
+        );
+        if alter_agent {
+            role_sql.push('\n');
+            role_sql.push_str(&alter_role_password_sql(&agent, &agent_pw));
         }
+        refuse_dangerous_role_sql(&role_sql)?;
+
+        su_psql(ops, &cl, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(role_sql.as_bytes()))?;
+        // Migrator is NOINHERIT and is not a member of the agent until this
+        // GRANT. SET ROLE on the guest query session needs it. Never the reverse.
+        grant_grantee_membership(ops, &cl, &name, &agent)?;
+
+        let create_db = format!(
+            "CREATE DATABASE {db} OWNER {owner};",
+            db = pg_quote_ident(&name),
+            owner = pg_quote_ident(&migrator),
+        );
+        su_psql(ops, &cl, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(create_db.as_bytes()))?;
+        (migrator_pw, agent_pw, existing_agent_ref)
     };
-
-    let mut role_sql = format!(
-        "{}\n{}\n{}",
-        ensure_role_sql(&migrator, &migrator_pw),
-        alter_role_password_sql(&migrator, &migrator_pw),
-        ensure_role_sql(&agent, &agent_pw),
-    );
-    if alter_agent {
-        role_sql.push('\n');
-        role_sql.push_str(&alter_role_password_sql(&agent, &agent_pw));
-    }
-    refuse_dangerous_role_sql(&role_sql)?;
-
-    su_psql(ops, &cl, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(role_sql.as_bytes()))?;
-    // Migrator is NOINHERIT and is not a member of the agent until this
-    // GRANT. SET ROLE on the guest query session needs it. Never the reverse.
-    grant_grantee_membership(ops, &cl, &name, &agent)?;
-
-    let create_db = format!(
-        "CREATE DATABASE {db} OWNER {owner};",
-        db = pg_quote_ident(&name),
-        owner = pg_quote_ident(&migrator),
-    );
-    su_psql(ops, &cl, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(create_db.as_bytes()))?;
 
     let grants = format!(
         "GRANT CONNECT ON DATABASE {db} TO {agent};\n\
@@ -1310,6 +1361,34 @@ fn create_database_inner(
         );
     }
     Ok(v)
+}
+
+/// Kubernetes (P4 T3 decision 1): the operator makes the database and its
+/// two logins (`preparedDatabases`, passwords in its Secrets); K2 then
+/// gives them its own shape as superuser — NOINHERIT, the database owned
+/// by the migrator, the migrator a member of the agent for SET ROLE — and the
+/// caller's grants SQL does the rest, as on a host. Returns the
+/// passwords; the agent's is never a reused vault entry here.
+fn create_on_operator(
+    ops: &dyn SystemOps,
+    cl: &Cluster,
+    name: &str,
+    migrator: &str,
+    agent: &str,
+) -> Result<(String, String, Option<String>), OpsError> {
+    let (m, a) = super::k8s::prepare_database(super::k8s::operator(), name, migrator, agent).map_err(OpsError::Engine)?;
+    let shape = format!(
+        "ALTER ROLE {m} NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT;\n\
+         ALTER ROLE {a} NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT;\n\
+         ALTER DATABASE {db} OWNER TO {m};",
+        m = pg_quote_ident(migrator),
+        a = pg_quote_ident(agent),
+        db = pg_quote_ident(name),
+    );
+    refuse_dangerous_role_sql(&shape)?;
+    su_psql(ops, cl, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(shape.as_bytes()))?;
+    grant_grantee_membership(ops, cl, name, agent)?;
+    Ok((m.password, a.password, None))
 }
 
 fn dsn_json(
@@ -1457,7 +1536,7 @@ fn migrator_creds(secrets: &dyn SecretStore, row: &DbRow) -> Result<(String, Str
         .resolve(sref)
         .map_err(OpsError::Engine)?
         .ok_or_else(|| OpsError::Engine("migrator secret missing from vault".into()))?;
-    Ok((format!("{}_migrator", row.name), pw))
+    Ok((migrator_role(&row.name), pw))
 }
 
 fn exec_as(
@@ -2119,6 +2198,15 @@ pub fn restore(
     Ok(serde_json::json!({ "ok": true, "restored": file }))
 }
 
+/// Kubernetes: take the database off the operator's object first, or its
+/// next sync would create it again. The operator never drops it; K2 does.
+fn forget_on_operator(name: &str) -> Result<(), OpsError> {
+    if !super::k8s::kubernetes() {
+        return Ok(());
+    }
+    super::k8s::operator().patch_cluster(&super::k8s::forget_database_patch(name)).map_err(OpsError::Engine)
+}
+
 pub fn drop_database(ops: &dyn SystemOps, project_id: &str) -> Result<serde_json::Value, OpsError> {
     require_running()?;
     let row = active_row(project_id)?;
@@ -2129,6 +2217,7 @@ pub fn drop_database(ops: &dyn SystemOps, project_id: &str) -> Result<serde_json
         name = pg_quote_literal(&row.name),
         ident = pg_quote_ident(&row.name),
     );
+    forget_on_operator(&row.name)?;
     su_psql(ops, &cluster_of(&row.name)?, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(sql.as_bytes()))?;
     {
         let db = k2_core::db::shared();
@@ -2161,6 +2250,7 @@ pub fn drop_test_database(
         name = pg_quote_literal(&row.name),
         ident = pg_quote_ident(&row.name),
     );
+    forget_on_operator(&row.name)?;
     su_psql(ops, &cluster_of(&row.name)?, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(sql.as_bytes()))?;
     {
         let db = k2_core::db::shared();
@@ -2183,7 +2273,7 @@ pub fn drop_test_database(
 /// the *catalog* name shown to owners; DSN URL user on a grant is this
 /// LOGIN. Bind SET ROLE is owned-only and does not mint a password.
 pub fn default_agent_role(project_id: &str) -> String {
-    format!("{}_agent", pg_ident_for_project(project_id))
+    agent_role(&pg_ident_for_project(project_id))
 }
 
 /// R2: any vaulted secret for this cluster LOGIN, or None.
@@ -2205,7 +2295,7 @@ fn vaulted_secret_for_role(
         .collect();
     drop(stmt);
     for (name, sref) in owned {
-        if format!("{name}_agent") == role {
+        if agent_role(&name) == role {
             if let Some(pw) = secrets.resolve(&sref).map_err(OpsError::Engine)? {
                 return Ok(Some((sref, pw)));
             }
@@ -2266,6 +2356,10 @@ fn sync_grant_secret_refs_for_role(role: &str, sref: &str) -> Result<(), OpsErro
 /// Each role: new password → `ALTER ROLE` → only then the vault entry
 /// (same reference) gets the new value. Returns one line per role.
 pub fn rotate_db_role_passwords(ops: &dyn SystemOps) -> Vec<String> {
+    if super::k8s::kubernetes() {
+        // The logins are the operator's; their passwords live in its Secrets.
+        return vec!["skipped: on Kubernetes the database logins' passwords are the operator's".into()];
+    }
     let mut out = vec![];
     let vault = match crate::vault::get() {
         Ok(v) => v,
@@ -2294,7 +2388,7 @@ pub fn rotate_db_role_passwords(ops: &dyn SystemOps) -> Vec<String> {
             out.push(format!("{name}: skipped (moving to another Postgres major)"));
             continue;
         }
-        for (role, sref) in [(format!("{name}_agent"), agent_ref), (format!("{name}_migrator"), mig_ref)] {
+        for (role, sref) in [(agent_role(&name), agent_ref), (migrator_role(&name), mig_ref)] {
             let Some(sref) = sref.filter(|s| !s.is_empty()) else { continue };
             match rotate_role_everywhere(ops, &clusters, &role, &sref, &store) {
                 Some(line) => out.push(line),
@@ -2590,7 +2684,7 @@ fn grant_grantee_membership(
     db_name: &str,
     role: &str,
 ) -> Result<(), OpsError> {
-    let migrator = format!("{db_name}_migrator");
+    let migrator = migrator_role(db_name);
     let sql = format!(
         "GRANT {role} TO {migrator};",
         role = pg_quote_ident(role),
@@ -2606,7 +2700,7 @@ fn revoke_grantee_membership(
     db_name: &str,
     role: &str,
 ) -> Result<(), OpsError> {
-    let migrator = format!("{db_name}_migrator");
+    let migrator = migrator_role(db_name);
     let sql = format!(
         "REVOKE {role} FROM {migrator};",
         role = pg_quote_ident(role),
@@ -2620,7 +2714,7 @@ fn revoke_grantee_membership(
 /// migrator-owned schema. Runs as superuser so FOR ROLE names the
 /// migrator (not current_user).
 fn revoke_grantee_privileges_sql(db_name: &str, role: &str) -> String {
-    let migrator = format!("{db_name}_migrator");
+    let migrator = migrator_role(db_name);
     let mig_lit = pg_quote_literal(&migrator);
     let role_lit = pg_quote_literal(role);
     format!(
@@ -3253,7 +3347,7 @@ fn store_ddl_creds(
 }
 
 fn agent_role_for_db(db_name: &str) -> String {
-    format!("{db_name}_agent")
+    agent_role(db_name)
 }
 
 fn store_table_exists(
@@ -4475,7 +4569,7 @@ fn active_row_by_name(db_name: &str) -> Result<DbRow, OpsError> {
 /// (the shared `ws_*_agent` logins). Answers (database id, project, roles).
 pub(crate) fn move_roles(db_name: &str) -> Result<(String, String, Vec<String>), OpsError> {
     let row = active_row_by_name(db_name)?;
-    let mut roles = vec![format!("{}_migrator", row.name), agent_login_for(&row)];
+    let mut roles = vec![migrator_role(&row.name), agent_login_for(&row)];
     if let Some(b) = row.bind_role.as_ref().filter(|b| !b.is_empty()) {
         roles.push(b.clone());
     }

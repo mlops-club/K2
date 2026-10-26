@@ -158,6 +158,14 @@ provision-k2-server.sh --bake --with-db (or K2_BAKE_DB=1). The daemon does not a
 /// D29 ram fence is applied even when the sidecar is already running so
 /// an upgrade re-enable converges MemoryHigh/Max + GUC pins.
 pub fn enable_with(ops: &dyn SystemOps) -> Result<serde_json::Value, EnableError> {
+    if super::k8s::kubernetes() {
+        if !try_begin_enable() {
+            return Err(EnableError::InProgress);
+        }
+        let result = run_enable_kubernetes(ops);
+        end_enable();
+        return result;
+    }
     if !is_baked(ops) {
         return Err(EnableError::NotBaked(NOT_BAKED_HINT.into()));
     }
@@ -253,6 +261,54 @@ fn run_enable_machine(ops: &dyn SystemOps) -> Result<serde_json::Value, EnableEr
     }))
 }
 
+/// Kubernetes (P4 T3 decision 1): nothing to install, start or fence —
+/// the operator runs Postgres. Enable reads the server's major as the
+/// operator's superuser and records the one cluster databases go on.
+fn run_enable_kubernetes(ops: &dyn SystemOps) -> Result<serde_json::Value, EnableError> {
+    ensure_installing_row().map_err(EnableError::Engine)?;
+    let fail = |step: &str, err: String| -> EnableError {
+        let msg = format!("{step}: {err}");
+        set_status("error");
+        set_last_error(Some(&msg));
+        EnableError::Engine(msg)
+    };
+    set_current("catalog");
+    let version_out = ops
+        .run_helper(&["psql", "-d", "postgres", "-tA"], Some(b"SHOW server_version_num;"))
+        .map_err(|e| fail("catalog", e))?;
+    let major = parse_installed_major(&version_out).unwrap_or(0);
+    if major <= 0 {
+        return Err(fail("catalog", format!("unreadable server_version_num '{}'", version_out.trim())));
+    }
+    {
+        let db = k2_core::db::shared();
+        let conn = db.lock();
+        let _ = conn.execute(
+            "UPDATE sql_server SET installed_major = ?1, listen = ?2, \
+             installed_at = COALESCE(installed_at, ?3), updated_at = ?3 WHERE id = 1",
+            rusqlite::params![major, super::k8s::host(), now_secs()],
+        );
+        cluster::record_primary_major(&conn, major as u32).map_err(|e| fail("catalog", e))?;
+    }
+    mark_step("catalog");
+    let mut p = progress_load();
+    p["completedAt"] = serde_json::json!(now_secs());
+    p["current"] = serde_json::Value::Null;
+    p["placement"] = serde_json::json!("kubernetes");
+    p["cluster"] = serde_json::json!(super::k8s::cluster_name());
+    progress_save(&p);
+    set_status("running");
+    set_last_error(None);
+    Ok(serde_json::json!({
+        "ok": true,
+        "state": "running",
+        "installedMajor": major,
+        "listen": super::k8s::host(),
+        "cluster": super::k8s::cluster_name(),
+        "alreadyEnabled": false,
+    }))
+}
+
 pub fn parse_installed_major(raw: &str) -> Option<i64> {
     let token = raw
         .split(|c: char| c.is_whitespace() || c == '.')
@@ -273,7 +329,10 @@ pub fn parse_installed_major(raw: &str) -> Option<i64> {
 }
 
 pub fn disable_with(ops: &dyn SystemOps) -> Result<(), String> {
-    ops.run_helper(&["systemctl", "disable", "--now", PG_UNIT], None)?;
+    // Kubernetes: the operator's Postgres keeps running; K2 stops using it.
+    if !super::k8s::kubernetes() {
+        ops.run_helper(&["systemctl", "disable", "--now", PG_UNIT], None)?;
+    }
     let _ = current_status();
     set_status("disabled");
     set_last_error(None);
@@ -361,12 +420,20 @@ fn serving_clusters() -> Vec<(cluster::Cluster, usize)> {
 }
 
 pub fn refresh_health() -> serde_json::Value {
-    let ping = || -> Result<(), String> {
-        RealSystemOps
-            .run_helper(&["psql", "-d", "postgres", "-tA"], Some(b"SELECT 1;"))
-            .map(|_| ())
+    let health = if super::k8s::kubernetes() {
+        // No unit: the operator's cluster answers SELECT 1 or it does not.
+        match super::k8s::KUBE_SQL_OPS.run_helper(&["psql", "-d", "postgres", "-tA"], Some(b"SELECT 1;")) {
+            Ok(_) => Health::Running,
+            Err(e) => Health::Degraded(format!("postgresql/{} did not answer SELECT 1: {e}", super::k8s::cluster_name())),
+        }
+    } else {
+        let ping = || -> Result<(), String> {
+            RealSystemOps
+                .run_helper(&["psql", "-d", "postgres", "-tA"], Some(b"SELECT 1;"))
+                .map(|_| ())
+        };
+        health_check_with(&RealSystemOps, &ping)
     };
-    let health = health_check_with(&RealSystemOps, &ping);
     persist_health(&health);
     serde_json::json!({
         "state": health.as_status_str(),
@@ -398,10 +465,13 @@ pub fn spawn_health_loop() {
     }
     // `k2 db upgrade`: a move the last daemon died in is finished or
     // undone before any new one starts (§13; security review #2 F6).
-    super::pgmove::k2::spawn_boot_recovery();
+    let kubernetes = super::k8s::kubernetes();
+    if !kubernetes {
+        super::pgmove::k2::spawn_boot_recovery();
+    }
     let _ = std::thread::Builder::new()
         .name("sql-health".into())
-        .spawn(|| loop {
+        .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
             if enable_running().load(Ordering::SeqCst) {
                 continue;
@@ -421,6 +491,9 @@ pub fn spawn_health_loop() {
                 // Fold the box's clusters into K2's records (helper 9);
                 // older helpers: the records stay as enable wrote them.
                 let _ = std::panic::catch_unwind(|| {
+                    if kubernetes {
+                        return; // one cluster, the operator's: nothing to fold
+                    }
                     if let Err(e) = cluster::reconcile(&RealSystemOps) {
                         if !e.starts_with("helper_needed") {
                             eprintln!("[db] clusters: {e}");
@@ -428,8 +501,8 @@ pub fn spawn_health_loop() {
                     }
                 });
                 let _ = std::panic::catch_unwind(|| {
-                    let ops = RealSystemOps;
-                    for line in super::ops::seal_existing_databases(&ops) {
+                    let ops: &dyn SystemOps = if kubernetes { &super::k8s::KUBE_SQL_OPS } else { &RealSystemOps };
+                    for line in super::ops::seal_existing_databases(ops) {
                         eprintln!("[db] boot seal: {line}");
                     }
                 });

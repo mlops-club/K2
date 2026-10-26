@@ -556,6 +556,12 @@ pub fn handle(who: Who, is_post: bool, body: &[u8], params: &HashMap<String, Str
     if matches!(who, Who::Other | Who::Member { .. }) {
         return err(403, versions_access::OWNER_ONLY, "moving a database needs the owner, or an agent with \"Allow this agent to manage Postgres versions\"");
     }
+    if crate::sql::k8s::kubernetes() {
+        return err(409, "major_is_the_operators", format!(
+            "on Kubernetes postgresql/{} runs Postgres: change its spec.postgresql.version and the operator upgrades every database",
+            crate::sql::k8s::cluster_name()
+        ));
+    }
     if !crate::sql::sql_supported() {
         return err(503, "unsupported", "Postgres runs on Linux deployments only");
     }

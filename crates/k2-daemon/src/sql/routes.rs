@@ -142,6 +142,9 @@ pub(crate) fn current_ops() -> &'static dyn SystemOps {
             return ops;
         }
     }
+    if super::k8s::kubernetes() {
+        return &super::k8s::KUBE_SQL_OPS;
+    }
     &RealSystemOps
 }
 

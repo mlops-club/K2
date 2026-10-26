@@ -434,11 +434,12 @@ pub fn guest_error_message(raw: &str, internal: &[String]) -> String {
         return GUEST_GENERIC_ERROR.into();
     };
     let low = msg.to_ascii_lowercase();
-    const SETUP: [&str; 7] = [
+    const SETUP: [&str; 8] = [
         "k2_principal_lock",
         "k2_guest_query",
         "pg_temp",
         "_migrator",
+        "_owner_user", // the migrator on Kubernetes (ops::migrator_role)
         "set role",
         "role \"",
         "statement_timeout",

@@ -7,6 +7,7 @@
 pub mod actor;
 pub mod cluster;
 pub mod identity;
+pub mod k8s;
 pub mod ops;
 pub mod paths;
 pub mod pgmove;
