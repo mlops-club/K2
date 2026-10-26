@@ -473,8 +473,11 @@ def k2_msg_as(c, host, to, text, sender):
     h = c.fleet.host(host)
     p = c.fleet.proc(h["proc"])
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", "HOME": h["home"],
-           "K2_HOME": os.path.join(h["home"], ".k2"), "TMPDIR": p["env"]["TMPDIR"],
+           # compose keeps a daemon's env in the compose file: a tmp of our own.
+           "K2_HOME": os.path.join(h["home"], ".k2"),
+           "TMPDIR": p["env"].get("TMPDIR") or os.path.join(c.fleet.st["root"], "k2msg-tmp"),
            "K2_PORT": str(p["port"])}
+    os.makedirs(env["TMPDIR"], exist_ok=True)
     r = subprocess.run([os.path.join(REPO, "cli", "k2"), "msg", to, text, "--from", sender],
                        env=env, capture_output=True, text=True, timeout=HTTP_TIMEOUT_S)
     out = (r.stdout + r.stderr).strip()
