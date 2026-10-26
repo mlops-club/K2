@@ -15,11 +15,14 @@ pub struct Options {
     pub max_bytes: u64,
     /// One file's cap.
     pub max_object: u64,
+    /// The host's work root: the manifest records the workspace's path
+    /// relative to it, so another host can put it under its own.
+    pub work_root: Option<PathBuf>,
 }
 
 impl Options {
     pub fn new(home: &Path) -> Options {
-        Options { home: home.to_path_buf(), max_bytes: super::DEFAULT_MAX_BYTES, max_object: MAX_OBJECT_BYTES }
+        Options { home: home.to_path_buf(), max_bytes: super::DEFAULT_MAX_BYTES, max_object: MAX_OBJECT_BYTES, work_root: None }
     }
 }
 
@@ -133,6 +136,12 @@ pub fn push(
         remote.put_object(sha, &bytes)?;
         sent_bytes += bytes.len() as u64;
     }
+    let work_rel = opts
+        .work_root
+        .as_ref()
+        .and_then(|root| Path::new(&project).strip_prefix(root).ok())
+        .map(|r| r.to_string_lossy().into_owned())
+        .filter(|r| !r.is_empty());
     let manifest = Manifest {
         version: super::MANIFEST_VERSION,
         agent: agent.to_string(),
@@ -140,6 +149,7 @@ pub fn push(
         host: host.to_string(),
         created_ms: now_ms(),
         project_path: project,
+        work_rel,
         slug,
         parent_seq,
         entries: files.into_iter().map(|(e, _)| e).collect(),

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # P3 T1 home sync on three real processes: a K2_ROLE=controller, host-1 and
-# host-2 (K2_ROLE=host, each its own throwaway HOME, K2_WORK_ROOT set,
+# host-2 (K2_ROLE=host, each its own throwaway HOME and its own disk:
+# K2_WORK_ROOT=<root>/work-h1 and <root>/work-h2,
 # enrolled with W5 one-time tokens, so the home transfers authenticate with
 # the hosts' signed nonces), k2-fake-agent as `claude`. An agent's home survives a drain to another
 # host, then a sleep and a move back.
@@ -11,17 +12,21 @@
 #      git repo with two commits, a dirty file and an untracked file
 #   2. SIGTERM host-1: it drains, saves notes' home (host.home_saved), says
 #      released, and exits by itself; the controller holds snapshot 1
-#   3. the workspace is deleted (host-2 is another machine) and notes is
-#      woken with --resume while host-1 is down: it lands on host-2, which
-#      restores snapshot 1 first (host.home_restored)
+#   3. notes is woken with --resume while host-1 is down: it lands on host-2,
+#      which restores snapshot 1 first into its own work root, fetching every
+#      object (host.home_restored, fetched > 0), and runs it there
 #   4. on host-2: the workspace byte for byte (git HEAD, history, dirty and
 #      untracked state), MEMORY.md and the transcript as host-1 left them;
 #      the CLI resumed the same session, and its new turn appended to memory
-#   5. notes sleeps (v2 close): host-2 saves snapshot 2 before it closes, and
+#   5. a new agent on host-2 whose cwd doesn't exist yet: the host creates it
+#      (under its work root) and the agent runs
+#   6. one cwd per agent: a second agent spawned in notes' cwd runs, but its
+#      home isn't saved there (the close reply says why; the host warns)
+#   7. notes sleeps (v2 close): host-2 saves snapshot 2 before it closes, and
 #      the close reply says so (home.seq = 2)
-#   6. host-1 comes back, host-2 goes: notes wakes on host-1, which still
-#      held snapshot 1 and now restores 2 over it: host-2's memory line is
-#      there
+#   8. host-1 comes back, host-2 goes: notes wakes on host-1, which still
+#      held snapshot 1 and now restores 2 over it (fetching what changed):
+#      host-2's memory line is there
 #
 # Ports: HS_CTL_PORT (default 17480), HS_H1_PORT (17481), HS_H2_PORT (17482);
 # the script stops if one is taken.
@@ -64,11 +69,12 @@ FAKE="$RUN/bin/k2-fake-agent"
 # A short root: ptyd's socket path must fit in sun_path (104 bytes on macOS).
 ROOT=$(mktemp -d "${LAB_SHORT_TMP:-/tmp}/k2hs-XXXXXX") || exit 1
 ROOT=$(cd "$ROOT" && pwd -P)
-mkdir -p "$ROOT"/{ctl,h1,h2}/{home,tmp,run} "$ROOT/shim" "$ROOT/work"
+mkdir -p "$ROOT"/{ctl,h1,h2}/{home,tmp,run} "$ROOT/shim" "$ROOT/work-h1" "$ROOT/work-h2"
 head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ROOT/bootstrap-token"
 "$FAKE" --install-shims "$ROOT/shim" || exit 1
 CTL_PID="" H1_PID="" H2_PID=""
-WS="$ROOT/work/notes"
+WS="$ROOT/work-h1/notes"   # where the app registered it; on host-2 it is work-h2/notes
+WS2="$ROOT/work-h2/notes"
 SESSION=$(uuidgen | tr A-Z a-z)
 
 down() {
@@ -143,7 +149,7 @@ start_host() { # name dir port; prints the pid. A first start mints the host's o
         USER="$(id -un)" LANG=en_US.UTF-8 \
         K2_ROLE=host K2_CONTROLLER_URL="ws://127.0.0.1:$CTL_PORT" \
         K2_HOST_AUTH=enroll K2_HOST_ENROLL_TOKEN_FILE="$ROOT/$2-token" K2_HOST_NAME="$1" \
-        K2_WORK_ROOT="$ROOT/work" K2_HOST_DRAIN_SECS=60 \
+        K2_WORK_ROOT="$ROOT/work-$2" K2_HOST_DRAIN_SECS=60 \
         K2_DAEMON_PORT="$3" K2_TRACE_FILE="$RUN/$1.trace.jsonl" \
         K2_TEST_AGENT_SHIM_DIR="$ROOT/shim" K2_FAKE_AGENT_TRACE="$RUN/fake-agent.trace.jsonl" \
         K2_FAKE_AGENT_TURN_MS="${LAB_TURN_MS:-200}" K2_FAKE_AGENT_SEED="${LAB_SEED:-0}" \
@@ -158,14 +164,21 @@ post() { # path json → HTTP code; the body in $RUN/post.out
         "http://127.0.0.1:$CTL_PORT$1?token=$CTL_TOKEN" -d "$2"
 }
 
-spawn() { # args (a JSON array) → HTTP code
-    post /cli/sessions/v2/spawn "{\"agent_name\":\"notes\",\"cwd\":\"$WS\",\"command\":\"claude\",\"args\":$1}"
+spawn() { # args (a JSON array) [agent cwd] → HTTP code
+    post /cli/sessions/v2/spawn "{\"agent_name\":\"${2:-notes}\",\"cwd\":\"${3:-$WS}\",\"command\":\"claude\",\"args\":$1}"
 }
 
-placed_on() { grep -E "\[hosts\] placed agent notes on host " "$RUN/controller.log" | tail -1 | sed -E 's/.* on host ([^ ]+) .*/\1/'; }
+placed_on() { grep -E "\[hosts\] placed agent ${1:-notes} on host " "$RUN/controller.log" | tail -1 | sed -E 's/.* on host ([^ ]+) .*/\1/'; }
+# The last host.home_restored on a host: "seq fetched".
+last_restore() {
+    python3 -I -c '
+import json,sys
+ev=[json.loads(l) for l in open(sys.argv[1]) if "host.home_restored" in l]
+print("%s %s" % (ev[-1]["attrs"]["seq"], ev[-1]["attrs"]["fetched"]) if ev else "none 0")' "$RUN/$1.trace.jsonl" 2>/dev/null || echo "none 0"
+}
 
 # The fake agent's files under a host's HOME (the same layout as Claude's).
-memory_of() { find "$ROOT/$1/home/.claude/projects" -path '*/memory/MEMORY.md' 2>/dev/null | head -1; }
+memory_of() { find "$ROOT/$1/home/.claude/projects" -path '*-notes/memory/MEMORY.md' 2>/dev/null | head -1; }
 transcript_of() { find "$ROOT/$1/home/.claude/projects" -name "$SESSION.jsonl" 2>/dev/null | head -1; }
 sha() { [ -f "$1" ] && shasum -a 256 "$1" | cut -d' ' -f1; }
 
@@ -177,16 +190,18 @@ wait_for() { # seconds command…: until the command succeeds
 has_line() { [ -f "$1" ] && grep -q "$2" "$1"; }
 traced() { [ -f "$1" ] && grep -q "\"event\":\"$2\"" "$1"; }
 
-git_ws() {
+git_in() { # dir args…
+    local d=$1; shift
     env -i PATH=/usr/bin:/bin HOME="$ROOT/ctl/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
         GIT_AUTHOR_NAME=lab GIT_AUTHOR_EMAIL=lab@example.invalid GIT_COMMITTER_NAME=lab GIT_COMMITTER_EMAIL=lab@example.invalid \
-        git -C "$WS" "$@"
+        git -C "$d" "$@"
 }
-ws_state() { # HEAD, history, porcelain status, and the files' hashes (no .git internals)
-    git_ws rev-parse HEAD
-    git_ws log --format='%H %s'
-    git_ws status --porcelain
-    (cd "$WS" && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort | xargs shasum -a 256)
+git_ws() { git_in "$WS" "$@"; }
+ws_state() { # dir: HEAD, history, porcelain status, and the files' hashes (no .git internals)
+    git_in "$1" rev-parse HEAD
+    git_in "$1" log --format='%H %s'
+    git_in "$1" status --porcelain
+    (cd "$1" && find . -path ./.git -prune -o -type f -print | LC_ALL=C sort | xargs shasum -a 256)
 }
 
 # ── the workspace ──────────────────────────────────────────────────────
@@ -216,7 +231,7 @@ check "notes placed on host-1; its first turn wrote MEMORY.md and the transcript
     "$([ "$c" = 200 ] && [ "$(placed_on)" = host-1 ] && has_line "$M1" "before the drain" && [ -f "$T1" ] && echo 1)" \
     "HTTP $c, on $(placed_on); memory ${M1:-none}; transcript ${T1:-none}"
 MEM1_SHA=$(sha "$M1"); TR1_SHA=$(sha "$T1")
-ws_state > "$RUN/workspace-on-host-1.txt"
+ws_state "$WS" > "$RUN/workspace-on-host-1.txt"
 
 # 2. drain host-1
 kill -TERM "$H1_PID"
@@ -229,16 +244,16 @@ check "SIGTERM host-1: it saved notes' home, released it and exited by itself; t
     "$([ "$gone" = 1 ] && traced "$RUN/host-1.trace.jsonl" host.home_saved && traced "$RUN/host-1.trace.jsonl" host.drain_release && [ "$seq1" = 1 ] && echo 1)" \
     "exited $gone; status $(cat "$RUN/home-status-1.json")"
 
-# 3. another machine: no workspace; notes wakes with --resume while host-1 is down
-rm -rf "$WS"
+# 3. host-2 is another disk: notes wakes with --resume while host-1 is down
 c=$(spawn "[\"--resume\",\"$SESSION\",\"remember after the move\"]")
 wait_for 30 has_line "$(memory_of h2)" "after the move"
-check "notes wakes on host-2 (host-1 down), which restores snapshot 1 before the spawn" \
-    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-2 ] && traced "$RUN/host-2.trace.jsonl" host.home_restored && echo 1)" \
-    "HTTP $c $(head -c 300 "$RUN/post.out"); on $(placed_on)"
+read -r rseq rfetched <<< "$(last_restore host-2)"
+check "notes wakes on host-2 (host-1 down), which restores snapshot 1 into its own work root first, fetching its objects" \
+    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-2 ] && [ "$rseq" = 1 ] && [ "$rfetched" -gt 0 ] && [ -d "$WS2/.git" ] && echo 1)" \
+    "HTTP $c $(head -c 200 "$RUN/post.out"); on $(placed_on); restored seq $rseq fetched $rfetched objects; $WS2/.git $([ -d "$WS2/.git" ] && echo exists || echo MISSING)"
 
 # 4. byte for byte, and the same conversation
-ws_state > "$RUN/workspace-on-host-2.txt"
+ws_state "$WS2" > "$RUN/workspace-on-host-2.txt"
 M2=$(memory_of h2); T2=$(transcript_of h2)
 first_part=$(head -c "$(wc -c < "$M1")" "$M2" | shasum -a 256 | cut -d' ' -f1)
 resumed=$(python3 -I -c '
@@ -250,22 +265,38 @@ check "host-2 has the workspace byte for byte (git HEAD, history, dirty, untrack
     "$(cmp -s "$RUN/workspace-on-host-1.txt" "$RUN/workspace-on-host-2.txt" && [ "$first_part" = "$MEM1_SHA" ] && has_line "$M2" "after the move" && [ -f "$T2" ] && [ "${resumed:-0}" -ge 1 ] && echo 1)" \
     "workspace $(cmp -s "$RUN/workspace-on-host-1.txt" "$RUN/workspace-on-host-2.txt" && echo same || echo DIFFERENT); MEMORY.md (host-1 part) $first_part vs $MEM1_SHA; transcript ${T2:-none} (host-1's sha $TR1_SHA); resumed execs $resumed"
 
-# 5. notes sleeps: host-2 saves before it closes
+# 5. a new agent whose cwd doesn't exist yet on this fresh disk
+FRESH="$ROOT/work-h2/fresh"
+c=$(spawn "[\"--session-id\",\"$(uuidgen | tr A-Z a-z)\",\"remember a new start\"]" fresh "$FRESH")
+wait_for 30 has_line "$(find "$ROOT/h2/home/.claude/projects" -path '*fresh*/memory/MEMORY.md' 2>/dev/null | head -1)" "a new start"
+check "a new agent on host-2 with no cwd yet: the host creates it under its work root and the agent runs" \
+    "$([ "$c" = 200 ] && [ "$(placed_on fresh)" = host-2 ] && [ -d "$FRESH" ] && echo 1)" \
+    "HTTP $c $(head -c 200 "$RUN/post.out"); on $(placed_on fresh); $FRESH $([ -d "$FRESH" ] && echo exists || echo MISSING)"
+
+# 6. one cwd per agent: twin in notes' cwd
+c=$(spawn "[\"--session-id\",\"$(uuidgen | tr A-Z a-z)\"]" twin "$WS2")
+c2=$(post /cli/sessions/v2/close '{"agent_name":"twin","force":true}')
+twin_home=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("home",{}).get("error",""))' "$RUN/post.out" 2>/dev/null)
+check "one cwd per agent: twin, in notes' cwd, runs, but its home is not saved there (and the host warns)" \
+    "$([ "$c" = 200 ] && [ "$c2" = 200 ] && echo "$twin_home" | grep -q 'one cwd per agent' && grep -q 'WARNING: .*one cwd per agent' "$RUN/host-2.log" && echo 1)" \
+    "spawn HTTP $c, close HTTP $c2: home.error: $twin_home"
+
+# 7. notes sleeps: host-2 saves before it closes
 c=$(post /cli/sessions/v2/close '{"agent_name":"notes","force":true}')
 home_seq=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("home",{}).get("seq",""))' "$RUN/post.out" 2>/dev/null)
 check "notes sleeps (v2 close): host-2 saved snapshot 2 first, and the close reply says so" \
     "$([ "$c" = 200 ] && [ "$home_seq" = 2 ] && echo 1)" "HTTP $c $(cat "$RUN/post.out")"
 
-# 6. host-1 back, host-2 gone: notes wakes on host-1, which restores 2 over its 1
+# 8. host-1 back, host-2 gone: notes wakes on host-1, which restores 2 over its 1
 H1_PID=$(start_host host-1 h1 "$H1_PORT")
 wait_ready host-1 "$H1_PID" "$H1_PORT" "$RUN/host-1.log" && wait_linked "$H1_PORT" || exit 1
 kill -TERM "$H2_PID"; wait_for 90 sh -c "! kill -0 $H2_PID 2>/dev/null"; wait "$H2_PID" 2>/dev/null; H2_PID=""
 c=$(spawn "[\"--resume\",\"$SESSION\"]")
 wait_for 30 has_line "$(memory_of h1)" "after the move"
-restored2=$(grep -c '"event":"host.home_restored"' "$RUN/host-1.trace.jsonl" 2>/dev/null)
-check "notes wakes on host-1 again, with host-2's turn in its memory (snapshot 2 over 1)" \
-    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-1 ] && has_line "$(memory_of h1)" "after the move" && [ "${restored2:-0}" -ge 1 ] && echo 1)" \
-    "HTTP $c; on $(placed_on); memory $(tr '\n' '|' < "$(memory_of h1)")"
+read -r rseq rfetched <<< "$(last_restore host-1)"
+check "notes wakes on host-1 again, with host-2's turn in its memory (snapshot 2 over 1, only what changed fetched)" \
+    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-1 ] && has_line "$(memory_of h1)" "after the move" && [ "$rseq" = 2 ] && [ "$rfetched" -gt 0 ] && echo 1)" \
+    "HTTP $c; on $(placed_on); restored seq $rseq fetched $rfetched; memory $(tr '\n' '|' < "$(memory_of h1)")"
 
 ctl_get /cli/hosts/home/status > "$RUN/home-status-final.json"
 grep -hE '\[hosts/(home|drain)\]' "$RUN"/host-*.log > "$RUN/home-sync.log" 2>/dev/null || true

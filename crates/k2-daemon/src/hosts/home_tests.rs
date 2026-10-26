@@ -223,3 +223,43 @@ fn only_workspaces_under_the_work_root_are_synced() {
     assert!(!in_scope(&r, &root.0), "outside");
     assert!(!in_scope(&r, Path::new("/tmp")));
 }
+
+#[test]
+fn one_cwd_per_agent_the_second_agent_in_a_placed_agents_cwd_is_refused() {
+    let mut claims = std::collections::HashMap::new();
+    let cwd = Path::new("/w/notes");
+    let placed = |a: &str| a == "notes";
+    assert_eq!(claim_in(&mut claims, cwd, "notes", &placed), Ok(()));
+    let err = claim_in(&mut claims, cwd, "twin", &placed).unwrap_err();
+    assert!(err.contains("agent notes's workspace") && err.contains("one cwd per agent"), "{err}");
+    assert_eq!(claim_in(&mut claims, cwd, "notes", &placed), Ok(()), "the owner itself, again");
+    // Once the owner isn't placed here any more, the cwd is free.
+    assert_eq!(claim_in(&mut claims, cwd, "twin", &|_| false), Ok(()));
+    assert_eq!(claims.get(cwd).map(String::as_str), Some("twin"));
+}
+
+#[test]
+fn a_spawn_runs_the_agent_where_its_workspace_is_on_this_host() {
+    let here = || Some((PathBuf::from("/disk-b/work/team/notes"), Some("team/notes".to_string())));
+    // Named under host A's root: the same place under this host's.
+    assert_eq!(map_cwd(Path::new("/disk-a/work/team/notes"), here()), Some(PathBuf::from("/disk-b/work/team/notes")));
+    assert_eq!(map_cwd(Path::new("/disk-b/work/team/notes"), here()), None, "already here");
+    assert_eq!(map_cwd(Path::new("/disk-a/work/other"), here()), None, "another workspace");
+    assert_eq!(map_cwd(Path::new("/disk-a/work/team/notes"), None), None, "no home here yet");
+    assert_eq!(map_cwd(Path::new("/x/team/notes"), Some((PathBuf::from("/b/team/notes"), None))), None);
+}
+
+#[test]
+fn a_new_agents_cwd_is_created_under_the_work_root_only() {
+    let root = TempDir::new();
+    let work = root.0.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let fresh = work.join("team").join("fresh");
+    assert_eq!(prepare_cwd(&work, &fresh), Ok(true));
+    assert!(fresh.is_dir());
+    assert_eq!(prepare_cwd(&work, &fresh), Ok(false), "already there");
+    let outside = root.0.join("elsewhere").join("x");
+    assert_eq!(prepare_cwd(&work, &outside), Ok(false));
+    assert!(!outside.exists(), "never created outside the work root");
+    assert_eq!(prepare_cwd(&work, &work), Ok(false));
+}

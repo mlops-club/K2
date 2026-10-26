@@ -11,7 +11,11 @@
 //! epoch no lower than the newest snapshot's.
 //!
 //! Host (`K2_ROLE=host`), only for agents whose cwd is under `K2_WORK_ROOT`
-//! (T1-e):
+//! (T1-e). A workspace has the same path relative to every host's work root
+//! (D2); a spawn whose cwd names it under another root runs it under this
+//! one. One cwd per agent: a second agent in a cwd another placed agent
+//! owns is warned about, and its home is neither saved nor restored there.
+//! A new agent's cwd is created under the work root before its spawn.
 //! - every release saves the home first: a `close` from the controller
 //!   (sleep, a pool's scale-down, the v2 close) is answered after the push
 //!   ([`before_close`], [`with_home`]); the SIGTERM drain pushes before its
@@ -330,10 +334,64 @@ pub fn work_root(get: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     Some(std::fs::canonicalize(&p).unwrap_or(p))
 }
 
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Is `cwd` a workspace under `root` (not the root itself)?
 pub fn in_scope(root: &Path, cwd: &Path) -> bool {
-    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = canon(cwd);
     cwd.starts_with(root) && cwd != root
+}
+
+/// Which agent owns each synced cwd on this host (the first placed there).
+fn claims() -> &'static Mutex<HashMap<PathBuf, String>> {
+    static C: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    C.get_or_init(Mutex::default)
+}
+
+/// One cwd per agent: `agent` may sync `cwd` unless another agent that is
+/// still `placed` owns it; the first claim wins.
+pub(crate) fn claim_in(claims: &mut HashMap<PathBuf, String>, cwd: &Path, agent: &str, placed: &dyn Fn(&str) -> bool) -> Result<(), String> {
+    match claims.get(cwd) {
+        Some(owner) if owner != agent && placed(owner) => Err(format!(
+            "{} is agent {owner}'s workspace; one cwd per agent, so {agent}'s home is not synced there",
+            cwd.display()
+        )),
+        _ => {
+            claims.insert(cwd.to_path_buf(), agent.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// [`claim_in`] on this host, with a warning when the cwd is shared.
+fn claim(agent: &str, cwd: &Path) -> Result<(), String> {
+    let placed = |a: &str| crate::agent_host::host().find_agent(a).is_some();
+    let r = claim_in(&mut claims().lock(), &canon(cwd), agent, &placed);
+    if let Err(why) = &r {
+        log_debug!("[hosts/home] WARNING: {why}");
+    }
+    r
+}
+
+/// Where a spawn asked for `requested` runs on this host: the agent's
+/// workspace here when `requested` names it under another host's work root
+/// (the same path relative to the root, D2).
+pub(crate) fn map_cwd(requested: &Path, here: Option<(PathBuf, Option<String>)>) -> Option<PathBuf> {
+    let (local, rel) = here?;
+    let rel = rel?;
+    (requested != local && requested.ends_with(&rel)).then_some(local)
+}
+
+/// Create a new agent's cwd before its spawn, under the work root only.
+/// `Ok(true)` when it was created.
+pub(crate) fn prepare_cwd(root: &Path, cwd: &Path) -> Result<bool, String> {
+    if cwd.exists() || !cwd.is_absolute() || !cwd.starts_with(root) || cwd == root {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(cwd).map_err(|e| format!("create the agent's cwd {}: {e}", cwd.display()))?;
+    Ok(true)
 }
 
 fn max_bytes(get: impl Fn(&str) -> Option<String>) -> u64 {
@@ -469,6 +527,7 @@ pub async fn save(agent: &str, epoch: u64) -> Result<Option<Pushed>, String> {
         log_debug!("[hosts/home] {agent}: {} is not under {WORK_ROOT_VAR}={}; its home stays here", cwd.display(), root.display());
         return Ok(None);
     }
+    claim(agent, &cwd)?;
     let _one = transfers().lock().await;
     let host = this_host();
     let result = async {
@@ -479,6 +538,7 @@ pub async fn save(agent: &str, epoch: u64) -> Result<Option<Pushed>, String> {
             let parent = restore::held(&t.state, &agent).map(|h| h.seq);
             let mut opts = Options::new(&t.home);
             opts.max_bytes = max_bytes(env);
+            opts.work_root = t.work_root.clone();
             let p = snapshot::push(&remote, &agent, epoch, &host, &cwd.to_string_lossy(), parent, &opts)?;
             restore::mark(&t.state, &agent, p.seq, &p.manifest_sha, &p.manifest.encode())?;
             Ok::<_, String>(p)
@@ -541,10 +601,37 @@ pub fn with_home(body: String, home: Value) -> String {
     }
 }
 
-/// The link's spawn hook: restore `agent`'s newest snapshot first. `Some`
-/// is the reply that fails the spawn.
-pub async fn before_spawn(req: u64, agent: &str) -> Option<Frame> {
+/// The link's spawn hook: restore `agent`'s newest snapshot first, run it
+/// where its workspace is on this host (`body.cwd`), and create a new
+/// agent's cwd. `Some` is the reply that fails the spawn.
+pub async fn before_spawn(req: u64, agent: &str, body: &mut Value) -> Option<Frame> {
     let root = work_root(env)?;
+    let t = host_target(root.clone()).ok()?;
+    let local = |t: &Target, requested: PathBuf| map_cwd(&requested, restore::local_project(t, agent)).unwrap_or(requested);
+    let requested = body.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+    let shared = requested.clone().map(|r| local(&t, r)).filter(|c| in_scope(&root, c)).map(|c| claim(agent, &c)).and_then(Result::err);
+    if shared.is_none() {
+        if let Some(reply) = restore_first(req, agent, root.clone()).await {
+            return Some(reply);
+        }
+    }
+    let cwd = requested.map(|r| local(&t, r))?;
+    if body.get("cwd").and_then(Value::as_str) != Some(&*cwd.to_string_lossy()) {
+        log_debug!("[hosts/home] {agent}: runs in {} (its workspace on this host)", cwd.display());
+        body["cwd"] = json!(cwd.to_string_lossy());
+        let _ = claim(agent, &cwd);
+    }
+    match prepare_cwd(&root, &cwd) {
+        Ok(true) => log_debug!("[hosts/home] {agent}: created its cwd {}", cwd.display()),
+        Ok(false) => {}
+        Err(e) => {
+            return Some(Frame::Reply { req, status: "500 Internal Server Error".into(), body: json!({"error": e}).to_string() })
+        }
+    }
+    None
+}
+
+async fn restore_first(req: u64, agent: &str, root: PathBuf) -> Option<Frame> {
     let _one = transfers().lock().await;
     let result = async {
         let remote = connect().await?;

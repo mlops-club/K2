@@ -235,6 +235,7 @@ fn the_store_takes_a_commit_only_from_the_writer_its_fence_admits() {
         host: "host-a".into(),
         created_ms: 0,
         project_path: l.project.to_string_lossy().into_owned(),
+        work_rel: None,
         slug: "s".into(),
         parent_seq: None,
         entries: vec![Entry { class: Class::Workspace, path: "x".into(), sha256: "0".repeat(64), size: 1, mode: None }],
@@ -385,6 +386,39 @@ fn a_home_over_its_cap_is_refused_with_the_setting_named() {
 }
 
 #[test]
+fn a_host_with_its_own_work_root_gets_the_workspace_at_the_same_place_under_it() {
+    // Separate disks: host A's workspaces under work-a, host B's under work-b.
+    let l = lab();
+    let (root_a, root_b) = (l._root.0.join("work-a"), l._root.0.join("work-b"));
+    let project_a = root_a.join("team").join("notes");
+    fs::create_dir_all(&project_a).unwrap();
+    write(&project_a.join("README.md"), "# notes\n");
+    let pa = project_a.to_string_lossy().into_owned();
+    let slug_a = l.a.home.join(".claude/projects").join(claude_project_hash(&pa));
+    write(&slug_a.join("memory/MEMORY.md"), "- remember x\n");
+    write(&slug_a.join("s1.jsonl"), &format!("{{\"cwd\":\"{pa}\",\"text\":\"hi\"}}\n"));
+    let mut opts = Options::new(&l.a.home);
+    opts.work_root = Some(root_a.clone());
+    let pushed = snapshot::push(&remote(&l, "host-a"), "notes", 1, "host-a", &pa, None, &opts).unwrap();
+    assert_eq!(pushed.manifest.work_rel.as_deref(), Some("team/notes"));
+
+    let b = Target { home: l.b.home.clone(), state: l.b.state.clone(), work_root: Some(root_b.clone()) };
+    let out = restore::restore(&remote(&l, "host-b"), "notes", &b).unwrap();
+    assert!(matches!(out, Outcome::Restored { fetched, .. } if fetched == 3), "every object fetched: {out:?}");
+    let project_b = root_b.join("team").join("notes");
+    let pb = project_b.to_string_lossy().into_owned();
+    assert_eq!(fs::read_to_string(project_b.join("README.md")).unwrap(), "# notes\n");
+    let slug_b = l.b.home.join(".claude/projects").join(claude_project_hash(&pb));
+    assert_eq!(fs::read_to_string(slug_b.join("memory/MEMORY.md")).unwrap(), "- remember x\n");
+    assert_eq!(
+        fs::read_to_string(slug_b.join("s1.jsonl")).unwrap(),
+        format!("{{\"cwd\":\"{pb}\",\"text\":\"hi\"}}\n"),
+        "the transcript names host B's workspace"
+    );
+    assert_eq!(restore::local_project(&b, "notes"), Some((project_b, Some("team/notes".into()))));
+}
+
+#[test]
 fn a_workspace_outside_the_work_root_is_never_restored() {
     let l = lab();
     seed(&l, &l.a);
@@ -407,6 +441,7 @@ fn a_manifest_with_an_unsafe_path_never_decodes() {
             host: "h".into(),
             created_ms: 0,
             project_path: "/w/a".into(),
+            work_rel: None,
             slug: "s".into(),
             parent_seq: None,
             entries: vec![Entry { class: Class::Workspace, path: p.into(), sha256: "0".repeat(64), size: 0, mode: None }],

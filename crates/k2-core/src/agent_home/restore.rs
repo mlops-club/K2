@@ -117,6 +117,32 @@ pub fn mark(state: &Path, agent: &str, seq: u64, manifest_sha: &str, manifest: &
     write_atomic(&held_path(state, agent), &serde_json::to_vec(&h).expect("held serializes"))
 }
 
+/// Where `m`'s workspace goes on this host: the same path under this
+/// host's work root, or the manifest's own path without one.
+pub fn project_for(m: &Manifest, t: &Target) -> PathBuf {
+    match (&t.work_root, &m.work_rel) {
+        (Some(root), Some(rel)) => root.join(rel),
+        _ => PathBuf::from(&m.project_path),
+    }
+}
+
+/// The snapshot this host holds for `agent`: where its workspace is here,
+/// and its path relative to the work root.
+pub fn local_project(t: &Target, agent: &str) -> Option<(PathBuf, Option<String>)> {
+    let h = held(&t.state, agent)?;
+    let m = cached_manifest(&t.state, &h.manifest_sha)?;
+    Some((project_for(&m, t), m.work_rel.clone()))
+}
+
+/// Does `e`'s content embed the workspace path (transcripts)?
+fn embeds_path(e: &Entry) -> bool {
+    match e.class {
+        Class::Session => true,
+        Class::Provider => e.path.ends_with(".jsonl") || e.path.ends_with(".json"),
+        _ => false,
+    }
+}
+
 fn cached_manifest(state: &Path, sha: &str) -> Option<Manifest> {
     let bytes = std::fs::read(manifest_path(state, sha)).ok()?;
     (sha256_hex(&bytes) == sha).then(|| Manifest::decode(&bytes).ok()).flatten()
@@ -159,8 +185,8 @@ fn dest_of(m: &Manifest, e: &Entry, home: &Path, project: &Path, slug: &str) -> 
             (projects.clone(), projects.join(renamed).join(comps.as_path()))
         }
         Class::Provider => {
-            let p = &m.project_path;
-            match crate::clone::providers::reroot_provider(&rel, home, p, p) {
+            let p = project.to_string_lossy();
+            match crate::clone::providers::reroot_provider(&rel, home, &m.project_path, &p) {
                 Some(crate::clone::providers::ProviderDest::File(out)) => (home.to_path_buf(), out),
                 _ => return Ok(None),
             }
@@ -256,16 +282,25 @@ pub(crate) fn restore_until(remote: &dyn Remote, agent: &str, t: &Target, kill: 
     if m.agent != agent {
         return Err(format!("snapshot {} is agent {}'s, not {agent}'s", latest.seq, m.agent));
     }
+    let project = project_for(&m, t);
     if let Some(root) = &t.work_root {
-        if !Path::new(&m.project_path).starts_with(root) || Path::new(&m.project_path) == root.as_path() {
-            return Err(format!("{agent}'s workspace {} is not under this host's work root {}", m.project_path, root.display()));
+        if !project.starts_with(root) || project == *root {
+            return Err(format!("{agent}'s workspace {} is not under this host's work root {}", project.display(), root.display()));
         }
     }
     // The workspace dir first, so its slug is the one everything else
     // computes (`claude_project_hash` canonicalizes an existing path).
-    let project = PathBuf::from(&m.project_path);
     std::fs::create_dir_all(&project).map_err(|e| format!("create {}: {e}", project.display()))?;
-    let slug = claude_project_hash(&m.project_path);
+    let slug = claude_project_hash(&project.to_string_lossy());
+    // Transcripts name the workspace; on another path they must name ours.
+    let (from, to) = (m.project_path.as_bytes().to_vec(), project.to_string_lossy().as_bytes().to_vec());
+    let rewrite = |e: &Entry, bytes: &mut Vec<u8>| {
+        if embeds_path(e) && from != to && !from.is_empty() {
+            if let Some(b) = crate::clone::unpack::replace_bytes(bytes, &from, &to) {
+                *bytes = b;
+            }
+        }
+    };
 
     let mut moves = Vec::new();
     let mut chmods = Vec::new();
@@ -275,7 +310,7 @@ pub(crate) fn restore_until(remote: &dyn Remote, agent: &str, t: &Target, kill: 
     for e in &m.entries {
         let Some((_, dest)) = dest_of(&m, e, &t.home, &project, &slug)? else { continue };
         new_dests.insert(dest.clone());
-        if file_sha(&dest).as_deref() == Some(e.sha256.as_str()) {
+        if !(embeds_path(e) && from != to) && file_sha(&dest).as_deref() == Some(e.sha256.as_str()) {
             kept += 1;
             if let (Some(mode), Ok(meta)) = (e.mode, std::fs::metadata(&dest)) {
                 if super::file_mode(&meta) != Some(mode) {
@@ -290,7 +325,7 @@ pub(crate) fn restore_until(remote: &dyn Remote, agent: &str, t: &Target, kill: 
     // What the snapshot this host held put here, and the new one lacks.
     let mut deletes = Vec::new();
     if let Some(old) = before.as_ref().and_then(|h| cached_manifest(&t.state, &h.manifest_sha)) {
-        let old_project = PathBuf::from(&old.project_path);
+        let old_project = project_for(&old, t);
         for e in &old.entries {
             if let Ok(Some((_, dest))) = dest_of(&old, e, &t.home, &old_project, &slug) {
                 if !new_dests.contains(&dest) && file_sha(&dest).as_deref() == Some(e.sha256.as_str()) {
@@ -314,17 +349,21 @@ pub(crate) fn restore_until(remote: &dyn Remote, agent: &str, t: &Target, kill: 
             if let Some(dir) = mv.staged.parent() {
                 std::fs::create_dir_all(dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
             }
-            if let Some(src) = first_staged.get(e.sha256.as_str()) {
+            if let Some(src) = first_staged.get(e.sha256.as_str()).filter(|_| !embeds_path(e)) {
                 std::fs::copy(src, &mv.staged).map_err(|err| format!("copy to {}: {err}", mv.staged.display()))?;
             } else {
-                let bytes = remote.get_object(&e.sha256)?;
+                let mut bytes = remote.get_object(&e.sha256)?;
                 if sha256_hex(&bytes) != e.sha256 {
                     return Err(format!("object {} for {} doesn't match its hash; nothing was changed", e.sha256, e.path));
                 }
+                let len = bytes.len() as u64;
+                rewrite(e, &mut bytes);
                 std::fs::write(&mv.staged, &bytes).map_err(|err| format!("write {}: {err}", mv.staged.display()))?;
                 fetched += 1;
-                fetched_bytes += bytes.len() as u64;
-                first_staged.insert(e.sha256.as_str(), mv.staged.clone());
+                fetched_bytes += len;
+                if !embeds_path(e) {
+                    first_staged.insert(e.sha256.as_str(), mv.staged.clone());
+                }
             }
             if let Some(mode) = mv.mode {
                 set_mode(&mv.staged, mode)?;

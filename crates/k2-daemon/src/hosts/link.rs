@@ -353,12 +353,12 @@ fn handle(
         return Ok(());
     }
     match f {
-        Frame::Spawn { req, agent_id, epoch, body } => {
+        Frame::Spawn { req, agent_id, epoch, mut body } => {
             placed.lock().epochs.insert(agent_id.clone(), epoch);
             let tx = tx.clone();
             let placed = Arc::clone(placed);
             tokio::spawn(async move {
-                if let Some(reply) = super::home::before_spawn(req, &agent_id).await {
+                if let Some(reply) = super::home::before_spawn(req, &agent_id, &mut body).await {
                     let _ = tx.send(reply);
                     return;
                 }
@@ -449,12 +449,12 @@ fn handle(
                 let _ = tx.send(Frame::BytesClose { stream, reason });
             });
         }
-        Frame::SpawnWorkspace { req, agent_id, epoch, request } => {
+        Frame::SpawnWorkspace { req, agent_id, epoch, mut request } => {
             placed.lock().epochs.insert(agent_id.clone(), epoch);
             let tx = tx.clone();
             let placed = Arc::clone(placed);
             tokio::spawn(async move {
-                if let Some(reply) = super::home::before_spawn(req, &agent_id).await {
+                if let Some(reply) = super::home::before_spawn(req, &agent_id, &mut request).await {
                     let _ = tx.send(reply);
                     return;
                 }

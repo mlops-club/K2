@@ -46,7 +46,7 @@ pub(crate) mod providers;
 mod repair;
 mod scrub;
 mod settings;
-mod unpack;
+pub(crate) mod unpack;
 
 #[cfg(test)]
 mod tests;

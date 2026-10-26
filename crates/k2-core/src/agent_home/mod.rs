@@ -17,8 +17,13 @@
 //!   before the commit leaves the old tree; after it, [`restore::recover`]
 //!   finishes it.
 //!
-//! Paths are the same on every host (D2): the workspace at its
-//! `project_path`, the provider files under the host's own home.
+//! Paths are the same on every host relative to its work root (D2, as the
+//! coordinator settled it for T1): a manifest records the workspace's path
+//! under the snapshotting host's `K2_WORK_ROOT` (`work_rel`), and a restore
+//! puts it at the same place under its own. With the same root everywhere
+//! (production) that is the same absolute path. Provider files go under the
+//! host's own home; transcripts get their embedded workspace path rewritten
+//! when it differs.
 
 pub mod restore;
 pub mod snapshot;
@@ -68,8 +73,11 @@ pub struct Manifest {
     pub epoch: u64,
     pub host: String,
     pub created_ms: i64,
-    /// The workspace path, the same on every host (D2).
+    /// The workspace path on the host that took it.
     pub project_path: String,
+    /// The same path relative to that host's work root (`K2_WORK_ROOT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_rel: Option<String>,
     /// `claude_project_hash(project_path)` where it was taken.
     pub slug: String,
     /// The snapshot this host last held, if any.
@@ -101,6 +109,9 @@ impl Manifest {
         }
         if !Path::new(&self.project_path).is_absolute() {
             return Err(format!("manifest project_path {:?} is not absolute", self.project_path));
+        }
+        if let Some(rel) = &self.work_rel {
+            safe_rel(rel)?;
         }
         for e in &self.entries {
             safe_rel(&e.path)?;
