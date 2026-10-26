@@ -76,6 +76,13 @@ class Grid:
     def text(self):
         return "\n".join(self.scrollback + self.rows)
 
+    def has(self, needle):
+        """`needle` is on the grid, also when a soft wrap splits it over two
+        rows (a line that starts mid-row, after typed-ahead input, wraps at
+        the terminal's width)."""
+        t = self.text()
+        return needle in t or needle in t.replace("\n", "")
+
     def screen(self):
         return "\n".join(self.rows).rstrip("\n")
 
@@ -122,7 +129,7 @@ class Run:
         deadline."""
         start = time.monotonic()
         deadline = start + DEADLINE_S
-        while needle not in self.grid.text():
+        while not self.grid.has(needle):
             left = deadline - time.monotonic()
             if left <= 0:
                 self.log("deadline waiting for %s" % what)

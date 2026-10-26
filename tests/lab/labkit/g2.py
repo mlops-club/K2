@@ -428,7 +428,7 @@ class Client:
             self.log("%s; grid frames applied %s; grid text tail %r" % (why, frames or "none", tail))
             return False
 
-        while needle not in grid.text():
+        while not grid.has(needle):
             left = end - time.monotonic()
             if left <= 0:
                 return missed("deadline waiting for %r on the grid" % needle)

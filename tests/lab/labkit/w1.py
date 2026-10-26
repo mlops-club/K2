@@ -322,7 +322,7 @@ class W1:
 
     def grid_wait(self, sock, grid, needle):
         deadline = time.monotonic() + DEADLINE_S
-        while needle not in grid.text():
+        while not grid.has(needle):
             left = deadline - time.monotonic()
             if left <= 0:
                 self.log("deadline waiting for %r on the grid" % needle)

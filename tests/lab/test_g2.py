@@ -359,6 +359,14 @@ class Plan(unittest.TestCase):
             g2.run("state", d, ["S8"])
         self.assertEqual([os.path.basename(c) for c in calls], ["round-1", "round-2", "round-3"])
 
+    def test_a_needle_split_by_a_soft_wrap_is_on_the_grid(self):
+        from labkit import s1
+        g = s1.Grid()
+        g.rows = ["[from lab-g2 · m_x] s8-while-down-1k2-fake-agent (as claude) · ses",
+                  "sion 645f43a8 · resumed", ">"]
+        self.assertTrue(g.has("session 645f43a8"))
+        self.assertFalse(g.has("session 999"))
+
     def test_s10_is_fleet_only_and_opt_in(self):
         self.assertIn("S10", g2.FLEET_ONLY)
         self.assertIn("S10", g2.SCENARIOS)

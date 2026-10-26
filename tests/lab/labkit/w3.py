@@ -70,7 +70,7 @@ class Phase:
         """Apply grid events until `needle` is on the client's screen. Returns
         (found, how it ended)."""
         deadline = time.monotonic() + DEADLINE_S
-        while needle not in grid.text():
+        while not grid.has(needle):
             left = deadline - time.monotonic()
             if left <= 0:
                 return False, "deadline"
