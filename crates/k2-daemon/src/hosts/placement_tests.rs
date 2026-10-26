@@ -551,6 +551,52 @@ async fn answer_spawn(host: &mut Ws, agent: &str, session: &str) -> (u64, Value)
     }
 }
 
+/// K2-e: `agent` resumes on `host` while `msg_id` waits for it. Until its
+/// spawn answers it is only reserved there, and a Deliver would meet "no
+/// agent here" (final): the outbox's passes send nothing and spend no
+/// attempt. Once the spawn answers, the message goes out on its first
+/// attempt. Step by step, so no tick can slip in between. The spawn's
+/// epoch and body.
+async fn resume_then_deliver(
+    remote: &RemoteHost,
+    outbox: &crate::delivery_drain::Controller,
+    host: &mut Ws,
+    host_id: &str,
+    agent: &str,
+    session: &str,
+    msg_id: &str,
+) -> (u64, Value) {
+    use k2_core::delivery::State;
+    let (req, epoch, body) = match recv(host).await {
+        Frame::Spawn { req, agent_id, epoch, body } => {
+            assert_eq!(agent_id, agent);
+            (req, epoch, body)
+        }
+        other => panic!("expected {agent}'s resume before anything for it, got {other:?}"),
+    };
+    assert_eq!(
+        remote.placement(agent).map(|p| (p.host_id, p.epoch.0, p.session_id)),
+        Some((host_id.to_string(), epoch, None)),
+        "reserved, its spawn not answered"
+    );
+    for _ in 0..3 {
+        outbox.pass(k2_core::delivery::now_ms());
+    }
+    let row = outbox.get(msg_id).unwrap();
+    assert_eq!((row.state, row.attempts), (State::Queued, 0), "nothing sent while the spawn runs");
+    send(host, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": session, "reused": false}).to_string() }).await;
+    match recv(host).await {
+        Frame::Deliver { msg_id: m, agent_id, attempt, .. } => {
+            assert_eq!((m.as_str(), agent_id.as_str(), attempt), (msg_id, agent, 1), "after the spawn, its first attempt");
+            send(host, &Frame::DeliverAck { msg_id: m, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the waiting message after the spawn, got {other:?}"),
+    }
+    let row = wait_final(outbox, msg_id).await;
+    assert_eq!((row.state, row.attempts), (State::Delivered, 1), "delivered once");
+    (epoch, body)
+}
+
 /// `host-a` links again, still running `agent` at `epoch` (hello.resume).
 async fn back_with(url: &str, agent: &str, epoch: u64) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
@@ -616,19 +662,12 @@ async fn a_portable_agent_on_a_lost_host_moves_resumes_elsewhere_and_its_message
     assert_eq!(outbox.get(&id).unwrap().state, State::Queued);
 
     // Lost past K2_HOST_MOVE_AFTER: bob moves, and resumes on host-b at a
-    // new epoch, the same conversation.
+    // new epoch, the same conversation; the message follows the spawn's
+    // answer, never before it (K2-e).
     assert_eq!(remote.move_lost(now, Duration::ZERO), vec!["bob"]);
-    let (e2, body) = answer_spawn(&mut b, "bob", &sid(2)).await;
+    let (e2, body) = resume_then_deliver(remote, &outbox, &mut b, "host-b", "bob", &sid(2), &id).await;
     assert!(e2 > e1, "a new epoch: {e2} after {e1}");
     assert_eq!(body["args"], json!(["--resume", "conv-1"]));
-    match recv(&mut b).await {
-        Frame::Deliver { msg_id, agent_id, .. } => {
-            assert_eq!((msg_id.as_str(), agent_id.as_str()), (id.as_str(), "bob"));
-            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
-        }
-        other => panic!("expected the waiting message on host-b, got {other:?}"),
-    }
-    assert_eq!(wait_final(&outbox, &id).await.state, State::Delivered);
     assert_eq!(remote.placement("bob").unwrap().host_id, "host-b");
     assert!(!remote.awaiting_resume("bob"));
 
@@ -723,7 +762,6 @@ async fn drained_for_good(remote: &'static RemoteHost, host: &mut Ws, agent: &st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_message_for_a_drained_portable_agent_resumes_it_on_another_host_at_once() {
-    use k2_core::delivery::State;
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
@@ -739,17 +777,8 @@ async fn a_message_for_a_drained_portable_agent_resumes_it_on_another_host_at_on
     // A message is a need: bob resumes on host-b now, the same conversation
     // (host-b restores its home snapshot first: T1), then gets it, once.
     let id = outbox.send("agent:alice", "bob", json!({"kind": "msg", "text": "after the scale-down"})).unwrap();
-    let (_, body) = answer_spawn(&mut b, "bob", &sid(2)).await;
+    let (_, body) = resume_then_deliver(remote, &outbox, &mut b, "host-b", "bob", &sid(2), &id).await;
     assert_eq!(body["args"], json!(["--resume", "conv-1"]));
-    match recv(&mut b).await {
-        Frame::Deliver { msg_id, agent_id, attempt, .. } => {
-            assert_eq!((msg_id.as_str(), agent_id.as_str(), attempt), (id.as_str(), "bob", 1));
-            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
-        }
-        other => panic!("expected the message on host-b, got {other:?}"),
-    }
-    let row = wait_final(&outbox, &id).await;
-    assert_eq!((row.state, row.attempts), (State::Delivered, 1), "delivered once");
     assert_eq!(remote.placement("bob").unwrap().host_id, "host-b");
     assert!(!remote.awaiting_resume("bob"));
 }
@@ -897,7 +926,6 @@ async fn the_controller_follows_turns_and_a_close_mid_turn_fails_the_unanswered_
 /// on its first attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_message_waits_for_the_spawn_to_answer_and_goes_out_on_its_first_attempt() {
-    use k2_core::delivery::State;
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
@@ -910,29 +938,5 @@ async fn a_message_waits_for_the_spawn_to_answer_and_goes_out_on_its_first_attem
     wait_hosts(remote, 1).await;
 
     let id = outbox.send("agent:alice", "ann", json!({"kind": "msg", "text": "hello again"})).unwrap();
-    let (req, epoch) = match recv(&mut b).await {
-        Frame::Spawn { req, agent_id, epoch, .. } => {
-            assert_eq!(agent_id, "ann");
-            (req, epoch)
-        }
-        other => panic!("expected ann's resume, got {other:?}"),
-    };
-    // Reserved on host-b, its spawn not answered: nothing is sent.
-    assert_eq!(remote.placement("ann").map(|p| (p.host_id, p.epoch.0, p.session_id)), Some(("host-b".into(), epoch, None)));
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    let row = outbox.get(&id).unwrap();
-    assert_eq!((row.state, row.attempts), (State::Queued, 0), "no attempt spent while the spawn runs");
-
-    send(&mut b, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": sid(2), "reused": false}).to_string() }).await;
-    match recv(&mut b).await {
-        Frame::Deliver { msg_id, attempt, .. } => {
-            assert_eq!((msg_id.as_str(), attempt), (id.as_str(), 1), "its first attempt");
-            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
-        }
-        other => panic!("expected the message after the spawn, got {other:?}"),
-    }
-    let row = wait_final(&outbox, &id).await;
-    assert_eq!((row.state, row.attempts), (State::Delivered, 1));
+    resume_then_deliver(remote, &outbox, &mut b, "host-b", "ann", &sid(2), &id).await;
 }
