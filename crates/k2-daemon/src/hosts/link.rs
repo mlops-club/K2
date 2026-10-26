@@ -343,6 +343,10 @@ fn handle(
     streams: &Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<String>>>>,
     placed: &Arc<Mutex<Placed>>,
 ) -> Result<(), String> {
+    if let Some(reply) = super::drain::refuse(&f) {
+        let _ = tx.send(reply);
+        return Ok(());
+    }
     match f {
         Frame::Spawn { req, agent_id, epoch, body } => {
             placed.lock().epochs.insert(agent_id.clone(), epoch);

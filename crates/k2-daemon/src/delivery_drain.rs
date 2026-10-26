@@ -299,6 +299,7 @@ impl Controller {
     pub fn is_direct(&self, recipient: &str, body: &Value) -> bool {
         matches!(body.get("kind").and_then(Value::as_str), Some("msg") | None)
             && self.placed(recipient).is_none()
+            && !self.awaiting_resume(recipient)
             && (self.direct.resolves)(recipient)
     }
 
@@ -315,6 +316,12 @@ impl Controller {
         aliases.iter().find_map(|a| self.remote.placement(a)).or_else(|| {
             self.remote.placements().into_iter().find(|p| p.session_id.as_ref().is_some_and(|s| aliases.contains(s)))
         })
+    }
+
+    /// Was `recipient` (or one of its aliases) drained off a host and not
+    /// placed again yet? Its messages wait in the outbox (S8).
+    fn awaiting_resume(&self, recipient: &str) -> bool {
+        self.remote.awaiting_resume(recipient) || (self.direct.aliases)(recipient).iter().any(|a| self.remote.awaiting_resume(a))
     }
 
     /// A `deliver` from a host: answered from `delivery_seen` when this
@@ -532,6 +539,11 @@ impl HostSide {
     /// A `deliver` from the controller: deliver once per `msg_id`. Returns
     /// the ack to send, or `None` to stay silent so the controller resends.
     pub fn receive(&self, m: &Incoming, now: i64) -> Option<Frame> {
+        // A draining host takes nothing new: no ack, the controller keeps
+        // the message and resends it once the agent is placed again.
+        if crate::hosts::drain::draining() {
+            return None;
+        }
         let _one = self.receiving.lock();
         let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason });
         let before = seen::status(&self.db.lock(), &m.msg_id);
@@ -699,6 +711,11 @@ pub fn host_linked(tx: mpsc::UnboundedSender<Frame>) {
     STARTED.get_or_init(|| {
         tokio::spawn(Arc::clone(h).run());
     });
+}
+
+/// The current link to the controller, if any (the drain's channel).
+pub fn host_link() -> Option<mpsc::UnboundedSender<Frame>> {
+    host_side().link.lock().clone()
 }
 
 /// `link::handle`'s hook for `deliver` and `deliver.ack` from the controller.

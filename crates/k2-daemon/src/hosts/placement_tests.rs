@@ -177,3 +177,107 @@ async fn the_home_host_is_remembered_across_a_controller_restart() {
     assert_eq!(remote.placement("s7").unwrap().host_id, "host-a");
     std::fs::remove_file(&path).unwrap();
 }
+
+// ── S8: a draining host, its agents resumed, their messages kept ───────
+
+fn mem_db() -> crate::delivery_drain::Db {
+    Arc::new(parking_lot::ReentrantMutex::new(rusqlite::Connection::open_in_memory().unwrap()))
+}
+
+const FAST: k2_core::delivery::Policy = k2_core::delivery::Policy {
+    backoff_base_ms: 100,
+    backoff_max_ms: 400,
+    max_attempts: 1_000,
+    ttl_ms: 3_600_000,
+    keep_finished_ms: 3_600_000,
+    seen_cap: 1_000,
+};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_agent_is_resumed_when_its_host_is_back_and_its_messages_wait_for_it() {
+    use crate::delivery_drain::{start_controller, Direct};
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    // Every address resolves on this controller, as a workspace would: an
+    // unplaced one would take the direct path, unless it awaits a resume.
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| panic!("a drained agent's message never takes the direct path")),
+        },
+    );
+    super::drain::ensure_controller_resumes_with(remote, Arc::new(super::drain::resume_v2));
+    let mut a = fake_host(&url, "host-a").await;
+    let body = json!({"agent_name": "bob", "cwd": "/w/bob", "command": "claude", "args": ["--session-id", "conv-1"]}).to_string();
+    let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
+    let Frame::Spawn { req, .. } = recv(&mut a).await else { panic!("expected spawn") };
+    send(&mut a, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": sid(1), "reused": false}).to_string() }).await;
+    assert_eq!(within("spawn", spawn).await.unwrap().0, "200 OK");
+    let mut b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+
+    // SIGTERM on host-a: it says it is draining. New agents go elsewhere.
+    send(&mut a, &Frame::Refused { code: super::drain::DRAINING_CODE.into(), message: "draining".into() }).await;
+    within("the controller to see the drain", async {
+        while remote.status_json()["hosts"][0]["draining"] != json!(true) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // carol's cwd was last run on host-a (bob's), which would win; host-a
+    // is draining, so it lands on host-b.
+    spawn_on(remote, &mut b, "carol", "/w/bob", &sid(2)).await;
+    assert_eq!(remote.placement("carol").unwrap().host_id, "host-b");
+
+    // bob's turn ended: host-a releases it, then stops it and exits.
+    send(&mut a, &Frame::Released { req: 0, agent_id: "bob".into(), epoch: 0, ring_end: None }).await;
+    within("bob's resume to be recorded", async {
+        while !remote.awaiting_resume("bob") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(remote.status_json()["resuming"], json!(["bob"]));
+    assert!(remote.placement("bob").is_none());
+    send(&mut a, &Frame::SessionGone { agent_id: "bob".into(), epoch: None, exit_code: None }).await;
+    drop(a);
+    wait_hosts(remote, 1).await;
+
+    // A message for bob while host-a is gone: queued, not delivered directly.
+    let msg_body = json!({"kind": "msg", "text": "while you were out"});
+    assert!(!outbox.is_direct("bob", &msg_body), "awaiting a resume: the outbox keeps it");
+    let msg_id = outbox.send("agent:alice", "bob", msg_body).unwrap();
+
+    // host-a is back (a restart): bob is resumed there, same conversation.
+    let mut a = fake_host(&url, "host-a").await;
+    match recv(&mut a).await {
+        Frame::Spawn { req, agent_id, body, .. } => {
+            assert_eq!(agent_id, "bob");
+            assert_eq!(body["args"], json!(["--resume", "conv-1"]));
+            assert_eq!(body["cwd"], json!("/w/bob"));
+            send(&mut a, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": sid(3), "reused": false}).to_string() })
+                .await;
+        }
+        other => panic!("expected bob's resume, got {other:?}"),
+    }
+    // Then the message that waited, once.
+    match recv(&mut a).await {
+        Frame::Deliver { msg_id: got, agent_id, .. } => {
+            assert_eq!((got.as_str(), agent_id.as_str()), (msg_id.as_str(), "bob"));
+            send(&mut a, &Frame::DeliverAck { msg_id: got, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the waiting message, got {other:?}"),
+    }
+    within("the message to be delivered", async {
+        while outbox.get(&msg_id).map(|r| r.state) != Some(k2_core::delivery::State::Delivered) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(!remote.awaiting_resume("bob"));
+    assert_eq!(remote.placement("bob").unwrap().host_id, "host-a");
+}

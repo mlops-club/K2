@@ -120,6 +120,7 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
         return match super::controller() {
             Some(cfg) => {
                 crate::delivery_drain::ensure_controller_drain();
+                super::drain::ensure_controller_resumes();
                 super::hub::serve_attach(&mut *stream, remote::global(), &cfg.token).await;
                 true
             }
