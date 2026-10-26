@@ -392,6 +392,27 @@ Throwaway branches `k2-dist/lab-g2-wave3d-run` (ff933ef19) and
 | `2026-10-26T13-14-36Z` | 0c6d3c9f7 | 7, 2 rounds | **S1–S10 PASS, I1–I4 pass**, S10 never redone |
 | `2026-10-26T13-19-19Z` | 0c6d3c9f7 | 4117, 2 rounds | **S1–S10 PASS, I1–I4 pass**, S10 never redone |
 
+On the final tree, wave3 897c06c4a + lab-g2 (`k2-dist/lab-g2-wave3f-run`,
+deleted), `LAB_S10=1`, `LAB_S8_RESUME_ELSEWHERE=1`:
+
+| Run | Backend | Chaos | Result |
+|---|---|---|---|
+| `2026-10-26T13-24-38Z` | compose | none | S1–S7, S9, S10 PASS, I1–I4 pass; S8 FAIL once (below) |
+| `2026-10-26T13-46-26Z` | procs | 2026, 1 round (7 kills, 15 skipped) | **S1–S10 PASS, I1–I4 pass** |
+| `2026-10-26T13-50-31Z` | compose | none | **S1–S10 PASS, I1–I4 pass** |
+
+The compose S8 red, not reproduced (K2 candidate, seen once): after the
+drain, the need resumed the agent on host-1 (`--resume`, same session; one
+live CLI when host-2 returned; the waiting message delivered once), but the
+lab, attached through the controller at 13:42:13.47, got the stream's
+`label_initial` and `mode` events and then no grid frame for 90 s. host-1
+had accepted the controller's grid stream for the session ("grid stream 33
+… for the owner") and sent its first snapshot within 0.09 ms, so the
+controller didn't relay it. The rerun on the same tree passed.
+
+`LAB_NO_ACTIVATE=1` (db793378c) skips the app's activate in `open_chat`:
+message-only agents, the K2-d variant, for after drain-move lands.
+
 Caveat: S10 holds the fleet for most of a round, so in the last two runs
 chaos mostly skipped (seed 7: 4 kills, 26 skipped; 4117: 5 kills, 23
 skipped). S1–S9 under fuller chaos on 0c6d3c9f7 is `12-30-20Z` (4117).
