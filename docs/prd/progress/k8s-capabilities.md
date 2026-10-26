@@ -88,7 +88,7 @@ sequenceDiagram
 |---|---|---|
 | 1 | NetworkPolicy is enforced on kindnet (deny probe, then allow) | **PASS** (ad28865c1, `scripts/kind/caps/netpol-check.sh`): same node and across nodes; deny, allow, and removal |
 | 2 | S12 parity: an App gives a Deployment, Service and NetworkPolicy; its database user is made through `postgresql/k2-pg` and logs in; the policy lets the controller and its database in and keeps a neighbour out; `/cli/db` lists it; deleting the App removes all four | **PASS on kind** (`scripts/kind/caps/apps-check.sh`, log `lab-runs/caps/apps-check.log`): install then deploy; the instance is a Deployment, Service and NetworkPolicy owned by the Deployment; the init container fetched the Seed from the controller with its token (`sha256 ok`); the pinned `node@sha256` image, uid 20001, `/app` read-only; the controller's health gate and router reach it through the Service and the controller has it `running`; it reaches `k2-pg:5432` and the controller, not a neighbour, and the neighbour can't reach it; the workspace database's login works from a pod and `/cli/db` lists it; uninstall removes the three objects. The first kind run found two bugs (b98eb019f): the Seed tar's root entry (`.`) failed to unpack on the volume's root (uid 20001 can't chmod it), and the check never called `/cli/app/deploy`. The database is the App's workspace database, made through `postgresql/k2-pg` (decision 1; per-App databases are S21). Uninstalling the App removes its three objects; the database is the workspace's and stays (its drop is `db-check.sh`'s) |
-| 3 | Mail and Sew answer on their management APIs | **Mail: PASS** after decision 4: `mail-check.sh` (never open, 401 without credentials, 8080 for the controller only) and `mail-enable-check.sh` (the controller sets it up and leaves no recovery credential known). **Sew: no image exists**, deferred. Before decision 4, mail answered but was unconfigured (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
+| 3 | Mail and Sew answer on their management APIs | **Mail: PASS** after decision 4: `mail-check.sh` (never open, 401 without credentials, 8080 for the controller only) and `mail-enable-check.sh` (the controller sets it up and leaves no recovery credential known). **Sew: out of reach without a design decision** (checked 2026-10-26, see "Sew on Kubernetes" below). Before decision 4, mail answered but was unconfigured (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
 | 4 | Front door through a Gateway (D7 (a): Envoy Gateway in its own namespace) | **PASS** (`scripts/kind/caps/gateway-check.sh`): `gateway.yaml`'s listener and route with TLS passthrough; the client sees the backend's own certificate, a line round-trips, an unknown SNI gets no route. The backend is a stand-in for the controller's front door until item 5 runs a controller here |
 | 5 | `/boot-status` capabilities read `delegated` for each | **PASS** (`scripts/kind/caps/controller-check.sh`, image `k2-daemon:caps` at 7720600b8). A controller shaped like `controller.yaml`, with the RBAC of `rbac.yaml`, reads `delegated` for postgres, mail, sew, apps and front. Its drivers report: postgres ok (`postgresql/k2-pg` Running, `k2` credentials readable), apps ok (may list Deployments), mail ok (`/healthz/ready` 200; still unconfigured, see decision 4), front ok. Sew is not ok, as expected with no Sew image |
 | – | k8s client (D1) and capability drivers | `crates/k2-daemon/src/k8s/` and `capabilities/kubernetes/`: every delegated feature gets a driver that checks its backend every 30 s, and `/boot-status` shows `capabilities.<f>.driver`. `cargo test -p k2-daemon --lib -- k8s:: capabilities:: boot_status`: 61 passed, twice |
@@ -210,4 +210,37 @@ All of it is through `$TMPDIR/k2-kind/caps/kubeconfig` (`kind get kubeconfig --n
 - MILESTONE decision 1: `/cli/db` through the operator's `preparedDatabases` (`db-check.sh` PASS).
 - MILESTONE CONNECT hardening (0951429dd).
 - Decisions 2 and 3: code done, tests pass (full `k2-daemon` lib: 4484 passed, 0 failed).
-- Item 2 passed on kind. Item 3 waits only on a Sew image.
+- Item 2 passed on kind. Item 3's Sew half needs a decision first (below).
+
+## Sew on Kubernetes: why item 3's Sew half can't just be built
+
+Checked against Sew 0.3.0, K2's pin (`crates/k2-root-proto/src/sew.rs`). The
+arm64 tarball from the public `Alakazam-211/sew-releases` v0.3.0 matches the
+pin (tarball `297d556d…`, binary `fbbb513d…`). Its own help, `sew install
+--print-units` and its config keys show:
+
+- **No image packaging anywhere.** The repo pins tarballs for the root
+  helper's box install; nothing builds `ghcr.io/alakazam-211/sew:0.3.0`,
+  which `deploy/kubernetes/edge/sew.yaml` names (ghcr answers 401: no such
+  public image).
+- **No TCP management API.** `[mgmt]` has `socket` (`/run/sew/mgmt.sock`),
+  `group`, `allow_uids`, `token_file`/`token_source`/`token_credential`.
+  `GET /mgmt/v1/health` is served on the socket, with the token. The only
+  TCP listener is the chat server's `server.bind`, and plain HTTP only on
+  loopback. `sew.yaml`'s `mgmt` port 9090 does not exist in Sew, and the
+  driver's unauthenticated GET on `K2_SEW_MGMT_URL` could not pass anyway.
+- **A systemd box service.** `sew serve` is `Type=notify` with a watchdog;
+  the master key is an encrypted systemd credential (a `--cred-mode plain`
+  exists); a private PostgreSQL 16 (`sew-db`) by Unix socket and peer auth
+  only; users and groups `sew`, `sew-db`, `sew-mgmt`.
+
+Options, for the coordinator (or Sew):
+(a) Sew ships a container entrypoint and a TCP (TLS, token) mgmt listener;
+K2's driver sends the token. (b) K2 packages it: one pod running sew-db
+(postgresql-16) and `sew serve` with `--cred-mode plain` and the master key
+from a Secret, plus a sidecar exposing the mgmt socket on a port only the
+controller may reach (NetworkPolicy), and a driver check that sends the
+token. (c) Sew stays a box service (the root helper) on Kubernetes too, and
+`K2_CAP_SEW=host`/`external` points at it. Recommendation: (a), since the
+mgmt contract is Sew's; (b) is a K2-side stopgap.
+
