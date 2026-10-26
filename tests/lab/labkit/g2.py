@@ -61,8 +61,9 @@ TITLES = {
     "S7": "CLI killed mid-turn, next need resumes",
     "S8": "Host killed mid-turn, nothing lost silently",
     "S9": "Controller restart, agents keep running",
+    "S10": "Host lost mid-session, its agent moves with its last turn's home",
 }
-FLEET_ONLY = ("S8", "S9")
+FLEET_ONLY = ("S8", "S9", "S10")
 
 
 def now_iso():
@@ -201,6 +202,7 @@ class Client:
         self.out = out
         self.sc = None  # the running Scenario (for logging)
         self.tag = uuid.uuid4().hex[:6]
+        self.projects = {}  # cwd -> project id (register_enabled)
 
     # ── plumbing ────────────────────────────────────────────────────────
     def log(self, msg):
@@ -265,7 +267,20 @@ class Client:
         st, text, _ = self.http("POST", "/cli/projects/update", body={"id": pid, "agentEnabled": 1})
         if st != 200:
             return None, "update HTTP %s %s" % (st, text[:200])
+        self.projects[cwd] = pid
         return pid, "project %s" % pid
+
+    def activate(self, cwd):
+        """What the app does when it opens or focuses a workspace: POST
+        /cli/projects/activate {projectId} stamps its need clock, so the
+        active reaper leaves its chat alone for the interaction window
+        (without it a chat counts as aged out and is closed ~30-60 s on,
+        even mid-turn). Logged, never fatal (an older daemon: 404)."""
+        pid = self.projects.get(cwd)
+        if pid:
+            st, text, _ = self.http("POST", "/cli/projects/activate", body={"projectId": pid})
+            if st != 200:
+                self.log("activate %s: HTTP %s %s" % (pid, st, text[:120]))
 
     def msg(self, workspace, text, wake=True, sender="lab-g2", port=None, token=None):
         form = {"workspace": workspace, "text": text, "from": sender, "wake": "true" if wake else "false"}
@@ -789,7 +804,9 @@ def s6(c, sc):
 
 def open_chat(c, sc, cwd, what):
     """The app opening a workspace's agent: POST /cli/workspace/ensure-pinned-chat
-    {project}. Returns (daemon session, claude session, reused, sock, grid) or None."""
+    {project}, after activating it as the app does (Client.activate).
+    Returns (daemon session, claude session, reused, sock, grid) or None."""
+    c.activate(cwd)
     st, raw, resp = c.http("POST", "/cli/workspace/ensure-pinned-chat", body={"project": cwd})
     sid, csid = resp.get("sessionId"), resp.get("claudeSessionId")
     if not sc.check(what, st == 200 and sid and csid,
@@ -1116,18 +1133,18 @@ def s9(c, sc):
     """The controller restarts under a running agent. S9 is about that
     agent's CLI surviving, so when --chaos itself SIGKILLed the CLI
     (chaos.log) the attempt shows nothing: it is redone with a fresh agent
-    (at most 3 attempts, each one counted in info)."""
+    (at most 5 attempts, each one counted in info)."""
     redo_on_chaos(c, sc, s9_attempt, "S9")
 
 
-def redo_on_chaos(c, sc, attempt_fn, what):
-    """Run attempt_fn(c, sc, attempt) up to 3 times. An attempt is redone
+def redo_on_chaos(c, sc, attempt_fn, what, attempts=5):
+    """Run attempt_fn(c, sc, attempt) up to `attempts` times. An attempt is redone
     when it failed a check and chaos.log shows --chaos itself killed the
     attempt's agent CLI or its host (sc.info host / cli_pid), or, when the
     attempt failed its first check (a spawn), the controller: then what
     failed says nothing about the property under test. The dropped checks
     stay in the log and in info["redone_after_chaos"]."""
-    for attempt in (1, 2, 3):
+    for attempt in range(1, attempts + 1):
         mark, since = len(sc.checks), now_iso()
         sc.info.pop("cli_pid", None)
         sc.info.pop("host", None)  # set again by the attempt (S8: the crash half set them)
@@ -1140,7 +1157,7 @@ def redo_on_chaos(c, sc, attempt_fn, what):
             # it was in flight (a spawn is never sent twice), so S9 never got
             # an agent to test.
             hits = chaos_hit("controller", None, since, kinds=("controller",))
-        if not hits or attempt == 3:
+        if not hits or attempt == attempts:
             return
         # --chaos killed this agent's CLI or its host: what failed after it
         # says nothing about the controller restart. Kept in log and info.
@@ -1249,7 +1266,181 @@ def s9_attempt(c, sc, attempt):
         c.close(name)
 
 
-SCENARIOS = {"S2": s2, "S3": s3, "S6": s6, "S7": s7, "S8": s8, "S9": s9}
+# ── S10 ─────────────────────────────────────────────────────────────────
+
+def move_after_s():
+    """The controller's K2_HOST_MOVE_AFTER in the lab (fleet.host_move_after),
+    or None (the daemon's own 300 s)."""
+    v = fleetlib.host_move_after()
+    try:
+        return int(v) if v else None
+    except ValueError:
+        return None
+
+
+def s10(c, sc):
+    """P3 T2 (outbox's turn-end snapshots): a host SIGKILLed mid-session (no
+    drain, nothing saved then). Its portable agent moves once the host has
+    been lost for K2_HOST_MOVE_AFTER and resumes on the other host with the
+    home its last finished turn saved (MEMORY.md, the transcript, the same
+    session) and the conversation; the turn in progress is lost, and its
+    message, never acked, is delivered again there. When the dead host
+    returns, no second CLI appears (I1).
+
+    The fleet's hosts share one work dir (LAB_HOME_SYNC), so the workspace
+    half of the home is outbox's turn-snapshots.sh (a work root per host);
+    S10 checks what each host keeps apart: its HOME (memory, transcript).
+    Opt-in (LAB_S10=1): before T2 the agent waits for its host (W3)."""
+    redo_on_chaos(c, sc, s10_attempt, "S10")
+
+
+def s10_attempt(c, sc, attempt):
+    after = move_after_s() or 300
+    name = "s10-%s%s" % (c.tag, "" if attempt == 1 else "-%d" % attempt)
+    cwd = c.fleet.workspace(name)
+    pid, why = c.register_enabled(cwd)
+    if not sc.check("workspace %s registered" % name, pid, why):
+        return
+    sock = None
+    try:
+        a = open_chat(c, sc, cwd, "the app opens the agent (ensure-pinned-chat)")
+        if not a:
+            return
+        facts = ["s10 fact one %s" % uuid.uuid4().hex[:6], "s10 fact two %s" % uuid.uuid4().hex[:6]]
+        for i, fact in enumerate(facts, 1):
+            text = "s10 turn %d [[remember: %s]]" % (i, fact)
+            ok, a = ask_chat(c, sc, cwd, a, text)
+            if not sc.check("turn %d answered" % i, ok, text):
+                return
+        sid, csid, _, sock, grid = a
+        ex = c.exec_of(csid)
+        h1, cli_pid = (ex or {}).get("host"), (ex or {}).get("pid")
+        sc.info.update(host=h1, cli_pid=cli_pid, claude_session=csid, agent=pid)
+        # Turn two's end: its sha (the fake agent traces it) and host-1's
+        # turn-end save of it (P3 T2: trigger turn).
+        wait_until(lambda: len(c.turn_events(csid, "cli.turn.end")) >= 2, 30)
+        end2 = c.turn_events(csid, "cli.turn.end")[-1]
+        mem2 = (end2.get("attrs") or {}).get("memory_sha256")
+        saves = wait_until(lambda: [e for e in c.fleet.daemon_events(h1, "host.home_saved")
+                                    if e.get("agent_id") == pid and (e.get("attrs") or {}).get("trigger") == "turn"
+                                    and (e.get("ts") or "") >= end2["ts"]], 30) or []
+        sc.check("turn two's end saved the agent's home on %s (host.home_saved, trigger turn)" % h1, bool(saves),
+                 json.dumps([e.get("attrs") for e in saves][-1:])[:300])
+        places = [e for e in c.fleet.daemon_events("controller", "ctl.place") if e.get("agent_id") == pid]
+        epoch1 = (places[-1].get("attrs") or {}).get("epoch") if places else None
+
+        # Turn three: a long one, by message (the outbox), so its message
+        # is not acked when the host dies.
+        # 30 s: long enough to kill it mid-turn; its redelivered copy runs
+        # the full 30 s again on the new host.
+        n3 = "s10 turn 3 %s [[turn-ms=30000]] [[remember: s10 lost turn]]" % uuid.uuid4().hex[:6]
+        starts = len(c.turn_events(csid, "cli.turn.start"))
+        st, raw, resp = c.msg(cwd, n3, wake=True)
+        msg_id = resp.get("msgId")
+        if not sc.check("turn three (a message) started on %s and the agent recorded its prompt" % h1,
+                        st == 200 and wait_until(lambda: len(c.turn_events(csid, "cli.turn.start")) > starts
+                                                 and c.prompts_with(cwd, n3.split(" [[")[0]), 30),
+                        "HTTP %s %s" % (st, raw[:200])):
+            return
+        sock.close()
+        sock = None
+        with c.fleet.control():
+            t_kill = now_iso()
+            killed = c.fleet.kill(h1)
+            # Its CLI goes with it (the host's process tree), as outbox's
+            # turn-snapshots.sh does.
+            with contextlib.suppress(fleetlib.FleetError, ProcessLookupError, TypeError):
+                if c.fleet.cli_alive(h1, cli_pid):
+                    c.fleet.kill_cli(cli_pid, host=h1)
+            sc.check("%s SIGKILLed with its CLI mid-turn (no drain, no release save)" % h1,
+                     killed and wait_until(lambda: not c.fleet.cli_alive(h1, cli_pid), 10)
+                     and len(c.turn_events(csid, "cli.turn.end")) == starts,
+                     "pid %s on %s" % (cli_pid, h1))
+            # Not before K2_HOST_MOVE_AFTER: the agent stays placed on the lost host.
+            time.sleep(max(0, after / 2))
+            early = [e for e in c.fleet.daemon_events("controller", "ctl.move_decision")
+                     if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill]
+            sc.check("no move before %s has been lost for K2_HOST_MOVE_AFTER (%d s)" % (h1, after), not early,
+                     json.dumps(early)[:200])
+            moves = wait_until(lambda: [e for e in c.fleet.daemon_events("controller", "ctl.move_decision")
+                                        if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill], after + 30, 0.5) or []
+            mv = moves[0] if moves else {}
+            lost_ms = (mv.get("attrs") or {}).get("lost_ms") or 0
+            sc.check("the controller moves the agent once %s has been lost for %d s (ctl.move_decision)" % (h1, after),
+                     bool(moves) and (mv.get("attrs") or {}).get("from") == h1 and lost_ms >= after * 1000,
+                     "killed %s; %s" % (t_kill, json.dumps(mv)[:300]))
+            # It resumes on the other host (the resume loop), at a new epoch,
+            # restoring the last turn's snapshot first.
+            resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
+                                          if e.get("host") not in (None, h1) and (e.get("ts") or "") >= t_kill
+                                          and (e.get("attrs") or {}).get("resumed")], 60) or []
+            rx = resumed[0] if resumed else {}
+            h2 = rx.get("host")
+            sc.info["moved_to"] = h2
+            ra = rx.get("attrs") or {}
+            new_places = [e for e in c.fleet.daemon_events("controller", "ctl.place")
+                          if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill]
+            epoch2 = (new_places[0].get("attrs") or {}).get("epoch") if new_places else None
+            sc.check("it resumes on the other host, same session, --resume, at a new epoch (no lab spawn)",
+                     bool(rx) and "--resume" in (ra.get("argv") or []) and csid in (ra.get("argv") or [])
+                     and bool(new_places) and (new_places[0].get("attrs") or {}).get("host") == h2
+                     and epoch1 is not None and epoch2 is not None and epoch2 > epoch1,
+                     "exec %s; epoch %s -> %s" % (json.dumps(rx)[:250], epoch1, epoch2))
+            restored = [e for e in c.fleet.daemon_events(h2, "host.home_restored")
+                        if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill] if h2 else []
+            ra2 = (restored[0].get("attrs") or {}) if restored else {}
+            sc.check("%s restored the last turn's snapshot before resuming (host.home_restored, fetched > 0)" % h2,
+                     bool(restored) and (ra2.get("fetched") or 0) > 0 and restored[0]["ts"] <= rx.get("ts", ""),
+                     json.dumps(ra2)[:200])
+            # The home: the memory the resumed CLI started with is turn two's.
+            sc.check("I3: the moved CLI started with turn two's MEMORY.md (sha256): the lost turn left nothing",
+                     ra.get("memory_sha256") == mem2 and mem2 not in (None, "absent"),
+                     "turn two %s, at resume %s" % (mem2, ra.get("memory_sha256")))
+            # The conversation: turns one and two are in its transcript there.
+            mine = [(h, s_) for h, s_, _ in c.prompts_with(cwd, "s10 turn 1 ") + c.prompts_with(cwd, "s10 turn 2 ")
+                    if h == h2]
+            sc.check("the conversation moved: turns one and two are in the transcript on %s" % h2,
+                     len(mine) == 2 and all(s_ == csid for _, s_ in mine), "%s" % mine)
+            # The lost turn's message is delivered again there, once, and answered.
+            key3 = n3.split(" [[")[0]
+            wait_until(lambda: c.replied(cwd, key3) and [p for p in c.prompts_with(cwd, key3) if p[0] == h2],
+                       gone_wait_s() + 30)
+            on2 = [p for p in c.prompts_with(cwd, key3) if p[0] == h2]
+            state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
+            sc.check("turn three's message, never acked, is delivered again on %s exactly once and answered" % h2,
+                     len(on2) == 1 and c.replied(cwd, key3) and state == "delivered",
+                     "on %s %d time(s); outbox state %s" % (h2, len(on2), state))
+            mem_now = c.memory_file(h2, cwd) if h2 else ""
+            mem_bytes = open(mem_now, "rb").read() if os.path.isfile(mem_now) else b""
+            sc.check("MEMORY.md on %s holds turns one and two" % h2, all(f.encode() in mem_bytes for f in facts), mem_now)
+            # The dead host returns: the agent stays where it moved (I1).
+            # Still holding the fleet: what S10 checks is the lab's own host
+            # loss, not one --chaos adds on top.
+            t_back = now_iso()
+            c.fleet.start(h1)  # waits for its link
+            most, live = 0, []
+            end = time.monotonic() + 15
+            while time.monotonic() < end:
+                live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
+                most = max(most, len(live))
+                time.sleep(0.5)
+            sc.check("I1: once %s is back, one live CLI for the agent, on %s (not adopted back, not placed twice)" % (h1, h2),
+                     most == 1 and [e.get("host") for e in live] == [h2] and c.placed_host(pid, t_back) in (None, h2),
+                     "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
+            # And it goes on there.
+            n4 = "s10 after %s" % uuid.uuid4().hex[:6]
+            st, raw, resp = c.msg(cwd, n4, wake=False)  # it is live there: queued, with a msg id (I2)
+            wait_until(lambda: c.replied(cwd, n4), DEADLINE_S)
+            sc.check("a message after the move lands on %s and is answered" % h2,
+                     c.replied(cwd, n4) and [p[0] for p in c.prompts_with(cwd, n4)] == [h2],
+                     "HTTP %s; prompts %s" % (st, [p[0] for p in c.prompts_with(cwd, n4)]))
+    finally:
+        if sock:
+            sock.close()
+        c.close(pid)
+
+
+SCENARIOS = {"S2": s2, "S3": s3, "S6": s6, "S7": s7, "S8": s8, "S9": s9, "S10": s10}
 
 
 def run(state_path, out, only, min_seconds=0):
@@ -1299,6 +1490,9 @@ def run_once(state_path, out, only, ledger_dir):
         c.sc = sc
         if sid in FLEET_ONLY and c.fleet.layout != "fleet":
             results[sid] = sc.finish(reason="applies to fleet only (PRD scenario matrix: - on solo)", status="n/a")
+            continue
+        if sid == "S10" and os.environ.get("LAB_S10") != "1":
+            results[sid] = sc.finish(reason="opt-in: LAB_S10=1 (needs P3 T2 turn-end snapshots and home sync)", status="n/a")
             continue
         try:
             SCENARIOS[sid](c, sc)

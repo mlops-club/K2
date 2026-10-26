@@ -227,14 +227,17 @@ class W1:
         alive = self.cli_alive_fn(ex.get("host"), pid) if getattr(self, "cli_alive_fn", None) else pid_alive(pid)
         return not alive
 
-    def turn_or_again(self, info, cwd, text, again, session=None):
+    def turn_or_again(self, info, cwd, text, again, session=None, tries=3):
         """wait_turn_done; when the CLI that took the prompt died before
         answering, the turn in progress is lost (PRD failure table): do it
-        again once with a fresh prompt made by `again()` (send the message
-        again, fire again). Counted in info. Returns (turn, text)."""
+        again with a fresh prompt made by `again()` (send the message again,
+        fire again), at most `tries` times in all (under --chaos the CLI the
+        retry woke can be killed too). Counted in info. Returns (turn, text)."""
         turn = self.wait_turn_done(cwd, text, session)
-        answered = turn and any(REPLY_MARKER in r and text in r for r in turn["replies"])
-        if turn and not answered and self.cli_dead(turn["session"]):
+        for _ in range(tries - 1):
+            answered = turn and any(REPLY_MARKER in r and text in r for r in turn["replies"])
+            if not (turn and not answered and self.cli_dead(turn["session"])):
+                break
             info["again_after_cli_death"] = info.get("again_after_cli_death", 0) + 1
             self.log("the CLI died before answering %r: doing it again" % text)
             text = again()

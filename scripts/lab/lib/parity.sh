@@ -75,7 +75,7 @@ run_clean() {
         echo "lab: stopped after ${deadline}s (hung?)" >>"$log"; rc=124
     fi
     # Anything the suite left running under its sandbox.
-    pkill -9 -f "$h/" 2>/dev/null || true
+    [ -n "${h:-}" ] && pkill -9 -f "$h/" 2>/dev/null || true
     rm -rf "$h"
     return $rc
 }

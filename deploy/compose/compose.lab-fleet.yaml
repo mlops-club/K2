@@ -57,6 +57,7 @@ services:
       K2_LISTEN: lan
       K2_HOSTS: "1"
       K2_HOST_BOOTSTRAP_TOKEN_FILE: ${LAB_ROOT:?}/host-token
+      K2_HOST_MOVE_AFTER: ${LAB_HOST_MOVE_AFTER:-}   # P3 T2 (S10); empty = the daemon's 300 s
       K2_DAEMON_PORT: ${LAB_CTL_PORT:?}
       K2_TRACE_FILE: /lab/traces/controller.daemon.jsonl
     working_dir: ${LAB_ROOT:?}/controller

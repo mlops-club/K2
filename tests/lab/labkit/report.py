@@ -56,6 +56,7 @@ _G2 = [
 ]
 SCENARIOS[("G2", "fleet")] = [(sid, title, True) for sid, title in _G2]
 SCENARIOS[("G2", "solo")] = [(sid, title, sid not in ("S8", "S9")) for sid, title in _G2]
+OPT_IN = ("S10",)
 NOT_BUILT = "not implemented in wave 1 (the lab ships S1 only)"
 NOT_BUILT_BY = {"S12": "no S12 client yet (Postgres, Apps, mail, Sew, front door): not built by the lab"}
 
@@ -163,6 +164,17 @@ def build(run_dir):
         if req:
             required.append({"kind": "scenario", "id": sid, "title": title, "status": r["status"],
                              "reason": r.get("reason") or _first_failed(r)})
+    # Opt-in scenarios beyond the gate's matrix (S10, LAB_S10=1): shown and
+    # required when they ran.
+    listed = {sid for sid, _, _ in SCENARIOS.get((gate, topo), [])}
+    for sid in OPT_IN:
+        r = _maybe(os.path.join(run_dir, "scenarios", sid + ".json"))
+        if sid in listed or r is None or r.get("status") == "n/a":
+            continue
+        r["required"] = True
+        scenarios.append(r)
+        required.append({"kind": "scenario", "id": sid, "title": r.get("title", sid), "status": r["status"],
+                         "reason": r.get("reason") or _first_failed(r)})
 
     invariants = []
     na = INVARIANT_NA.get((gate, topo), {})

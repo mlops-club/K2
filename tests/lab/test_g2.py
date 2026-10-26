@@ -322,6 +322,36 @@ class Plan(unittest.TestCase):
             c.outbox = lambda proc=None, msg_id=None, resp=resp: resp
             self.assertEqual(c.final_state("m"), want, (evs, row, resp_ok))
 
+    def test_host_move_after_reaches_the_controller_only_and_is_20_s_under_s10(self):
+        for env, want in (({}, ""), ({"LAB_S10": "1"}, "20"), ({"LAB_S10": "1", "LAB_HOST_MOVE_AFTER": "7"}, "7"),
+                          ({"LAB_HOST_MOVE_AFTER": "9"}, "9")):
+            with unittest.mock.patch.dict(os.environ, env):
+                for k in ("LAB_S10", "LAB_HOST_MOVE_AFTER"):
+                    if k not in env:
+                        os.environ.pop(k, None)
+                st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
+                self.assertEqual(g2.move_after_s(), int(want) if want else None)
+            self.assertEqual(st["procs"]["controller"]["env"]["K2_HOST_MOVE_AFTER"], want, env)
+            self.assertNotIn("K2_HOST_MOVE_AFTER", st["procs"]["host-1"]["env"])
+
+    def test_open_chat_activates_a_registered_workspace_first_as_the_app_does(self):
+        c = g2.Client.__new__(g2.Client)
+        c.projects, calls = {"/w/a": "p1"}, []
+        c.http = lambda method, path, body=None, **kw: calls.append((path, body)) or (500, "x", {})
+        c.log = lambda msg: None
+        sc = unittest.mock.Mock(check=lambda name, ok, detail="": ok)
+        self.assertIsNone(g2.open_chat(c, sc, "/w/a", "opens"))
+        self.assertEqual(calls[0], ("/cli/projects/activate", {"projectId": "p1"}))
+        self.assertEqual(calls[1][0], "/cli/workspace/ensure-pinned-chat")
+        calls.clear()
+        g2.open_chat(c, sc, "/w/unregistered", "opens")
+        self.assertEqual([p for p, _ in calls], ["/cli/workspace/ensure-pinned-chat"])
+
+    def test_s10_is_fleet_only_and_opt_in(self):
+        self.assertIn("S10", g2.FLEET_ONLY)
+        self.assertIn("S10", g2.SCENARIOS)
+        self.assertIn("S10", g2.TITLES)
+
     def test_gone_grace_reaches_every_daemon_only_when_the_lab_sets_it(self):
         with unittest.mock.patch.dict(os.environ, {"LAB_GONE_GRACE_S": "30"}):
             st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
