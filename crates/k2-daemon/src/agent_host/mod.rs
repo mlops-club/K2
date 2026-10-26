@@ -526,3 +526,13 @@ pub(crate) fn host() -> &'static dyn AgentHost {
         crate::runtime_role::Role::All | crate::runtime_role::Role::Host => &IN_PROCESS,
     }
 }
+
+/// K2-d: is `agent_id`'s turn running (session `session_id`)? On a
+/// controller, by the hooks its host forwards; here, by this process's own
+/// hook stream or its activity row being `Working`.
+pub(crate) fn in_turn(agent_id: &str, session_id: &str) -> bool {
+    match crate::runtime_role::current() {
+        crate::runtime_role::Role::Controller => remote::global().in_turn(agent_id),
+        crate::runtime_role::Role::All | crate::runtime_role::Role::Host => crate::hosts::drain::session_in_turn(session_id),
+    }
+}

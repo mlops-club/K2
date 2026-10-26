@@ -26,6 +26,14 @@
 //! clock via [`note_workspace_need`]). Forced dismiss still fires
 //! against a live PTY.
 //!
+//! ## A turn in progress is never cut (K2-d)
+//! A chat whose agent is in its turn (from its hooks, or its activity row
+//! `Working`; on a controller, the hooks its host forwards) is neither armed
+//! nor fired: an armed grace is pushed back until the turn ends, then runs
+//! again in full. Delivering a message to an agent (the outbox, on a
+//! controller) is a need, like an app attach: it bumps the clock
+//! ([`note_agent_activity`]).
+//!
 //! ## Grace
 //! When a workspace first becomes reap-eligible — either the window-tick
 //! finds it aged, or an explicit `dismiss` arms it NOW — a 15s timer
@@ -134,6 +142,14 @@ pub fn note_workspace_need(project_id: &str) {
     let _ = k2_core::projects_ops::projects_touch_interaction(project_id);
     clear_dismiss_suppression(project_id);
     recompute_and_broadcast_active();
+}
+
+/// K2-d: a message was delivered to (or a wake placed) `agent_name`: a
+/// need for its workspace, as an app attach is. A canonical chat's name is
+/// its project id; a heartbeat PTY's is `{project_id}:hb:…`.
+pub fn note_agent_activity(agent_name: &str) {
+    let project_id = agent_name.split(":hb:").next().unwrap_or(agent_name);
+    note_workspace_need(project_id);
 }
 
 /// Eagerly lift a dismiss: a wake/re-activation of the workspace means
@@ -258,12 +274,17 @@ struct LiveChat {
     /// time — used to detect re-activation that cancels a forced
     /// (dismiss) timer.
     last_interaction_secs: Option<i64>,
+    /// K2-d: its agent's turn is running: never reaped now.
+    in_turn: bool,
 }
 
 /// Spawn the Active reaper as a background tokio task. Returns the
 /// JoinHandle (not currently aborted on shutdown; the task exits when
 /// the runtime drops). Mirrors `watchdog::spawn`'s shape.
 pub fn spawn() -> JoinHandle<()> {
+    // K2-d: this process's turns, from its own hooks (a controller's come
+    // from its hosts instead).
+    crate::hosts::drain::track_turns();
     tokio::spawn(async move { run().await })
 }
 
@@ -330,6 +351,14 @@ async fn reconcile_pass(armed: &mut HashMap<String, ArmState>, grace_dur: Durati
 
     for chat in &snapshot.live_chats {
         let pid = &chat.project_id;
+        // K2-d: never in its turn. An armed grace starts over once it ends.
+        if chat.in_turn {
+            if let Some(state) = armed.get_mut(pid) {
+                state.deadline = now + grace_dur;
+                log_debug!("[active-reaper] project={pid} is in its turn: its grace waits for the turn to end");
+            }
+            continue;
+        }
         let active = snapshot.active_ids.contains(pid);
         let dismissed_this_pass = dismissed.contains(pid);
         let existing = armed.get(pid).cloned();
@@ -441,6 +470,16 @@ async fn reconcile_pass(armed: &mut HashMap<String, ArmState>, grace_dur: Durati
         .unwrap_or(true); // fail closed: skip the reap on join error
 
         let active = recheck;
+        // K2-d: a turn that began since the snapshot still spares it.
+        let (agent, session) = (chat.agent_name.clone(), chat.session_id.clone());
+        let turning = tokio::task::spawn_blocking(move || crate::agent_host::in_turn(&agent, &session)).await.unwrap_or(true);
+        if turning {
+            log_debug!("[active-reaper] skip fire for project={} (its turn is running)", chat.project_id);
+            if let Some(state) = armed.get_mut(&chat.project_id) {
+                state.deadline = Instant::now() + grace_dur;
+            }
+            continue;
+        }
         // Non-forced: spare only if window-Active or pinned again.
         // Live PTY and heartbeat enablement do not spare. Forced
         // (dismiss) ignores window: user asked to remove it; arming
@@ -529,14 +568,15 @@ fn collect_snapshot(now_ms: i64, window: u32) -> Snapshot {
             .get(&project_id)
             .copied()
             .flatten();
-        live_chats.push(LiveChat {
-            agent_name,
-            project_id,
-            session_id: session.session_id().to_string(),
-            last_interaction_secs,
-        });
+        let session_id = session.session_id().to_string();
+        live_chats.push(LiveChat { agent_name, project_id, session_id, last_interaction_secs, in_turn: false });
     }
     drop(conn);
+    // After the DB lock: on a controller this takes the placement table's,
+    // which is taken before the DB's elsewhere.
+    for c in live_chats.iter_mut() {
+        c.in_turn = crate::agent_host::in_turn(&c.agent_name, &c.session_id);
+    }
 
     Snapshot {
         active_ids,

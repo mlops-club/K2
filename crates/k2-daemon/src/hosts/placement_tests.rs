@@ -652,3 +652,209 @@ async fn a_host_back_with_an_agent_that_moved_meanwhile_is_told_to_release_it() 
     assert!(remote.placement("eve").is_none(), "the stale copy is not adopted");
     assert_eq!(remote.resume_due().iter().map(|r| r.agent_id.as_str()).collect::<Vec<_>>(), vec!["eve"]);
 }
+
+// ── drain-move: a drained agent doesn't wait for its host forever ──────
+
+/// The outbox with every address resolving here and no direct path.
+fn outbox_for(remote: &'static RemoteHost) -> Arc<crate::delivery_drain::Controller> {
+    use crate::delivery_drain::{start_controller, Direct};
+    start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| panic!("these agents' messages never take the direct path")),
+        },
+    )
+}
+
+/// `agent` (`--session-id conv-1`) on `host`, then `host` drains it and
+/// goes for good (a scale-down). Returns once the controller holds the
+/// resume row and the host is unlinked.
+async fn drained_for_good(remote: &'static RemoteHost, host: &mut Ws, agent: &str) {
+    let body = json!({"agent_name": agent, "cwd": format!("/w/{agent}"), "command": "claude", "args": ["--session-id", "conv-1"]}).to_string();
+    let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
+    answer_spawn(host, agent, &sid(1)).await;
+    assert_eq!(within("spawn", spawn).await.unwrap().0, "200 OK");
+    send(host, &Frame::Refused { code: super::drain::DRAINING_CODE.into(), message: "draining".into() }).await;
+    send(host, &Frame::Released { req: 0, agent_id: agent.into(), epoch: 0, ring_end: None }).await;
+    within("the resume to be recorded", async {
+        while !remote.awaiting_resume(agent) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    send(host, &Frame::SessionGone { agent_id: agent.into(), epoch: None, exit_code: None }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_for_a_drained_portable_agent_resumes_it_on_another_host_at_once() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    super::drain::ensure_controller_resumes_with(remote, Arc::new(super::drain::resume_v2));
+    let mut a = fake_host(&url, "host-a").await;
+    let mut b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+    drained_for_good(remote, &mut a, "bob").await;
+    drop(a);
+    wait_hosts(remote, 1).await;
+    assert!(remote.resume_due().is_empty(), "no need yet: bob waits for host-a (K2_HOST_MOVE_AFTER)");
+
+    // A message is a need: bob resumes on host-b now, the same conversation
+    // (host-b restores its home snapshot first: T1), then gets it, once.
+    let id = outbox.send("agent:alice", "bob", json!({"kind": "msg", "text": "after the scale-down"})).unwrap();
+    let (_, body) = answer_spawn(&mut b, "bob", &sid(2)).await;
+    assert_eq!(body["args"], json!(["--resume", "conv-1"]));
+    match recv(&mut b).await {
+        Frame::Deliver { msg_id, agent_id, attempt, .. } => {
+            assert_eq!((msg_id.as_str(), agent_id.as_str(), attempt), (id.as_str(), "bob", 1));
+            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the message on host-b, got {other:?}"),
+    }
+    let row = wait_final(&outbox, &id).await;
+    assert_eq!((row.state, row.attempts), (State::Delivered, 1), "delivered once");
+    assert_eq!(remote.placement("bob").unwrap().host_id, "host-b");
+    assert!(!remote.awaiting_resume("bob"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_pinned_agent_waits_for_its_host_even_with_a_message() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    let _b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+    remote.policy().set_mode("lap", &crate::provisioner::Mode::Pinned { host: "host-a".into() }).unwrap();
+    drained_for_good(remote, &mut a, "lap").await;
+    drop(a);
+    wait_hosts(remote, 1).await;
+    let id = outbox.send("agent:alice", "lap", json!({"kind": "msg", "text": "hold on"})).unwrap();
+    for _ in 0..3 {
+        outbox.pass(k2_core::delivery::now_ms());
+    }
+    assert!(remote.resume_due().is_empty(), "pinned: never resumed elsewhere");
+    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), Vec::<String>::new());
+    assert!(remote.resume_due().is_empty());
+    assert!(remote.awaiting_resume("lap"));
+    assert_eq!(outbox.get(&id).unwrap().state, State::Queued, "the message waits with it");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_portable_agent_resumes_anywhere_once_its_host_is_gone_for_k2_host_move_after() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let mut a = fake_host(&url, "host-a").await;
+    let _b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+    drained_for_good(remote, &mut a, "cat").await;
+    let now = std::time::Instant::now();
+    assert_eq!(remote.move_lost(now, Duration::ZERO), Vec::<String>::new(), "host-a is still linked: it may resume cat");
+    drop(a);
+    wait_hosts(remote, 1).await;
+    assert!(remote.resume_due().is_empty());
+    let later = std::time::Instant::now();
+    assert_eq!(remote.move_lost(later, Duration::from_secs(3600)), Vec::<String>::new(), "not gone long enough");
+    assert_eq!(remote.move_lost(later, Duration::ZERO), vec!["cat"]);
+    let due = remote.resume_due();
+    assert_eq!(
+        due.iter().map(|r| (r.agent_id.as_str(), r.host_id.as_str())).collect::<Vec<_>>(),
+        vec![("cat", super::drain::ANY_HOST)],
+        "any host now"
+    );
+    assert_eq!(remote.move_lost(later, Duration::ZERO), Vec::<String>::new(), "once");
+}
+
+// ── K2-d: a turn in progress is never cut silently ─────────────────────
+
+async fn hook(host: &mut Ws, pane: &str, event: &str) {
+    send(host, &Frame::Hook { pane: pane.into(), event: event.into(), session_id: Some(pane.into()), conversation: None, agent_pid: None, at_ms: 0, epoch: None })
+        .await;
+}
+
+/// The outbox delivers `text` to `agent` on `host`, which acks it.
+async fn delivered(outbox: &crate::delivery_drain::Controller, host: &mut Ws, agent: &str, text: &str) -> String {
+    let id = outbox.send("agent:alice", agent, json!({"kind": "msg", "text": text})).unwrap();
+    match recv(host).await {
+        Frame::Deliver { msg_id, .. } => {
+            assert_eq!(msg_id, id);
+            send(host, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the delivery, got {other:?}"),
+    }
+    assert_eq!(wait_final(outbox, &id).await.state, k2_core::delivery::State::Delivered);
+    id
+}
+
+/// `remote.unplace(agent)` with `host` answering its close.
+async fn close_on(remote: &'static RemoteHost, host: &mut Ws, agent: &str) {
+    let a = agent.to_string();
+    let unplace = tokio::task::spawn_blocking(move || crate::agent_host::AgentHost::unplace(remote, &a).is_some());
+    match recv(host).await {
+        Frame::Close { req, agent_id, .. } => {
+            assert_eq!(agent_id, agent);
+            send(host, &Frame::Reply { req, status: "200 OK".into(), body: json!({"closed": true}).to_string() }).await;
+        }
+        other => panic!("expected the close, got {other:?}"),
+    }
+    assert!(within("unplace", unplace).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_controller_follows_turns_and_a_close_mid_turn_fails_the_unanswered_message() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let seen: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+    let s = Arc::clone(&seen);
+    outbox.set_activity(Arc::new(move |a: &str| s.lock().push(a.to_string())));
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "dan", "/w/dan", &sid(1)).await;
+    spawn_on(remote, &mut a, "eve", "/w/eve", &sid(2)).await;
+
+    // A message-only agent, no app: the delivery is activity (the reaper's
+    // need clock), and its turn runs from UserPromptSubmit to Stop.
+    let m1 = delivered(&outbox, &mut a, "dan", "first").await;
+    assert!(seen.lock().iter().any(|x| x == "dan"), "the delivery counted as activity: {:?}", seen.lock());
+    assert!(!remote.in_turn("dan"));
+    hook(&mut a, &sid(1), "UserPromptSubmit").await;
+    within("dan's turn to start", async {
+        while !remote.in_turn("dan") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    hook(&mut a, &sid(1), "Stop").await;
+    within("dan's turn to end", async {
+        while remote.in_turn("dan") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Answered, then closed: it stays delivered.
+    close_on(remote, &mut a, "dan").await;
+    assert_eq!(outbox.get(&m1).unwrap().state, State::Delivered);
+
+    // eve gets a message and its turn starts; something closes it anyway
+    // (a forced dismiss, a deadline): the message fails, saying why.
+    let m2 = delivered(&outbox, &mut a, "eve", "second").await;
+    hook(&mut a, &sid(2), "UserPromptSubmit").await;
+    within("eve's turn to start", async {
+        while !remote.in_turn("eve") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    close_on(remote, &mut a, "eve").await;
+    let row = outbox.get(&m2).unwrap();
+    assert_eq!(row.state, State::Failed, "never left as answered");
+    assert!(row.reason.as_deref().unwrap_or_default().contains("interrupted: eve was closed mid-turn"), "{row:?}");
+    assert!(!remote.in_turn("eve"), "no placement, no turn");
+}

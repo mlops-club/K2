@@ -653,3 +653,71 @@ async fn post_activate_after_dismiss_unsuppresses_immediately() {
     drop(session);
     v2_session_map::clear_for_tests();
 }
+
+/// K2-d: a message-only agent (no app ever attached: its workspace was
+/// never activated) whose turn is running is never reaped, even past its
+/// grace. Once the turn ends, the grace starts over, then the reap fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_only_agent_in_its_turn_is_not_reaped_until_the_turn_ends() {
+    let _g = lock();
+    init_for_tests();
+    v2_session_map::clear_for_tests();
+
+    let (pid, path) = setup_project("in-turn");
+    // Never interacted: outside the Active set from the start.
+    set_last_interaction(&pid, None);
+    let session = spawn_chat_pty(&pid, &path);
+    let pane = session.session_id.to_string();
+    // The delivered message started a turn (its UserPromptSubmit hook).
+    k2_daemon::hosts::drain::note_turn_hook(&pane, "UserPromptSubmit");
+
+    let mut reaper = ReaperTestDriver::with_grace_ms(GRACE_MS);
+    for _ in 0..3 {
+        reaper.pass().await;
+        assert!(!reaper.is_armed(&pid), "in its turn: never armed");
+        tokio::time::sleep(Duration::from_millis(GRACE_MS + 30)).await;
+    }
+    assert!(is_live(&pid), "in its turn: never reaped");
+
+    // The turn ends (its Stop).
+    k2_daemon::hosts::drain::note_turn_hook(&pane, "Stop");
+    reaper.pass().await;
+    assert!(reaper.is_armed(&pid), "the turn ended: aged out, armed");
+    tokio::time::sleep(Duration::from_millis(GRACE_MS + 30)).await;
+    reaper.pass().await;
+    assert!(!is_live(&pid), "after the turn and a full grace: reaped");
+
+    drop(session);
+    v2_session_map::clear_for_tests();
+}
+
+/// K2-d: a turn that starts while a grace is armed pushes the reap back
+/// until it ends (the grace runs again in full).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_starting_under_an_armed_grace_holds_the_reap() {
+    let _g = lock();
+    init_for_tests();
+    v2_session_map::clear_for_tests();
+
+    let (pid, path) = setup_project("turn-under-grace");
+    set_last_interaction(&pid, Some(now_secs() - 100 * 3600));
+    let session = spawn_chat_pty(&pid, &path);
+    let pane = session.session_id.to_string();
+
+    let mut reaper = ReaperTestDriver::with_grace_ms(GRACE_MS);
+    reaper.pass().await;
+    assert!(reaper.is_armed(&pid));
+    k2_daemon::hosts::drain::note_turn_hook(&pane, "UserPromptSubmit");
+    tokio::time::sleep(Duration::from_millis(GRACE_MS + 30)).await;
+    reaper.pass().await;
+    assert!(is_live(&pid), "its turn began under the grace: not reaped");
+    k2_daemon::hosts::drain::note_turn_hook(&pane, "Stop");
+    reaper.pass().await;
+    assert!(is_live(&pid), "the grace started over when the turn was seen; not elapsed yet");
+    tokio::time::sleep(Duration::from_millis(GRACE_MS + 30)).await;
+    reaper.pass().await;
+    assert!(!is_live(&pid), "reaped a full grace after the turn");
+
+    drop(session);
+    v2_session_map::clear_for_tests();
+}

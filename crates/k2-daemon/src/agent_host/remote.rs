@@ -211,6 +211,20 @@ struct Inner {
     /// agent's messages a grace period, then the direct path or a loud
     /// failure. In the store as `host_ended`.
     ended: HashMap<String, i64>,
+    /// K2-d: each placed agent's turn, from the hooks its host forwards,
+    /// and the messages delivered to it since its last turn ended.
+    turns: HashMap<String, Turn>,
+}
+
+/// One agent's turn as the controller follows it (K2-d).
+#[derive(Debug, Default, Clone)]
+struct Turn {
+    /// The session (pane) the hooks came from.
+    pane: String,
+    running: bool,
+    /// Messages delivered since its last turn ended: unanswered until one
+    /// ends.
+    delivered: Vec<String>,
 }
 
 
@@ -980,9 +994,11 @@ impl RemoteHost {
                 let hit = inner.placements.values_mut().find(|p| {
                     p.host_id == host_id && p.session_id.as_deref() == Some(pane.as_str())
                 });
+                let mut turn_of = None;
                 match hit {
                     Some(p) if epoch.is_none_or(|e| e == p.epoch.0) => {
                         p.hooks += 1;
+                        turn_of = Some(p.agent_id.clone());
                         let hook = HostHook {
                             host_id: host_id.to_string(),
                             agent_id: p.agent_id.clone(),
@@ -997,6 +1013,20 @@ impl RemoteHost {
                         let _ = self.hooks.send(hook);
                     }
                     _ => log_debug!("[hosts] dropped hook {event} from host {host_id}: session {pane} is not placed there at that epoch"),
+                }
+                if let Some(agent) = turn_of {
+                    let t = inner.turns.entry(agent).or_default();
+                    if t.pane != pane {
+                        *t = Turn { pane: pane.clone(), ..Turn::default() };
+                    }
+                    match event.as_str() {
+                        "UserPromptSubmit" => t.running = true,
+                        "Stop" | "StopFailure" | "SessionEnd" => {
+                            t.running = false;
+                            t.delivered.clear();
+                        }
+                        _ => {}
+                    }
                 }
             }
             Frame::OpenUrl { url, source } => {
@@ -1942,6 +1972,24 @@ impl RemoteHost {
     /// from the first call. The agents moved.
     pub fn move_lost(&self, now: Instant, after: Duration) -> Vec<String> {
         let mut inner = self.inner.lock();
+        // drain-move: a drained agent waits for its host only so long. A
+        // portable one whose host has been unlinked for `after` (a pool's
+        // scale-down, node maintenance: it won't come back) resumes on any
+        // host, the same rule as a lost host's placements below.
+        let waiting: Vec<(String, String)> = inner
+            .resume
+            .values()
+            .filter(|r| r.host_id != crate::hosts::drain::ANY_HOST && !inner.links.contains_key(&r.host_id))
+            .map(|r| (r.agent_id.clone(), r.host_id.clone()))
+            .collect();
+        let mut moved = Vec::new();
+        for (agent, host) in waiting {
+            let since = *inner.seen_hosts.entry(host.clone()).or_insert(Some(now));
+            let away = since.map(|t| now.saturating_duration_since(t)).unwrap_or_default();
+            if away >= after && self.promote_resume(&mut inner, &agent, &format!("host {host} drained it and has been gone for {away:?}")) {
+                moved.push(agent);
+            }
+        }
         let holding: BTreeSet<String> = inner.placements.values().map(|p| p.host_id.clone()).collect();
         for h in &holding {
             if !inner.links.contains_key(h) {
@@ -1956,7 +2004,6 @@ impl RemoteHost {
             .collect();
         let candidates: Vec<RemotePlacement> =
             inner.placements.values().filter(|p| lost.contains_key(&p.host_id)).cloned().collect();
-        let mut moved = Vec::new();
         for p in candidates {
             if let crate::provisioner::Mode::Pinned { host } = self.policy.need(&p.agent_id).mode {
                 log_debug!("[hosts] agent {} is pinned to {host}, lost: it waits for it", p.agent_id);
@@ -1996,6 +2043,50 @@ impl RemoteHost {
         }
         moved.sort();
         moved
+    }
+
+    /// drain-move (1): a need for an agent waiting to resume (a message
+    /// the outbox holds for it, a wake) places it now: a portable agent's
+    /// resume row becomes "any host", so the resume loop puts it on any
+    /// usable host at once, which restores its newest home snapshot. A
+    /// pinned agent keeps waiting for its host. `ids` are the recipient and
+    /// its aliases. The agent promoted, if any.
+    pub fn resume_anywhere(&self, ids: &[String], why: &str) -> Option<String> {
+        let mut inner = self.inner.lock();
+        let agent = ids.iter().find(|a| inner.resume.contains_key(*a))?.clone();
+        self.promote_resume(&mut inner, &agent, why).then_some(agent)
+    }
+
+    /// `agent`'s resume row → any host, unless it is already, or the agent
+    /// is pinned (then it waits for its host). True when promoted now.
+    fn promote_resume(&self, inner: &mut Inner, agent: &str, why: &str) -> bool {
+        let any = crate::hosts::drain::ANY_HOST;
+        let Some(from) = inner.resume.get(agent).map(|r| r.host_id.clone()) else { return false };
+        if from == any {
+            return false;
+        }
+        if let crate::provisioner::Mode::Pinned { host } = self.policy.need(agent).mode {
+            log_debug!("[hosts] agent {agent} is pinned to {host}: it waits for it to resume ({why})");
+            return false;
+        }
+        let Some(row) = inner.resume.get_mut(agent) else { return false };
+        row.host_id = any.to_string();
+        if let Some(store) = &self.store {
+            if let Err(e) = store.add_resume(row) {
+                log_debug!("[hosts] {e}");
+            }
+        }
+        let epoch = row.epoch;
+        log_debug!("[hosts] agent {agent} (drained from {from}) resumes on the next host that can take it: {why}");
+        k2_core::trace::emit(|| {
+            k2_core::trace::Event::new(crate::hosts::drain::events::CTL_MOVE)
+                .agent(agent)
+                .attr("from", from.as_str())
+                .attr("epoch", epoch)
+                .attr("drained", true)
+                .attr("why", why)
+        });
+        true
     }
 
     /// The protocol the link to `host_id` speaks, if it is linked.
@@ -2134,6 +2225,29 @@ impl RemoteHost {
     }
 
     // ── reads ──────────────────────────────────────────────────────────
+
+    /// K2-d: is `agent_id`'s turn running, by the hooks its host forwarded
+    /// (`UserPromptSubmit` until `Stop`, `StopFailure` or `SessionEnd`)?
+    pub fn in_turn(&self, agent_id: &str) -> bool {
+        let inner = self.inner.lock();
+        let Some(t) = inner.turns.get(agent_id) else { return false };
+        t.running && inner.placements.get(agent_id).is_some_and(|p| p.session_id.as_deref() == Some(t.pane.as_str()))
+    }
+
+    /// K2-d: the outbox delivered `msg_id` to `agent_id`: unanswered until
+    /// its turn ends.
+    pub fn note_delivered(&self, agent_id: &str, msg_id: &str) {
+        let mut inner = self.inner.lock();
+        let pane = inner.placements.get(agent_id).and_then(|p| p.session_id.clone());
+        let Some(pane) = pane else { return };
+        let t = inner.turns.entry(agent_id.to_string()).or_default();
+        if t.pane != pane {
+            *t = Turn { pane, ..Turn::default() };
+        }
+        if !t.delivered.iter().any(|m| m == msg_id) {
+            t.delivered.push(msg_id.to_string());
+        }
+    }
 
     /// The host that last ran `agent_id` (S7's affinity), placed or not.
     pub fn last_host_of(&self, agent_id: &str) -> Option<String> {
@@ -2428,14 +2542,22 @@ impl AgentHost for RemoteHost {
     /// Remove the placement and close it on the host (kill, no index
     /// clearing), as the in-process unplace does.
     fn unplace(&self, agent_id: &str) -> Option<AgentSession> {
-        let (placement, session) = {
+        let (placement, session, cut) = {
             let mut inner = self.inner.lock();
             let placed = (inner.placements.remove(agent_id), inner.sessions.remove(agent_id));
             if placed.0.is_some() {
                 self.note_ended(&mut inner, agent_id);
             }
-            placed
+            let turn = inner.turns.remove(agent_id).unwrap_or_default();
+            let cut = if turn.running { turn.delivered } else { Vec::new() };
+            (placed.0, placed.1, cut)
         };
+        // K2-d: closed mid-turn, its messages since the last turn end are
+        // not answered: they fail loudly instead of reading as delivered.
+        if !cut.is_empty() {
+            log_debug!("[hosts] {agent_id} closed mid-turn: {} message(s) delivered to it never answered", cut.len());
+            crate::delivery_drain::turn_cut(self, agent_id, &cut);
+        }
         let placement = placement?;
         self.forget(agent_id, placement.epoch);
         let body = json!({"agent_name": agent_id, "force": true});
