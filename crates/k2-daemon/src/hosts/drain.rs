@@ -171,6 +171,20 @@ pub fn track_turns() {
     });
 }
 
+/// Tests (integration): a hook from the lead of `pane`, as [`track_turns`]
+/// would see it.
+#[doc(hidden)]
+pub fn note_turn_hook(pane: &str, event: &str) {
+    turns().note(pane, event, false);
+}
+
+/// Is this process's session `session_id` in its turn: from its hooks
+/// ([`track_turns`]), or its activity row being `Working`?
+pub fn session_in_turn(session_id: &str) -> bool {
+    turns().in_turn(session_id)
+        || crate::activity_store::with_row(session_id, |r| r.lead.state == k2_core::activity::LeadState::Working).unwrap_or(false)
+}
+
 /// The link's hook: the answer to a spawn while `draining`, else `None`.
 pub fn refuse_while(draining: bool, f: &Frame) -> Option<Frame> {
     if !draining {
@@ -281,9 +295,7 @@ impl DrainHost for LiveHost {
     }
 
     fn in_turn(&self, session_id: &str) -> bool {
-        turns().in_turn(session_id)
-            || crate::activity_store::with_row(session_id, |r| r.lead.state == k2_core::activity::LeadState::Working)
-                .unwrap_or(false)
+        session_in_turn(session_id)
     }
 
     fn send(&self, f: Frame) -> bool {
@@ -400,10 +412,15 @@ fn resume_production(remote: &'static RemoteHost, r: &StoredPlacement) -> Result
         let conn = db.lock();
         k2_core::db::schema::Project::get(&conn, &r.agent_id).ok().map(|p| p.path)
     };
-    match project_path {
+    let resumed = match project_path {
         Some(path) => crate::pinned_chat::ensure_pinned_chat(&path, false, false).map(drop),
         None => resume_v2(remote, r),
+    };
+    // K2-d: a resume is a wake: the idle reaper's clock starts over.
+    if resumed.is_ok() {
+        crate::active_reaper::note_agent_activity(&r.agent_id);
     }
+    resumed
 }
 
 #[cfg(test)]

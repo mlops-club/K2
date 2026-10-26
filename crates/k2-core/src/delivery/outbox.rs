@@ -242,6 +242,18 @@ pub fn mark_failed(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_
     Ok(n == 1)
 }
 
+/// A `delivered` message whose recipient was stopped before it answered
+/// (K2-d: its turn was cut): it ends `failed` with `reason` instead of
+/// reading as answered. Returns false unless the row was `delivered`.
+pub fn mark_interrupted(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_ms: i64) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE delivery_outbox SET state = 'failed', reason = ?3, updated_ms = ?4
+         WHERE hop = ?1 AND msg_id = ?2 AND state = 'delivered'",
+        params![hop.as_str(), msg_id, reason, now_ms],
+    )?;
+    Ok(n == 1)
+}
+
 /// The dead-letter rule, run by the drain before each pass: a `sent` row
 /// whose last ack wait ran out after `max_attempts` sends fails `no_ack`;
 /// any unfinished row older than the TTL fails `expired`; finished rows

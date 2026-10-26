@@ -174,7 +174,13 @@ pub struct Controller {
     gone_grace_ms: AtomicI64,
     /// Rows handed to the direct path and not finished yet.
     handing: parking_lot::Mutex<HashSet<String>>,
+    /// K2-d: told of each agent a message was sent to (the idle reaper's
+    /// need clock in production, [`crate::active_reaper::note_agent_activity`]).
+    activity: parking_lot::RwLock<Activity>,
 }
+
+/// [`Controller::set_activity`]'s hook.
+pub type Activity = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `k2 msg` recipients the controller resolves itself instead of queueing
 /// for a placement: today's cascade (live inject, `dormant_no_wake`,
@@ -275,6 +281,7 @@ pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy, dir
         direct,
         gone_grace_ms: AtomicI64::new(DEFAULT_GONE_GRACE.as_millis() as i64),
         handing: Default::default(),
+        activity: parking_lot::RwLock::new(Arc::new(|_: &str| {})),
     });
     all.push(Arc::clone(&c));
     tokio::spawn(Arc::clone(&c).run());
@@ -288,7 +295,19 @@ pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy, dir
 pub fn ensure_controller_drain() -> Arc<Controller> {
     let c = start_controller(crate::agent_host::remote::global(), k2_core::db::shared(), Policy::PRODUCTION, Direct::production());
     c.set_gone_grace(gone_grace(|k| std::env::var(k).ok()));
+    c.set_activity(Arc::new(crate::active_reaper::note_agent_activity));
     c
+}
+
+/// `RemoteHost::unplace`'s hook (K2-d): `agent` was closed mid-turn with
+/// `msg_ids` delivered to it and not answered.
+pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String]) {
+    match controller_for(remote) {
+        Some(c) => {
+            c.turn_cut(agent, msg_ids, delivery::now_ms());
+        }
+        None => log_debug!("[delivery] {agent} closed mid-turn; no controller drain to fail {} message(s)", msg_ids.len()),
+    }
 }
 
 /// `RemoteHost::on_frame`'s hook for `deliver` and `deliver.ack` from a host.
@@ -448,6 +467,7 @@ impl Controller {
                 .attr("status", format!("{status:?}").to_lowercase())
         });
         let conn = self.db.lock();
+        let recipient = outbox::get(&conn, Hop::Down, msg_id).ok().flatten().map(|r| r.recipient);
         let changed = match status {
             DeliverStatus::Delivered | DeliverStatus::Duplicate => outbox::mark_delivered(&conn, Hop::Down, msg_id, now),
             DeliverStatus::Rejected => {
@@ -464,13 +484,52 @@ impl Controller {
                 r
             }
         };
+        let now_delivered = matches!(changed, Ok(true));
         match changed {
             Ok(true) => log_debug!("[delivery] {msg_id} {status:?} by host {host_id}"),
             Ok(false) => log_debug!("[delivery] late or unknown ack {msg_id} ({status:?}) from host {host_id}"),
             Err(e) => log_debug!("[delivery] ERROR: ack {msg_id}: {e}"),
         }
         drop(conn);
+        // K2-d: delivered into the agent's session: unanswered until its
+        // turn ends, and activity for the idle reaper.
+        if matches!(status, DeliverStatus::Delivered) && now_delivered {
+            if let Some(p) = recipient.and_then(|r| self.placed(&r)).filter(|p| p.host_id == host_id) {
+                self.remote.note_delivered(&p.agent_id, msg_id);
+                let activity = Arc::clone(&self.activity.read());
+                activity(&p.agent_id);
+            }
+        }
         self.nudge.notify_one();
+    }
+
+    /// K2-d: `agent` was closed mid-turn. The messages delivered to it
+    /// since its last turn ended were never answered: each fails, loudly,
+    /// rather than read as delivered. Not resent: the cut turn may already
+    /// have acted on it, so the sender decides.
+    pub fn turn_cut(&self, agent: &str, msg_ids: &[String], now: i64) -> usize {
+        let why = format!("interrupted: {agent} was closed mid-turn before it answered");
+        let conn = self.db.lock();
+        let mut failed = Vec::new();
+        for id in msg_ids {
+            match outbox::mark_interrupted(&conn, Hop::Down, id, &why, now) {
+                Ok(true) => {
+                    if let Ok(Some(row)) = outbox::get(&conn, Hop::Down, id) {
+                        failed.push(row);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => log_debug!("[delivery] ERROR: interrupt {id}: {e}"),
+            }
+        }
+        drop(conn);
+        report_failed(Hop::Down, &failed);
+        failed.len()
+    }
+
+    /// K2-d: what hears of each agent the outbox sent a message to.
+    pub fn set_activity(&self, f: Activity) {
+        *self.activity.write() = f;
     }
 
     pub fn set_gone_grace(&self, d: Duration) {
@@ -491,8 +550,13 @@ impl Controller {
     /// row whose address resolves on this controller goes through the
     /// direct path (returned, to run off this task; today's wake rules
     /// apply), anything else fails `recipient_gone` (I2: final, loud).
-    fn after_gone(&self, conn: &Connection, r: &Row, now: i64) -> Option<Row> {
+    fn after_gone(&self, conn: &Connection, r: &Row, now: i64, needs: &mut Vec<(Vec<String>, String)>) -> Option<Row> {
         if self.awaiting_resume(&r.recipient) {
+            // drain-move (1): the message is a need: the agent resumes now
+            // on any host that can take it (pinned: it waits for its own).
+            let mut ids = vec![r.recipient.clone()];
+            ids.extend((self.direct.aliases)(&r.recipient));
+            needs.push((ids, format!("message {} waits for it", r.msg_id)));
             return None;
         }
         let ended = self.ended_at(&r.recipient)?;
@@ -580,6 +644,10 @@ impl Controller {
             }
         };
         let mut gone = Vec::new();
+        // Acted on once the outbox's lock is released (they take the
+        // placement table's, which is taken before the DB's elsewhere).
+        let mut needs = Vec::new();
+        let mut active = Vec::new();
         for r in due {
             if self.handing.lock().contains(&r.msg_id) {
                 continue;
@@ -588,7 +656,7 @@ impl Controller {
             // (its session ended) the gone rule. The address stays the
             // row's; the host gets the placement id.
             let Some(p) = self.placed(&r.recipient) else {
-                gone.extend(self.after_gone(&conn, &r, now));
+                gone.extend(self.after_gone(&conn, &r, now, &mut needs));
                 continue;
             };
             let attempt = r.attempts + 1;
@@ -615,9 +683,21 @@ impl Controller {
                             .attr("host", p.host_id.as_str())
                             .attr("attempt", attempt)
                     });
+                    // K2-d: a delivery is activity, as an app attach is.
+                    active.push(p.agent_id.clone());
                 }
                 Err(e) => log_debug!("[delivery] {} waits: {e}", r.msg_id),
             }
+        }
+        drop(conn);
+        for (ids, why) in needs {
+            self.remote.resume_anywhere(&ids, &why);
+        }
+        active.sort();
+        active.dedup();
+        let activity = Arc::clone(&self.activity.read());
+        for agent in active {
+            activity(&agent);
         }
         gone
     }
