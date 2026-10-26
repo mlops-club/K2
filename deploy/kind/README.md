@@ -281,6 +281,33 @@ overrides it for one run. The value goes into the `k2-host` pod template,
 so turning it on or off rolls the hosts. At 0 the render is unchanged
 from before the switch existed, so nothing rolls.
 
+### Signed host enrollment (`--host-auth=enroll`, test variant only for now)
+
+By default, a host links with the shared bootstrap token in `k2-secrets`.
+With `up.sh --dist --fake --host-auth=enroll` (W5,
+`docs/prd/progress/host-enroll.md`), each host has its own key and
+enrolls once:
+
+- `up.sh` starts the controller with `K2_HOST_AUTH=enroll`. For every host
+  that has no key yet, `scripts/kind/enroll.py` mints a one-time token
+  through `POST /cli/hosts/enroll-tokens`, using the owner token on a
+  pipe. Each token goes into the Secret `k2-host-enroll` under the host's
+  name; tokens are never printed. The hosts start only after that.
+- Each host reads `/run/secrets/k2-enroll/<its pod name>` and keeps its
+  key at `$HOME/.k2/host-key.pem` on its own volume (0600). After a pod
+  restart it relinks by signing the controller's nonce with that key; no
+  new token is needed.
+- A revoked host is refused. To revoke, pipe the controller's daemon
+  token into `python3 -I scripts/kind/enroll.py revoke --url
+  http://127.0.0.1:7442 --host k2-host-1`. `up.sh` mints no token for a
+  revoked name.
+- `scripts/kind/enroll-check.sh` checks all of this. It deletes a host's
+  pod (the host relinks by key), revokes the host (it is refused, also
+  after a restart), and then gives it a new key and token.
+
+`up.sh` without the flag goes back to the bootstrap token. The owner's
+`k2-kind-dist` refuses `--host-auth=enroll` until the owner decides.
+
 ### The lab's G2 scenarios on kind (`--dist --fake`, test only)
 
 ```sh
