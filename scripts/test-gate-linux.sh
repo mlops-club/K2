@@ -32,6 +32,15 @@
 #                        with one job and 256 units at opt-level 1).
 #                        Debuginfo is already 0 (K2_GATE_DEBUG) and
 #                        incremental off. Unset (the default), nothing changes.
+#   K2_GATE_BATCH=N      for a box with little disk (the lab's Docker VM):
+#                        run each package's tests in steps instead of one
+#                        `cargo test -p`: lib + bins, then the
+#                        integration tests N targets at a time, then the
+#                        doctests, removing the linked test executables after
+#                        each step. Same tests, same flags; k2-daemon's ~160
+#                        test binaries otherwise need ~25 GB linked at once.
+#                        Logs: <pkg>.log, <pkg>-tests-NN.log, <pkg>-doc.log.
+#                        Unset or 0 (the default), one `cargo test -p`.
 #   K2_GATE_REALPG_PORT / K2_GATE_REALPG_SOCK / K2_GATE_REALPG_BIN
 #                        a throwaway Postgres 16 cluster (TCP port, socket dir,
 #                        bin dir with psql): set all three and the gate RUNS
@@ -156,10 +165,42 @@ echo "gate: cargo build -p k2-ptyd --bin k2-ptyd (ptyd_backend needs the binary)
 if ! clean_cargo "$LOGS/k2-ptyd-bin.log" build -p k2-ptyd --bin k2-ptyd; then
   STATUS=1
 fi
+# Linked test and bin executables in deps/ (the libraries stay, so a later
+# step or run relinks instead of rebuilding; target/debug/<bin> copies stay).
+drop_linked() {
+  find "$WORK/target/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete 2>/dev/null
+}
+BATCH=${K2_GATE_BATCH:-0}
 for pkg in k2-core k2-daemon; do
-  echo "gate: cargo test -p $pkg --no-fail-fast"
-  if ! clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --no-fail-fast "${THREAD_ARGS[@]}"; then
-    STATUS=1
+  if [ "$BATCH" -gt 0 ] 2>/dev/null; then
+    echo "gate: cargo test -p $pkg --no-fail-fast, in steps of $BATCH integration tests (K2_GATE_BATCH)"
+    clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --lib --bins --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+    drop_linked
+    # Integration test targets, as cargo discovers them: tests/*.rs and
+    # tests/<dir>/main.rs.
+    dir="$SRC/crates/$pkg/tests"
+    TESTS=()
+    if [ -d "$dir" ]; then
+      while IFS= read -r t; do TESTS+=("$t"); done < <(
+        { for f in "$dir"/*.rs; do [ -f "$f" ] && basename "$f" .rs; done
+          for f in "$dir"/*/main.rs; do [ -f "$f" ] && basename "$(dirname "$f")"; done; } | sort)
+    fi
+    n=0
+    for ((i = 0; i < ${#TESTS[@]}; i += BATCH)); do
+      n=$((n + 1))
+      args=()
+      for t in "${TESTS[@]:i:BATCH}"; do args+=(--test "$t"); done
+      clean_cargo "$LOGS/$pkg-tests-$(printf %02d $n).log" test -p "$pkg" "${args[@]}" --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+      drop_linked
+    done
+    echo "gate: $pkg: ${#TESTS[@]} integration test targets in $n steps"
+    clean_cargo "$LOGS/$pkg-doc.log" test -p "$pkg" --doc --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+    drop_linked
+  else
+    echo "gate: cargo test -p $pkg --no-fail-fast"
+    if ! clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --no-fail-fast "${THREAD_ARGS[@]}"; then
+      STATUS=1
+    fi
   fi
   echo "gate: $pkg done (exit $([ $STATUS -eq 0 ] && echo 0 || echo non-zero so far), free $(avail_gb "$WORK")G)"
 done
@@ -209,7 +250,7 @@ COMPILE_ERR=$(grep -h -E '^error(\[E[0-9]+\])?: ' "$LOGS"/*.log | sort -u)
 
 echo
 echo "== ignored =="
-IGNORED=$(grep -h -E '^test .* \.\.\. ignored' "$LOGS"/k2-core.log "$LOGS"/k2-daemon.log \
+IGNORED=$(grep -h -E '^test .* \.\.\. ignored' "$LOGS"/k2-core*.log "$LOGS"/k2-daemon*.log \
   | sed -E 's/^test (.*) \.\.\. ignored.*$/\1/' | sort -u)
 echo "${IGNORED:-(none)}"
 UNEXPECTED=""
@@ -235,7 +276,7 @@ if [ $STATUS -eq 0 ]; then echo "GATE GREEN ($FULL_SHA)"; else echo "GATE RED ($
 if [ -d "$WORK/target/debug" ]; then
   before=$(du -sh "$WORK/target/" 2>/dev/null | cut -f1)
   rm -rf "$WORK/target/debug/incremental"
-  find "$WORK/target/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete 2>/dev/null
+  drop_linked
   echo "(target trimmed: $before -> $(du -sh "$WORK/target/" 2>/dev/null | cut -f1): incremental and linked executables removed)"
 fi
 if [ "${K2_GATE_KEEP:-0}" != "1" ]; then

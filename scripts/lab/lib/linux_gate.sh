@@ -25,6 +25,11 @@
 # - the tests run as the unprivileged user k2gate (K2_GATE_TEST_USER;
 #   created at container start, owning cargo, rustup and the target
 #   volume); the gate's root-only allowlisted run stays root.
+# - disk: the VM's disk is shared and k2-daemon's ~160 integration test
+#   binaries need ~25 GB linked at once (ENOSPC at link on 2026-10-25), so
+#   the gate runs with K2_GATE_BATCH=${LAB_GATE_BATCH:-20} (steps of 20 test
+#   targets, linked executables removed after each step; 0 = one
+#   `cargo test -p` per package).
 # - the image build only runs apt-get (no compile); BuildKit has no
 #   --memory flag, so the lock is its only limit.
 #
@@ -47,6 +52,8 @@ low=${LAB_GATE_LOW_MEMORY:-0}
 case "$mem" in [1-9]g|1[0-9]g) ;; *) echo "lab: LAB_GATE_MEMORY is <N>g, 1g..19g (got '$mem')"; exit 2 ;; esac
 case "$low" in 0|1) ;; *) echo "lab: LAB_GATE_LOW_MEMORY is 0 or 1 (got '$low')"; exit 2 ;; esac
 low_env=()
+batch=${LAB_GATE_BATCH:-20}
+case "$batch" in ''|*[!0-9]*) echo "lab: LAB_GATE_BATCH is a number (got '$batch')"; exit 2 ;; esac
 low_desc="normal build (K2_GATE_LOW_MEMORY unset)"
 if [ "$low" = 1 ]; then
     low_env=(-e K2_GATE_LOW_MEMORY=1)
@@ -78,6 +85,7 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "limits: --memory=$mem --memory-swap=$mem --cpus 3, $low_desc, K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
     echo "user: tests as k2gate (uid 10001, K2_GATE_TEST_USER); the root-only allowlisted runs as root"
     echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
+    echo "batch: K2_GATE_BATCH=$batch (integration test targets per cargo step; 0 = one cargo test -p)"
 } >"$run/topology/linux-gate.txt"
 
 # The gate writes its per-package logs to <workdir>/logs; a symlink into
@@ -88,6 +96,7 @@ docker run --rm --name "$name" \
     --memory="$mem" --memory-swap="$mem" --cpus 3 \
     ${low_env[@]+"${low_env[@]}"} \
     --cap-add NET_ADMIN -e K2_GATE_THREADS="${LAB_TEST_THREADS:-3}" \
+    -e K2_GATE_BATCH="$batch" \
     -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
     -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \
