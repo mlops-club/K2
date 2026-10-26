@@ -139,6 +139,36 @@ topo_metrics() {
 
 topo_down() { :; }   # the deployments stay (the kind scripts own them; down.sh removes them)
 
+# fleet-g2's fresh step deletes the controller's data and the app login
+# with it: make the login again, or give it a new password (in the same
+# 0600 file), without redeploying. The token and password stay off every argv.
+kind_owner_login() { # <password file>
+    local pwf=$1 tok
+    tok=$(kind_kc -n "$KIND_NS_FLEET" exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token) || return 1
+    TOK=$tok PWF=$pwf python3 -I - <<'PY'
+import json, os, secrets, string, urllib.request
+tok, pwf = os.environ["TOK"], os.environ["PWF"]
+def call(path, body=None):
+    req = urllib.request.Request("http://127.0.0.1:7442%s?token=%s" % (path, tok),
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(24))
+if any(u.get("username") == "owner" for u in call("/cli/users").get("users", [])):
+    steps = (("/cli/users/set-password", {"username": "owner", "password": pw}),)
+else:
+    steps = (("/cli/users/add", {"username": "owner", "password": pw}),
+             ("/cli/users/set-role", {"username": "owner", "role": "owner"}))
+for path, body in steps:
+    if not call(path, body).get("success"):
+        raise SystemExit("kind_owner_login: %s failed" % path)
+fd = os.open(pwf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, (pw + "\n").encode()); os.close(fd)
+os.chmod(pwf, 0o600)
+PY
+}
+
 # G4 on kind: everything after topo_up (see the header).
 kind_g4() {
     local fleet="$RUN/fleet" w
@@ -173,6 +203,8 @@ PY
         kind_result K1 "Signed enrollment: relink by key, revoke, restore" not_run \
             "no k2-host-1 in $KIND_NS_FLEET at this point (the pool runs $(kind_kc -n "$KIND_NS_FLEET" get statefulset k2-host -o jsonpath='{.spec.replicas}') host(s))"
     fi
+    kind_owner_login "${TMPDIR:-/tmp}/k2-kind/dist-fake/owner-password" >"$RUN/topology/K2-login.log" 2>&1 \
+        || say "kind: could not make the app login again (K2 will fail)"
     kind_check K2 "The desktop app's path: login, spawn, attach with a session token" "$RUN/topology/K2-app-check.log" \
         "$LAB_KIND_REPO/scripts/kind/app-check.sh" --dist --fake --password-file="${TMPDIR:-/tmp}/k2-kind/dist-fake/owner-password"
 

@@ -133,6 +133,12 @@ fi
 source "$LAB_REPO/scripts/lab/lib/toolchain.sh"
 source "$LAB_REPO/scripts/lab/lib/parity.sh"
 
+finish() {
+    local rc
+    run_set finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" notes "$(json_list "${NOTES[@]+"${NOTES[@]}"}")"
+    python3 -I tests/lab/lab.py report --run-dir "$RUN" | tee -a "$RUN/prove.log"
+    rc=${PIPESTATUS[0]}
+
 # ── G4 on kind: the cluster runs the scenarios (scripts/lab/topology/kind.sh) ──
 if [ "$GATE/$TOPOLOGY" = G4/kind ]; then
     source "$LAB_REPO/scripts/lab/topology/kind.sh"
@@ -195,11 +201,6 @@ cleanup() {
 trap cleanup EXIT
 trap 'say "interrupted"; exit 130' INT TERM
 
-finish() {
-    local rc
-    run_set finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" notes "$(json_list "${NOTES[@]+"${NOTES[@]}"}")"
-    python3 -I tests/lab/lab.py report --run-dir "$RUN" | tee -a "$RUN/prove.log"
-    rc=${PIPESTATUS[0]}
     say "bundle: ${RUN#$LAB_REPO/}/ (open report.html first)"
     exit "$rc"
 }
