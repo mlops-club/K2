@@ -6182,6 +6182,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             }
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there, or refused (never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let result = if p == "/cli/fs/compress" {
                 crate::fs_routes::handle_compress(&body_bytes)
             } else {
@@ -6209,6 +6214,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             }
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there, or refused (never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let result = if p == "/cli/fs/extract" {
                 crate::fs_routes::handle_extract(&body_bytes)
             } else {
@@ -6573,6 +6583,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             };
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there, or refused (never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let path_owned = p.to_string();
             let resp = tokio::task::spawn_blocking(move || match path_owned.as_str() {
                 "/cli/fs/create" => crate::fs_routes::handle_create_gated(&body_bytes, skin_pass),
@@ -7582,6 +7597,11 @@ async fn handle_one_request(
             && super::http::extract_token(&query).is_some_and(k2_core::skin::is_skin_token) =>
         {
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there, or refused (never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let r = match super::http::extract_token(&query).and_then(crate::apps::gateway::resolve_pass) {
                 None => crate::skin_routes::revoked_skin_response(),
                 Some(pass) => tokio::task::spawn_blocking(move || {

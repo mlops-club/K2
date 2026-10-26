@@ -55,7 +55,6 @@ const GET_ROUTES: &[&str] = &[
     "/cli/fs/read-binary",
     "/cli/fs/read-range",
     "/cli/fs/stat",
-    "/cli/fs/search-tree",
     "/cli/fs/zip-list",
     "/cli/git/branches",
     "/cli/git/changes",
@@ -82,6 +81,8 @@ const POST_ROUTES: &[&str] = &[
     "/cli/fs/write-file",
     "/cli/fs/upload-binary",
     "/cli/fs/upload-chunk",
+    "/cli/fs/search-tree",
+    "/cli/fs/resolve-links",
     "/cli/git/abort-merge",
     "/cli/git/commit",
     "/cli/git/create-worktree",
@@ -97,6 +98,16 @@ const POST_ROUTES: &[&str] = &[
     "/cli/git/stage-all",
     "/cli/git/unstage",
 ];
+
+/// POSTs the relay doesn't carry yet that act on a workspace's files: for a
+/// workspace on a host they are refused (501), never run on the
+/// controller's copy (re-review H6). Their cancels and status polls name a
+/// job, not a path, and stay local.
+const NOT_RELAYED_POST: &[&str] = &["/cli/fs/compress", "/cli/fs/extract"];
+
+/// The largest encoded frame either side sends (the link's frames are
+/// capped at 16 MiB; JSON escaping can grow a body several times).
+pub const MAX_RELAY_FRAME: usize = 15 << 20;
 
 /// Is `method path` one the relay carries? Exact routes only.
 pub fn relayed(method: &str, path: &str) -> bool {
@@ -129,6 +140,8 @@ const PATH_KEYS: &[&str] = &[
     "worktreePath",
     "repo_root",
     "repoRoot",
+    "workspace",
+    "prefixes",
 ];
 
 /// Keys whose values are relative names inside a path: never `..`.
@@ -199,10 +212,6 @@ pub fn map_json(v: &mut Value, maps: &[(PathBuf, PathBuf)]) {
     }
 }
 
-fn decode(v: &str) -> String {
-    url::form_urlencoded::parse(format!("x={v}").as_bytes()).next().map(|(_, v)| v.into_owned()).unwrap_or_default()
-}
-
 fn encode(v: &str) -> String {
     url::form_urlencoded::byte_serialize(v.as_bytes()).collect()
 }
@@ -228,15 +237,17 @@ pub fn map_query(query: &str, maps: &[(PathBuf, PathBuf)]) -> String {
 /// The paths a request names (known keys): query values, and a JSON (or
 /// form) body's.
 pub fn named_paths(query: &str, body: &[u8]) -> Vec<String> {
+    // Absolute paths route; a relative one (a repo-relative `old_path`) is
+    // resolved on the host, against its request's base path.
     let mut out: Vec<String> =
-        pairs(query).into_iter().filter(|(k, v)| PATH_KEYS.contains(&k.as_str()) && !v.is_empty()).map(|(_, v)| v).collect();
+        pairs(query).into_iter().filter(|(k, v)| PATH_KEYS.contains(&k.as_str()) && v.starts_with('/')).map(|(_, v)| v).collect();
     if body.is_empty() {
         return out;
     }
     if let Ok(mut v) = serde_json::from_slice::<Value>(body) {
         let mut ps = Vec::new();
         path_values_mut(&mut v, &mut ps);
-        out.extend(ps.into_iter().map(|s| s.clone()).filter(|s| !s.is_empty()));
+        out.extend(ps.into_iter().map(|s| s.clone()).filter(|s| s.starts_with('/')));
     } else if let Ok(form) = std::str::from_utf8(body) {
         out.extend(named_paths(form, b""));
     }
@@ -265,7 +276,7 @@ fn has_dot_dot(p: &str) -> bool {
 /// The controller's own work root (`K2_WORK_ROOT` on the controller): where
 /// the app's workspace paths are, mapped to each host's root. As given and
 /// canonical (a request may name it either way: `/tmp` and `/private/tmp`).
-fn controller_roots() -> Vec<PathBuf> {
+pub fn controller_roots() -> Vec<PathBuf> {
     let raw = std::env::var(super::home::WORK_ROOT_VAR).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     let mut roots: Vec<PathBuf> = raw.iter().map(PathBuf::from).collect();
     if let Some(c) = super::home::work_root(|k| std::env::var(k).ok()) {
@@ -303,7 +314,7 @@ pub enum Decision {
 /// Where a request goes, from the paths it names: refused when it names a
 /// `..`, a path outside the workspace it would be relayed to, workspaces on
 /// two hosts, or one on a host that is away.
-pub fn decide(remote: &RemoteHost, ctl_roots: &[PathBuf], query: &str, body: &[u8]) -> Decision {
+pub fn decide(remote: &RemoteHost, query: &str, body: &[u8]) -> Decision {
     let paths = named_paths(query, body);
     if paths.iter().any(|p| has_dot_dot(p)) {
         return Decision::Refuse(Answer::json(
@@ -311,7 +322,7 @@ pub fn decide(remote: &RemoteHost, ctl_roots: &[PathBuf], query: &str, body: &[u
             json!({"error": "a path with '..' is not accepted on a controller with agent hosts", "code": "bad_path"}),
         ));
     }
-    match remote.workspace_route(&paths, ctl_roots) {
+    match remote.workspace_route(&paths) {
         WorkspaceRoute::Local => Decision::Local,
         WorkspaceRoute::Relay { host, maps } => {
             // Every path must be in the workspace it goes to: a second path
@@ -359,6 +370,13 @@ fn exchange(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf)], method
     let frame_query = map_query(query, maps);
     let body_b64 = base64::engine::general_purpose::STANDARD.encode(map_body(body, maps));
     let (m, p) = (method.to_ascii_uppercase(), path.to_string());
+    let probe = Frame::HttpRelay { req: u64::MAX, method: m.clone(), path: p.clone(), query: frame_query.clone(), body_b64: body_b64.clone() };
+    if probe.encode().len() > MAX_RELAY_FRAME {
+        return Answer::json(
+            "413 Payload Too Large",
+            json!({"error": format!("too big for one relay frame ({MAX_RELAY_FRAME} bytes encoded)"), "code": "too_large"}),
+        );
+    }
     let r = remote.relay_blocking(host, |req| Frame::HttpRelay { req, method: m, path: p, query: frame_query, body_b64 }, RELAY_DEADLINE);
     k2_core::trace::emit(|| {
         k2_core::trace::Event::new(events::CTL_FS_RELAY).attr("host", host).attr("path", path).attr("ok", r.is_ok())
@@ -383,18 +401,31 @@ fn exchange(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf)], method
     }
 }
 
+/// An App pass (`k2skn_`): fs-relay doesn't carry its identity (its room,
+/// its caps) to a host, so on a controller whose workspaces live on hosts
+/// its file requests are refused, never served from the controller's copy
+/// (re-review H6).
+fn app_pass(query: &str) -> bool {
+    http::extract_token(query).is_some_and(k2_core::skin::is_skin_token)
+}
+
+fn app_pass_refused() -> Answer {
+    Answer::json(
+        "501 Not Implemented",
+        json!({"error": "App passes don't reach workspace files on a controller whose workspaces live on agent hosts (not relayed yet)", "code": "not_relayed"}),
+    )
+}
+
 /// `gate::route`'s hook (controller), for GETs: `true` = answered (over a
 /// host, or refused); `false` = the controller's own routes carry on,
 /// untouched.
 pub async fn route(stream: &mut TcpStream, buf: &mut [u8], method: &str, path: &str, query: &str, owner_token: &str) -> bool {
-    route_on(crate::agent_host::remote::global(), &controller_roots(), stream, buf, method, path, query, owner_token).await
+    route_on(crate::agent_host::remote::global(), stream, buf, method, path, query, owner_token).await
 }
 
-/// [`route`] over `remote`, with the controller's work roots.
-#[allow(clippy::too_many_arguments)]
+/// [`route`] over `remote`.
 pub async fn route_on(
     remote: &'static RemoteHost,
-    ctl_roots: &[PathBuf],
     stream: &mut TcpStream,
     buf: &mut [u8],
     method: &str,
@@ -402,21 +433,24 @@ pub async fn route_on(
     query: &str,
     owner_token: &str,
 ) -> bool {
-    if !method.eq_ignore_ascii_case("GET") || !relayed(method, path) {
+    if !method.eq_ignore_ascii_case("GET") || !relayed(method, path) || !remote.any_host_on_own_disk() {
         return false;
     }
-    // The caller first: no work, and nothing about the hosts, before it.
-    if !http::token_ok(query, owner_token) || !remote.any_host_on_own_disk() {
+    let answer = if app_pass(query) {
+        app_pass_refused()
+    } else if !http::token_ok(query, owner_token) {
+        // The caller first: no work, and nothing about the hosts, before it.
         return false;
-    }
-    let answer = match decide(remote, ctl_roots, query, b"") {
-        Decision::Local => return false,
-        Decision::Refuse(a) => a,
-        Decision::Relay { host, maps } => {
-            let (p, q) = (path.to_string(), query.to_string());
-            tokio::task::spawn_blocking(move || exchange(remote, &host, &maps, "GET", &p, &q, b""))
-                .await
-                .unwrap_or_else(|e| Answer::json("500 Internal Server Error", json!({"error": format!("relay: {e}")})))
+    } else {
+        match decide(remote, query, b"") {
+            Decision::Local => return false,
+            Decision::Refuse(a) => a,
+            Decision::Relay { host, maps } => {
+                let (p, q) = (path.to_string(), query.to_string());
+                tokio::task::spawn_blocking(move || exchange(remote, &host, &maps, "GET", &p, &q, b""))
+                    .await
+                    .unwrap_or_else(|e| Answer::json("500 Internal Server Error", json!({"error": format!("relay: {e}")})))
+            }
         }
     };
     let _ = http::read_post_body_capped(&mut *stream, buf, 1 << 20).await;
@@ -431,38 +465,108 @@ pub async fn relay_post(path: &str, query: &str, owner_token: &str, body: &[u8])
     if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
         return None;
     }
-    relay_post_on(crate::agent_host::remote::global(), &controller_roots(), path, query, owner_token, body).await
+    relay_post_on(crate::agent_host::remote::global(), path, query, owner_token, body).await
 }
 
-/// [`relay_post`] over `remote`, with the controller's work roots.
-pub async fn relay_post_on(
-    remote: &'static RemoteHost,
-    ctl_roots: &[PathBuf],
-    path: &str,
-    query: &str,
-    owner_token: &str,
-    body: &[u8],
-) -> Option<Answer> {
-    if !relayed("POST", path) || !http::token_ok(query, owner_token) || !remote.any_host_on_own_disk() {
+/// [`relay_post`] over `remote`.
+pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str, owner_token: &str, body: &[u8]) -> Option<Answer> {
+    let not_relayed = NOT_RELAYED_POST.contains(&path);
+    if !(relayed("POST", path) || not_relayed) || !remote.any_host_on_own_disk() {
         return None;
     }
-    match decide(remote, ctl_roots, query, body) {
+    if app_pass(query) {
+        return Some(app_pass_refused());
+    }
+    if !http::token_ok(query, owner_token) {
+        return None;
+    }
+    let (path, query, body) = (path.to_string(), query.to_string(), body.to_vec());
+    tokio::task::spawn_blocking(move || post_blocking(remote, &path, &query, &body, not_relayed))
+        .await
+        .unwrap_or_else(|e| Some(Answer::json("500 Internal Server Error", json!({"error": format!("relay: {e}")}))))
+}
+
+fn post_blocking(remote: &RemoteHost, path: &str, query: &str, body: &[u8], not_relayed: bool) -> Option<Answer> {
+    // resolve-links names its workspace by address or id too: the
+    // controller resolves it (its registry), the host gets the path.
+    let resolved;
+    let body = if path == "/cli/fs/resolve-links" {
+        match resolve_links_body(body) {
+            Some(b) => {
+                resolved = b;
+                resolved.as_slice()
+            }
+            None => body,
+        }
+    } else {
+        body
+    };
+    match decide(remote, query, body) {
         Decision::Local => None,
         Decision::Refuse(a) => Some(a),
-        // Never the controller's copy instead: too big to relay is a 413.
+        Decision::Relay { host, .. } if not_relayed => Some(Answer::json(
+            "501 Not Implemented",
+            json!({"error": format!("{path} is not relayed to agent hosts yet; this workspace is on {host}"), "code": "not_relayed"}),
+        )),
+        Decision::Relay { host, maps } if path == "/cli/fs/upload-chunk" => Some(upload_chunk_split(remote, &host, &maps, query, body)),
         Decision::Relay { host, .. } if body.len() > MAX_RELAY_BODY => Some(Answer::json(
             "413 Payload Too Large",
             json!({"error": format!("this workspace is on agent host {host}; a request to it carries at most {MAX_RELAY_BODY} bytes (send smaller upload chunks)"), "code": "too_large"}),
         )),
-        Decision::Relay { host, maps } => {
-            let (p, q, b) = (path.to_string(), query.to_string(), body.to_vec());
-            Some(
-                tokio::task::spawn_blocking(move || exchange(remote, &host, &maps, "POST", &p, &q, &b))
-                    .await
-                    .unwrap_or_else(|e| Answer::json("500 Internal Server Error", json!({"error": format!("relay: {e}")}))),
-            )
-        }
+        Decision::Relay { host, maps } => Some(exchange(remote, &host, &maps, "POST", path, query, body)),
     }
+}
+
+/// resolve-links' body with its `workspace` as the registered path.
+fn resolve_links_body(body: &[u8]) -> Option<Vec<u8>> {
+    let mut v: Value = serde_json::from_slice(body).ok()?;
+    let token = v.get("workspace")?.as_str()?.trim().to_string();
+    if token.starts_with('/') {
+        return None;
+    }
+    let root = crate::workspace_msg::resolve_workspace_allowing_handle(&token)?;
+    v["workspace"] = Value::String(root);
+    Some(v.to_string().into_bytes())
+}
+
+/// The decoded bytes each relayed upload sub-chunk carries.
+const UPLOAD_PIECE: usize = 4 << 20;
+
+/// An upload chunk relayed as sub-chunks the link can carry (the app's
+/// chunks are up to 16 MiB), each at its own offset; only the last is the
+/// chunk's last. The answer is the last sub-chunk's (or the first refusal).
+fn upload_chunk_split(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf)], query: &str, body: &[u8]) -> Answer {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return exchange(remote, host, maps, "POST", "/cli/fs/upload-chunk", query, body);
+    };
+    let Some(bytes) = v.get("base64").and_then(Value::as_str).and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok()) else {
+        return exchange(remote, host, maps, "POST", "/cli/fs/upload-chunk", query, body);
+    };
+    let offset = v.get("offset").and_then(Value::as_u64).unwrap_or(0);
+    let is_last = v.get("is_last").and_then(Value::as_bool).unwrap_or(false);
+    let pieces: Vec<&[u8]> = if bytes.is_empty() { vec![&bytes[..]] } else { bytes.chunks(UPLOAD_PIECE).collect() };
+    let n = pieces.len();
+    let mut at = offset;
+    let mut answer = None;
+    for (i, piece) in pieces.into_iter().enumerate() {
+        let mut sub = v.clone();
+        sub["offset"] = json!(at);
+        sub["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(piece));
+        sub["is_last"] = json!(is_last && i + 1 == n);
+        if i > 0 {
+            // The full size travels with the transfer's first chunk only.
+            if let Some(o) = sub.as_object_mut() {
+                o.remove("total_bytes");
+            }
+        }
+        let a = exchange(remote, host, maps, "POST", "/cli/fs/upload-chunk", query, sub.to_string().as_bytes());
+        if !a.status.starts_with('2') {
+            return a;
+        }
+        at += piece.len() as u64;
+        answer = Some(a);
+    }
+    answer.expect("at least one piece")
 }
 
 pub mod events {
@@ -490,48 +594,83 @@ fn plain_route(method: &str, path: &str) -> bool {
     plain && relayed(method, path)
 }
 
-/// `p`, resolved on this host's disk: canonical when it exists, else its
-/// nearest existing ancestor's canonical path with the rest appended.
-fn resolve(p: &Path) -> Option<PathBuf> {
-    if let Ok(c) = std::fs::canonicalize(p) {
-        return Some(c);
-    }
-    let mut rest = Vec::new();
-    let mut cur = p;
-    loop {
-        rest.push(cur.file_name()?.to_os_string());
-        cur = cur.parent()?;
-        if let Ok(c) = std::fs::canonicalize(cur) {
-            let mut out = c;
-            for seg in rest.iter().rev() {
-                out.push(seg);
+/// `p` with `.` and `..` resolved lexically (no filesystem).
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
             }
-            return Some(out);
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
         }
     }
+    out
+}
+
+/// `p` resolved on this host's disk, one component at a time (`lstat`):
+/// every symlink is followed, a dangling one too, to where it points (a
+/// write through it would land there). `None` past 40 links.
+fn resolve(p: &Path) -> Option<PathBuf> {
+    fn walk(p: &Path, hops: &mut u32) -> Option<PathBuf> {
+        let mut out = PathBuf::from("/");
+        let parts: Vec<_> = normalize(p).components().skip(1).map(|c| c.as_os_str().to_os_string()).collect();
+        for (i, part) in parts.iter().enumerate() {
+            let next = out.join(part);
+            match std::fs::symlink_metadata(&next) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    *hops += 1;
+                    if *hops > 40 {
+                        return None;
+                    }
+                    let target = std::fs::read_link(&next).ok()?;
+                    let mut t = if target.is_absolute() { target } else { out.join(target) };
+                    for rest in &parts[i + 1..] {
+                        t.push(rest);
+                    }
+                    return walk(&t, hops);
+                }
+                _ => out = next,
+            }
+        }
+        Some(out)
+    }
+    walk(p, &mut 0)
 }
 
 /// Every path a relayed request names is under this host's work root
-/// (strictly: a workspace, never the root itself), after symlinks; names
-/// inside a path never climb out. Absolute strings under any key but the
-/// text keys count as paths.
+/// (strictly: a workspace, never the root itself), after every symlink,
+/// dangling ones included; a relative name is resolved against the
+/// request's base path (`path`) and confined the same way. Absolute
+/// strings under any key but the text keys count as paths.
 fn confine(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), String> {
+    let base = query
+        .iter()
+        .find(|(k, v)| k == "path" && v.starts_with('/'))
+        .map(|(_, v)| v.clone())
+        .or_else(|| body.get("path").and_then(Value::as_str).filter(|v| v.starts_with('/')).map(str::to_string));
+    let inside = |v: &str, p: &Path| -> Result<(), String> {
+        let r = resolve(p).ok_or_else(|| format!("{v} can't be resolved"))?;
+        if r == root || !r.starts_with(root) {
+            return Err(format!("{v} is not in a workspace under this host's work root"));
+        }
+        Ok(())
+    };
     let check = |key: &str, v: &str| -> Result<(), String> {
-        if TEXT_KEYS.contains(&key) {
+        if TEXT_KEYS.contains(&key) || v.is_empty() {
             return Ok(());
         }
-        if NAME_KEYS.contains(&key) || PATH_KEYS.contains(&key) {
-            if has_dot_dot(v) {
-                return Err(format!("{key} has '..'"));
-            }
+        let named = NAME_KEYS.contains(&key) || PATH_KEYS.contains(&key);
+        if (named || v.starts_with('/')) && has_dot_dot(v) {
+            return Err(format!("{key} has '..'"));
         }
         if v.starts_with('/') {
-            if has_dot_dot(v) {
-                return Err(format!("{v} has '..'"));
-            }
-            let r = resolve(Path::new(v)).ok_or_else(|| format!("{v} can't be resolved"))?;
-            if r == root || !r.starts_with(root) {
-                return Err(format!("{v} is not in a workspace under this host's work root"));
+            return inside(v, Path::new(v));
+        }
+        if named {
+            if let Some(b) = &base {
+                return inside(v, &Path::new(b).join(v));
             }
         }
         Ok(())
@@ -628,6 +767,15 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
             }
         }
         Err(e) => reply("502 Bad Gateway", json!({"error": format!("this host's daemon: {}", e.without_url())})),
+    };
+    // The whole frame, escaped, within what the link carries (M1).
+    let out = if out.encode().len() > MAX_RELAY_FRAME {
+        reply(
+            "413 Payload Too Large",
+            json!({"error": format!("the answer is too big for one relay frame ({MAX_RELAY_FRAME} bytes encoded)"), "code": "too_large"}),
+        )
+    } else {
+        out
     };
     if let Frame::HttpReply { status, .. } = &out {
         k2_core::trace::emit(|| k2_core::trace::Event::new(events::HOST_FS_SERVED).attr("path", path).attr("status", status.as_str()));

@@ -158,6 +158,23 @@ paths outside the workspace) are open, for phase 2. Decision 1 above now
 reads: the notes, `open-changes` and `/cli/worktree` (a database setting)
 are not relayed; uploads are. Decision 7 is replaced by H6's fix.
 
+## Re-review of cb6ee1009: what changed
+
+The re-review found H1, H4 and H6 partial, M1 partial, and three lows.
+Each is fixed, with a test:
+
+| Finding | Fix | Test |
+|---|---|---|
+| H4 a host's label and cwd steer routing | **Coordinator's decision:** the controller decides each host's work root: `K2_HOST_WORK_ROOT` (default `/var/lib/k2/work`), `K2_HOST_WORK_ROOTS=host=/root,…` per host (the lab). A host's `k2.work_root` label only says it has its own disk. Routing comes only from the controller's own bindings (`relay_space`, kept across restarts): the cwd it asked for at a spawn, strictly under its own work root (`K2_WORK_ROOT`), never a host's report; only paths under the controller's work root route; the longest workspace wins; a binding expires after `K2_RELAY_SPACE_TTL_SECS` (7 days) without a spawn | `h4_a_hostile_work_root_label_and_cwd_capture_nothing`, `a_path_goes_to_the_host_the_controller_spawned_its_workspace_on`, `the_controllers_root_matches_as_given_and_canonical` |
+| H1 a dangling symlink | The host resolves every path one component at a time (`lstat`): each link is followed to where it points, a dangling one too, `..` resolved lexically, 40 links at most; the result must be strictly under the work root. A relative name is resolved against its request's `path` and confined the same way | `h1_a_write_through_a_dangling_symlink_is_refused` |
+| H6 fallbacks | `search-tree` is a POST (moved); `resolve-links` is relayed (the controller resolves an address or id to its registered path first); `compress` and `extract` for a workspace on a host are a 501 `not_relayed`; an App pass (`k2skn_`) to a relayed route on a controller with own-disk hosts is a 501 `not_relayed`. Every POST arm that serves these routes asks the relay (the create/copy/move/rename arm, the App-pass resolve-links arm, compress and extract were missing) | `m3_h6_auth_first_and_no_silent_fallback`, the end-to-end test (POST search-tree, an App pass GET) |
+| M1 escaping past the frame cap | Both sides refuse a frame whose encoded size is over 15 MiB (the link's cap is 16 MiB), on top of the 8 MiB body cap | `m1_a_frame_of_max_size_with_escapes_is_refused_on_the_host` |
+| Low: 8 MB upload chunks | The controller relays an upload chunk in 4 MiB pieces at their own offsets (only the last is the chunk's last) | the end-to-end test (an 8 MB chunk, byte for byte) |
+| Low: a renamed file's diff | Only absolute paths route; a repo-relative `old_path` goes to the host, which confines it against `path` | the end-to-end test (`diff-file … old_path … sides=1`), `h1_traversal_…` |
+
+Not changed: the remaining lows from the first review (retries and
+idempotency, the blocking pool, worktree paths outside the workspace).
+
 ## Checks
 
 | Check | Result |

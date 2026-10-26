@@ -5,6 +5,8 @@
 # browser and git panel, called through the controller with the
 # controller's paths (work-ctl/notes), show and change the agent's
 # workspace on the host's disk (work-h1/notes), never the controller's copy.
+# The controller decides host-1's work root (K2_HOST_WORK_ROOTS); the
+# workspace is bound to host-1 by the spawn the controller asked for.
 #
 # Checks:
 #   1. host-1 links with the k2.work_root label (it is on its own disk)
@@ -141,7 +143,7 @@ env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="$ROOT/ctl/tmp" XDG_RUNTIME_DIR="$ROOT/ctl/run" K2_RUNTIME_DIR= \
     USER="$(id -un)" LANG=en_US.UTF-8 \
     K2_ROLE=controller K2_HOSTS=1 K2_HOST_BOOTSTRAP_TOKEN_FILE="$ROOT/bootstrap-token" K2_HOST_AUTH=enroll \
-    K2_WORK_ROOT="$ROOT/work-ctl" \
+    K2_WORK_ROOT="$ROOT/work-ctl" K2_HOST_WORK_ROOTS="host-1=$ROOT/work-h1" \
     K2_DAEMON_PORT="$CTL_PORT" K2_TRACE_FILE="$RUN/controller.trace.jsonl" \
     "$DAEMON" >>"$RUN/controller.log" 2>&1 &
 CTL_PID=$!
@@ -179,7 +181,7 @@ label=$(js 'next((l for h in d["hosts"] for l in h.get("labels",[]) if l.startsw
 check "host-1 links with k2.work_root (its own disk)" "$([ "$label" = "k2.work_root=$ROOT/work-h1" ] && echo 1)" "label: ${label:-none}"
 
 # 2.
-c=$(post /cli/sessions/v2/spawn "{\"agent_name\":\"notes\",\"cwd\":\"$WS_H1\",\"command\":\"claude\",\"args\":[\"--session-id\",\"$(uuidgen | tr A-Z a-z)\"]}")
+c=$(post /cli/sessions/v2/spawn "{\"agent_name\":\"notes\",\"cwd\":\"$WS_CTL\",\"command\":\"claude\",\"args\":[\"--session-id\",\"$(uuidgen | tr A-Z a-z)\"]}")
 on=$(grep -E "\[hosts\] placed agent notes on host " "$RUN/controller.log" | tail -1 | sed -E 's/.* on host ([^ ]+) .*/\1/')
 check "notes placed on host-1, its workspace a git repo on host-1's disk; the controller holds only a decoy" \
     "$([ "$c" = 200 ] && [ "$on" = host-1 ] && [ -d "$WS_H1/.git" ] && [ ! -d "$WS_CTL/.git" ] && echo 1)" "HTTP $c, on ${on:-nothing}"
