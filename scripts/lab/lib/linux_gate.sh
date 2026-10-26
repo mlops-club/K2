@@ -93,8 +93,8 @@ docker run --rm --name "$name" \
     -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \
     -v "$target_vol:/cache/target" -v "$registry_vol:/usr/local/cargo/registry" \
     -v "$run/parity/linux-gate-logs:/out/logs" \
-    "$image" \
     -e K2_GATE_TEST_USER=k2gate \
+    "$image" \
     bash -c 'rm -rf /gate/work && mkdir -p /gate/work && ln -s /cache/target /gate/work/target \
              && ln -s /out/logs /gate/work/logs \
              && { id -u k2gate >/dev/null 2>&1 || useradd --uid 10001 --create-home k2gate; } \
