@@ -143,12 +143,21 @@ def check_i1(ev):
                 places.append((_ts(e), ep, e.get("agent_id"), (e.get("attrs") or {}).get("host")))
     places.sort()
     last = None
+    seen = {}
     for ts, ep, agent, host in places:
         if ep is None:
             diffs.append("%s: ctl.place of %s on %s carries no epoch" % (ts, agent, host))
             continue
-        if last is not None and int(ep) <= int(last[1]):
+        # The same placement traced again (e.g. a spawn refused while its
+        # host is lost keeps it) is not a new one; another placement reusing
+        # an epoch, or a lower one, is.
+        if seen.get(int(ep)) == (agent, host):
+            continue
+        if int(ep) in seen:
+            diffs.append("%s: epoch %s for %s on %s was already issued to %s on %s" % (ts, ep, agent, host, *seen[int(ep)]))
+        elif last is not None and int(ep) <= int(last[1]):
             diffs.append("%s: epoch %s for %s on %s is not above %s (issued %s)" % (ts, ep, agent, host, last[1], last[0]))
+        seen[int(ep)] = (agent, host)
         last = (ts, ep)
     ran = bool(ev.samples) and bool(ev.clis)
     return _result("I1", diffs, ran,

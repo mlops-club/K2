@@ -103,6 +103,14 @@ class Invariants(unittest.TestCase):
         self.r.daemon("controller", 3.0, "ctl.place", agent_id="a", attrs={"host": "host-2", "epoch": 8})
         self.assertEqual(self.check()["I1"]["status"], "pass")
 
+    def test_i1_the_same_placement_traced_again_is_not_a_new_one(self):
+        self.r.cli("host-1", 100, 1.0)
+        self.r.sample(1.5, [100])
+        self.r.daemon("controller", 1.0, "ctl.place", agent_id="a", attrs={"host": "host-1", "epoch": 8})
+        self.r.daemon("controller", 2.0, "ctl.place", agent_id="a", attrs={"host": "host-1", "epoch": 8})
+        self.r.daemon("controller", 3.0, "ctl.place", agent_id="a", attrs={"host": "host-1", "epoch": 9})
+        self.assertEqual(self.check()["I1"]["status"], "pass")
+
     def test_i1_an_epoch_reissued_after_a_restart_fails(self):
         self.r.cli("host-1", 100, 1.0)
         self.r.sample(1.5, [100])
