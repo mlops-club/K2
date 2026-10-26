@@ -259,7 +259,7 @@ second_host() {
 
 echo "== 6. the running images, for the rollback"
 for pair in k2-controller=k2-daemon k2-host=k2-agents; do
-    id=$(sed -n "s/^${pair%%=*} //p" "$OUT/before.txt")
+    id=$(sed -n '/^# images/,$p' "$OUT/before.txt" | awk -v n="${pair%%=*}" '$1 == n {print $2}')   # that section only
     case "$id" in sha256:*) ;; *) echo "owner-roll-rc1.sh: no image id for ${pair%%=*}" >&2; exit 1 ;; esac
     docker image inspect "$id" >/dev/null 2>&1 || { echo "owner-roll-rc1.sh: ${pair%%=*}'s image $id is not on this Mac" >&2; exit 1; }
     docker tag "$id" "${pair#*=}:dist-wave3"
