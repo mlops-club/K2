@@ -1556,6 +1556,30 @@ async fn handle_one_request(
             )
             .await;
         }
+        // P4 T3 (K2_CAP_APPS=kubernetes): an App instance's init container
+        // fetches its Seed with its per-App token (apps::k8s_engine). The
+        // tar is streamed; the token, not the caller's address, decides.
+        p if p.starts_with("/cli/apps/k8s-seed/") => {
+            let _ = stream.read(&mut buf).await;
+            match crate::apps::k8s_engine::handle_seed_fetch(p, bearer_token.as_deref()) {
+                Ok(file) => match tokio::fs::File::open(&file).await {
+                    Ok(mut f) => {
+                        let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                        );
+                        if stream.write_all(head.as_bytes()).await.is_ok() {
+                            let _ = tokio::io::copy(&mut f, &mut *stream).await;
+                        }
+                        let _ = stream.shutdown().await;
+                    }
+                    Err(_) => super::http::send_response(&mut *stream, "404 Not Found", "application/json", r#"{"error":"seed_not_packed"}"#).await,
+                },
+                Err((status, code)) => {
+                    super::http::send_response(&mut *stream, status, "application/json", &serde_json::json!({ "error": code }).to_string()).await
+                }
+            }
+        }
         "/boot-status" => {
             let _ = stream.read(&mut buf).await;
             // 0.39.5: daemon-identity + readiness handshake. ConnectionGate

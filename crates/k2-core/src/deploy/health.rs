@@ -64,18 +64,39 @@ impl Probe {
     }
 }
 
+/// Connect to `host:port` (`None`: `127.0.0.1`, no name lookup).
+fn connect_at(host: Option<&str>, port: u16, timeout: Duration) -> std::io::Result<TcpStream> {
+    let addr: SocketAddr = match host {
+        None => ([127, 0, 0, 1], port).into(),
+        Some(h) => {
+            use std::net::ToSocketAddrs;
+            (h, port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{h}: no address")))?
+        }
+    };
+    TcpStream::connect_timeout(&addr, timeout)
+}
+
 /// One `GET path` on `127.0.0.1:port`, bounded by `timeout` overall.
 pub fn probe_once(port: u16, path: &str, headers: &[(String, String)], timeout: Duration) -> Probe {
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    probe_once_at(None, port, path, headers, timeout)
+}
+
+/// [`probe_once`] on `host` (`None`: `127.0.0.1`, as [`probe_once`]):
+/// an instance off this machine (the Kubernetes engine's Service).
+pub fn probe_once_at(host: Option<&str>, port: u16, path: &str, headers: &[(String, String)], timeout: Duration) -> Probe {
     let deadline = Instant::now() + timeout;
-    let mut s = match TcpStream::connect_timeout(&addr, timeout) {
+    let mut s = match connect_at(host, port, timeout) {
         Ok(s) => s,
         Err(e) => return Probe::NoAnswer(format!("connect: {e}")),
     };
+    let host = host.unwrap_or("127.0.0.1");
     let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(10));
     let _ = s.set_read_timeout(Some(left));
     let _ = s.set_write_timeout(Some(left));
-    let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: k2-health/1\r\nConnection: close\r\n");
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: k2-health/1\r\nConnection: close\r\n");
     for (k, v) in headers {
         if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
             return Probe::NoAnswer("refused a header with a line break".into());
@@ -119,15 +140,20 @@ pub fn probe_once(port: u16, path: &str, headers: &[(String, String)], timeout: 
 /// `GET /` and counts any byte back, or a connection still open and quiet
 /// after a moment, as listening; a close or reset before any byte is not.
 pub fn probe_tcp(port: u16, timeout: Duration) -> Probe {
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let mut s = match TcpStream::connect_timeout(&addr, timeout) {
+    probe_tcp_at(None, port, timeout)
+}
+
+/// [`probe_tcp`] on `host` (`None`: `127.0.0.1`, as [`probe_tcp`]).
+pub fn probe_tcp_at(host: Option<&str>, port: u16, timeout: Duration) -> Probe {
+    let mut s = match connect_at(host, port, timeout) {
         Ok(s) => s,
         Err(e) => return Probe::NoAnswer(format!("connect: {e}")),
     };
+    let host = host.unwrap_or("127.0.0.1");
     let quiet = timeout.min(Duration::from_millis(1500));
     let _ = s.set_read_timeout(Some(quiet));
     let _ = s.set_write_timeout(Some(quiet));
-    let _ = s.write_all(format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: k2-health/1\r\nConnection: close\r\n\r\n").as_bytes());
+    let _ = s.write_all(format!("GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: k2-health/1\r\nConnection: close\r\n\r\n").as_bytes());
     let mut b = [0u8; 1];
     match s.read(&mut b) {
         Ok(n) if n > 0 => Probe::Status(200),
@@ -139,10 +165,15 @@ pub fn probe_tcp(port: u16, timeout: Duration) -> Probe {
 
 /// One probe the way the manifest asks: TCP accept or `GET path` 2xx.
 pub fn probe_as(tcp: bool, port: u16, path: &str, headers: &[(String, String)], timeout: Duration) -> Probe {
+    probe_as_at(None, tcp, port, path, headers, timeout)
+}
+
+/// [`probe_as`] on `host` (`None`: `127.0.0.1`).
+pub fn probe_as_at(host: Option<&str>, tcp: bool, port: u16, path: &str, headers: &[(String, String)], timeout: Duration) -> Probe {
     if tcp {
-        probe_tcp(port, timeout)
+        probe_tcp_at(host, port, timeout)
     } else {
-        probe_once(port, path, headers, timeout)
+        probe_once_at(host, port, path, headers, timeout)
     }
 }
 
@@ -177,6 +208,22 @@ pub fn wait_healthy_as(
     every: Duration,
     probe_timeout: Duration,
     gate: Duration,
+    alive: impl FnMut() -> bool,
+) -> Result<u32, GateFailure> {
+    wait_healthy_as_at(None, tcp, port, path, headers, every, probe_timeout, gate, alive)
+}
+
+/// [`wait_healthy_as`] on `host` (`None`: `127.0.0.1`).
+#[allow(clippy::too_many_arguments)]
+pub fn wait_healthy_as_at(
+    host: Option<&str>,
+    tcp: bool,
+    port: u16,
+    path: &str,
+    headers: &[(String, String)],
+    every: Duration,
+    probe_timeout: Duration,
+    gate: Duration,
     mut alive: impl FnMut() -> bool,
 ) -> Result<u32, GateFailure> {
     let what = if tcp { format!("a connection on port {port}") } else { format!("GET {path}") };
@@ -191,7 +238,7 @@ pub fn wait_healthy_as(
             });
         }
         n += 1;
-        last = probe_as(tcp, port, path, headers, probe_timeout);
+        last = probe_as_at(host, tcp, port, path, headers, probe_timeout);
         if last.healthy() {
             return Ok(n);
         }

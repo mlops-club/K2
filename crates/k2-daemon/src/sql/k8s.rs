@@ -291,23 +291,12 @@ impl SystemOps for KubeSqlOps {
 
 // ── The real Operator: the Kubernetes API from inside the controller ───
 
-/// Blocking calls over [`k8s::Client`]. Each runs on its own thread with a
-/// current-thread runtime, so it is safe from route handlers and plain
-/// threads alike.
+/// Blocking calls over [`k8s::Client`] ([`k8s::blocking`]).
 pub struct KubeOperator;
 
 impl KubeOperator {
-    fn call<T: Send + 'static>(
-        f: impl FnOnce(k8s::Client) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>> + Send + 'static,
-    ) -> Result<T, String> {
-        std::thread::spawn(move || {
-            let cfg = k8s::Config::in_cluster(std::path::Path::new(k8s::SA_DIR)).map_err(|e| e.to_string())?;
-            let client = k8s::Client::new(cfg).map_err(|e| e.to_string())?;
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-            rt.block_on(f(client))
-        })
-        .join()
-        .map_err(|_| "the Kubernetes call panicked".to_string())?
+    fn call<T: Send + 'static>(f: impl FnOnce(k8s::Client) -> k8s::CallFuture<T> + Send + 'static) -> Result<T, String> {
+        k8s::blocking(f)
     }
 }
 

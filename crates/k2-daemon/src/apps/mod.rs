@@ -44,6 +44,7 @@ pub mod grace;
 pub mod grants;
 pub mod origins;
 pub mod guarded;
+pub mod k8s_engine;
 pub mod guest_rooms;
 /// Switch-1 default limits (§4.3).
 pub mod limits;

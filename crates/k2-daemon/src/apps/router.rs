@@ -29,6 +29,9 @@ use tokio::sync::watch;
 #[derive(Debug)]
 pub struct Backend {
     pub app_id: String,
+    /// Where the instance listens: `None` is host loopback (every local
+    /// engine); `Some` a host name (the Kubernetes engine's Service, P4 T3).
+    pub host: Option<String>,
     pub port: u16,
     /// 0.46.3: rewrite each HTTP/1.1 request for the client IP
     /// (`crate::client_ip`). `false` = the manifest's `host.clientIp:
@@ -41,10 +44,11 @@ pub struct Backend {
 }
 
 impl Backend {
-    fn new(app_id: &str, port: u16, client_ip: bool) -> Arc<Self> {
+    fn new(app_id: &str, host: Option<String>, port: u16, client_ip: bool) -> Arc<Self> {
         let (cut_tx, _) = watch::channel(false);
         Arc::new(Self {
             app_id: app_id.to_string(),
+            host,
             port,
             client_ip,
             active: AtomicUsize::new(0),
@@ -66,6 +70,11 @@ impl Backend {
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    /// The dial host: the instance's own, else `127.0.0.1`.
+    pub fn dial_host(&self) -> &str {
+        self.host.as_deref().unwrap_or("127.0.0.1")
     }
 }
 
@@ -95,15 +104,21 @@ pub fn switch(app_id: &str, port: u16) -> (Arc<Backend>, Option<Arc<Backend>>) {
 
 /// [`switch`] with the App's `host.clientIp` (`false` = raw splice).
 pub fn switch_with(app_id: &str, port: u16, client_ip: bool) -> (Arc<Backend>, Option<Arc<Backend>>) {
+    switch_to(app_id, None, port, client_ip)
+}
+
+/// [`switch_with`] to an instance that listens on `host` (`None`: host
+/// loopback, exactly as [`switch_with`]).
+pub fn switch_to(app_id: &str, host: Option<String>, port: u16, client_ip: bool) -> (Arc<Backend>, Option<Arc<Backend>>) {
     let _g = write_lock().lock().unwrap_or_else(|e| e.into_inner());
     let cur = table().load_full();
     let prev = cur.get(app_id).cloned();
     if let Some(p) = &prev {
-        if p.port == port && p.client_ip == client_ip {
+        if p.host == host && p.port == port && p.client_ip == client_ip {
             return (p.clone(), None);
         }
     }
-    let be = Backend::new(app_id, port, client_ip);
+    let be = Backend::new(app_id, host, port, client_ip);
     let mut next: Table = (*cur).clone();
     next.insert(app_id.to_string(), be.clone());
     table().store(Arc::new(next));
@@ -159,10 +174,10 @@ pub async fn splice<S>(client: &mut S, be: Arc<Backend>, mode: Option<crate::cli
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut upstream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(("127.0.0.1", be.port)))
+    let mut upstream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((be.dial_host(), be.port)))
         .await
-        .map_err(|_| format!("App {} backend :{} did not accept within 5s", be.app_id, be.port))?
-        .map_err(|e| format!("App {} backend :{}: {e}", be.app_id, be.port))?;
+        .map_err(|_| format!("App {} backend {}:{} did not accept within 5s", be.app_id, be.dial_host(), be.port))?
+        .map_err(|e| format!("App {} backend {}:{}: {e}", be.app_id, be.dial_host(), be.port))?;
     // 0.46.3: never splice visitors into the daemon's own main listener;
     // any other splice is marked so it can never pass as local.
     crate::splice_guard::refuse_self_dial(&upstream)

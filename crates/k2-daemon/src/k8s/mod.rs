@@ -215,6 +215,23 @@ impl Client {
     }
 }
 
+/// A future [`blocking`] runs.
+pub type CallFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send>>;
+
+/// One call to this pod's API server (in-cluster config) from blocking
+/// code: on its own thread with a current-thread runtime, so it is safe
+/// from route handlers, the App supervisor's threads and plain threads.
+pub fn blocking<T: Send + 'static>(f: impl FnOnce(Client) -> CallFuture<T> + Send + 'static) -> Result<T, String> {
+    std::thread::spawn(move || {
+        let cfg = Config::in_cluster(std::path::Path::new(SA_DIR)).map_err(|e| e.to_string())?;
+        let client = Client::new(cfg).map_err(|e| e.to_string())?;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+        rt.block_on(f(client))
+    })
+    .join()
+    .map_err(|_| "the Kubernetes call panicked".to_string())?
+}
+
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

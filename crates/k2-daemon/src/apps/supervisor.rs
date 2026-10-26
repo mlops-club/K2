@@ -122,6 +122,15 @@ pub fn engine_for(iso: Isolation) -> Option<&'static dyn RuntimeEngine> {
 /// the open path's `process` exception (owner-approved, a sandboxed
 /// system unit as `k2appx`) is not stage 1's unwalled process engine.
 pub fn engine_for_app(app: &AppRow) -> Option<&'static dyn RuntimeEngine> {
+    if super::k8s_engine::enabled() {
+        // P4 T3: on Kubernetes every container App (guarded or open) is a
+        // Deployment; nothing runs as a process on the controller (AR24:
+        // no other wall than asked, so `process` has no engine here).
+        return match Isolation::parse(&app.isolation) {
+            Some(Isolation::Container) => Some(super::k8s_engine::engine() as &'static dyn RuntimeEngine),
+            _ => None,
+        };
+    }
     if app.is_process_exception() {
         return cfg!(target_os = "linux").then(|| super::process_exception::engine() as &'static dyn RuntimeEngine);
     }
@@ -194,7 +203,9 @@ fn is_process_engine(h: &RunHandle) -> bool {
 
 /// The engine that runs an instance (by its handle).
 pub fn engine_of(h: &RunHandle) -> &'static dyn RuntimeEngine {
-    if super::open::owns(h) {
+    if super::k8s_engine::owns(h) {
+        super::k8s_engine::engine()
+    } else if super::open::owns(h) {
         super::open::engine()
     } else if super::guarded::owns(h) {
         super::guarded::engine()
@@ -308,7 +319,13 @@ fn boot() {
     let unwalled_ok = deploy::process_engine_enabled();
     let mut adopted = if unwalled_ok { engine().adopt().unwrap_or_default() } else { Vec::new() };
     let unwalled_orphans = if unwalled_ok { Vec::new() } else { engine().adopt().unwrap_or_default() };
-    if let Some(g) = engine_for(Isolation::Container) {
+    if super::k8s_engine::enabled() {
+        // P4 T3: the App Deployments outlive the controller's pod.
+        match super::k8s_engine::engine().adopt() {
+            Ok(mut v) => adopted.append(&mut v),
+            Err(e) => k2_core::log_debug!("[apps] kubernetes engine adopt: {}", e.message),
+        }
+    } else if let Some(g) = engine_for(Isolation::Container) {
         match g.adopt() {
             Ok(mut v) => adopted.append(&mut v),
             Err(e) => k2_core::log_debug!("[apps] guarded engine adopt: {}", e.message),
@@ -327,7 +344,7 @@ fn boot() {
             .and_then(|d| adopted.iter().find(|h| h.app_id == app.app_id && h.deployment_id == d));
         if let (Some(h), Some(seed)) = (live, app.live_seed.as_deref()) {
             let inst = instance_for(h.clone(), seed);
-            router::switch_with(&app.app_id, h.port, inst.client_ip);
+            router::switch_to(&app.app_id, super::k8s_engine::upstream_host(h), h.port, inst.client_ip);
             claimed.insert(h.deployment_id.clone());
             // Smoke r6: an unwalled instance outlives a restart (KillMode=
             // process). If its logs went through a pipe to the old daemon it
@@ -708,7 +725,9 @@ fn pipeline(app_id: &str, dep: &str, seed: &str, kind: &str) {
     let path = m.health_path();
     let gate = Duration::from_secs(m.host.health.as_ref().and_then(|h| h.timeout_secs).unwrap_or(t.deploy_timeout_secs));
     let tcp = m.tcp_health();
-    let healthy = health::wait_healthy_as(
+    let upstream = super::k8s_engine::upstream_host(&h);
+    let healthy = health::wait_healthy_as_at(
+        upstream.as_deref(),
         tcp,
         port,
         &path,
@@ -738,7 +757,7 @@ fn pipeline(app_id: &str, dep: &str, seed: &str, kind: &str) {
 /// The switch: route new connections to `inst`, drain the old one, keep it
 /// warm for the watch window.
 fn go_live(app: &AppRow, dep: &str, inst: Instance, kind: &str, t: &Timings) {
-    let (_, prev_be) = router::switch_with(&app.app_id, inst.handle.port, inst.client_ip);
+    let (_, prev_be) = router::switch_to(&app.app_id, super::k8s_engine::upstream_host(&inst.handle), inst.handle.port, inst.client_ip);
     let watch_secs = t.watch_secs;
     let (older_warm, prev_live, replace) = with_rt(&app.app_id, |rt| {
         let older = rt.warm.take();
@@ -810,7 +829,8 @@ fn probe(inst: &Instance, t: &Timings) -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
-    health::probe_as(inst.probe_tcp, inst.handle.port, &inst.health_path, &headers, Duration::from_millis(t.probe_timeout_ms)).healthy()
+    let upstream = super::k8s_engine::upstream_host(&inst.handle);
+    health::probe_as_at(upstream.as_deref(), inst.probe_tcp, inst.handle.port, &inst.health_path, &headers, Duration::from_millis(t.probe_timeout_ms)).healthy()
 }
 
 fn tick() {
@@ -936,7 +956,7 @@ fn relaunch(app_id: &str, live: &Instance, why: &'static str) {
 }
 
 fn auto_rollback(app_id: &str, w: &Watch, bad: Instance, prev: Instance, why: &str, exit: Exit, t: &Timings) {
-    let (_, bad_be) = router::switch_with(app_id, prev.handle.port, prev.client_ip);
+    let (_, bad_be) = router::switch_to(app_id, super::k8s_engine::upstream_host(&prev.handle), prev.handle.port, prev.client_ip);
     with_rt(app_id, |rt| {
         rt.live = Some(prev.clone());
         rt.warm = None;
@@ -1166,7 +1186,7 @@ pub fn rollback_to_warm(app: &AppRow, target: &str, actor: &str) -> Result<Optio
     if matches!(engine_of(&warm.handle).liveness(&warm.handle), Liveness::Exited(_)) || !probe(&warm, &t) {
         return Ok(None);
     }
-    let (_, bad_be) = router::switch_with(&app.app_id, warm.handle.port, warm.client_ip);
+    let (_, bad_be) = router::switch_to(&app.app_id, super::k8s_engine::upstream_host(&warm.handle), warm.handle.port, warm.client_ip);
     let bad = with_rt(&app.app_id, |rt| {
         let bad = rt.live.take();
         rt.live = Some(warm.clone());

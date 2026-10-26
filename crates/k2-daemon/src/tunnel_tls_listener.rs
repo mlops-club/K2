@@ -953,7 +953,7 @@ async fn serve_one(
             if let Some((label, be)) =
                 label.and_then(|l| crate::apps::router::live(&l).map(|be| (l, be)))
             {
-                log_debug!("[daemon/e2e] routing {sni} → App backend :{}", be.port);
+                log_debug!("[daemon/e2e] routing {sni} → App backend {}:{}", be.dial_host(), be.port);
                 let mode = crate::apps::router::rewrite_mode(&be, &label, crate::client_ip::Mode::Tunnel(client_ip));
                 if let Err(e) = crate::apps::router::splice(&mut tls, be, mode).await {
                     log_debug!("[daemon/e2e] {sni}: {e} — answering 502");
