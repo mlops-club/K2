@@ -186,9 +186,19 @@ fi
 say "wave3 source: $WAVE3_SRC at ${WAVE3_COMMIT:0:9}"
 
 echo "== 5. keep the current images for the rollback"
-docker tag k2-daemon:dist k2-daemon:dist-prev
-docker tag k2-agents:dist k2-agents:dist-prev
-ok "k2-daemon:dist-prev and k2-agents:dist-prev"
+# A rerun keeps the -prev of the first run: by then :dist may already be
+# wave3's build, and tagging it -prev would leave nothing to go back to.
+for img in k2-daemon k2-agents; do
+    rev() { docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$1" 2>/dev/null; }
+    if docker image inspect "$img:dist-prev" >/dev/null 2>&1; then
+        [ "$(rev "$img:dist-prev")" != "$WAVE3_COMMIT" ] \
+            || { echo "owner-roll-wave3.sh: $img:dist-prev is wave3's build; no rollback image" >&2; exit 1; }
+        ok "kept $img:dist-prev (revision $(rev "$img:dist-prev" | cut -c1-9), from an earlier run)"
+    else
+        docker tag "$img:dist" "$img:dist-prev"
+        ok "$img:dist-prev (revision $(rev "$img:dist-prev" | cut -c1-9))"
+    fi
+done
 
 echo "== 6. build from wave3 and rehearse on k2-kind-dist-fake"
 K2_KIND_BUILD_MEMORY=${K2_KIND_BUILD_MEMORY:-6g} CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1} \
