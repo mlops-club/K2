@@ -261,9 +261,11 @@ check "six wakes end with 3 host pods, each enrolled by key" "$ok" \
 # 3. at the maximum
 r=$(spawn a7)
 check "a seventh wake is refused naming K2_PROVISIONER_MAX_HOSTS" \
-    "$(case "$r" in "503 "*K2_PROVISIONER_MAX_HOSTS=3*) echo 1 ;; esac)" "$r; replicas $(replicas)"
+    "$(echo "$r" | grep -q '^503 .*K2_PROVISIONER_MAX_HOSTS=3' && echo 1)" "$r; replicas $(replicas)"
 
-# 4. readiness by --host-health
+# 4. readiness by --host-health. A host links (and takes its wake) before
+# its next probe runs: wait for the probes, then read the conditions.
+kn wait --for=condition=Ready pod -l app.kubernetes.io/name=k2-host --timeout=180s > "$RUN/wait-ready.txt" 2>&1
 ready=$(kn get pods -l app.kubernetes.io/name=k2-host -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status} {end}')
 probe=$(kn get pod k2-host-0 -o jsonpath='{.spec.containers[0].readinessProbe.exec.command}')
 check "every host pod Ready through k2-daemon --host-health (D10)" \
