@@ -158,6 +158,7 @@ edits in other files are one call each:
 | `hosts/link.rs` `serve_once` | `let token = super::enroll::hello_token(cfg).await?;` before the connect, and `token,` in the `Hello` (was `cfg.token.clone()`) |
 | `hosts/gate.rs` `route` | `if super::enroll::route(stream, buf, path, query, owner_token).await { return true; }` before the `role != Controller` return |
 | `runtime_role.rs` `check_settings` | controller and host also run `hosts::enroll::auth_mode(&get)` at boot |
+| `routes/route_policy.rs` | five rows for the new routes (the dispatcher 405s any POST not in the table): `challenge` and `enroll` `Public`, `enroll-tokens`, `keys` and `keys/revoke` `NoLogin` (the handlers check the owner token) |
 
 The host key loader repeats `k2_node::identity::load_or_create_key`'s rule
 (made once, 0600) in about 20 lines, because the daemon links `k2-node` only
@@ -204,4 +205,20 @@ curl -s -X POST "http://ctl:7420/cli/hosts/keys/revoke?token=$OWNER" -d '{"host_
 
 ## Status
 
-In progress.
+Done. Branch `k2-dist/host-enroll`: 48f76eb6c (code), 23dd7bed4 (lab, docs),
+b908afbd8 (merge of `k2-dist/wave2-preview` 6e24dd5be: wave1, W1, W2 and
+its fixes, W3; it merged cleanly, and the checks below were rerun on it).
+
+### Results
+
+| check | result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: runtime_role:: routes::route_policy delivery_drain::` (merged tree) | 87 passed, 2 runs out of 2 |
+| enroll tests in `hosts/enroll_tests.rs` | 16 passed: enroll once per token, enroll needs the private key, signed hello admitted, bad signature, single-use and expiring nonces, unknown key, another host's name, bootstrap token refused in enroll mode, token mode unchanged (and names a mode mismatch), revoke (refused, can't re-enroll, a new key may take the name), enrollments survive a controller restart, owner-only routes, the host key made once 0600, and on loopback through the real hub: enroll over HTTP, signed link, replay, stolen bootstrap token, revoke cutting the live link |
+| `scripts/lab/topology/two-process-enroll.sh` | PASS 5/5 before the merge (`lab-runs/host-enroll/20261025T213035Z`) and after it (`20261026T003547Z`) |
+| `scripts/lab/topology/two-process.sh` (token mode, the default) on the merged tree | PASS |
+| `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway `HOME` (pre-merge tree) | 162 test binaries, 5225 passed, 0 failed, 6 ignored |
+
+An existing flake seen once: `hosts::tests::host_reconnects_after_a_reset_a_mute_peer_and_a_silent_controller`
+expected the reset to surface as `read:` and got `send: Broken pipe`, a race over which side sees the RST
+first. In token mode the link hook only clones the token. The test then passed 6/6 alone and in 3 runs of `hosts::`.
