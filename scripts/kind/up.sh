@@ -3,7 +3,8 @@
 # (deploy/kind/README.md has the app steps).
 #
 #   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]
-#                             [--provisioner=static|kubernetes]] [--fake] [--rebuild-daemon]
+#                             [--provisioner=static|kubernetes [--max-hosts=N]]
+#                             [--work-root=PATH] [--login-from=POD]] [--fake] [--rebuild-daemon]
 #                      [--reset-password] [--port-forward] [--password-file=PATH] [--render-only=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
@@ -49,6 +50,19 @@
 # _MAX_HOSTS): never fewer hosts than that, and never a host added that a
 # later idle scale-down could take away with its agents' homes on it
 # (home sync, P3 T1, is not in yet). static (the default) is as before.
+# --max-hosts=N (with --provisioner=kubernetes; default --hosts) raises the
+# ceiling only: the pool starts at --hosts and may add hosts up to N. Use it
+# only with home sync (--work-root), so a scale-down saves agents' homes.
+# --work-root=PATH sets K2_WORK_ROOT on the hosts (home sync, P3 T1: agents
+# whose cwd is under it are saved on release and restored on spawn). The
+# workspaces volume is mounted at /var/lib/k2/work.
+# --login-from=POD (e.g. k2-host-0) gives every host an init container that
+# mounts POD's HOME volume (data-POD) read-only and, when the host has no
+# Claude login of its own yet, copies POD's (.claude/.credentials.json,
+# 0600, and .claude.json) onto the host's own volume. Inside the cluster
+# only: nothing is read out or printed. A host that has a login keeps it;
+# POD itself is skipped. The volumes are ReadWriteOnce, which works because
+# every host sits on the controller's node (above).
 # --render-only=PATH builds nothing and applies nothing: it writes the
 # manifests a --dist run would apply, at its final host count, to PATH
 # (for `kubectl diff`), and exits.
@@ -62,7 +76,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
-provisioner=static render_to=
+provisioner=static render_to= max_hosts= work_root= login_from=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -76,7 +90,10 @@ for a in "$@"; do
         --host-auth=token|--host-auth=enroll) host_auth=${a#--host-auth=} ;;
         --provisioner=static|--provisioner=kubernetes) provisioner=${a#--provisioner=} ;;
         --render-only=*) render_to=${a#--render-only=} ;;
-        -h|--help) sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --max-hosts=*) max_hosts=${a#--max-hosts=} ;;
+        --work-root=*) work_root=${a#--work-root=} ;;
+        --login-from=*) login_from=${a#--login-from=} ;;
+        -h|--help) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -96,6 +113,19 @@ if [ "$provisioner" = kubernetes ] && { [ "$dist" = 0 ] || [ "$host_auth" != enr
 fi
 if [ -n "$render_to" ] && [ "$dist" = 0 ]; then
     echo "up.sh: --render-only needs --dist" >&2; exit 2
+fi
+max_hosts=${max_hosts:-$hosts}
+case "$max_hosts" in ''|*[!0-9]*) echo "up.sh: --max-hosts=N takes a number" >&2; exit 2 ;; esac
+if [ "$max_hosts" != "$hosts" ] && [ "$provisioner" != kubernetes ]; then
+    echo "up.sh: --max-hosts needs --provisioner=kubernetes" >&2; exit 2
+fi
+if [ "$max_hosts" -lt "$hosts" ]; then
+    echo "up.sh: --max-hosts=$max_hosts is below --hosts=$hosts" >&2; exit 2
+fi
+case "$work_root" in ''|/*) ;; *) echo "up.sh: --work-root takes an absolute path" >&2; exit 2 ;; esac
+case "$login_from" in ''|k2-host-[0-9]*) ;; *) echo "up.sh: --login-from takes a host pod (k2-host-N)" >&2; exit 2 ;; esac
+if { [ -n "$work_root" ] || [ -n "$login_from" ]; } && [ "$dist" = 0 ]; then
+    echo "up.sh: --work-root and --login-from need --dist" >&2; exit 2
 fi
 kind_variant_from_flags "$fake" "$dist"
 ptyd=${ptyd:-${K2_KIND_PTYD:-$KIND_PTYD_DEFAULT}}
@@ -179,8 +209,8 @@ $([ "$provisioner" = kubernetes ] && printf '  - %s\n' "$(python3 -I -c 'import 
 replicas:
   - {name: k2-host, count: $1}
 EOF
-        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ]; then echo "patches:"; fi
-        if [ "$ptyd" = 1 ]; then
+        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ]; then echo "patches:"; fi
+        if [ "$ptyd" = 1 ] || [ -n "$work_root" ]; then
             cat <<EOF
   - target: {kind: StatefulSet, name: k2-host}
     patch: |-
@@ -194,7 +224,54 @@ EOF
             containers:
               - name: k2-host
                 env:
-                  - {name: K2_PTYD, value: "1"}
+EOF
+            [ "$ptyd" = 1 ] && echo '                  - {name: K2_PTYD, value: "1"}'
+            [ -n "$work_root" ] && echo "                  - {name: K2_WORK_ROOT, value: \"$work_root\"}"
+        fi
+        if [ -n "$login_from" ]; then
+            # The variant's agents image by its own name: the base's images:
+            # mapping doesn't reach what this overlay's patch adds.
+            cat <<EOF
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            initContainers:
+              - name: login-seed
+                image: $KIND_IMAGE
+                imagePullPolicy: Never
+                command:
+                  - sh
+                  - -c
+                  - |
+                    set -eu
+                    [ "\$(cat /etc/hostname)" != "$login_from" ] || { echo "login-seed: the source host itself"; exit 0; }
+                    if [ -e /var/lib/k2-host/.claude/.credentials.json ]; then echo "login-seed: has its own login"; exit 0; fi
+                    if [ ! -s /login-src/.claude/.credentials.json ]; then echo "login-seed: $login_from has no login"; exit 0; fi
+                    umask 077
+                    mkdir -p /var/lib/k2-host/.claude
+                    cp /login-src/.claude/.credentials.json /var/lib/k2-host/.claude/.credentials.json.tmp
+                    chmod 600 /var/lib/k2-host/.claude/.credentials.json.tmp
+                    mv /var/lib/k2-host/.claude/.credentials.json.tmp /var/lib/k2-host/.claude/.credentials.json
+                    if [ ! -e /var/lib/k2-host/.claude.json ] && [ -s /login-src/.claude.json ]; then
+                      cp /login-src/.claude.json /var/lib/k2-host/.claude.json
+                    fi
+                    echo "login-seed: copied $login_from's login"
+                securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+                volumeMounts:
+                  - {name: data, mountPath: /var/lib/k2-host}
+                  - {name: login-src, mountPath: /login-src, readOnly: true}
+            # Read-only on the init container's mount only: on POD itself
+            # this is its own HOME volume, and readOnly here (the pod's
+            # volume) made the whole volume read-only, its HOME too.
+            volumes:
+              - name: login-src
+                persistentVolumeClaim: {claimName: data-$login_from}
 EOF
         fi
         if [ "$host_auth" = enroll ]; then
@@ -225,7 +302,7 @@ EOF
                   - {name: K2_PROVISIONER, value: kubernetes}
                   - {name: K2_PROVISIONER_HOST_STATEFULSET, value: k2-host}
                   - {name: K2_PROVISIONER_MIN_HOSTS, value: "$hosts"}
-                  - {name: K2_PROVISIONER_MAX_HOSTS, value: "$hosts"}
+                  - {name: K2_PROVISIONER_MAX_HOSTS, value: "$max_hosts"}
             serviceAccountName: k2-controller
             automountServiceAccountToken: true
 EOF
@@ -288,7 +365,7 @@ fi
 if [ -n "$render_to" ]; then
     write_overlay "$hosts"
     cp "$rendered" "$render_to"
-    say "rendered $KIND_OVERLAY (${hosts} host(s), K2_PTYD=$ptyd, K2_HOST_AUTH=$host_auth, K2_PROVISIONER=$provisioner) to $render_to"
+    say "rendered $KIND_OVERLAY (${hosts} host(s), K2_PTYD=$ptyd, K2_HOST_AUTH=$host_auth, K2_PROVISIONER=$provisioner, max $max_hosts${work_root:+, K2_WORK_ROOT=$work_root}${login_from:+, login from $login_from}) to $render_to"
     exit 0
 fi
 if [ "$KIND_DIST" = 1 ]; then
