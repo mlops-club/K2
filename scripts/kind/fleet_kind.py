@@ -17,6 +17,7 @@ Every daemon runs under deploy/kind/dist-fake/supervise.sh. A proc's
   kill    writes $HOME/.k2-lab/hold, then `kubectl exec <pod> -- kill -<SIG>
           <pid>` (--kill=process, the default) or `kubectl delete pod`
           (--kill=pod; the StatefulSet makes a new pod, held until start);
+          the image has no kill binary, so it is sh's builtin
           waits for the process to be gone
   start   removes the hold file; waits for a new k2-daemon process
   CLIs    "<host>:<pid>" of processes run from the fake-agent shim dir
@@ -174,7 +175,7 @@ def kill(st, name, sig=signal.SIGKILL, wait_s=None):
     else:
         num = pid.split("@")[0] if pid else ""
         if num:
-            _exec(st, name, "kill", "-%d" % int(sig), num, timeout=30)
+            _exec(st, name, "sh", "-c", 'kill -"$1" "$2"', "kill", str(int(sig)), num, timeout=30)
     end = time.monotonic() + wait
     while True:
         snap = snapshot(st, name, fresh=True)
@@ -196,7 +197,7 @@ def agent_cli_pids(st):
 
 def kill_cli(st, host, pid, sig=signal.SIGKILL):
     proc = next(h["proc"] for h in st["hosts"] if h["name"] == host)
-    r = _exec(st, proc, "kill", "-%d" % int(sig), str(pid))
+    r = _exec(st, proc, "sh", "-c", 'kill -"$1" "$2"', "kill", str(int(sig)), str(pid))
     _snap.pop(proc, None)
     if r.returncode != 0:
         raise ProcessLookupError("kill %s on %s: %s" % (pid, host, r.stderr.strip()[-200:]))

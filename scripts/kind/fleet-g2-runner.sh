@@ -25,6 +25,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Rows of this run only: the outboxes live on the pods' volumes and keep
+# earlier runs' rows (judged by those runs).
+START_MS=$(python3 -I -c 'import time; print(int(time.time() * 1000))')
 "${KIND_PY[@]}" plan --state "$STATE" --run-dir "$RUN" --namespace "$NS" --hosts "$HOSTS" --kill "$KILL" \
     | tee -a "$RUN/fleet-g2.log" || exit 1
 # This run's traces only: the files live on the pods' volumes and are
@@ -112,7 +115,21 @@ fi
 
 hosts_status hosts-status-end.json
 say "controller /cli/hosts/status at the end: $(head -c 1500 "$RUN/hosts-status-end.json")"
-"${LAB[@]}" collect --state "$STATE" --out "$RUN/outbox-final" 2>&1 | tee -a "$RUN/fleet-g2.log"
+"${LAB[@]}" collect --state "$STATE" --out "$RUN/outbox-all" 2>&1 | tee -a "$RUN/fleet-g2.log"
+# outbox-final/ (what invariants I2 reads): the rows created since this run
+# started; outbox-all/ keeps every row as listed.
+python3 -I - "$RUN" "$START_MS" <<'PY' | tee -a "$RUN/fleet-g2.log"
+import json, os, sys
+run, start = sys.argv[1], int(sys.argv[2])
+os.makedirs(os.path.join(run, "outbox-final"), exist_ok=True)
+for f in sorted(os.listdir(os.path.join(run, "outbox-all"))):
+    doc = json.load(open(os.path.join(run, "outbox-all", f)))
+    if isinstance(doc, dict) and isinstance(doc.get("messages"), list):
+        before = len(doc["messages"])
+        doc["messages"] = [m for m in doc["messages"] if (m.get("created_ms") or 0) >= start]
+        print("outbox %s: %d row(s) of this run, %d earlier" % (f[:-5], len(doc["messages"]), before - len(doc["messages"])))
+    json.dump(doc, open(os.path.join(run, "outbox-final", f), "w"), indent=2)
+PY
 # Traces under the names labkit/invariants.py reads.
 python3 -I - "$STATE" "$RUN/traces" <<'PY'
 import json, shutil, sys
@@ -127,12 +144,12 @@ say "invariants I1 to I4"
 python3 -I - "$RUN" <<'PY' | tee -a "$RUN/fleet-g2.log"
 import glob, json, os, sys
 run = sys.argv[1]
+s1 = os.path.join(run, "scenarios", "S1", "S1.json")
+if os.path.isfile(s1):
+    print("S1  %-5s %s" % (json.load(open(s1)).get("status", "?").upper(), "One agent through the controller (lab.py s1)"))
 for f in sorted(glob.glob(os.path.join(run, "scenarios", "S*.json"))):
     d = json.load(open(f))
     print("%-3s %-5s %s" % (d.get("scenario"), d.get("status", "?").upper(), d.get("title", "")))
-s1 = os.path.join(run, "scenarios", "S1")
-if os.path.isdir(s1):
-    print("S1  (lab.py s1: see scenarios/S1/)")
 PY
 say "done (rc=$rc)"
 exit $rc

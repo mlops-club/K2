@@ -133,7 +133,10 @@ fi
 mkdir -p "$stage/scripts/kind"
 cp scripts/kind/fleet_kind.py scripts/kind/fleet-g2-runner.sh "$stage/scripts/kind/"
 find "$stage" -name __pycache__ -prune -exec rm -rf {} +
-tar -C "$stage" -cf - . | kc -n "$KIND_NS" exec -i "$RUNNER" -- tar -xf - -C /lab/repo
+# No macOS metadata in the stream; the pod's /lab/repo (an emptyDir owned
+# by root) keeps its own mode and times.
+COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$stage" -cf - tests cli scripts \
+    | kc -n "$KIND_NS" exec -i "$RUNNER" -- tar -xf - -C /lab/repo --no-overwrite-dir --no-same-permissions -m
 rm -rf "$stage"
 say "lab: tests/lab and cli/ from $lab_rev; fleet_kind.py from $(git rev-parse --short HEAD)"
 
@@ -143,7 +146,7 @@ kc -n "$KIND_NS" exec "$RUNNER" -- env NS="$KIND_NS" HOSTS="$hosts" ONLY="$only"
     CHAOS_MIN_S="${LAB_CHAOS_MIN_S:-180}" bash /lab/repo/scripts/kind/fleet-g2-runner.sh || rc=$?
 
 # ── 5. the evidence ─────────────────────────────────────────────────────
-kc -n "$KIND_NS" exec "$RUNNER" -- tar -C /lab/run --exclude=./home -cf - . | tar -xf - -C "$out"
+kc -n "$KIND_NS" exec "$RUNNER" -- tar -C /lab/run --exclude=./home -cf - . | tar -xf - -C "$out" -m
 {
     echo "lab: $lab_rev"
     echo "kind: $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD)), namespace $KIND_NS, hosts $hosts, kill=$kill_mode${chaos:+, chaos seed=$chaos}"
