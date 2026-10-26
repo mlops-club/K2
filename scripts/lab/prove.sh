@@ -7,13 +7,18 @@
 #                        [--chaos seed=N] [--parity full|none] [--record-baseline]
 #                        [--linux-gate hold|run]
 #
-# Wave 1 implements gate G0 on topology solo. Anything else exits 2.
+# Implemented: G0 on solo; G2 on solo and fleet (docs/prd/progress/lab-g2.md).
+# Anything else exits 2. LAB_FLEET_BACKEND=procs (default) or compose picks
+# how fleet runs.
 #
 # Writes lab-runs/<gate>/<UTC timestamp>/ (open report.html first):
 #   report.html, report.json   pass/fail matrix, machine-readable twin
 #   parity/                    one log (and result JSON) per existing suite
 #   scenarios/S1.*             log, result, trace, the client's screen (.cast)
-#   flows.json                 the PRD flows against the trace (expected only in wave 1)
+#   scenarios/S2..S9.*         G2: result and log per scenario; messages.jsonl
+#   traces/, samples.jsonl     G2: daemon and fake-agent traces, the fleet monitor
+#   chaos.log                  G2 with --chaos: what was killed, when
+#   flows.json                 the PRD flows against the trace
 #   invariants.txt, metrics.csv, topology/, demo.cast (when asciinema is installed)
 #
 # Exit 0 only when every required item passed. --parity none is for
@@ -57,12 +62,12 @@ export LAB_LINUX_GATE
 export LAB_TEST_THREADS=${LAB_TEST_THREADS:-3}
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
-if [ "$GATE" != G0 ] || [ "$TOPOLOGY" != solo ]; then
-    echo "prove.sh: $GATE on topology $TOPOLOGY is not implemented in wave 1 (only: prove.sh G0 --topology solo)" >&2
-    exit 2
-fi
-if [ "$RECORD_BASELINE" = 1 ] && [ "$PARITY" != full ]; then
-    echo "prove.sh: --record-baseline needs --parity full" >&2; exit 2
+case "$GATE/$TOPOLOGY" in
+    G0/solo|G2/solo|G2/fleet) ;;
+    *) echo "prove.sh: $GATE on topology $TOPOLOGY is not implemented (G0 solo; G2 solo, fleet)" >&2; exit 2 ;;
+esac
+if [ "$RECORD_BASELINE" = 1 ] && { [ "$PARITY" != full ] || [ "$GATE/$TOPOLOGY" != G0/solo ]; }; then
+    echo "prove.sh: --record-baseline needs G0 --topology solo --parity full" >&2; exit 2
 fi
 
 LAB_REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -73,11 +78,16 @@ RUN="$LAB_REPO/lab-runs/$GATE/$TS"
 mkdir -p "$RUN/parity" "$RUN/scenarios" "$RUN/topology"
 export LAB_REPO LAB_SHA RUN
 LAB_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-run-XXXXXX")
-BASELINE="tests/lab/baselines/$GATE-$TOPOLOGY.json"
+# I5 compares the parity suites with the pre-change baseline. The suites
+# don't depend on the gate or the topology, so every gate uses G0's.
+BASELINE="tests/lab/baselines/G0-solo.json"
 NOTES=()
 say() { printf '%s lab: %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$RUN/prove.log"; }
 
-for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+' || true); do unset "$v"; done
+# Keep the machine-wide cargo slot's own knobs (K2_DIST_PRIORITY, K2_DIST_SLOTS):
+# only ~/.cache/k2-dist-cargo-slot.sh reads them; suites and the daemon start
+# under env -i anyway.
+for v in $(env | grep -oE '^K2(SO)?_[A-Z0-9_]+' | grep -vxE 'K2_DIST_(PRIORITY|SLOTS)' || true); do unset "$v"; done
 
 # run.json: merge key=value (value is JSON when it parses as JSON).
 run_set() {
@@ -103,16 +113,26 @@ run_set gate "$GATE" topology "$TOPOLOGY" sha "$LAB_SHA" branch "$(git rev-parse
 if [ -n "$(git status --porcelain --untracked-files=no -- . ':!lab-runs')" ]; then
     NOTES+=("The working tree has uncommitted changes. Solo and the local suites ran on the working tree; the Linux gate ran on the committed sha $LAB_SHA.")
 fi
-if [ -n "$CHAOS" ]; then
+if [ -n "$CHAOS" ] && [ "$GATE" = G0 ]; then
     NOTES+=("--chaos $CHAOS recorded; G0 has no chaos scenarios (chaos applies to S3 to S10).")
 fi
 
 source "$LAB_REPO/scripts/lab/lib/toolchain.sh"
 source "$LAB_REPO/scripts/lab/lib/parity.sh"
-source "$LAB_REPO/scripts/lab/topology/$TOPOLOGY.sh"
+if [ "$GATE" = G2 ]; then
+    # Both G2 topologies run under the fleet manager (layout = topology).
+    export LAB_FLEET_LAYOUT=$TOPOLOGY
+    source "$LAB_REPO/scripts/lab/topology/fleet.sh"
+    run_set fleet_backend "${LAB_FLEET_BACKEND:-procs}"
+else
+    source "$LAB_REPO/scripts/lab/topology/$TOPOLOGY.sh"
+fi
 
-GATE_PID="" GATE_NOT_RUN=""
+GATE_PID="" GATE_NOT_RUN="" MONITOR_PID="" CHAOS_PID=""
 cleanup() {
+    for p in "$CHAOS_PID" "$MONITOR_PID"; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null && wait "$p" 2>/dev/null
+    done
     topo_down 2>/dev/null
     if [ -n "$GATE_PID" ] && kill -0 "$GATE_PID" 2>/dev/null; then
         docker rm -f "k2-lab-gate-$$" >/dev/null 2>&1
@@ -130,6 +150,41 @@ finish() {
     rc=${PIPESTATUS[0]}
     say "bundle: ${RUN#$LAB_REPO/}/ (open report.html first)"
     exit "$rc"
+}
+
+# ── G2: scenarios S2 to S9, chaos, invariants (topology up) ─────────────
+g2_scenarios() {
+    local only="S2,S3,S4,S5,S6,S7,S8,S9"
+    say "fleet monitor: samples.jsonl (live daemons and agent CLIs every 0.5 s)"
+    python3 -I tests/lab/lab.py fleet monitor --state "$LAB_FLEET_STATE" --out "$RUN/samples.jsonl" &
+    MONITOR_PID=$!
+    say "scenario S2: hook events land on the right agent"
+    python3 -I tests/lab/lab.py g2 --state "$LAB_FLEET_STATE" --out "$RUN/scenarios" --only S2 | tee -a "$RUN/prove.log"
+    if [ -n "$CHAOS" ]; then
+        say "chaos ${CHAOS}: on for S3 to S9 (chaos.log)"
+        python3 -I tests/lab/lab.py chaos --state "$LAB_FLEET_STATE" --seed "${CHAOS#seed=}" --out "$RUN/chaos.log" \
+            >>"$RUN/prove.log" 2>&1 &
+        CHAOS_PID=$!
+    fi
+    say "scenarios S3 to S9"
+    # Under chaos the set repeats in rounds for at least LAB_CHAOS_MIN_S (180 s),
+    # so chaos acts even where the scenarios are quick (solo).
+    python3 -I tests/lab/lab.py g2 --state "$LAB_FLEET_STATE" --out "$RUN/scenarios" --only "${only#S2,}" \
+        ${CHAOS:+--min-seconds "${LAB_CHAOS_MIN_S:-180}"} | tee -a "$RUN/prove.log"
+    if [ -n "$CHAOS_PID" ]; then
+        say "chaos: off (it restores anything it took down)"
+        kill "$CHAOS_PID" 2>/dev/null
+        wait "$CHAOS_PID" 2>/dev/null
+        CHAOS_PID=""
+    fi
+    say "settle: waiting for every outbox row to be final, then snapshotting them"
+    python3 -I tests/lab/lab.py collect --state "$LAB_FLEET_STATE" --out "$RUN/outbox-final" | tee -a "$RUN/prove.log"
+    kill "$MONITOR_PID" 2>/dev/null
+    wait "$MONITOR_PID" 2>/dev/null
+    MONITOR_PID=""
+    topo_metrics | sed 's/^/after_scenarios_/' >>"$RUN/metrics.csv"
+    say "invariants I1 to I4"
+    python3 -I tests/lab/lab.py invariants --run-dir "$RUN" --layout "$TOPOLOGY" | tee -a "$RUN/prove.log"
 }
 
 # ── Node for the must-not-break suite (22.18+) ──────────────────────────
@@ -200,7 +255,9 @@ for k, note in notes.items():
     print("%s,%s,ms,%s" % (k, m.get(k, "NA"), note))
 PY
     topo_metrics | sed 's/^daemon_rss,/daemon_rss_after_s1,/' >>"$RUN/metrics.csv"
-    if [ "$PARITY" = full ]; then
+    if [ "$GATE" = G2 ]; then
+        g2_scenarios
+    elif [ "$PARITY" = full ]; then
         say "parity: tier 1 against the solo daemon"
         parity_tier1
     fi
@@ -211,10 +268,24 @@ import json, sys
 json.dump({"scenario": "S1", "title": "Spawn, attach, type, see output", "status": "not_run",
            "reason": "topology failed to start: " + sys.argv[2], "checks": []}, open(sys.argv[1], "w"), indent=2)
 PY
-    [ "$PARITY" = full ] && result_json tier1 "tests/behavior-test-tier1.sh" not_run "the solo daemon did not start" "" - 0
+    [ "$PARITY" = full ] && [ "$GATE" = G0 ] && result_json tier1 "tests/behavior-test-tier1.sh" not_run "the solo daemon did not start" "" - 0
 fi
 topo_down
 say "topology $TOPOLOGY: down"
+# G2: tier 1 against today's solo daemon, exactly as at G0 (I5 compares it).
+if [ "$GATE" = G2 ] && [ "$PARITY" = full ]; then
+    say "parity: tier 1 against a solo daemon (scripts/lab/topology/solo.sh, as at G0)"
+    (
+        source "$LAB_REPO/scripts/lab/topology/solo.sh"
+        trap topo_down EXIT
+        mkdir -p "$RUN/topology/tier1-solo"
+        if topo_up "$RUN/topology/tier1-solo" 2>"$RUN/topology/tier1-solo/up.err"; then
+            parity_tier1
+        else
+            result_json tier1 "tests/behavior-test-tier1.sh" not_run "the solo daemon did not start: $(tail -1 "$RUN/topology/tier1-solo/up.err")" "" - 0
+        fi
+    )
+fi
 
 # ── The other parity suites ─────────────────────────────────────────────
 if [ "$PARITY" = full ]; then
@@ -234,7 +305,14 @@ else
 fi
 
 # ── Flows, baseline, report ─────────────────────────────────────────────
-python3 -I tests/lab/lab.py flows --flows-dir docs/prd/flows --trace "$RUN/scenarios/S1.trace.jsonl" \
+FLOW_TRACE="$RUN/scenarios/S1.trace.jsonl"
+if [ "$GATE" = G2 ] && [ -d "$RUN/traces" ]; then
+    # Every trace of the run in one file: the lab's S1 events, each
+    # daemon's and each host's fake agents.
+    FLOW_TRACE="$RUN/traces/all.jsonl"
+    cat "$RUN/scenarios/S1.trace.jsonl" "$RUN"/traces/*.daemon.jsonl "$RUN"/traces/*.fake.jsonl 2>/dev/null >"$FLOW_TRACE"
+fi
+python3 -I tests/lab/lab.py flows --flows-dir docs/prd/flows --trace "$FLOW_TRACE" \
     --out "$RUN/flows.json" >>"$RUN/prove.log" 2>&1 \
     || python3 -I tests/lab/lab.py flows --flows-dir docs/prd/flows --out "$RUN/flows.json" >>"$RUN/prove.log" 2>&1
 if [ "$RECORD_BASELINE" = 1 ]; then

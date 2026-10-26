@@ -11,6 +11,13 @@ scenarios, invariants, report) is the same for every topology.
 | `topo_metrics` | Current resource use. | Lines `metric,value,unit,note` on stdout (at least `daemon_rss`) |
 | `topo_down` | Stop everything `topo_up` started and remove its temp dirs. Safe to call twice. | |
 
+Gate G2 uses `fleet.sh` for both of its topologies (`LAB_FLEET_LAYOUT` =
+`fleet` or `solo`): it runs the processes through `tests/lab/labkit/fleet.py`
+and also exports `LAB_FLEET_STATE`, the state file scenarios, chaos and the
+invariant checkers read (ports, pids or container ids, homes, trace files).
+`LAB_FLEET_BACKEND=compose` runs the fleet layout as
+`deploy/compose/compose.lab-fleet.yaml` (`scripts/lab/lib/compose.sh`).
+
 Wave 1 ships `solo` (today's daemon on this machine, in-process agent host).
 `container` (from the `image` task), `fleet` (Compose: controller plus two
 hosts) and `kind` plug in here as `container.sh`, `fleet.sh`, `kind.sh`;

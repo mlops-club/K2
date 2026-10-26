@@ -1,0 +1,98 @@
+# The K2 lab's fleet topology on Docker Compose (PRD section 3, "Fleet is
+# Docker Compose with one controller and two hosts standing in for VMs").
+# TEST ONLY: agents are k2-fake-agent. Started by the lab, not by hand:
+#
+#   LAB_FLEET_BACKEND=compose scripts/lab/prove.sh G2 --topology fleet
+#
+# scripts/lab/lib/compose.sh builds the image (k2-lab-fleet:<sha>), writes
+# the host token and fills every LAB_* variable below. Paths are the same
+# inside and outside the containers (bind mounts at identical absolute
+# paths under /private/tmp), so the lab reads agent homes and workspaces
+# directly; traces are mounted at /lab/traces. Each daemon listens on its
+# own port inside and outside (K2_DAEMON_PORT = the published port), as in
+# the procs backend. Every container is capped at 3 GB and 2 CPUs.
+#
+# Env contract: docs/prd/progress/dist-link.md, "Env contract".
+
+name: ${LAB_COMPOSE_PROJECT:-k2-lab-fleet}
+
+x-daemon: &daemon
+  image: ${LAB_FLEET_IMAGE:?set by scripts/lab/lib/compose.sh}
+  init: false            # tini is the image's entrypoint
+  user: "0:0"
+  mem_limit: 3g
+  memswap_limit: 3g
+  cpus: 2
+  stop_grace_period: 2m  # a host's SIGTERM drain (S8) gets time; the lab kills with SIGKILL for chaos
+  networks: [fleet]
+  volumes:
+    - ${LAB_ROOT:?}:${LAB_ROOT:?}
+    - ${LAB_TRACES:?}:/lab/traces
+
+x-host-env: &host-env
+  PATH: /opt/k2-shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  LANG: C.UTF-8
+  K2_ROLE: host
+  K2_LISTEN: lan
+  K2_CONTROLLER_URL: ws://controller:${LAB_CTL_PORT:?}
+  K2_HOST_ENROLL_TOKEN_FILE: ${LAB_ROOT:?}/host-token
+  K2_TEST_AGENT_SHIM_DIR: /opt/k2-shim
+  K2_FAKE_AGENT_TURN_MS: ${LAB_TURN_MS:-300}
+  K2_FAKE_AGENT_SEED: ${LAB_SEED:-0}
+
+services:
+  controller:
+    <<: *daemon
+    hostname: controller
+    environment:
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      LANG: C.UTF-8
+      HOME: ${LAB_ROOT:?}/controller/home
+      K2_HOME: ${LAB_ROOT:?}/controller/home/.k2
+      TMPDIR: /tmp
+      K2_ROLE: controller
+      K2_LISTEN: lan
+      K2_HOSTS: "1"
+      K2_HOST_BOOTSTRAP_TOKEN_FILE: ${LAB_ROOT:?}/host-token
+      K2_DAEMON_PORT: ${LAB_CTL_PORT:?}
+      K2_TRACE_FILE: /lab/traces/controller.daemon.jsonl
+    working_dir: ${LAB_ROOT:?}/controller
+    ports:
+      - "127.0.0.1:${LAB_CTL_PORT:?}:${LAB_CTL_PORT:?}"
+
+  host-1:
+    <<: *daemon
+    hostname: host-1
+    environment:
+      <<: *host-env
+      HOME: ${LAB_ROOT:?}/host-1/home
+      K2_HOME: ${LAB_ROOT:?}/host-1/home/.k2
+      TMPDIR: /tmp
+      K2_HOST_NAME: host-1
+      K2_DAEMON_PORT: ${LAB_H1_PORT:?}
+      K2_TRACE_FILE: /lab/traces/host-1.daemon.jsonl
+      K2_FAKE_AGENT_TRACE: /lab/traces/host-1.fake.jsonl
+      K2_FAKE_AGENT_HOST: host-1
+    working_dir: ${LAB_ROOT:?}/host-1
+    ports:
+      - "127.0.0.1:${LAB_H1_PORT:?}:${LAB_H1_PORT:?}"
+
+  host-2:
+    <<: *daemon
+    hostname: host-2
+    environment:
+      <<: *host-env
+      HOME: ${LAB_ROOT:?}/host-2/home
+      K2_HOME: ${LAB_ROOT:?}/host-2/home/.k2
+      TMPDIR: /tmp
+      K2_HOST_NAME: host-2
+      K2_DAEMON_PORT: ${LAB_H2_PORT:?}
+      K2_TRACE_FILE: /lab/traces/host-2.daemon.jsonl
+      K2_FAKE_AGENT_TRACE: /lab/traces/host-2.fake.jsonl
+      K2_FAKE_AGENT_HOST: host-2
+    working_dir: ${LAB_ROOT:?}/host-2
+    ports:
+      - "127.0.0.1:${LAB_H2_PORT:?}:${LAB_H2_PORT:?}"
+
+networks:
+  fleet: {}

@@ -23,15 +23,23 @@
 #                        panics still carry file:line and messages)
 #   K2_GATE_KEEP=1       keep the workdir (logs, target) after the run
 #   K2_GATE_THREADS      --test-threads (default: libtest's choice)
-#   K2_GATE_LOW_MEMORY=1 for a memory-capped box (the lab's 6 GB Docker
-#                        container): one cargo build job, 256 codegen units
-#                        and opt-level 0 for the workspace default of dev and
-#                        test (packages with their own [profile.dev.package]
-#                        opt-level keep it), so the single rustc for
-#                        k2-daemon's lib test fits (it was SIGKILLed at 6 GB
-#                        with one job and 256 units at opt-level 1).
+#   K2_GATE_LOW_MEMORY=1 for a memory-capped box (the lab's 10 GB Docker
+#                        container): one cargo build job and 256 codegen
+#                        units. The profile's opt-level stays: at opt-level 0
+#                        k2-daemon's async stacks overflow (115 test binaries
+#                        and every spawned test daemon aborted on 3912ab2ff),
+#                        so a cheaper build would not be the same tests.
 #                        Debuginfo is already 0 (K2_GATE_DEBUG) and
 #                        incremental off. Unset (the default), nothing changes.
+#   K2_GATE_BATCH=N      for a box with little disk (the lab's Docker VM):
+#                        run each package's tests in steps instead of one
+#                        `cargo test -p`: lib + bins, then the
+#                        integration tests N targets at a time, then the
+#                        doctests, removing the linked test executables after
+#                        each step. Same tests, same flags; k2-daemon's ~160
+#                        test binaries otherwise need ~25 GB linked at once.
+#                        Logs: <pkg>.log, <pkg>-tests-NN.log, <pkg>-doc.log.
+#                        Unset or 0 (the default), one `cargo test -p`.
 #   K2_GATE_REALPG_PORT / K2_GATE_REALPG_SOCK / K2_GATE_REALPG_BIN
 #                        a throwaway Postgres 16 cluster (TCP port, socket dir,
 #                        bin dir with psql): set all three and the gate RUNS
@@ -96,24 +104,45 @@ RUSTUP_HOME_DIR=${RUSTUP_HOME:-$HOME/.rustup}
 THREAD_ARGS=()
 [ -n "${K2_GATE_THREADS:-}" ] && THREAD_ARGS=(-- "--test-threads=$K2_GATE_THREADS")
 
+# K2_GATE_TEST_USER=<user>: when the gate runs as root (a container), run
+# the build and the package tests as this unprivileged user, so tests that
+# check ownership see what they see on a developer's machine; the root-only
+# allowlisted runs below stay root. The workdir is handed to that user.
+RUN_AS=()
+TEST_USER=${K2_GATE_TEST_USER:-}
+if [ -n "$TEST_USER" ]; then
+  [ "$(id -u)" -eq 0 ] || { echo "refusing to run: K2_GATE_TEST_USER needs the gate to run as root"; exit 2; }
+  id -u "$TEST_USER" >/dev/null 2>&1 || { echo "refusing to run: no user $TEST_USER (K2_GATE_TEST_USER)"; exit 2; }
+  command -v runuser >/dev/null || { echo "refusing to run: runuser not found (util-linux)"; exit 2; }
+  # Logs are written by this (root) shell's redirects, so they stay root's.
+  chown -R "$TEST_USER" "$SRC" "$WORK/target/" || { echo "chown of the workdir for $TEST_USER failed"; exit 2; }
+  RUN_AS=(runuser -u "$TEST_USER" --)
+  echo "gate: tests run as $TEST_USER (uid $(id -u "$TEST_USER")); root-only runs as root"
+fi
+
 LOW_MEM_ENV=()
 if [ "${K2_GATE_LOW_MEMORY:-0}" = 1 ]; then
-  LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256
-               CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_TEST_OPT_LEVEL=0)
+  LOW_MEM_ENV=(CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=256 CARGO_PROFILE_TEST_CODEGEN_UNITS=256)
   echo "gate: K2_GATE_LOW_MEMORY=1: ${LOW_MEM_ENV[*]}"
 fi
 
 # Run cargo in a clean environment: only what the toolchain needs, a fresh
 # HOME and TMPDIR per package, no SHELL, no K2_* / K2SO_* variables.
 # Extra VAR=value pairs for one clean_cargo call: EXTRA_ENV=(...) clean_cargo ...
+# AS=(...) clean_cargo ... runs it as someone else (default: RUN_AS).
 EXTRA_ENV=()
 clean_cargo() {
   local log=$1; shift
-  local h t rc
+  local h t rc user
+  local as=("${RUN_AS[@]+"${RUN_AS[@]}"}")
+  [ "${AS_ROOT:-0}" = 1 ] && as=()
+  user=$(id -un)
+  [ ${#as[@]} -gt 0 ] && user=$TEST_USER
   h=$(mktemp -d "${TMPDIR:-/tmp}/k2-gate-home-XXXXXX")
   t=$(mktemp -d "${TMPDIR:-/tmp}/k2-gate-tmp-XXXXXX")
-  ( cd "$SRC" && env -i \
-      HOME="$h" TMPDIR="$t" PATH="$TOOL_PATH" USER="$(id -un)" LANG=C.UTF-8 \
+  [ ${#as[@]} -gt 0 ] && chown "$user" "$h" "$t"
+  ( cd "$SRC" && ${as[@]+"${as[@]}"} env -i \
+      HOME="$h" TMPDIR="$t" PATH="$TOOL_PATH" USER="$user" LANG=C.UTF-8 \
       CARGO_HOME="$CARGO_HOME_DIR" RUSTUP_HOME="$RUSTUP_HOME_DIR" \
       CARGO_TARGET_DIR="$WORK/target" CARGO_INCREMENTAL=0 \
       CARGO_PROFILE_DEV_DEBUG="${K2_GATE_DEBUG:-0}" CARGO_PROFILE_TEST_DEBUG="${K2_GATE_DEBUG:-0}" \
@@ -134,10 +163,42 @@ echo "gate: cargo build -p k2-ptyd --bin k2-ptyd (ptyd_backend needs the binary)
 if ! clean_cargo "$LOGS/k2-ptyd-bin.log" build -p k2-ptyd --bin k2-ptyd; then
   STATUS=1
 fi
+# Linked test and bin executables in deps/ (the libraries stay, so a later
+# step or run relinks instead of rebuilding; target/debug/<bin> copies stay).
+drop_linked() {
+  find "$WORK/target/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' -delete 2>/dev/null
+}
+BATCH=${K2_GATE_BATCH:-0}
 for pkg in k2-core k2-daemon; do
-  echo "gate: cargo test -p $pkg --no-fail-fast"
-  if ! clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --no-fail-fast "${THREAD_ARGS[@]}"; then
-    STATUS=1
+  if [ "$BATCH" -gt 0 ] 2>/dev/null; then
+    echo "gate: cargo test -p $pkg --no-fail-fast, in steps of $BATCH integration tests (K2_GATE_BATCH)"
+    clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --lib --bins --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+    drop_linked
+    # Integration test targets, as cargo discovers them: tests/*.rs and
+    # tests/<dir>/main.rs.
+    dir="$SRC/crates/$pkg/tests"
+    TESTS=()
+    if [ -d "$dir" ]; then
+      while IFS= read -r t; do TESTS+=("$t"); done < <(
+        { for f in "$dir"/*.rs; do [ -f "$f" ] && basename "$f" .rs; done
+          for f in "$dir"/*/main.rs; do [ -f "$f" ] && basename "$(dirname "$f")"; done; } | sort)
+    fi
+    n=0
+    for ((i = 0; i < ${#TESTS[@]}; i += BATCH)); do
+      n=$((n + 1))
+      args=()
+      for t in "${TESTS[@]:i:BATCH}"; do args+=(--test "$t"); done
+      clean_cargo "$LOGS/$pkg-tests-$(printf %02d $n).log" test -p "$pkg" "${args[@]}" --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+      drop_linked
+    done
+    echo "gate: $pkg: ${#TESTS[@]} integration test targets in $n steps"
+    clean_cargo "$LOGS/$pkg-doc.log" test -p "$pkg" --doc --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+    drop_linked
+  else
+    echo "gate: cargo test -p $pkg --no-fail-fast"
+    if ! clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --no-fail-fast "${THREAD_ARGS[@]}"; then
+      STATUS=1
+    fi
   fi
   echo "gate: $pkg done (exit $([ $STATUS -eq 0 ] && echo 0 || echo non-zero so far), free $(avail_gb "$WORK")G)"
 done
@@ -146,7 +207,7 @@ if [ "$(id -u)" -eq 0 ]; then
   for entry in "${ROOT_RUNS[@]}"; do
     pkg=${entry%% *}; filter=${entry#* }
     echo "gate: root-only: $pkg $filter"
-    if ! clean_cargo "$LOGS/root-${filter//::/_}.log" test -p "$pkg" --lib -- --ignored --exact "$filter"; then
+    if ! AS_ROOT=1 clean_cargo "$LOGS/root-${filter//::/_}.log" test -p "$pkg" --lib -- --ignored --exact "$filter"; then
       STATUS=1
     fi
   done
@@ -187,7 +248,7 @@ COMPILE_ERR=$(grep -h -E '^error(\[E[0-9]+\])?: ' "$LOGS"/*.log | sort -u)
 
 echo
 echo "== ignored =="
-IGNORED=$(grep -h -E '^test .* \.\.\. ignored' "$LOGS"/k2-core.log "$LOGS"/k2-daemon.log \
+IGNORED=$(grep -h -E '^test .* \.\.\. ignored' "$LOGS"/k2-core*.log "$LOGS"/k2-daemon*.log \
   | sed -E 's/^test (.*) \.\.\. ignored.*$/\1/' | sort -u)
 echo "${IGNORED:-(none)}"
 UNEXPECTED=""
@@ -206,6 +267,16 @@ fi
 
 echo
 if [ $STATUS -eq 0 ]; then echo "GATE GREEN ($FULL_SHA)"; else echo "GATE RED ($FULL_SHA)"; fi
+# Keep a reused target dir bounded (the lab's Docker run links target/ to a
+# volume that outlives the run, so the removal below only drops the link):
+# drop incremental state and the linked test and bin executables; the
+# compiled libraries stay, so the next run relinks instead of rebuilding.
+if [ -d "$WORK/target/debug" ]; then
+  before=$(du -sh "$WORK/target/" 2>/dev/null | cut -f1)
+  rm -rf "$WORK/target/debug/incremental"
+  drop_linked
+  echo "(target trimmed: $before -> $(du -sh "$WORK/target/" 2>/dev/null | cut -f1): incremental and linked executables removed)"
+fi
 if [ "${K2_GATE_KEEP:-0}" != "1" ]; then
   rm -rf "$WORK/target" "$SRC"
   echo "(target + src removed; logs kept in $LOGS)"

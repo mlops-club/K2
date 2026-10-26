@@ -21,14 +21,22 @@
 //!   K2's `notify.sh` sees `K2_HOOK_SOCK`, `K2_HOOK_TOKEN`, `K2_PANE_ID` and
 //!   `$PPID` exactly as it does under the real CLI;
 //! - `--resume <id>` keeps the session id and never rewrites the memory
-//!   file (invariant I3); only a prompt starting with `remember ` appends to
-//!   it.
+//!   file (invariant I3); only a prompt starting with `remember ` (or
+//!   holding a `[[remember: text]]` directive) appends to it.
+//!
+//! Directives, anywhere in a prompt (so they survive `k2 msg`'s `[from …]`
+//! prefix): `[[turn-ms=N]]` makes this turn last N ms (at most 10 min), for
+//! scenarios that interrupt a turn; `[[remember: text]]` appends to the
+//! memory file like a `remember ` prompt.
 //!
 //! With `K2_FAKE_AGENT_TRACE=<file>` it also appends its own trace events
 //! (the lab trace format, `docs/prd/progress/lab.md`) to that file:
 //! `cli.exec`, `cli.hook` (before the hook command runs), `cli.hook.done`
 //! (after, with its exit status), `cli.turn.start`, `cli.turn.end`,
-//! `cli.exit`.
+//! `cli.exit`. Each carries `host` (`K2_FAKE_AGENT_HOST`, the lab's name for
+//! the host that spawned it); `cli.exec` has the cwd, and `cli.exec`,
+//! `cli.turn.end` and `cli.exit` the sha256 of the memory file (`absent` when
+//! there is none), so the lab can check I3 across a resume.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -38,6 +46,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// The version `--version` reports. At or above K2's full hook set floor
 /// (`CLAUDE_FULL_SET_FLOOR`, 2.1.292), so the daemon installs every hook.
@@ -194,6 +203,42 @@ pub fn turn_duration_ms(turn_ms: u64, seed: u64, n: u64) -> u64 {
 }
 
 /// The reply line for turn `n`.
+/// The longest turn a `[[turn-ms=N]]` directive may ask for.
+pub const MAX_DIRECTIVE_TURN_MS: u64 = 600_000;
+
+/// Directives in a prompt: `[[turn-ms=N]]` (the last one wins, capped at
+/// [`MAX_DIRECTIVE_TURN_MS`]) and every `[[remember: text]]`, in order.
+/// Malformed directives are ignored (they stay plain prompt text).
+pub fn directives(prompt: &str) -> (Option<u64>, Vec<String>) {
+    let mut turn_ms = None;
+    let mut remember = Vec::new();
+    let mut rest = prompt;
+    while let Some(start) = rest.find("[[") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else { break };
+        let body = after[..end].trim();
+        if let Some(n) = body.strip_prefix("turn-ms=") {
+            if let Ok(n) = n.trim().parse::<u64>() {
+                turn_ms = Some(n.min(MAX_DIRECTIVE_TURN_MS));
+            }
+        } else if let Some(text) = body.strip_prefix("remember:") {
+            if !text.trim().is_empty() {
+                remember.push(text.trim().to_string());
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    (turn_ms, remember)
+}
+
+/// sha256 (hex) of the file at `path`, or `absent` when there is none.
+pub fn file_sha256(path: &Path) -> String {
+    match fs::read(path) {
+        Ok(bytes) => Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => "absent".to_string(),
+    }
+}
+
 pub fn reply_text(n: u64, prompt: &str) -> String {
     format!("{REPLY_MARKER}{n}: {prompt}")
 }
@@ -410,6 +455,7 @@ pub struct Session {
     pub seed: u64,
     settings_files: Vec<PathBuf>,
     trace: Option<PathBuf>,
+    host: Option<String>,
     pane: Option<String>,
     last_uuid: Option<String>,
     turns: u64,
@@ -477,6 +523,7 @@ impl Session {
             seed,
             settings_files,
             trace: env.get("K2_FAKE_AGENT_TRACE").filter(|t| !t.is_empty()).map(PathBuf::from),
+            host: env.get("K2_FAKE_AGENT_HOST").filter(|h| !h.is_empty()),
             pane: env.get("K2_PANE_ID").or_else(|| env.get("K2SO_PANE_ID")),
             last_uuid,
             turns,
@@ -494,6 +541,7 @@ impl Session {
             "ts": now(),
             "event": event,
             "src": "k2-fake-agent",
+            "host": self.host,
             "session_id": self.id,
             "pane": self.pane,
             "pid": std::process::id(),
@@ -555,10 +603,24 @@ impl Session {
         Ok(())
     }
 
-    /// `remember <text>` appends `- <text>` to MEMORY.md (creating it with
-    /// a `# Memory` header). Nothing else ever writes the memory file.
+    /// sha256 of the memory file now (`absent` when there is none).
+    pub fn memory_sha256(&self) -> String {
+        file_sha256(&self.paths.memory())
+    }
+
+    /// `remember <text>` and each `[[remember: text]]` append `- <text>` to
+    /// MEMORY.md (creating it with a `# Memory` header). Nothing else ever
+    /// writes the memory file.
     fn remember(&self, prompt: &str) -> Result<(), String> {
-        let Some(text) = prompt.strip_prefix("remember ") else { return Ok(()) };
+        let mut texts: Vec<String> = prompt.strip_prefix("remember ").map(|t| t.to_string()).into_iter().collect();
+        texts.extend(directives(prompt).1);
+        for text in texts {
+            self.remember_one(&text)?;
+        }
+        Ok(())
+    }
+
+    fn remember_one(&self, text: &str) -> Result<(), String> {
         let path = self.paths.memory();
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -583,7 +645,7 @@ impl Session {
         self.trace("cli.turn.start", json!({ "turn": n }));
         self.fire("UserPromptSubmit", None, json!({ "prompt": prompt }));
         self.append_entry("user", json!({ "role": "user", "content": prompt }))?;
-        let ms = turn_duration_ms(self.turn_ms, self.seed, n);
+        let ms = directives(prompt).0.unwrap_or_else(|| turn_duration_ms(self.turn_ms, self.seed, n));
         std::thread::sleep(Duration::from_millis(ms));
         self.remember(prompt)?;
         let reply = reply_text(n, prompt);
@@ -597,7 +659,7 @@ impl Session {
                 "content": [{ "type": "text", "text": reply }],
             }),
         )?;
-        self.trace("cli.turn.end", json!({ "turn": n, "turn_ms": ms }));
+        self.trace("cli.turn.end", json!({ "turn": n, "turn_ms": ms, "memory_sha256": self.memory_sha256() }));
         self.fire("Stop", None, json!({ "stop_hook_active": false }));
         Ok(reply)
     }
@@ -730,7 +792,16 @@ pub fn run(name: &str, argv: &[String], env: &Env, input: &mut dyn BufRead, out:
         }
     };
     let source = if s.resumed { "resume" } else { "startup" };
-    s.trace("cli.exec", json!({ "as": name, "argv": argv, "resumed": s.resumed }));
+    s.trace(
+        "cli.exec",
+        json!({
+            "as": name,
+            "argv": argv,
+            "resumed": s.resumed,
+            "cwd": s.cwd.to_string_lossy(),
+            "memory_sha256": s.memory_sha256(),
+        }),
+    );
     s.fire("SessionStart", Some(source), json!({ "source": source }));
     if args.print {
         let prompt = args.prompt.clone().unwrap_or_default();
@@ -742,7 +813,7 @@ pub fn run(name: &str, argv: &[String], env: &Env, input: &mut dyn BufRead, out:
             }
         };
         s.fire("SessionEnd", None, json!({ "reason": "other" }));
-        s.trace("cli.exit", json!({ "code": code }));
+        s.trace("cli.exit", json!({ "code": code, "memory_sha256": s.memory_sha256() }));
         return code;
     }
     let _ = writeln!(
@@ -787,7 +858,7 @@ pub fn run(name: &str, argv: &[String], env: &Env, input: &mut dyn BufRead, out:
         }
     }
     s.fire("SessionEnd", None, json!({ "reason": reason }));
-    s.trace("cli.exit", json!({ "code": code }));
+    s.trace("cli.exit", json!({ "code": code, "memory_sha256": s.memory_sha256() }));
     code
 }
 
@@ -797,6 +868,26 @@ mod tests {
 
     fn a(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn directives_are_found_anywhere_in_a_prompt() {
+        let (ms, rem) = directives("[from lab] go [[turn-ms=8000]] and [[remember: the sky is green]] [[remember:x]]");
+        assert_eq!(ms, Some(8000));
+        assert_eq!(rem, vec!["the sky is green".to_string(), "x".to_string()]);
+        assert_eq!(directives("[[turn-ms=99999999]]").0, Some(MAX_DIRECTIVE_TURN_MS));
+        assert_eq!(directives("plain [[turn-ms=abc]] [[remember: ]] [[open"), (None, vec![]));
+    }
+
+    #[test]
+    fn file_sha256_is_hex_or_absent() {
+        let dir = std::env::temp_dir().join(format!("k2fa-sha-{}-{}", std::process::id(), new_uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("m");
+        assert_eq!(file_sha256(&f), "absent");
+        fs::write(&f, b"abc").unwrap();
+        assert_eq!(file_sha256(&f), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

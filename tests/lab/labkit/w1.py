@@ -51,9 +51,11 @@ import uuid
 if __package__ in (None, ""):
     # Run as a script: make `labkit` importable from tests/lab.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from labkit import g2  # noqa: E402
     from labkit import s1  # noqa: E402
     from labkit import ws as wslib  # noqa: E402
 else:
+    from . import g2  # noqa: E402
     from . import s1  # noqa: E402
     from . import ws as wslib  # noqa: E402
 
@@ -76,9 +78,11 @@ def read_jsonl(path):
                 line = line.strip()
                 if line:
                     try:
-                        out.append(json.loads(line))
+                        v = json.loads(line)
                     except ValueError:
-                        pass
+                        continue
+                    if isinstance(v, dict):  # a CLI killed mid-write leaves a torn line
+                        out.append(v)
     return out
 
 
@@ -104,7 +108,10 @@ def wait_until(fn, deadline=DEADLINE_S, poll=0.1):
 class W1:
     def __init__(self, a, token):
         self.a, self.token = a, token
-        self.port, self.home, self.out = a.port, a.home, a.out
+        self.port, self.out = a.port, a.out
+        # One home (solo) or one per host (fleet): an agent's transcript is
+        # in the home of whichever host ran it.
+        self.homes = list(a.home) if isinstance(a.home, (list, tuple)) else [a.home]
         self.fake_trace = a.fake_trace
         self.checks, self.log_lines, self.flows = [], [], {}
         self.tag = uuid.uuid4().hex[:6]
@@ -124,8 +131,11 @@ class W1:
         """JSON body (`body`) or form-encoded body (`form`). Returns
         (status, text, parsed-json-or-{})."""
         q = dict(query or {})
-        q["token"] = self.token
-        url = "http://127.0.0.1:%d%s?%s" % (self.port, path, urllib.parse.urlencode(q))
+
+        def url():
+            # A restarted daemon has a new token (--chaos): read it each time.
+            q["token"] = self.token_fn() if getattr(self, "token_fn", None) else self.token
+            return "http://127.0.0.1:%d%s?%s" % (self.port, path, urllib.parse.urlencode(q))
         headers = {}
         if form is not None:
             data = urllib.parse.urlencode(form).encode()
@@ -135,15 +145,10 @@ class W1:
             headers["Content-Type"] = "application/json"
         else:
             data = b"" if method == "POST" else None
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         shown = form if form is not None else body
-        try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
-                status, text = r.status, r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            status, text = e.code, e.read().decode("utf-8", "replace")
-        except OSError as e:
-            status, text = 0, "request failed: %s" % e
+        # Waits while the daemon is down or booting (--chaos), as the app does.
+        status, text = g2.send_waiting_for_daemon(
+            lambda: urllib.request.Request(url(), data=data, method=method, headers=headers), self.log, method, path)
         self.log("%s %s %s -> %s %s" % (method, path, json.dumps(shown), status, text[:600]))
         try:
             parsed = json.loads(text)
@@ -175,8 +180,12 @@ class W1:
                           status == 200, "HTTP %s %s" % (status, text[:200]))
 
     def transcripts(self, cwd):
-        d = os.path.join(self.home, ".claude", "projects", s1.claude_project_slug(cwd))
-        return sorted(glob.glob(os.path.join(d, "*.jsonl")))
+        slug = s1.claude_project_slug(cwd)
+        return sorted(p for home in self.homes
+                      for p in glob.glob(os.path.join(home, ".claude", "projects", slug, "*.jsonl")))
+
+    def _home_of(self, path):
+        return next((h for h in self.homes if path.startswith(os.path.join(h, ""))), self.homes[0])
 
     def find_turn(self, cwd, needle, session=None):
         """The transcript turn whose user prompt contains `needle`:
@@ -198,7 +207,7 @@ class W1:
                             if isinstance(part, dict) and part.get("type") == "text":
                                 replies.append(part.get("text", ""))
                     return {"session": sid, "prompt": content, "replies": replies,
-                            "file": os.path.relpath(path, self.home)}
+                            "file": os.path.relpath(path, self._home_of(path))}
         return None
 
     def wait_turn_done(self, cwd, needle, session=None):
@@ -207,6 +216,30 @@ class W1:
             t = self.find_turn(cwd, needle, session)
             return t if t and any(REPLY_MARKER in r and needle in r for r in t["replies"]) else None
         return wait_until(done) or self.find_turn(cwd, needle, session)
+
+    def cli_dead(self, session):
+        """True when the newest CLI of `session` is gone (a --chaos kill, or
+        the solo daemon's restart, which ends every agent PTY)."""
+        ex = (self.fake_events("cli.exec", session) or [{}])[-1]
+        pid = ex.get("pid")
+        if not pid:
+            return False
+        alive = self.cli_alive_fn(ex.get("host"), pid) if getattr(self, "cli_alive_fn", None) else pid_alive(pid)
+        return not alive
+
+    def turn_or_again(self, info, cwd, text, again, session=None):
+        """wait_turn_done; when the CLI that took the prompt died before
+        answering, the turn in progress is lost (PRD failure table): do it
+        again once with a fresh prompt made by `again()` (send the message
+        again, fire again). Counted in info. Returns (turn, text)."""
+        turn = self.wait_turn_done(cwd, text, session)
+        answered = turn and any(REPLY_MARKER in r and text in r for r in turn["replies"])
+        if turn and not answered and self.cli_dead(turn["session"]):
+            info["again_after_cli_death"] = info.get("again_after_cli_death", 0) + 1
+            self.log("the CLI died before answering %r: doing it again" % text)
+            text = again()
+            turn = self.wait_turn_done(cwd, text, session)
+        return turn, text
 
     def fake_events(self, event, session):
         return [e for e in read_jsonl(self.fake_trace)
@@ -251,7 +284,8 @@ class W1:
         grid = s1.Grid()
         try:
             sock = wslib.WebSocket("127.0.0.1", self.port, "/cli/sessions/grid?" + urllib.parse.urlencode(
-                {"session": sid, "token": self.token}), timeout=DEADLINE_S)
+                {"session": sid, "token": self.token_fn() if getattr(self, "token_fn", None) else self.token}),
+                timeout=DEADLINE_S)
         except (OSError, wslib.WsError) as e:
             self.check(f, "attach WS /cli/sessions/grid", False, str(e))
             return
@@ -338,7 +372,11 @@ class W1:
                           status == 200 and resp.get("success") is True and resp.get("woke") is True,
                           "HTTP %s %s" % (status, raw[:300])):
             return
-        turn = self.wait_turn_done(cwd, text1)
+        def again1():
+            t = "w1 wake %s" % uuid.uuid4().hex[:6]
+            self.send_msg(info, "wake1-again", cwd, t, wake=True)
+            return t
+        turn, text1 = self.turn_or_again(info, cwd, text1, again1)
         info["turn1"] = turn
         ok = bool(turn) and any(REPLY_MARKER in r and text1 in r for r in turn["replies"])
         self.check(f, "the woken agent got the message and answered (transcript)", ok,
@@ -368,7 +406,11 @@ class W1:
         status, raw, resp = self.send_msg(info, "wake2", cwd, text2, wake=True)
         self.check(f, "a second msg wakes it again", status == 200 and resp.get("success") is True
                    and resp.get("woke") is True, "HTTP %s %s" % (status, raw[:300]))
-        turn2 = self.wait_turn_done(cwd, text2)
+        def again2():
+            t = "w1 wake-again %s" % uuid.uuid4().hex[:6]
+            self.send_msg(info, "wake2-again", cwd, t, wake=True)
+            return t
+        turn2, text2 = self.turn_or_again(info, cwd, text2, again2)
         info["turn2"] = turn2
         self.check(f, "the second wake resumed the same conversation (same session id, answered)",
                    bool(turn2) and turn2["session"] == csid
@@ -413,7 +455,10 @@ class W1:
                               resp.get("terminalId") or resp.get("targetSessionId"))
                           if status == 200 else "HTTP %s %s" % (status, raw[:300])):
             return
-        turn = self.wait_turn_done(cwd, marker)
+        def fire_again():
+            self.http("POST", "/cli/heartbeat/fire", body=fire)
+            return marker  # the same WAKEUP.md instructions
+        turn, _ = self.turn_or_again(info, cwd, marker, fire_again)
         info["turn"] = turn
         self.check(f, "the agent got the wakeup prompt and answered (transcript)",
                    bool(turn) and any(REPLY_MARKER in r and marker in r for r in turn["replies"]),
@@ -449,7 +494,8 @@ def main(argv):
     p = argparse.ArgumentParser(prog="w1.py", description=__doc__.split("\n\n")[0])
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--token-file", required=True)
-    p.add_argument("--home", required=True, help="the agents' HOME (transcripts under .claude/projects)")
+    p.add_argument("--home", required=True, action="append",
+                   help="the agents' HOME (transcripts under .claude/projects); repeat for one per host")
     p.add_argument("--workspace", required=True, help="a dir to create the flows' workspaces under")
     p.add_argument("--out", required=True)
     p.add_argument("--fake-trace", default=None, help="K2_FAKE_AGENT_TRACE file (extra evidence)")

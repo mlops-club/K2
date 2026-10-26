@@ -40,7 +40,24 @@ SCENARIOS = {
         ("S7", "CLI killed mid-turn, next need resumes", False),
     ],
 }
+# G2 (PRD matrix): S1 to S7 on solo; S1 to S9 on fleet (S8, S9 are "-" on
+# solo, so not run there). S12 is required from G0 on and has no client yet.
+_G2 = [
+    ("S1", "Spawn, attach, type, see output"),
+    ("S2", "Hook events land on the right agent"),
+    ("S3", "k2 msg between agents on different hosts"),
+    ("S4", "Message wakes a sleeping agent"),
+    ("S5", "Heartbeat fires on a sleeping agent"),
+    ("S6", "Inbox delivery survives restarts"),
+    ("S7", "CLI killed mid-turn, next need resumes"),
+    ("S8", "Host killed mid-turn, nothing lost silently"),
+    ("S9", "Controller restart, agents keep running"),
+    ("S12", "Postgres, Apps, mail, Sew, front door parity"),
+]
+SCENARIOS[("G2", "fleet")] = [(sid, title, True) for sid, title in _G2]
+SCENARIOS[("G2", "solo")] = [(sid, title, sid not in ("S8", "S9")) for sid, title in _G2]
 NOT_BUILT = "not implemented in wave 1 (the lab ships S1 only)"
+NOT_BUILT_BY = {"S12": "no S12 client yet (Postgres, Apps, mail, Sew, front door): not built by the lab"}
 
 INVARIANTS = [
     ("I1", "An agent has at most one live placement (epochs)"),
@@ -136,8 +153,11 @@ def build(run_dir):
     for sid, title, req in SCENARIOS.get((gate, topo), []):
         r = _maybe(os.path.join(run_dir, "scenarios", sid + ".json"))
         if r is None:
-            r = {"scenario": sid, "title": title, "status": "not_run",
-                 "reason": NOT_BUILT if sid != "S1" else "no result written", "checks": []}
+            if gate == "G0":
+                why = NOT_BUILT if sid != "S1" else "no result written"
+            else:
+                why = NOT_BUILT_BY.get(sid, "no result written")
+            r = {"scenario": sid, "title": title, "status": "not_run", "reason": why, "checks": []}
         r["required"] = req
         scenarios.append(r)
         if req:
@@ -146,9 +166,16 @@ def build(run_dir):
 
     invariants = []
     na = INVARIANT_NA.get((gate, topo), {})
+    # G2 runs write invariants.json (labkit/invariants.py, I1 to I4).
+    judged = {r["id"]: r for r in (_maybe(os.path.join(run_dir, "invariants.json")) or [])}
     for iid, title in INVARIANTS:
         if iid in na:
             invariants.append({"id": iid, "title": title, "status": "n/a", "reason": na[iid], "required": False})
+            continue
+        if iid in judged:
+            j = judged[iid]
+            invariants.append({"id": iid, "title": title, "status": j["status"], "reason": j.get("reason"),
+                               "diffs": j.get("diffs", []), "required": True})
             continue
         if iid != "I5":
             invariants.append({"id": iid, "title": title, "status": "not_run",
@@ -182,6 +209,16 @@ def build(run_dir):
     demo = {"file": "demo.cast"} if os.path.isfile(os.path.join(run_dir, "demo.cast")) else {
         "file": None, "reason": run.get("demo_reason") or "asciinema is not installed; scenarios/S1.cast has the client's screen instead"}
 
+    chaos = None
+    cpath = os.path.join(run_dir, "chaos.log")
+    if os.path.isfile(cpath):
+        with open(cpath) as fh:
+            steps = [json.loads(l) for l in fh if l.strip()]
+        acted = [s for s in steps if s.get("action") in ("SIGKILL",)]
+        chaos = {"file": "chaos.log", "steps": len([s for s in steps if s.get("kind")]), "kills": len(acted),
+                 "skipped": len([s for s in steps if s.get("action") == "skipped"]),
+                 "targets": sorted({"%s %s" % (s.get("kind"), s.get("target")) for s in acted})}
+
     verdict = "pass" if required and all(r["status"] == "pass" for r in required) else "fail"
     return {
         "gate": gate, "topology": topo, "sha": run["sha"], "branch": run.get("branch"),
@@ -189,7 +226,7 @@ def build(run_dir):
         "parity_mode": run.get("parity"), "chaos": run.get("chaos"),
         "verdict": verdict, "required": required,
         "parity": [parity[s] for s, _ in PARITY_SUITES], "scenarios": scenarios,
-        "invariants": invariants, "flows": flows, "metrics": metrics, "demo": demo,
+        "invariants": invariants, "flows": flows, "metrics": metrics, "demo": demo, "chaos_log": chaos,
         "notes": run.get("notes", []),
     }
 
@@ -318,6 +355,13 @@ def render_html(rep):
         w("<tr><td><b>%s</b> %s</td><td>%s</td><td class='reason'>%s%s</td></tr>"
           % (_e(i["id"]), _e(i["title"]), _chip(i["status"]), _e(i.get("reason")), diffs))
     w("</table>")
+
+    if rep.get("chaos_log"):
+        c = rep["chaos_log"]
+        w("<h2>Chaos</h2><p>seed <code>%s</code> · %d steps · %d kills · %d skipped (a scenario held the fleet) · %s</p>"
+          % (_e(rep.get("chaos")), c["steps"], c["kills"], c["skipped"], _link(c["file"])))
+        if c["targets"]:
+            w("<p class='reason'>killed: %s</p>" % _e(", ".join(c["targets"])))
 
     w("<h2>Flows: the PRD's sequence diagrams as expected traces</h2>")
     w("<p class='reason'>Expected only until the daemon emits trace events (wave 2). Steps the lab or the fake agent "
