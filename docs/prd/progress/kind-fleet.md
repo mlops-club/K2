@@ -89,10 +89,10 @@ curl -s http://127.0.0.1:7442/cli/hosts/status # placements per host
 
 ## Results
 
-Run `lab-runs/kind-g2-fifth/`, 2026-10-26 00:35Z:
-- Fresh fleet: k2-host-0 and k2-host-1, kill=process.
-- Daemon: wave2-preview 6e24dd5be, built at 43efc6471.
-- Lab: k2-dist/lab-g2 b6f1177b8 (fake agent from aaec7c10b).
+**All of S1–S7 and I1–I4 pass** in run `lab-runs/kind-g2-13e5a5939-b/`, 2026-10-26 00:54Z:
+- Fresh fleet: k2-host-0 and k2-host-1, kill=process, `K2_PTYD=0`.
+- Daemon: wave2-preview 13e5a5939 (it has the outbox's recipient-by-workspace-name fix). It was built as `k2-daemon:dist-fake` only; the owner's `k2-daemon:dist` is still 6e24dd5be.
+- Lab: k2-dist/lab-g2 eacedaf11 (fake agent from b6f1177b8).
 
 | Scenario | Result | Evidence |
 |---|---|---|
@@ -100,22 +100,23 @@ Run `lab-runs/kind-g2-fifth/`, 2026-10-26 00:35Z:
 | S2 | PASS | `s2-a` on k2-host-0 and `s2-b` on k2-host-1; every hook recorded for its own session |
 | S3 | PASS | alice on k2-host-0 and bob on k2-host-1; `cli/k2 msg` on alice's host is delivered once into bob's transcript |
 | S4, S5 | PASS | the W1 wake and heartbeat flows through the controller |
-| S6 | **FAIL (K2)** | see below |
-| S7 | PASS | CLI SIGKILLed mid-turn on k2-host-1; the next need resumed the same session; MEMORY.md kept |
-| I1, I3, I4 | PASS | 13 placements: 6 on k2-host-0, 7 on k2-host-1 (`ctl.place`) |
-| I2 | FAIL (K2) | the one S6 row, `hop: down`, queued with 0 attempts |
+| S6 | PASS | bob's host k2-host-1 SIGKILLed; inbox item composed on k2-host-0 and queued; controller restarted (SIGTERM); host back. The controller's row is `delivered`, and the item is in bob's inbox once: `/var/lib/k2/work/lab/s6-bob-d8bafe/.k2/inbox/s6-inbox-item-ffdc0cc0.md` |
+| S7 | PASS | CLI SIGKILLed mid-turn; the next need resumed the same session; MEMORY.md kept |
+| I1–I4 | PASS | 13 placements: 6 on k2-host-0, 7 on k2-host-1 (`ctl.place`). I2: 2 messages, every outbox row final |
 
-**S6 is the outbox issue the lab recorded** (`lab-g2.md`, "The controller's outbox matches the recipient only against placement ids").
-- The item, composed on k2-host-0 for `s6-bob-…` while bob's host was down, is accepted (`ctl.msg_accept`).
-- The controller restarts and bob's host comes back. The controller adopts bob's placement as `gone`, then places him again under his project id.
-- The `hop: down` row addressed to his workspace name never matches and stays `queued` with 0 attempts.
-- The kind backend's part of S6 passes: host killed, controller restarted, host back.
+**Earlier runs: S6 failed on 6e24dd5be** (`lab-runs/kind-g2-fifth/`).
+- That was the outbox issue the lab recorded: the controller matched a queued row's recipient only against placement ids.
+- Bob is placed under his project id but addressed by workspace name. His row (`hop: down`, `recipient: s6-bob-…`) stayed `queued` with 0 attempts after he was placed again, and I2 failed on it.
+- 13e5a5939 fixes that, as the run above shows.
 
-Kind-side bugs found and fixed on the way (414da27e9 and after):
+**Sparser monitor than the lab's.** I1's monitor takes one sample per round of `kubectl exec` (about 1 s; the procs fleet samples every 0.5 s). That made 16 samples in this 17 s run, so I1 is weaker evidence here than on the procs fleet.
+
+Kind-side bugs found and fixed on the way:
 - The image has no `kill` binary; kills go through `sh -c 'kill …'`.
 - macOS tar metadata, and the root-owned `/lab/repo`, broke the copy in.
 - `lab.py fleet` takes the proc right after the action. The S1 hold was silently not applied, and an earlier S1 passed by luck of placement.
 - State left on the volumes steered placement (hence the fresh fleet).
+- The daemon id was `<pid>@<start>`, which two pods started on one clock tick shared. It is now `<pod>/<pid>@<start>` (616a7fe56).
 
 ## Lab interface (asked through the coordinator)
 
@@ -127,7 +128,7 @@ The kind backend works today through `fleet_kind.install()`. That puts its funct
 
 ## Status
 
-- MILESTONE: S1–S7 run on kind with 2 hosts. All pass except S6, a K2 issue the lab had already recorded.
+- MILESTONE: S1–S7 run on kind with 2 hosts. All pass on 13e5a5939, S6 included.
 - Next:
   - a chaos run (`--chaos=seed=N`, both kill modes);
   - S8 and S9, which W3 brings into wave2-preview, once the lab adds them for this fleet;
