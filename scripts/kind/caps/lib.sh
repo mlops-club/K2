@@ -27,7 +27,9 @@ kc() { kubectl --kubeconfig "$CAPS_KUBECONFIG" "$@"; }
 kn() { kubectl --kubeconfig "$CAPS_KUBECONFIG" -n "$CAPS_NS" "$@"; }
 say() { printf '%s caps: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
-# The namespace, Pod Security "restricted" like the declared end state.
+# The namespace, with the declared end state's Pod Security for namespace
+# k2 (deploy/kubernetes/namespaces.yaml): enforce "baseline" (Spilo and
+# Stalwart need more than "restricted"), warn on "restricted".
 caps_namespace() {
     kc apply -f - >&2 <<EOF
 apiVersion: v1
@@ -36,7 +38,7 @@ metadata:
   name: $CAPS_NS
   labels:
     k2.dev/test: k8s-capabilities
-    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/warn: restricted
 EOF
 }
