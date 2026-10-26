@@ -61,7 +61,7 @@ sequenceDiagram
     K->>V: remove .k2-lab/hold
     P->>P: supervise.sh starts k2-daemon
     P->>C: dial, enroll, adopt placements
-    K-->>L: new pid "<pid>@<start time>"
+    K-->>L: new pid "<pod>/<pid>@<start time>"
     L->>L: wait_ready via 127.0.0.1:17422 (linked)
 ```
 

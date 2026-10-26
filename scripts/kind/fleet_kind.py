@@ -11,8 +11,10 @@ inside the cluster, as the compose backend runs beside its containers:
   /lab/run             the run directory (copied back to the Mac afterwards)
 
 Every daemon runs under deploy/kind/dist-fake/supervise.sh. A proc's
-"pid" is "<pid>@<start time>" of its k2-daemon process inside the pod
-(opaque to the lab; a new process is a new pid). The backend:
+"pid" is "<pod>/<pid>@<start time>" of its k2-daemon process (opaque to
+the lab; a new process is a new pid). The pod is part of it: each pod has
+its own pid namespace, and two pods started on the same clock tick have
+the same "<pid>@<start time>". The backend:
 
   kill    writes $HOME/.k2-lab/hold, then `kubectl exec <pod> -- kill -<SIG>
           <pid>` (--kill=process, the default) or `kubectl delete pod`
@@ -113,7 +115,7 @@ def snapshot(st, name, fresh=False):
         for line in r.stdout.splitlines():
             kind, _, v = line.partition(" ")
             if kind == "D":
-                daemon = v.strip()
+                daemon = "%s/%s" % (st["kind"]["pods"][name], v.strip())
             elif kind == "C" and v.strip().isdigit():
                 clis.append(int(v))
         val = (daemon, sorted(clis))
@@ -173,7 +175,7 @@ def kill(st, name, sig=signal.SIGKILL, wait_s=None):
         grace = "1" if sig == signal.SIGKILL else str(int(max(1, wait)))
         kubectl(st, "delete", "pod", pod, "--wait=false", "--grace-period=" + grace, timeout=30)
     else:
-        num = pid.split("@")[0] if pid else ""
+        num = pid.rsplit("/", 1)[-1].split("@")[0] if pid else ""
         if num:
             _exec(st, name, "sh", "-c", 'kill -"$1" "$2"', "kill", str(int(sig)), num, timeout=30)
     end = time.monotonic() + wait
