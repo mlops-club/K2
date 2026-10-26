@@ -117,6 +117,7 @@ fetched_bytes, kept, deleted}`, `host.home_restore_failed {error}`,
 | A | **Separate disks in the lab**: each host its own `K2_WORK_ROOT` (`work-h1`, `work-h2`), and the restore must really fetch | D2 now reads "the same path **relative to `K2_WORK_ROOT`**": with the same root everywhere (production) that is the same absolute path. A manifest records `work_rel`, the workspace's path under the snapshotting host's root. A restore puts the workspace at `<its root>/<work_rel>` and rewrites the old path inside transcripts (Claude's `cwd` lines; other providers' `.json`/`.jsonl`). A spawn whose `cwd` names the workspace under another root runs it under this host's (`before_spawn` rewrites `cwd` in the spawn body). The lab asserts `host.home_restored` with `fetched > 0`, on both moves. Not mapped: the controller's `transcript.exists` probe (the wake path's resume check) still asks for the registered path. With different roots it answers "not here" and the wake starts a new conversation; with one root it is right |
 | B | **A new agent on a fresh host gets its cwd**: the host creates it before the spawn | `before_spawn` runs `mkdir -p` on the (mapped) cwd, only under `K2_WORK_ROOT` and never the root itself. Test `a_new_agents_cwd_is_created_under_the_work_root_only`; lab check 5 |
 | C | **One cwd per agent** | The first agent placed in a cwd on a host owns it. A second agent there while the owner is placed gets a warning in the log, no restore, and no save: its close reply carries `home.error: "… one cwd per agent …"`, so the two never overwrite each other's homes. When the owner is no longer placed, the cwd is free. Test `one_cwd_per_agent_the_second_agent_in_a_placed_agents_cwd_is_refused`; lab check 6 |
+| D | **After a drain, the agent resumes elsewhere** (lab on wave3: placed on the other host with the same session id, but started with `--session-id`, `resumed: false`) | (1) The snapshot already carries the conversation store: class `session` is `~/.claude/projects/<slug>/<id>.jsonl` (and the fake agent's, the same layout). (2) The controller chooses `--session-id` or `--resume` with its transcript probe *before* the new host has restored the home, so it chose `--session-id`. Now `before_spawn`, after the restore, turns `--session-id <id>` into `--resume <id>` when this host holds that conversation (`k2_core::sidecar::conversation_exists`), traced `host.home_resume`. Test `a_spawn_resumes_a_conversation_the_restored_home_holds` |
 | – | Optional: a `debug_assert` that `save_home`'s `block_on` runs on a blocking thread | Not added: tokio has no public way to tell a blocking thread, and `Handle::block_on` already panics ("Cannot start a runtime from within a runtime") on an async worker |
 
 ## Settings
@@ -133,6 +134,30 @@ fetched_bytes, kept, deleted}`, `host.home_restore_failed {error}`,
 | `cargo test -p k2-core --lib -- agent_home::` | **13 passed**: a home round trips byte for byte to another host (every workspace file and its mode bits, `.git` included; `git log` and `status` agree; `MEMORY.md` and the transcript), then is `Current`; a host with its own work root gets the workspace at the same place under it, every object fetched, the transcript's embedded path rewritten (A); secrets, bulk dirs and git hooks stay behind (`.env` listed as scrubbed); a second snapshot sends only the 2 changed files, a third with no change sends nothing; the store's fence refuses a stale epoch, and a manifest with missing objects, another agent's name or an unsafe path is invalid; a corrupt object is refused on the wire and in the store, and nothing changes; a restore killed after staging leaves exactly the old tree (recover removes the staged files), one killed after its commit is finished by the next restore; the overlay deletes what the old snapshot put there and keeps the host's own `node_modules` and `.env`; never through a symlink; never outside the work root; over the cap refused naming `K2_HOME_MAX_BYTES`; unsafe paths never decode |
 | `cargo test -p k2-daemon --lib -- hosts:: agent_host:: delivery_drain:: routes::route_policy` | **112 passed**, including: `a_home_moves_between_hosts_over_http_and_only_its_writer_may_commit` (fake hosts on the loopback hub, the routes on loopback HTTP, the host's `HttpRemote`: a wrong hello token gets no transfer token; host-b may neither commit nor read host-a's agent; after the agent's placement ends its last host may still save it; restored on host-b; host-a back with a stale copy is refused 409 naming host-b's epoch; status by owner token only); `the_fence_follows_the_placement_then_the_last_host`; one cwd per agent (C); the spawn's cwd mapped to this host's workspace (A); a new agent's cwd created under the work root only (B); the close reply's `home`; the work-root scope; the drain saves each agent before `released` |
 | `scripts/lab/topology/home-sync.sh` (controller, host-1 on `work-h1`, host-2 on `work-h2`; enrolled hosts; k2-fake-agent) runs `20261026T075156Z`, `20261026T075319Z` | **8/8 PASS, twice**. SIGTERM host-1: it drained, saved notes' home (35 files, 34 objects sent) and exited. With host-1 down, notes woke with `--resume` on host-2, which restored snapshot 1 into `work-h2/notes`, fetching all 34 objects, and ran it there: the workspace identical (git HEAD, history, dirty and untracked state, file hashes), `MEMORY.md` and the transcript as host-1 left them, the same session resumed, and its new turn appended to memory. A new agent with no cwd yet got `work-h2/fresh` created and ran (B). twin, spawned in notes' cwd, ran, but its close reply said `home.error: … one cwd per agent …` and host-2 logged a warning (C). notes slept (v2 close): host-2 saved snapshot 2 first (3 objects sent) and the close reply said `home.seq: 2`. host-1 came back and host-2 left: notes woke on host-1, which fetched 3 objects over its snapshot 1 and kept 32, and host-2's memory line was there |
+
+### Lab G2, S8 resume elsewhere (lab-g2 b0d0b81ae merged on a throwaway branch with this one)
+
+`LAB_S8_RESUME_ELSEWHERE=1 scripts/lab/prove.sh G2 --topology fleet --parity
+none --linux-gate hold`:
+
+| Run | S8 resume elsewhere | All |
+|---|---|---|
+| home sync on, in-process agents (`lab-runs/G2/2026-10-26T08-29-27Z`) | **PASS**: `--resume <same id>`, `resumed: true`, on the other host | S1–S9 PASS, I1–I4 pass |
+| home sync on, agents under k2-ptyd, `LAB_HOST_PTYD=1` (`08-30-36Z`) | **PASS** | S1–S9 PASS, I1–I4 pass |
+| control: home sync off, `LAB_HOME_SYNC=0` (`08-32-08Z`) | FAIL, `--session-id`, as lab saw on wave3 | |
+
+The report's verdict reads `fail` only because `--parity none` leaves the
+parity suites `not_run`. Two lab changes were needed, and lab-g2 should take
+both:
+
+- `tests/lab/labkit/fleet.py`: the fleet's hosts get
+  `K2_WORK_ROOT=<fleet work dir>` when `LAB_HOME_SYNC=1`, which is the
+  default when `LAB_S8_RESUME_ELSEWHERE=1`. Without it home sync is off.
+- `tests/lab/labkit/g2.py` `exec_of`: take the newest `cli.exec` by `ts`.
+  `fake_events` lists events host by host, so `evs[-1]` was the last
+  *host's* last exec. The first run here resumed correctly on host-1
+  (08:28:03.243, `--resume`) and was still judged by host-2's older
+  `--session-id` exec (08:27:53).
 
 ## Follow-ups
 
