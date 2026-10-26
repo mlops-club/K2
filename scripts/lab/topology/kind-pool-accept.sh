@@ -10,8 +10,10 @@
 # core/rbac.yaml plus D8's patch on the Secret k2-host-enroll, signed
 # enrollment (K2_HOST_AUTH=enroll); the StatefulSet k2-host at 0 replicas
 # (the provisioner mints and scales every host), K2_HOST_MAX_AWAKE=2, each
-# host its own volume (no shared k2-work), readiness = k2-daemon
-# --host-health (D10); the PDB maxUnavailable 1. Fake agents only.
+# host its own volume (no shared k2-work) at /var/lib/k2 with home sync on
+# (K2_WORK_ROOT=/var/lib/k2/work; each agent its own workspace under it),
+# readiness = k2-daemon --host-health (D10); the PDB maxUnavailable 1. Fake
+# agents only; each wake's first turn is "remember …" (MEMORY.md).
 #
 # Checks:
 #   1. the controller runs the kubernetes provisioner; 0 hosts
@@ -22,6 +24,10 @@
 #   5. kubectl get pdb: one disruption allowed
 #   6. after some agents sleep, the idle window drains the highest ordinal
 #      (its agent released: asleep) and the pool shrinks back to 1 pod
+#      - the drained agent's home: its host saved a snapshot at the released
+#        epoch before the pool scaled the host away; woken again, the agent
+#        lands on another pod, which restores that snapshot first (fetching
+#        its objects) and has its memory
 #   7. I1: no agent ever placed on two hosts at once (controller log)
 #
 # K2_P4_REAL=1: the variant with the real agents image (Claude Code in the
@@ -179,9 +185,10 @@ spec:
           image: $AGENTS_IMAGE
           imagePullPolicy: Never
           env:
-            - {name: HOME, value: /var/lib/k2-host}
-            - {name: K2_HOME, value: /var/lib/k2-host/.k2}
+            - {name: HOME, value: /var/lib/k2}
+            - {name: K2_HOME, value: /var/lib/k2/.k2}
             - {name: K2_ROLE, value: host}
+            - {name: K2_WORK_ROOT, value: /var/lib/k2/work}   # home sync (P3 T1): off without it
             - {name: K2_DAEMON_PORT, value: "7420"}
             - {name: K2_CONTROLLER_URL, value: "ws://k2-controller:7420"}
             - name: K2_HOST_NAME
@@ -197,7 +204,7 @@ spec:
           resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
           volumeMounts:
-            - {name: data, mountPath: /var/lib/k2-host}
+            - {name: data, mountPath: /var/lib/k2}
             - {name: k2-host-enroll, mountPath: /run/secrets/k2-enroll, readOnly: true}
       volumes:
         - name: k2-host-enroll
@@ -224,11 +231,21 @@ PF_PID=$!
 for i in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$PORT/boot-status" && break; sleep 0.3; done
 kn exec k2-controller-0 -- cat /var/lib/k2/.k2/daemon.token > "$PRIV/token" 2>/dev/null; chmod 600 "$PRIV/token"
 ctl() { curl -s --max-time "${2:-30}" "http://127.0.0.1:$PORT$1?token=$(cat "$PRIV/token")"; }
-spawn() { # agent → "HTTP body"
+mkdir -p "$PRIV/sessions"
+spawn() { # agent [args JSON] → "HTTP body". Each agent its own workspace under the
+    # hosts' work root; a first wake starts a conversation with one turn.
+    local args=${2:-}
+    if [ -z "$args" ]; then
+        uuidgen | tr A-Z a-z > "$PRIV/sessions/$1"
+        args="[\"--session-id\",\"$(cat "$PRIV/sessions/$1")\",\"remember $1 before the scale-down\"]"
+    fi
     curl -s --max-time 300 -o "$PRIV/spawn.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
         "http://127.0.0.1:$PORT/cli/sessions/v2/spawn?token=$(cat "$PRIV/token")" \
-        -d "{\"agent_name\":\"$1\",\"cwd\":\"/work/lab-agent\",\"command\":\"claude\",\"args\":[\"--session-id\",\"$(uuidgen | tr A-Z a-z)\"]}"
+        -d "{\"agent_name\":\"$1\",\"cwd\":\"/var/lib/k2/work/$1\",\"command\":\"claude\",\"args\":$args}"
     echo " $(head -c 300 "$PRIV/spawn.out")"
+}
+memory() { # pod agent: the agent's MEMORY.md there (the fake agent's, Claude's layout)
+    kn exec "$1" -- sh -c "cat /var/lib/k2/.claude/projects/*-work-$2/memory/MEMORY.md" 2>/dev/null
 }
 close() { curl -s --max-time 60 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     "http://127.0.0.1:$PORT/cli/sessions/v2/close?token=$(cat "$PRIV/token")" -d "{\"agent_name\":\"$1\",\"force\":true}"; }
@@ -245,7 +262,7 @@ if [ "${K2_P4_REAL:-0}" = 1 ]; then
     term() { # a plain shell terminal: the wake that makes the provisioner act
         curl -s --max-time 300 -o "$PRIV/spawn.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
             "http://127.0.0.1:$PORT/cli/sessions/v2/spawn?token=$(cat "$PRIV/token")" \
-            -d "{\"agent_name\":\"$1\",\"cwd\":\"/var/lib/k2-host\",\"command\":\"sh\",\"args\":[]}"
+            -d "{\"agent_name\":\"$1\",\"cwd\":\"/var/lib/k2\",\"command\":\"sh\",\"args\":[]}"
         echo " $(head -c 300 "$PRIV/spawn.out")"
     }
     r=$(term t1)
@@ -321,7 +338,36 @@ check "after the idle window: drained highest first, back to 1 pod; the drained 
         && grep -q 'scaled k2-host 3 -> 2' "$RUN/controller.log" && grep -q 'scaled k2-host 2 -> 1' "$RUN/controller.log" \
         && python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if [h["host_id"] for h in s["hosts"]]==["k2-host-0"] else 1)' "$RUN/status-idle.json" && echo 1)" \
     "replicas $(replicas); pods $(pods); $(grep -E 'scaled k2-host|draining' "$RUN/controller.log" | sed -E 's/^[^ ]+ //' | tr '\n' ';')"
-check "home snapshot of the drained host's agents" 0 "not built: P3 T1 home sync (portable homes) is not on this branch; the agent is released without a snapshot"
+# The drained agent's home. a5 was released by k2-host-2's drain: its close
+# saved a snapshot at the released epoch, committed before the scale-down.
+ctl /cli/hosts/home/status > "$RUN/home-status.json"
+read -r rel_epoch snap_seq snap_epoch snap_line scaled_line <<< "$(python3 -I - "$RUN/controller.log" <<'PY'
+import re,sys
+rel=seq=sep=snap_at=scaled_at="-"
+for i,line in enumerate(open(sys.argv[1], errors="replace")):
+    m=re.search(r"\[hosts\] placed agent a5 on host k2-host-2 epoch (\d+)", line)
+    if m: rel=m.group(1)
+    m=re.search(r"\[hosts/home\] a5: snapshot (\d+) from k2-host-2 at epoch (\d+)", line)
+    if m: seq,sep,snap_at=m.group(1),m.group(2),i
+    if "scaled k2-host 3 -> 2" in line and scaled_at=="-": scaled_at=i
+print(rel,seq,sep,snap_at,scaled_at)
+PY
+)"
+saved=$([ "$rel_epoch" != - ] && [ "$snap_epoch" = "$rel_epoch" ] && [ "$snap_line" != - ] && [ "$scaled_line" != - ] && [ "$snap_line" -lt "$scaled_line" ] && echo 1)
+# Woken again: k2-host-2 is gone; a1 sleeps so a5 fits on k2-host-0, which
+# restores the snapshot first, fetching its objects.
+echo "close a1: $(close a1)" >> "$RUN/sleeps.txt"
+r5=$(spawn a5 "[\"--resume\",\"$(cat "$PRIV/sessions/a5")\",\"remember a5 after the scale-down\"]")
+for i in $(seq 1 60); do memory k2-host-0 a5 | grep -q "after the scale-down" && break; sleep 1; done
+kn logs k2-host-0 > "$RUN/k2-host-0.log" 2>&1
+kn logs k2-controller-0 > "$RUN/controller-after.log" 2>&1
+mem=$(memory k2-host-0 a5)
+restored=$(grep -E "\[hosts/home\] a5: restored snapshot $snap_seq \(([1-9][0-9]*) objects" "$RUN/k2-host-0.log" | tail -1)
+moved=$(grep -c "placed agent a5 on host k2-host-0" "$RUN/controller-after.log")
+check "home snapshot of the drained host's agents: saved at the released epoch before the scale-down, restored on another pod" \
+    "$([ "$saved" = 1 ] && echo "$r5" | grep -q '^200 ' && [ "$moved" -ge 1 ] && [ -n "$restored" ] \
+        && echo "$mem" | grep -q "a5 before the scale-down" && echo "$mem" | grep -q "a5 after the scale-down" && echo 1)" \
+    "a5 released at epoch $rel_epoch; snapshot $snap_seq at epoch $snap_epoch (log line $snap_line, scale-down line $scaled_line); store: $(head -c 300 "$RUN/home-status.json"); wake $r5; on k2-host-0: ${restored:-no restore}; memory: $(echo "$mem" | tr '\n' '|')"
 
 # 7. I1
 i1=$(python3 -I - "$RUN/controller.log" <<'PY'

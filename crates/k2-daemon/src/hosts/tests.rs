@@ -1601,6 +1601,15 @@ impl crate::provisioner::kubernetes::Enroller for TestEnroll {
 /// A controller whose provisioner is `kubernetes` on the fake API server,
 /// `replicas` pods in `k2-host`, at most `max`.
 async fn k8s_controller(replicas: u32, max: u32, idle_after: Duration) -> (Controller, crate::k8s::fake::FakeApi) {
+    k8s_controller_with(replicas, max, idle_after, |r| r).await
+}
+
+async fn k8s_controller_with(
+    replicas: u32,
+    max: u32,
+    idle_after: Duration,
+    tune: impl FnOnce(RemoteHost) -> RemoteHost,
+) -> (Controller, crate::k8s::fake::FakeApi) {
     use crate::provisioner::kubernetes::{K8sPool, Kubernetes, PoolSettings};
     let api = crate::k8s::fake::FakeApi::start();
     api.state.lock().replicas.insert("k2-host".into(), replicas);
@@ -1608,11 +1617,11 @@ async fn k8s_controller(replicas: u32, max: u32, idle_after: Duration) -> (Contr
     let settings = PoolSettings { max_hosts: max, idle_after, ..PoolSettings::default() };
     let pool = K8sPool { client: api.client(), statefulset: "k2-host".into(), enroll_secret: "k2-host-enroll".into() };
     let k = Kubernetes::new(settings, Box::new(pool), std::sync::Arc::new(TestEnroll::default()));
-    let remote: &'static RemoteHost = Box::leak(Box::new(
+    let remote: &'static RemoteHost = Box::leak(Box::new(tune(
         RemoteHost::new()
             .with_placement(Box::new(k), std::sync::Arc::new(crate::provisioner::policy::PolicyStore::in_memory()))
             .with_host_wait(DEADLINE),
-    ));
+    )));
     (Controller::start_on(remote).await, api)
 }
 
@@ -1691,6 +1700,86 @@ async fn kubernetes_idle_drains_the_highest_ordinal_releases_its_agents_then_sca
     let step = tokio::task::spawn_blocking(move || remote.idle_tick(std::time::Instant::now())).await.unwrap();
     assert_eq!(step, crate::provisioner::IdleStep::ScaledDown { host: "k2-host-1".into(), to: 1 });
     assert_eq!(api.state.lock().replicas["k2-host"], 1);
+}
+
+// ── wave3-homes: a scale-down waits for the released agents' homes ───────
+
+type Homes = std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, k2_core::agent_home::Latest>>>;
+
+fn snapshot(seq: u64, epoch: u64) -> k2_core::agent_home::Latest {
+    k2_core::agent_home::Latest { seq, epoch, host: "k2-host-1".into(), manifest_sha: "sha".into(), created_ms: 0, files: 1, bytes: 1 }
+}
+
+/// Two hosts (a0 on k2-host-0, a1 on k2-host-1); the pool drains
+/// k2-host-1, whose close for a1 is answered with `home`. Returns a1's
+/// released epoch and the store the pool checks.
+async fn drained_with_home(home: Value) -> (Controller, crate::k8s::fake::FakeApi, u64, Homes) {
+    let homes: Homes = Default::default();
+    let h = std::sync::Arc::clone(&homes);
+    let (c, api) = k8s_controller_with(2, 3, Duration::ZERO, move |r| r.with_home_latest(move |a| h.lock().get(a).cloned())).await;
+    let mut h0 = fake_host_labeled(&c, "k2-host-0", &["k2.max_awake=2"]).await;
+    let mut h1 = fake_host_labeled(&c, "k2-host-1", &["k2.max_awake=2"]).await;
+    c.wait_hosts(2).await;
+    place(&c, &mut h0, "a0", &uuid::Uuid::new_v4().to_string()).await;
+    place(&c, &mut h1, "a1", &uuid::Uuid::new_v4().to_string()).await;
+    let epoch = c.remote.placement("a1").unwrap().epoch.0;
+    let remote = c.remote;
+    let tick = tokio::task::spawn_blocking(move || remote.idle_tick(std::time::Instant::now()));
+    let req = match recv(&mut h1).await {
+        Frame::Close { req, agent_id, .. } => {
+            assert_eq!(agent_id, "a1");
+            req
+        }
+        other => panic!("expected a1's release, got {other:?}"),
+    };
+    let body = crate::hosts::home::with_home(json!({"closed": true}).to_string(), home);
+    send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body }).await;
+    assert_eq!(within("the drain", tick).await.unwrap(), crate::provisioner::IdleStep::Drain("k2-host-1".into()));
+    std::mem::forget((h0, h1)); // the hosts stay linked
+    (c, api, epoch, homes)
+}
+
+async fn tick_at(c: &Controller, at: std::time::Instant) -> crate::provisioner::IdleStep {
+    let remote = c.remote;
+    tokio::task::spawn_blocking(move || remote.idle_tick(at)).await.unwrap()
+}
+
+/// The release's save failed on the host (or its reply never came): the
+/// pool holds the host until the store has a snapshot at the released
+/// epoch, then scales down and records the agent's `home_seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubernetes_scale_down_waits_until_the_released_agents_home_is_in_the_store() {
+    let (c, api, epoch, homes) = drained_with_home(json!({"error": "push: connection reset"})).await;
+    let now = std::time::Instant::now();
+    assert_eq!(tick_at(&c, now).await, crate::provisioner::IdleStep::Nothing, "a1's home isn't saved yet");
+    // An older snapshot (an earlier placement's) doesn't count.
+    homes.lock().insert("a1".into(), snapshot(3, epoch - 1));
+    assert_eq!(tick_at(&c, now).await, crate::provisioner::IdleStep::Nothing);
+    assert_eq!(api.state.lock().replicas["k2-host"], 2);
+    homes.lock().insert("a1".into(), snapshot(4, epoch));
+    assert_eq!(tick_at(&c, now).await, crate::provisioner::IdleStep::ScaledDown { host: "k2-host-1".into(), to: 1 });
+    assert_eq!(api.state.lock().replicas["k2-host"], 1);
+    assert_eq!(c.remote.policy().get("a1").unwrap().home_seq, Some(4));
+}
+
+/// The close reply says the home was saved: recorded, and the host may go
+/// on the next tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubernetes_scale_down_after_a_close_that_saved_the_home_records_its_seq() {
+    let (c, api, _, _) = drained_with_home(json!({"seq": 7, "files": 3, "bytes": 120})).await;
+    assert_eq!(c.remote.policy().get("a1").unwrap().home_seq, Some(7));
+    assert_eq!(tick_at(&c, std::time::Instant::now()).await, crate::provisioner::IdleStep::ScaledDown { host: "k2-host-1".into(), to: 1 });
+    assert_eq!(api.state.lock().replicas["k2-host"], 1);
+}
+
+/// A save that never reaches the store holds the host only so long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubernetes_scale_down_lets_the_host_go_after_the_home_save_wait() {
+    let (c, _, _, _) = drained_with_home(json!({"error": "push: connection reset"})).await;
+    let now = std::time::Instant::now();
+    assert_eq!(tick_at(&c, now).await, crate::provisioner::IdleStep::Nothing);
+    let later = now + crate::agent_host::remote::HOME_SAVE_WAIT;
+    assert_eq!(tick_at(&c, later).await, crate::provisioner::IdleStep::ScaledDown { host: "k2-host-1".into(), to: 1 });
 }
 
 // ── P3 follow-up 2: a host's S8 drain reaches placement ──────────────────

@@ -287,8 +287,8 @@ impl Provisioner for Kubernetes {
             return IdleStep::Nothing;
         }
         if st.draining.as_deref() == Some(highest.as_str()) {
-            if top.awake > 0 {
-                return IdleStep::Nothing; // its agents are being released
+            if top.awake > 0 || top.saving > 0 {
+                return IdleStep::Nothing; // its agents are being released, their homes saved
             }
             if let Err(e) = self.api.set_replicas(replicas - 1) {
                 k2_core::log_debug!("[provisioner] scale {} down to {}: {e}", self.settings.statefulset, replicas - 1);
