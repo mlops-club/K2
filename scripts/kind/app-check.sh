@@ -47,9 +47,12 @@ proc_scan() {  # proc_scan <pod> <container> → lines for processes whose argv 
 
 # Steps 1-3 and 5 in Python (labkit's WebSocket client); it pauses after the
 # line is seen so the shell can be found in /proc, then closes it.
-fifo=$(mktemp -u "${TMPDIR:-/tmp}/k2-app-check-XXXXXX"); mkfifo "$fifo"
-trap 'rm -f "$fifo"' EXIT
-exec 3<>"$fifo"     # read-write: neither side blocks on open, and reads can time out
+# Two FIFOs, one per direction: with one, Python could read back its own
+# "scan" before the shell saw it, and the scan never ran.
+fifo=$(mktemp -u "${TMPDIR:-/tmp}/k2-app-check-XXXXXX"); mkfifo "$fifo" "$fifo.back"
+trap 'rm -f "$fifo" "$fifo.back"' EXIT
+exec 3<>"$fifo"     # Python → shell; read-write: neither side blocks on open, and reads can time out
+exec 4<>"$fifo.back"   # shell → Python
 PORT=$KIND_PORT USER_NAME=${K2_KIND_USER:-owner} PASSWORD_FILE=$password_file \
     WORK=$KIND_WORK MARKER=$marker FAKE=$fake LABKIT="$KIND_REPO/tests/lab" FIFO=$fifo python3 -I - <<'PY' &
 import json, os, sys, time, urllib.error, urllib.parse, urllib.request
@@ -108,7 +111,7 @@ line = next((l for l in grid.text().splitlines() if want in l), "")
 sock.close()
 print("%s attach /cli/sessions/grid with the session token: %r" % ("ok  " if line else "FAIL", line), flush=True)
 open(os.environ["FIFO"], "w").write("scan\n")       # the shell side scans /proc now
-open(os.environ["FIFO"]).readline()                # ... and says when it is done (one line; the fifo never hits EOF)
+open(os.environ["FIFO"] + ".back").readline()      # ... and says when it is done (one line; the fifo never hits EOF)
 st, d = call("/cli/sessions/v2/close", {"agent_name": agent, "force": True, "clear_index": True}, tok)
 print("%s close -> HTTP %s %s" % ("ok  " if st == 200 else "FAIL", st, json.dumps(d)[:120]), flush=True)
 sys.exit(0 if line and st == 200 else 1)
@@ -124,7 +127,7 @@ if [ "$msg" = scan ]; then
         ctl=$(proc_scan "$KIND_POD" k2-daemon)
         echo "     /proc in $KIND_POD: ${ctl:-(none)}"
     fi
-    echo "done" >&3
+    echo "done" >&4
 fi
 rc=0
 wait "$py" || rc=$?
