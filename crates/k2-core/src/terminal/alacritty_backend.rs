@@ -508,6 +508,17 @@ impl TerminalManager {
                 );
             }
         }
+        // The CLI the daemon staged in its K2 home (`cli_stage`; under
+        // `K2_HOME` the only one): first on PATH, as on the v2 path.
+        if let Some(bin) = crate::cli_stage::agent_bin_dir() {
+            let existing_path = pty_options
+                .env
+                .get("PATH")
+                .cloned()
+                .or_else(|| std::env::var("PATH").or_else(|_| std::env::var("Path")).ok())
+                .unwrap_or_default();
+            pty_options.env.insert("PATH".to_string(), crate::terminal::path_env::prepend(&existing_path, &bin));
+        }
 
         // Set project path so the CLI knows which workspace it's operating in.
         // Resolve the project root by walking up from cwd to find .k2so/ or .git/,

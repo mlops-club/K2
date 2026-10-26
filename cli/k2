@@ -33,11 +33,15 @@ SCOPED_TOKEN="${K2_HOOK_TOKEN:-${K2SO_HOOK_TOKEN:-}}"
 # scoped session marker ($K2_HOOK_SOCK) is present.
 DISK_OWNER_TOKEN=""
 
-# Daemon home: ~/.k2 post-0.40 (the migration leaves ~/.k2so as a compat
-# symlink, so either resolves to the same files — prefer the new name,
-# fall back for a not-yet-migrated machine).
-K2_HOME="${HOME}/.k2"
-[ -d "$K2_HOME" ] || K2_HOME="${HOME}/.k2so"
+# Daemon home: $K2_HOME when set (the K2 home itself, as the daemon reads
+# it: a container's volume, a lab process; agent sessions inherit it),
+# else ~/.k2 post-0.40 (the migration leaves ~/.k2so as a compat symlink,
+# so either resolves to the same files — prefer the new name, fall back
+# for a not-yet-migrated machine).
+if [ -z "${K2_HOME:-}" ]; then
+    K2_HOME="${HOME}/.k2"
+    [ -d "$K2_HOME" ] || K2_HOME="${HOME}/.k2so"
+fi
 
 # Air-gap: same polarity as k2_core::airgap (env wins; garbage → on;
 # unset → persisted `airgap` in ~/.k2/settings.json; default off).
