@@ -125,6 +125,19 @@ sequenceDiagram
 ## Decisions (coordinator, owner AFK, per recommendation, 2026-10-26)
 
 1. **Databases:** the per-workspace databases (`/cli/db`) become Kubernetes-native through the operator (`preparedDatabases`; owner and writer roles for migrator and agent). Per-App databases wait for S21.
+   - **Done** (84ad76701, 70300b1f5; `lab-runs/caps/db-check.log`, `scripts/kind/caps/db-check.sh` PASS in a fresh namespace `k2-p4-db`). With `K2_CAP_POSTGRES=kubernetes`, `/cli/db` runs on the operator's cluster (`sql/k8s.rs`).
+     - `k2 db create` adds a `preparedDatabases` entry. The operator makes the database and the users `{db}_owner_user` and `{db}_writer_user`, with their Secrets. K2's migrator is the owner user and its agent the writer user.
+     - K2 waits until both roles and the database exist (the operator writes the Secrets first). Then, as the operator's superuser, it applies its own shape: NOINHERIT, the database owned by the migrator, the migrator a member of the agent, and the unchanged grants SQL (`_k2_*`, the `k2` helpers, the seal).
+     - The operator's syncs keep that shape (checked live).
+     - Drop removes the entry first, then the database; the operator does not recreate it.
+     - Enable has no unit, fence or GUC pins. `k2 db upgrade`, other majors and password rotation are the operator's.
+     - Checked on kind:
+       - DSNs reach the Service with `sslmode=require`; Spilo refuses other pods without TLS.
+       - Migrations run as the migrator.
+       - The agent writes but can't `CREATE TABLE` or alter K2's tables.
+       - Another workspace's agent can't read the tables.
+     - The controller image needs `psql`. `packaging/oci/Dockerfile` installs `postgresql-client`; kind adds it with `scripts/kind/caps/build-image.sh`.
+     - **Finding (same on a host, not changed):** K2 never revokes `PUBLIC`'s default `CONNECT` on a workspace database. Any K2 login can open another workspace's database, though not read its tables. Revoking it is a one-line hardening for host and Kubernetes alike, once decided.
 2. **App code:** the App's Deployment fetches its code archive (the Seed) from the controller with a per-App token. **This revises D6: no registry** (recorded in `p4-plan.md`).
 3. **Routing:** minimal edits in `apps/router.rs` and `tunnel_tls_listener.rs`: an optional upstream host, default unchanged, with tests proving `K2_ROLE=all` and local are byte for byte the same.
 4. **Mail, a security fix, first:** T3 now owns `deploy/kubernetes/core/mail.yaml`. A config Secret with a generated admin credential, never in git; no bootstrap or open admin; K2's mail code wired to `K2_STALWART_URL` and those credentials.
@@ -156,6 +169,7 @@ All of it is through `$TMPDIR/k2-kind/caps/kubeconfig` (`kind get kubeconfig --n
 | Envoy Gateway 1.9.2 (Helm release `eg`: Deployment, Services, ServiceAccounts, cluster-scoped ClusterRoles and bindings) | namespace `envoy-gateway-system` plus cluster scope | `helm --kubeconfig $TMPDIR/k2-kind/caps/kubeconfig -n envoy-gateway-system uninstall eg` |
 | Envoy Gateway's 8 CRDs (`*.gateway.envoyproxy.io`: backends, backendtrafficpolicies, clienttrafficpolicies, envoyextensionpolicies, envoypatchpolicies, envoyproxies, httproutefilters, securitypolicies) | cluster scope | `$KC delete crd backends.gateway.envoyproxy.io backendtrafficpolicies.gateway.envoyproxy.io clienttrafficpolicies.gateway.envoyproxy.io envoyextensionpolicies.gateway.envoyproxy.io envoypatchpolicies.gateway.envoyproxy.io envoyproxies.gateway.envoyproxy.io httproutefilters.gateway.envoyproxy.io securitypolicies.gateway.envoyproxy.io` |
 | GatewayClass `k2-p4-eg` and EnvoyProxy `k2-p4-eg` | cluster scope; `envoy-gateway-system` | `$KC delete gatewayclass k2-p4-eg && $KC delete namespace envoy-gateway-system` |
+| namespace `k2-p4-db` (`db-check.sh`: its own `postgresql k2-pg`, a controller, a client pod) | deleted by the check at the end; if one is left: `$KC -n k2-p4-db delete postgresql k2-pg --wait=true && $KC delete namespace k2-p4-db` | — |
 | image `k2-daemon:caps` | the kind nodes' image store (`kind load`), and the Mac's Docker | Mac: `docker rmi k2-daemon:caps`. Nodes: left alone (removing it means exec'ing into the node containers; an unused image does nothing) |
 | image `stalwartlabs/stalwart:v0.16.25` | pulled by a kind node (the kubelet) | left alone, as above |
 
@@ -171,4 +185,5 @@ All of it is through `$TMPDIR/k2-kind/caps/kubeconfig` (`kind get kubeconfig --n
 - Done: the Postgres operator path checked on k2lab (8ab1ee4f3); the k8s client and the drivers (7720600b8).
 - Left on k2lab, in `k2-p4-caps` only: `postgresql k2-pg` (for item 2), the namespace itself, and Envoy Gateway in `envoy-gateway-system` with GatewayClass `k2-p4-eg` (`gateway-check.sh --uninstall` removes them). The test Stalwart was deleted.
 - The mail checks clean up after themselves: the controller, Stalwart, their volumes and the Secret are deleted.
-- Next: decision 1 (`/cli/db` through the operator), then 2 and 3, then item 2. Item 3 waits only on a Sew image.
+- MILESTONE decision 1: `/cli/db` through the operator's `preparedDatabases` (`db-check.sh` PASS).
+- Next: decisions 2 and 3, then item 2. Item 3 waits only on a Sew image.

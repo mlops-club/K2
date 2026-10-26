@@ -22,8 +22,9 @@
 #   5. with A's agent DSN (GET /cli/db/dsn; it travels from the controller
 #      pod to a client pod over stdin, never printed), over TLS to the
 #      Service: insert and read work, CREATE TABLE is refused, and K2's
-#      _k2_migrations is not writable;
-#   6. B's agent cannot connect to A's database;
+#      _k2_migrations can't be altered (it is the migrator's);
+#   6. B's agent cannot read A's tables (it can CONNECT, as on a host:
+#      noted);
 #   7. POST /cli/db/drop for A: the entry leaves postgresql/k2-pg, the
 #      database is gone, and an operator sync does not bring it back.
 # No password is printed: the controller's token and the DSNs stay in pods.
@@ -44,6 +45,7 @@ caps_kubeconfig
 fails=0
 ok() { printf 'ok   %s\n' "$*"; }
 bad() { printf 'FAIL %s\n' "$*"; fails=$((fails + 1)); }
+note() { printf 'note %s\n' "$*"; }
 cleanup() {
     if [ "$keep" = 0 ]; then
         kn delete postgresql k2-pg --ignore-not-found --wait=true >/dev/null 2>&1 || true
@@ -246,15 +248,15 @@ for u in "${A}_owner_user" "${A}_writer_user"; do
 done
 [ "$(su_sql postgres "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='$A'")" = "${A}_owner_user" ] \
     && ok "$A is owned by ${A}_owner_user (K2's migrator)" || bad "$A owner: $(su_sql postgres "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='$A'")"
-inh=$(su_sql postgres "SELECT string_agg(rolname||'='||rolinherit, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('${A}_owner_user','${A}_writer_user')")
-[ "$inh" = "${A}_owner_user=f ${A}_writer_user=f" ] && ok "both logins NOINHERIT" || bad "inherit: $inh"
+inh=$(su_sql postgres "SELECT string_agg(rolname||'='||rolinherit::text, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname IN ('${A}_owner_user','${A}_writer_user')")
+[ "$inh" = "${A}_owner_user=false ${A}_writer_user=false" ] && ok "both logins NOINHERIT" || bad "inherit: $inh"
 [ "$(su_sql postgres "SELECT pg_has_role('${A}_owner_user','${A}_writer_user','MEMBER')")" = t ] \
     && ok "the migrator is a member of the agent (SET ROLE)" || bad "no membership owner_user → writer_user"
 [ "$(su_sql "$A" "SELECT tableowner FROM pg_tables WHERE tablename='_k2_migrations'")" = "${A}_owner_user" ] \
     && ok "K2's _k2_migrations is the migrator's" || bad "_k2_migrations owner: $(su_sql "$A" "SELECT tableowner FROM pg_tables WHERE tablename='_k2_migrations'")"
 
 echo "== 4. migrate A"
-kn exec -i k2-controller-0 -c k2-daemon -- sh -c 'cat > /var/lib/k2/work/dbcheck-a/.k2/db/migrations/001_notes.sql' <<'SQL'
+kn exec -i k2-controller-0 -c k2-daemon -- sh -c 'cat > /var/lib/k2/work/dbcheck-a/.k2/db/migrations/0001_notes.sql' <<'SQL'
 CREATE TABLE notes (id serial PRIMARY KEY, body text NOT NULL);
 SQL
 r=$(ctl POST /cli/db/migrate '{"project":"dbcheck-a"}')
@@ -262,16 +264,23 @@ owner=$(su_sql "$A" "SELECT tableowner FROM pg_tables WHERE tablename='notes'")
 [ "$owner" = "${A}_owner_user" ] && ok "migration applied as the migrator (notes owned by $owner)" || bad "migrate: $(printf '%s' "$r" | cut -c1-300); notes owner '$owner'"
 
 echo "== 5. A's agent, from a pod, over TLS"
-out=$(as_agent dbcheck-a "" "INSERT INTO notes (body) VALUES ('hello') RETURNING id; SELECT count(*) FROM notes; SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid();")
-[ "$(printf '%s' "$out" | tr '\n' ' ' | xargs)" = "1 1 t" ] && ok "insert and read as the agent, TLS on" || bad "agent: $out"
+out="$(as_agent dbcheck-a "" "INSERT INTO notes (body) VALUES ('hello')") $(as_agent dbcheck-a "" "SELECT count(*) FROM notes")"
+out="$out $(as_agent dbcheck-a "" "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")"
+[ "$out" = "INSERT 0 1 1 t" ] && ok "insert and read as the agent, TLS on" || bad "agent: $out"
 out=$(as_agent dbcheck-a "" "CREATE TABLE t (x int)")
 printf '%s' "$out" | grep -q "permission denied" && ok "the agent cannot CREATE TABLE" || bad "CREATE TABLE as the agent: $out"
-out=$(as_agent dbcheck-a "" "INSERT INTO _k2_migrations (version) VALUES ('x')")
-printf '%s' "$out" | grep -q "permission denied\|violates row-level security\|k2_internal" && ok "K2's _k2_migrations is sealed against the agent" || bad "agent writing _k2_migrations: $out"
+# The agent has DML on K2's tables (as on a host; the seal is for guests),
+# never their shape: they are the migrator's.
+out=$(as_agent dbcheck-a "" "ALTER TABLE _k2_migrations ADD COLUMN x int")
+printf '%s' "$out" | grep -q "must be owner" && ok "the agent cannot alter K2's _k2_migrations (the migrator's)" || bad "agent altering _k2_migrations: $out"
 
 echo "== 6. B's agent and A's database"
+out=$(as_agent dbcheck-b "$A" "SELECT count(*) FROM notes")
+printf '%s' "$out" | grep -q "permission denied for table notes" && ok "B's agent cannot read A's tables" || bad "B's agent reading $A: $out"
+# As on a host: K2 never revokes PUBLIC's default CONNECT, so any K2 login
+# can open the database; its tables are what is granted (sql/ops.rs).
 out=$(as_agent dbcheck-b "$A" "SELECT 1")
-printf '%s' "$out" | grep -q "permission denied for database\|not have CONNECT" && ok "B's agent cannot connect to $A" || bad "B's agent on $A: $out"
+[ "$out" = 1 ] && note "B's agent can CONNECT to $A (PUBLIC's default CONNECT; the same on a host)" || note "B's agent cannot CONNECT to $A: $out"
 
 echo "== 7. drop A"
 r=$(ctl POST /cli/db/drop '{"project":"dbcheck-a","yes":true}')
