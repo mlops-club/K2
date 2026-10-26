@@ -18,6 +18,9 @@
 
 use std::sync::OnceLock;
 
+/// Drivers for delegated features on Kubernetes (P4 T3).
+pub mod kubernetes;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Feature {
     Postgres,
@@ -190,10 +193,11 @@ impl Report {
     pub fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
         for e in &self.0 {
-            m.insert(
-                e.feature.key().into(),
-                serde_json::json!({"state": e.state.as_wire(), "mode": e.mode, "via": e.via}),
-            );
+            let mut v = serde_json::json!({"state": e.state.as_wire(), "mode": e.mode, "via": e.via});
+            if let Some(d) = kubernetes::status_json(e.feature).filter(|_| e.state == State::Delegated) {
+                v["driver"] = d;
+            }
+            m.insert(e.feature.key().into(), v);
         }
         serde_json::Value::Object(m)
     }

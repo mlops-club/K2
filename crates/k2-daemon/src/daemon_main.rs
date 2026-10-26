@@ -603,6 +603,9 @@ async fn async_main() {
     // P0 capability report: detected once, after the vault opens; logged
     // and shown on /boot-status. Nothing acts on it yet.
     log_debug!("{}", crate::capabilities::report().log_line());
+    // P4 T3: delegated features get a driver that checks what they are
+    // delegated to; /boot-status shows its answer (capabilities.*.driver).
+    crate::capabilities::kubernetes::start(crate::capabilities::report());
     // Clone slice A × B (CL18): a pending imported Thread settling onto
     // the clone's pin posts the clone's deferred "Leave blank" cards.
     crate::clone_vault::install_settle_listener();
