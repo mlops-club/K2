@@ -232,6 +232,13 @@ if [ "$KIND_DOCKERFILE" = deploy/kind/Dockerfile.agents ]; then
         }
         ref $d eq "HASH" or die "$f is not a JSON object\n";
         my %want = (hasCompletedOnboarding => JSON::PP::true, theme => "dark");
+        # Newer Claude Code keeps the theme in ~/.claude/settings.json (and
+        # drops it from .claude.json): one set there is the owner'"'"'s choice.
+        if (open(my $sf, "<", "$ENV{HOME}/.claude/settings.json")) {
+            my $st = do { local $/; <$sf> };
+            my $sd = eval { JSON::PP->new->utf8->decode($st) };
+            delete $want{theme} if ref $sd eq "HASH" && exists $sd->{theme};
+        }
         my @set = grep { !exists $d->{$_} } sort keys %want;
         if (!@set) { print "unchanged"; exit 0 }
         $d->{$_} = $want{$_} for @set;
