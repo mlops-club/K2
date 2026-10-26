@@ -761,18 +761,18 @@ def s6(c, sc):
             agents[bob] = (bob_cwd, agents[bob][1], b, hb)
         state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
         files = wait_until(lambda: inbox_files(bob_cwd, title), 30 if state != "failed" else 3)
-        # PRD failure table: when --chaos killed bob's CLI before the item
-        # landed (the host answers retry while no session is live), the gone
-        # rule failing it with a reason is the right end; then it is not in
-        # bob's inbox.
+        # PRD failure table: when --chaos killed bob's CLI, or his host with
+        # it, before the item landed (the host answers retry while no session
+        # is live), the gone rule failing it with a reason is the right end;
+        # then it is not in bob's inbox.
         csid = agents[bob][2][1]
         killed = [e for x in c.fake("cli.exec", csid) if (x.get("ts") or "") >= t_compose
-                  for e in chaos_hit(x.get("host"), x.get("pid"), t_compose) if e.get("kind") == "cli"]
-        sc.info["s6_chaos_kills_of_bob"] = [(e["ts"], e.get("host"), e.get("pid")) for e in killed]
+                  for e in chaos_hit(x.get("host"), x.get("pid"), t_compose)]
+        sc.info["s6_chaos_kills_of_bob"] = [(e["ts"], e.get("kind"), e.get("host"), e.get("pid")) for e in killed]
         lost_to_chaos = bool(killed) and state == "failed"
-        sc.check("the controller's outbox ends delivered (or failed with a reason after --chaos killed bob's CLI)",
+        sc.check("the controller's outbox ends delivered (or failed with a reason after --chaos killed bob's CLI or host)",
                  state == "delivered" or lost_to_chaos,
-                 "msg %s state %s; chaos kills of bob's CLI %s" % (msg_id, state, sc.info["s6_chaos_kills_of_bob"]))
+                 "msg %s state %s; chaos kills of bob's CLI or host %s" % (msg_id, state, sc.info["s6_chaos_kills_of_bob"]))
         sc.check("the item is in bob's inbox exactly once (none when it failed)",
                  len(files) == (0 if lost_to_chaos else 1), "%s" % files)
         # Read once alice's host answers (under --chaos it may be restarting).
