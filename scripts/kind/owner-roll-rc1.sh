@@ -54,7 +54,9 @@
 #  10. checks: the PVCs from before keep their uids; the login file is
 #      unchanged (size, mtime) with onboarding done; k2-host-0 linked by its
 #      key (0600) with K2_WORK_ROOT; app-check, reconnect-check
-#      --restart-live, owner-proof.py on k2-host-0 (one short prompt);
+#      --restart-live, owner-proof.py on k2-host-0 (one short prompt, a
+#      sleep and a wake into the same session, and the agent's turn-end
+#      home snapshot in the controller's store);
 #      then the second host: a token for k2-host-1 (enroll.py mint, as the
 #      pool does before it scales), k2-host at 2, k2-host-1 linked, its
 #      login-seed log "copied", its login file present (0600) with
@@ -330,7 +332,7 @@ kd exec k2-host-0 -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7
 "$KIND_REPO/scripts/kind/app-check.sh" --dist --password-file="$OWNER_PW" >&2 && ok "app-check --dist" || bad "app-check --dist"
 "$KIND_REPO/scripts/kind/reconnect-check.sh" --dist --restart-live --password-file="$OWNER_PW" >&2 && ok "reconnect-check --dist --restart-live" || bad "reconnect-check"
 python3 -I "$KIND_REPO/scripts/kind/owner-proof.py" --port "$PORT" --password-file "$OWNER_PW" \
-    --kubeconfig "$KIND_KUBECONFIG" --namespace "$NS" | tee "$OUT/owner-proof.txt" | sed 's/^/     /'
+    --kubeconfig "$KIND_KUBECONFIG" --namespace "$NS" --home-snapshot | tee "$OUT/owner-proof.txt" | sed 's/^/     /'
 grep -q "^PASS owner-proof" "$OUT/owner-proof.txt" && ok "the owner's path (owner-proof.py)" || bad "the owner's path (owner-proof.py)"
 # The second host only when the pool may have one (POOL_MAX=2).
 if [ "$POOL_MAX" = 2 ] && [ "$fails" = 0 ]; then second_host "$NS" "$PORT"; else note "POOL_MAX=1: no k2-host-1 on $NS"; fi

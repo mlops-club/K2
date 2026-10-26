@@ -14,11 +14,16 @@ up.sh wrote; read here, never printed), the routes the app and `k2 msg` use
   4. the reply is in Claude's transcript on k2-host-0's volume
      (~/.claude/projects/*/<session>.jsonl): an assistant line with the
      prompt's unique marker. Only counts and the session id are printed
+  4b. with --home-snapshot (home sync, rc1 on): before the sleep, the
+     controller's home store has a snapshot of this agent
+     (GET /cli/hosts/home/status, owner token read in the controller pod):
+     made at the turn's end (P3 T2), since nothing else saves it before
+     step 5. Its seq, files and bytes are printed
   5. POST /cli/sessions/v2/close (sleep), then a second short message wakes
      it again and is answered in the same session
 
     python3 -I scripts/kind/owner-proof.py --port 7443 --password-file F \\
-        --kubeconfig K --namespace k2-kind-dist [--user owner]
+        --kubeconfig K --namespace k2-kind-dist [--user owner] [--home-snapshot]
 
 Prints one line per check; exits 0 only if all pass. The agent is left
 asleep and the probe workspace registered (k2-roll-proof-<tag>).
@@ -31,6 +36,7 @@ a.add_argument("--password-file", required=True)
 a.add_argument("--kubeconfig", required=True)
 a.add_argument("--namespace", required=True)
 a.add_argument("--user", default="owner")
+a.add_argument("--home-snapshot", action="store_true")
 args = a.parse_args()
 tag = uuid.uuid4().hex[:8]
 fails = 0
@@ -120,6 +126,22 @@ check(st == 200 and d.get("success") is True and d.get("woke") is True, "msg wit
 r1 = wait_reply(m1)
 check(bool(r1), "Claude Code answered on k2-host-0 (its transcript has the reply)",
       "session %s, %d assistant line(s) with the marker" % r1 if r1 else "no reply within 240 s")
+
+# 4b.
+if args.home_snapshot and r1:
+    snap, end = None, time.time() + 120
+    while time.time() < end and not snap:
+        rc, out = pod("k2-controller-0", "k2-daemon",
+                      'curl -s "http://127.0.0.1:7420/cli/hosts/home/status?token=$(cat /var/lib/k2/.k2/daemon.token)"')
+        try:
+            snap = next((s for s in json.loads(out).get("snapshots", []) if s.get("agent") == pid), None)
+        except ValueError:
+            snap = None
+        if not snap:
+            time.sleep(3)
+    check(bool(snap), "a turn-end home snapshot of the agent is in the controller's store (before any sleep)",
+          "seq %s, %s file(s), %s bytes, from %s" % (snap.get("seq"), snap.get("files"), snap.get("bytes"),
+                                                     snap.get("host") or snap.get("host_id")) if snap else "none within 120 s")
 
 # 5.
 st, d = http("/cli/sessions/v2/close", {"agent_name": pid, "force": True}, token=token)
