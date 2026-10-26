@@ -11,7 +11,8 @@
 #      Postgres delegated (rbac.yaml); a neighbour pod (not the controller);
 #   2. a workspace, its database (POST /cli/db/create, through k2-pg), and
 #      an App folder in it (a small node server);
-#   3. POST /cli/app/install {app, workspace, folder}: the App's instance is
+#   3. POST /cli/app/install {app, workspace}, then /cli/app/deploy {app, folder}:
+#      the App's instance is
 #      a Deployment, a Service and a NetworkPolicy; its init container
 #      fetched the Seed from the controller with its token (sha256 checked);
 #      the App runs as uid 20001 on the pinned node image, /app read-only;
@@ -231,11 +232,14 @@ DB=$(printf '%s' "$r" | field name)
 [ -n "$DB" ] && ok "workspace database $DB (through postgresql/k2-pg)" || bad "db create: $(printf '%s' "$r" | sed 's/:[^:@]*@/:***@/' | cut -c1-200)"
 
 echo "== 3. install the App"
-r=$(ctl POST /cli/app/install "{\"app\":\"notes\",\"workspace\":\"appcheck\",\"folder\":\"$W/notes\",\"wait\":true}")
-printf '%s' "$r" | python3 -I -c 'import json,sys
+# install registers the App; the deploy (its own route) packs the folder's
+# Seed and starts the instance.
+show() { python3 -I -c 'import json,sys
 try: d=json.load(sys.stdin)
 except ValueError: d={"raw": sys.stdin.read()[:300]}
-print("     install -> " + json.dumps({k: d.get(k) for k in ("ok","state","error","code","message","deployment","hint") if k in d})[:400])'
+print("     " + sys.argv[1] + " -> " + json.dumps({k: d.get(k) for k in ("ok","state","error","code","message","deployment","hint") if k in d})[:400])' "$1"; }
+ctl POST /cli/app/install "{\"app\":\"notes\",\"workspace\":\"appcheck\"}" | show install
+ctl POST /cli/app/deploy "{\"app\":\"notes\",\"folder\":\"$W/notes\",\"wait\":300}" | show deploy
 inst=""
 for _ in $(seq 1 60); do
     inst=$(kn get deploy -l k2.dev/app=notes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)

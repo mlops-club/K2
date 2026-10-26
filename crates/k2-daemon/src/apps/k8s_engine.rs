@@ -118,7 +118,25 @@ pub fn pack_seed(seed: &SeedRef) -> std::result::Result<(PathBuf, String), Strin
             let mut b = tar::Builder::new(f);
             b.follow_symlinks(false);
             b.mode(tar::HeaderMode::Deterministic);
-            b.append_dir_all(".", &seed.path).map_err(|e| format!("tar the Seed: {e}"))?;
+            // Each top-level entry by its own name, no "." entry: `/app`
+            // is the volume's root, which the App's uid can't chmod or
+            // utime, so tar would fail on it.
+            let mut top: Vec<_> = std::fs::read_dir(&seed.path)
+                .map_err(|e| format!("read the Seed: {e}"))?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<std::io::Result<_>>()
+                .map_err(|e| format!("read the Seed: {e}"))?;
+            top.sort();
+            for name in top {
+                let p = seed.path.join(&name);
+                let md = std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                if md.is_dir() {
+                    b.append_dir_all(&name, &p)
+                } else {
+                    b.append_path_with_name(&p, &name)
+                }
+                .map_err(|e| format!("tar the Seed: {e}"))?;
+            }
             b.into_inner().and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
             std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
         })();
@@ -275,7 +293,7 @@ pub const FETCH_JS: &str = r#"const c=require('crypto'),fs=require('fs'),cp=requ
 if(!r.ok){console.error('k2 seed: HTTP '+r.status);process.exit(1)}
 const b=Buffer.from(await r.arrayBuffer());const h=c.createHash('sha256').update(b).digest('hex');
 if(h!==process.env.K2_SEED_SHA256){console.error('k2 seed: sha256 mismatch');process.exit(1)}
-const t='/app/.k2-seed.tar';fs.writeFileSync(t,b);cp.execFileSync('tar',['-xf',t,'-C','/app','--no-same-owner']);fs.unlinkSync(t);
+const t='/app/.k2-seed.tar';fs.writeFileSync(t,b);cp.execFileSync('tar',['-xmf',t,'-C','/app','--no-same-owner']);fs.unlinkSync(t);
 console.log('k2 seed: '+b.length+' bytes, sha256 ok')})().catch(e=>{console.error('k2 seed: '+e.message);process.exit(1)})"#;
 
 fn container_security() -> Value {

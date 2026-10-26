@@ -213,6 +213,13 @@ fn the_seed_route_serves_a_packed_seed_to_its_own_token_only() {
     assert_eq!(handle_seed_fetch(&path, Some(&token)).unwrap_err(), ("404 Not Found", "seed_not_packed"));
     let (tar, sha) = pack_seed(&SeedRef { hash: hash.clone(), path: src.clone() }).unwrap();
     assert_eq!(sha, sha256_file(&tar).unwrap());
+    // No root entry: the pod's uid can't chmod or utime `/app` itself.
+    let names: Vec<String> = tar::Archive::new(std::fs::File::open(&tar).unwrap())
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["server.js"]);
     assert_eq!(handle_seed_fetch(&path, Some(&token)).unwrap(), tar);
     assert_eq!(handle_seed_fetch(&path, Some("nope")).unwrap_err().1, "seed_token");
     assert_eq!(handle_seed_fetch(&path, None).unwrap_err().1, "seed_token");
