@@ -2820,6 +2820,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_workspace_address_gives_its_project_id_spawn_name_and_sessions_as_placement_aliases() {
+        k2_core::test_isolation::assert_no_prod_env();
+        let _db = k2_core::db::init_for_tests();
+        let dir = k2_core::test_env::unique_temp_path("alias-ws").join("bob-alias-ws");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let id = "p-alias-7f3e";
+        {
+            let db = k2_core::db::shared();
+            let conn = db.lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO projects (id, path, name, agent_mode) VALUES (?1, ?2, 'bob-alias-ws', 'custom')",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_sessions (id, project_id, session_id, active_terminal_id, harness, owner, status, created_at) \
+                 VALUES ('wsr-alias-7f3e', ?1, 'sess-saved', 'term-live', 'claude', 'user', 'running', unixepoch())",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let want: Vec<String> = [id, "bob-alias-ws", "term-live", "sess-saved"].map(String::from).to_vec();
+        assert_eq!(placement_aliases("bob-alias-ws"), want, "by workspace name");
+        assert_eq!(placement_aliases(&path), want, "by path");
+        assert!(placement_aliases("no-such-workspace-7f3e").is_empty());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn an_outbox_failure_keeps_todays_reason_when_the_controller_gave_one() {
         let failed = |why: &str| {
             MsgResponse::from_outbox(Ok(crate::delivery_drain::Sent {
