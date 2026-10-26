@@ -135,6 +135,18 @@ Usable = linked, not away, not draining. Away (phase A) = a host this process sa
 | `scripts/lab/topology/two-process.sh` (run `20261026T041202Z`) | **13/13 PASS**: the 12 before, plus "every placed agent has its placement policy" (8 agents, portable, last host host-1) |
 | `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 162 binaries: **5253 passed, 0 failed**, 6 ignored |
 
+## Follow-ups after verification (coordinator, 2026-10-26)
+
+| # | Follow-up | Done |
+|---|---|---|
+| 1 | Static's host set from W5's enrolled keys | `enroll::sync_enrolled` pushes the non-revoked key names into `RemoteHost::set_enrolled` at controller start and after each enroll and revoke (enroll mode only). Never read from the registry under `RemoteHost::inner` (the shared DB lock; W3's deadlock shape). An enrolled host that isn't linked is away; revoked, it's gone. Test `enrolled_hosts_count_as_away_until_they_link_or_are_revoked` |
+| 2 | `HostView.draining` from S8's drain state | waits for the outbox worker's S8 drain (coordinator relays) |
+| 3 | Bound the away list | a host is known if it is linked, enrolled, holds a placement (W3 lost), is some agent's **pinned** host, or linked to this process within `K2_HOST_AWAY_FORGET` (default 24 h) since it unlinked. A host that is only some agent's `last_host` is dropped after that window. Test `a_host_seen_only_as_a_last_host_is_forgotten_a_pinned_one_is_not` |
+| 4 | Adoption pinned every pre-existing agent | an agent adopted without a row gets D5 by its host's kind (the hello's labels are set before `adopt`): portable on a server, pinned on a laptop; an existing row keeps its mode. Tests `adopted_agents_from_before_the_table_are_portable_on_servers_pinned_on_laptops`, `provisioner::tests::policy_mode_…` |
+| – | ptyd's socket path under a long temp dir | `two-process.sh` makes its root under `/tmp` (`LAB_SHORT_TMP`), so `<home>/.k2/run/ptyd/ctl.sock` and ptyd's fallback under the host's `TMPDIR` stay within `sun_path` (104 bytes on macOS) |
+
+`cargo test -p k2-daemon --lib -- provisioner:: hosts:: agent_host::`: **74 passed**, 2 runs.
+
 ## Status
 
 - Milestones: diagrams written; phase A done.

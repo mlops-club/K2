@@ -159,6 +159,11 @@ pub fn start() {
             k2_core::log_debug!("[hosts] K2_ROLE=controller: waiting for agent hosts on {}", proto::ATTACH_PATH);
             // Transcripts are on the agents' hosts: the resume decision asks them.
             k2_core::transcript_probe::set(Some(controller_transcript_probe));
+            // P3: enrolled hosts count for placement (away until they link).
+            tokio::task::spawn_blocking(|| match enroll::controller_registry() {
+                Ok(reg) => enroll::sync_enrolled(&reg, crate::agent_host::remote::global()),
+                Err(e) => k2_core::log_debug!("[hosts] enroll registry: {e}"),
+            });
         }
         crate::runtime_role::Role::All => {}
     }

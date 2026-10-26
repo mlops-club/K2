@@ -1502,3 +1502,61 @@ async fn a_full_host_refuses_naming_k2_host_max_awake() {
     close_on(&c, &mut h, "first").await;
     place(&c, &mut h, "second", &uuid::Uuid::new_v4().to_string()).await;
 }
+
+// ── P3 phase A follow-ups: enrolled hosts, the away list, adoption ───────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enrolled_hosts_count_as_away_until_they_link_or_are_revoked() {
+    let c = Controller::start().await;
+    c.remote.set_enrolled(["vm-2".to_string()].into());
+    assert_eq!(c.remote.status_json()["away"], json!(["vm-2"]), "enrolled, never linked");
+    let _vm2 = fake_host(&c, "vm-2").await;
+    c.wait_hosts(1).await;
+    assert_eq!(c.remote.status_json()["away"], json!([]));
+    // Revoked (the enroll route pushes the new set): no longer known.
+    c.remote.set_enrolled(Default::default());
+    assert_eq!(c.remote.status_json()["away"], json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_seen_only_as_a_last_host_is_forgotten_a_pinned_one_is_not() {
+    // Forget at once: only what still names a host keeps it away.
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new().with_away_forget(Duration::ZERO)));
+    let c = Controller::start_on(remote).await;
+    let mut server = fake_host(&c, "h-old").await;
+    let mut laptop = fake_host_labeled(&c, "eric-mbp", &["k2.kind=laptop"]).await;
+    c.wait_hosts(2).await;
+    // Both empty: by name first (eric-mbp), then the emptier (h-old).
+    place(&c, &mut laptop, "notes", &uuid::Uuid::new_v4().to_string()).await;
+    place(&c, &mut server, "bob", &uuid::Uuid::new_v4().to_string()).await;
+    close_on(&c, &mut server, "bob").await;
+    close_on(&c, &mut laptop, "notes").await;
+    drop(server);
+    drop(laptop);
+    c.wait_hosts(0).await;
+    // bob's policy still names h-old as its last host; notes is pinned to eric-mbp.
+    assert_eq!(c.remote.policy().get("bob").unwrap().last_host.as_deref(), Some("h-old"));
+    assert_eq!(c.remote.status_json()["away"], json!(["eric-mbp"]), "h-old is forgotten; the laptop notes waits for is not");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopted_agents_from_before_the_table_are_portable_on_servers_pinned_on_laptops() {
+    let c = Controller::start().await;
+    let labeled_hello = |name: &'static str, labels: Vec<String>, resume| {
+        let url = c.attach_url.clone();
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("dial");
+            send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume }).await;
+            assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
+            ws
+        }
+    };
+    let _server = labeled_hello("h-1", vec![], vec![resumed("old-server", &uuid::Uuid::new_v4().to_string(), 5)]).await;
+    let _laptop =
+        labeled_hello("eric-mbp", vec!["k2.kind=laptop".into()], vec![resumed("old-laptop", &uuid::Uuid::new_v4().to_string(), 6)]).await;
+    c.wait_hosts(2).await;
+    let server = c.remote.policy().get("old-server").expect("adopted");
+    assert_eq!((server.mode, server.last_host.as_deref()), (crate::provisioner::Mode::Portable, Some("h-1")));
+    let laptop = c.remote.policy().get("old-laptop").expect("adopted");
+    assert_eq!(laptop.mode, crate::provisioner::Mode::Pinned { host: "eric-mbp".into() });
+}

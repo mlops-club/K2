@@ -122,14 +122,18 @@ fn policy_mode_comes_from_the_first_hosts_kind_and_last_host_from_every_placemen
     let row = p.record_placement("bob", "host-2", HostKind::Laptop).unwrap();
     assert_eq!((row.mode, row.last_host.as_deref()), (Mode::Portable, Some("host-2")), "the mode is set once");
     assert_eq!(p.need("bob").last_host.as_deref(), Some("host-2"));
-    // Adopted without a row (from before the table): pinned where it runs.
-    p.record_adopted("old", "host-1").unwrap();
-    assert_eq!(p.get("old").unwrap().mode, Mode::Pinned { host: "host-1".into() });
-    p.record_adopted("bob", "host-3").unwrap();
+    // Adopted without a row (from before the table): by the host's kind.
+    p.record_adopted("old-server", "host-1", HostKind::Server).unwrap();
+    assert_eq!(p.get("old-server").unwrap().mode, Mode::Portable, "a server's agent is portable");
+    assert_eq!(p.get("old-server").unwrap().last_host.as_deref(), Some("host-1"));
+    p.record_adopted("old-laptop", "eric-mbp", HostKind::Laptop).unwrap();
+    assert_eq!(p.get("old-laptop").unwrap().mode, Mode::Pinned { host: "eric-mbp".into() }, "a laptop's agent is pinned");
+    p.record_adopted("bob", "host-3", HostKind::Laptop).unwrap();
     assert_eq!(p.get("bob").unwrap().mode, Mode::Portable, "an existing row keeps its mode");
     p.set_mode("bob", &Mode::Pinned { host: "host-3".into() }).unwrap();
     assert_eq!(p.need("bob").mode, Mode::Pinned { host: "host-3".into() });
-    assert_eq!(p.hosts(), vec!["eric-mbp", "host-1", "host-3"]);
+    // Only pinned hosts are kept known: a last host alone isn't.
+    assert_eq!(p.pinned_hosts(), vec!["eric-mbp", "host-3"]);
 }
 
 #[test]

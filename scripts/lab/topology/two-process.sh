@@ -74,7 +74,11 @@ tp_wait_ready() {
 # The controller alone (no host yet). Exports LAB_PORT and LAB_TOKEN.
 tp_controller_up() {
     local run_dir=$1
-    TP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/k2lab-2p-XXXXXX") || return 1
+    # Short on purpose: k2-ptyd's socket (<home>/.k2/run/ptyd/ctl.sock, or
+    # its fallback under the host's TMPDIR, which is in here) must fit in
+    # sun_path (104 bytes on macOS); macOS's $TMPDIR (/var/folders/...)
+    # doesn't leave room.
+    TP_ROOT=$(mktemp -d "${LAB_SHORT_TMP:-/tmp}/k2lab-2p-XXXXXX") || return 1
     mkdir -p "$TP_ROOT"/{ctl,host}/{home,tmp,run} "$TP_ROOT/shim" "$run_dir"
     head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TP_ROOT/host-token"
     TP_CTL_ENV=(

@@ -5,8 +5,8 @@
 //! - Written on every placement: `last_host` always; the mode once, when
 //!   the agent is first placed (D5: on a `k2.kind=laptop` host it is pinned
 //!   there, anywhere else it is portable). Agents a controller adopts
-//!   without a row (they existed before this table) are pinned to the host
-//!   that runs them.
+//!   without a row (they existed before this table) get the same rule from
+//!   the host that runs them.
 //! - Its own connection to the controller's database file, as
 //!   `PlacementStore`'s: it is used while `RemoteHost::inner` is held, so it
 //!   must never wait on `k2_core::db::shared()` (W3's boot deadlock).
@@ -99,18 +99,11 @@ impl PolicyStore {
     }
 
     /// An agent a host resumed and the controller had no row for (it
-    /// existed before this table): pinned to that host (D5). An existing
-    /// row only gets its last host.
-    pub fn record_adopted(&self, agent: &str, host: &str) -> Result<(), String> {
-        self.db
-            .lock()
-            .execute(
-                "INSERT INTO agent_placement (agent, mode, pinned_host, last_host, updated_ms) VALUES (?1, 'pinned', ?2, ?2, ?3)
-                 ON CONFLICT(agent) DO UPDATE SET last_host = ?2, updated_ms = ?3",
-                params![agent, host, now_ms()],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("agent_placement: {e}"))
+    /// existed before this table): D5 by the host's kind, as a first
+    /// placement (pinned on a laptop, portable on a server). An existing row
+    /// only gets its last host.
+    pub fn record_adopted(&self, agent: &str, host: &str, kind: HostKind) -> Result<(), String> {
+        self.record_placement(agent, host, kind).map(|_| ())
     }
 
     pub fn set_mode(&self, agent: &str, mode: &Mode) -> Result<(), String> {
@@ -137,18 +130,15 @@ impl PolicyStore {
         st.query_map([], row_policy).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
     }
 
-    /// Every host a row names (pinned or last): hosts the controller knows
-    /// of even when they never linked to this process.
-    pub fn hosts(&self) -> Vec<String> {
+    /// Every host some agent is pinned to: those agents wait for it, so it
+    /// stays known (away) while it is gone, however long.
+    pub fn pinned_hosts(&self) -> Vec<String> {
         let mut hs: Vec<String> = self
             .list()
             .into_iter()
-            .flat_map(|p| {
-                let pinned = match p.mode {
-                    Mode::Pinned { host } => Some(host),
-                    Mode::Portable => None,
-                };
-                pinned.into_iter().chain(p.last_host)
+            .filter_map(|p| match p.mode {
+                Mode::Pinned { host } => Some(host),
+                Mode::Portable => None,
             })
             .collect();
         hs.sort();

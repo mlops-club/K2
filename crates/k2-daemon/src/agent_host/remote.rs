@@ -23,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::provisioner::policy::PolicyStore;
 use crate::provisioner::{HostView, Provisioner, Refusal};
@@ -189,8 +189,10 @@ struct Inner {
     last_host_for_cwd: HashMap<PathBuf, String>,
     /// P3: each host's `hello` labels (kept while it is away: its kind).
     host_labels: HashMap<String, Vec<String>>,
-    /// P3: every host that linked to this process.
-    known_hosts: BTreeSet<String>,
+    /// P3: every host that linked to this process: `None` while linked,
+    /// else when it unlinked (an away host is forgotten after `away_forget`
+    /// unless something else still names it).
+    seen_hosts: HashMap<String, Option<Instant>>,
 }
 
 /// An HTTP-shaped answer for the controller's routes: status line and
@@ -477,7 +479,15 @@ pub struct RemoteHost {
     provisioner: Box<dyn Provisioner>,
     /// P3: each agent's placement policy (`agent_placement`).
     policy: Arc<PolicyStore>,
+    /// P3: enrolled hosts (W5 keys not revoked; enroll mode), pushed by the
+    /// enroll routes: never read from the registry under `inner`.
+    enrolled: Mutex<BTreeSet<String>>,
+    /// P3: how long a host seen only on a link stays away after unlinking.
+    away_forget: Duration,
 }
+
+/// Default for `K2_HOST_AWAY_FORGET`.
+pub const AWAY_FORGET: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl Default for RemoteHost {
     fn default() -> Self {
@@ -500,7 +510,21 @@ impl RemoteHost {
             store: None,
             provisioner: Box::new(crate::provisioner::static_::Static),
             policy: Arc::new(PolicyStore::in_memory()),
+            enrolled: Mutex::default(),
+            away_forget: AWAY_FORGET,
         }
+    }
+
+    /// How long a host that only linked to this process stays away after it
+    /// unlinks.
+    pub fn with_away_forget(self, away_forget: Duration) -> Self {
+        Self { away_forget, ..self }
+    }
+
+    /// P3: the enrolled hosts (W5 keys not revoked). They count for
+    /// placement while not linked (away), until revoked.
+    pub fn set_enrolled(&self, hosts: BTreeSet<String>) {
+        *self.enrolled.lock() = hosts;
     }
 
     /// P3: place with `provisioner`, keeping policies in `policy`.
@@ -612,7 +636,7 @@ impl RemoteHost {
         let (tx, rx) = mpsc::unbounded_channel();
         let old = {
             let mut inner = self.inner.lock();
-            inner.known_hosts.insert(host_id.clone());
+            inner.seen_hosts.insert(host_id.clone(), None);
             inner.links.insert(
                 host_id.clone(),
                 Link { conn, host_name: host_name.to_string(), protocol, tx, pending: HashMap::new(), streams: HashMap::new() },
@@ -640,6 +664,7 @@ impl RemoteHost {
                 return;
             }
             let protocol = inner.links.get(host_id).map(|l| l.protocol).unwrap_or(1);
+            inner.seen_hosts.insert(host_id.to_string(), Some(Instant::now()));
             if protocol >= 2 {
                 // W3: the host's agents may still run. Keep every placement,
                 // marked lost, until the host links again and resumes them
@@ -841,13 +866,22 @@ impl RemoteHost {
         self.inner.lock().host_labels.insert(host_id.to_string(), labels);
     }
 
-    /// Every host placement knows of: linked now, linked earlier, holding a
-    /// placement, or named in an agent's policy. Those not linked are away.
+    /// Every host placement knows of: linked now; enrolled (W5); holding a
+    /// placement (lost, W3); some agent's pinned host; or linked to this
+    /// process within `away_forget`. Those not linked are away. A host that
+    /// is only some agent's last host isn't kept: it would stay away forever.
     fn host_views(&self, inner: &Inner) -> Vec<HostView> {
-        let mut ids: BTreeSet<String> = inner.known_hosts.clone();
+        let now = Instant::now();
+        let mut ids: BTreeSet<String> = inner
+            .seen_hosts
+            .iter()
+            .filter(|(_, gone)| gone.is_none_or(|t| now.saturating_duration_since(t) < self.away_forget))
+            .map(|(h, _)| h.clone())
+            .collect();
         ids.extend(inner.links.keys().cloned());
         ids.extend(inner.placements.values().map(|p| p.host_id.clone()));
-        ids.extend(self.policy.hosts());
+        ids.extend(self.enrolled.lock().iter().cloned());
+        ids.extend(self.policy.pinned_hosts());
         ids.into_iter()
             .map(|id| {
                 let mut v = HostView::from_labels(&id, inner.host_labels.get(&id).map(Vec::as_slice).unwrap_or_default());
@@ -1479,8 +1513,10 @@ impl RemoteHost {
         };
         let s = self.keep_session(inner, &r.agent_id, host_id, epoch, sid, meta);
         s.cached.lock().alive = r.child_alive;
-        // D5: an agent from before agent_placement is pinned where it runs.
-        if let Err(e) = self.policy.record_adopted(&r.agent_id, host_id) {
+        // D5: an agent from before agent_placement: pinned where it runs on
+        // a laptop, portable on a server.
+        let kind = HostView::from_labels(host_id, inner.host_labels.get(host_id).map(Vec::as_slice).unwrap_or_default()).kind;
+        if let Err(e) = self.policy.record_adopted(&r.agent_id, host_id, kind) {
             log_debug!("[hosts] agent {}: placement policy not written: {e}", r.agent_id);
         }
     }
@@ -1961,7 +1997,14 @@ pub fn global() -> &'static RemoteHost {
                 PolicyStore::in_memory()
             }
         };
-        host.with_placement(provisioner, Arc::new(policy))
+        let forget = match std::env::var("K2_HOST_AWAY_FORGET").ok().filter(|v| !v.trim().is_empty()) {
+            None => AWAY_FORGET,
+            Some(v) => v.trim().parse().map(Duration::from_secs).unwrap_or_else(|_| {
+                log_debug!("[provisioner] K2_HOST_AWAY_FORGET={v:?} is not a number of seconds; using {AWAY_FORGET:?}");
+                AWAY_FORGET
+            }),
+        };
+        host.with_placement(provisioner, Arc::new(policy)).with_away_forget(forget)
     });
     RESTORED.call_once(|| {
         r.restore();
