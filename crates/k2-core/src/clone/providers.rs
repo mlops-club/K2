@@ -706,7 +706,7 @@ pub(crate) fn grok_percent_encode_cwd(cwd: &str) -> String {
 ///
 /// Returns `None` for Hermes export (handled as SQL merge, not a file
 /// drop) and unrecognized/empty paths.
-pub(super) fn reroot_provider(
+pub(crate) fn reroot_provider(
     rest: &Path,
     home: &Path,
     _source_project_path: &str,
@@ -752,7 +752,7 @@ pub(super) fn reroot_provider(
 
 /// Where a provider archive entry should land.
 #[derive(Debug)]
-pub(super) enum ProviderDest {
+pub(crate) enum ProviderDest {
     /// Write bytes to this absolute path (after optional rewrite).
     File(PathBuf),
     /// Merge JSON export into dest `~/.hermes/state.db`.

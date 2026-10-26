@@ -414,7 +414,7 @@ impl SessionPathRewrite {
 /// with `replacement`. Returns `Some(new_bytes)` when at least one match
 /// was found, `None` when there were none (so the caller can skip the
 /// allocation). `needle` is assumed non-empty (caller guarantees it).
-pub(super) fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Option<Vec<u8>> {
     let mut matches: Vec<usize> = Vec::new();
     let mut i = 0;
     while i + needle.len() <= haystack.len() {

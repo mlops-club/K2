@@ -216,6 +216,9 @@ pub mod hire;
 pub mod home_avatars;
 /// homes-sync-v1 (0.46.1): a person's Homes synced between their devices.
 pub mod homes_sync;
+/// An agent's portable home (dist P3 T1): snapshots by content, the
+/// controller's store, journaled restore. Not `homes_sync` (the app's Homes).
+pub mod agent_home;
 // Phase 2.5c: workspace lifecycle + state + identity + launch helpers.
 // Post-Phase-2.1 "workspace == agent" 1:1 means these are
 // workspace-scoped concerns; was scattered under `agents/`.
