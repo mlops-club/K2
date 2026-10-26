@@ -433,3 +433,52 @@ async fn a_token_mode_controller_links_bootstrap_hosts_as_before() {
     let (_, wrong) = link(&c, "host-2", "wrong").await;
     assert_eq!(refused_code(&wrong), "bad_token");
 }
+
+/// After a controller DB restore the host's key is forgotten and its boot
+/// token is spent. The token file is read on every attempt: once the owner
+/// mints a new one into it, the next retry enrolls the same key again, with
+/// no host restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forgotten_key_enrolls_again_with_a_token_minted_after_the_refusal() {
+    let http = reqwest::Client::new();
+    let mint = |c: &Controller| {
+        let (http, base) = (http.clone(), c.base.clone());
+        async move {
+            let r = http.post(format!("{base}{TOKENS_PATH}?token={OWNER}")).body("{}").send().await.unwrap();
+            serde_json::from_str::<Value>(&r.text().await.unwrap()).unwrap()["token"].as_str().unwrap().to_string()
+        }
+    };
+    let file = k2_core::test_env::unique_temp_path("host-enroll-token");
+    let key = SigningKey::generate().unwrap();
+    // Enrolled on the first controller; the file holds the token used.
+    let c1 = Controller::start(Mode::Enroll).await;
+    std::fs::write(&file, mint(&c1).await).unwrap();
+    let f = || Some(file.to_string_lossy().into_owned());
+    within("enroll", enroll_hello_from(&c1.host("host-1", "boot-token"), &key, f())).await.unwrap();
+    // The DB is restored: a controller that never saw this key. The file's token is spent there.
+    let c2 = Controller::start(Mode::Enroll).await;
+    let err = within("refused", enroll_hello_from(&c2.host("host-1", "boot-token"), &key, f())).await.unwrap_err();
+    assert!(err.contains("token_invalid"), "{err}");
+    let again = within("still refused", enroll_hello_from(&c2.host("host-1", "boot-token"), &key, f())).await.unwrap_err();
+    assert!(again.contains("token_invalid"), "keeps retrying: {again}");
+    // The owner mints a new token into the file: the next retry enrolls the same key.
+    std::fs::write(&file, mint(&c2).await).unwrap();
+    let token = within("re-enroll", enroll_hello_from(&c2.host("host-1", "boot-token"), &key, f())).await.unwrap();
+    let (_, welcome) = link(&c2, "host-1", &token).await;
+    assert!(matches!(&welcome, Frame::Welcome { host_id, .. } if host_id == "host-1"), "{welcome:?}");
+    let keys = c2.reg.keys().unwrap();
+    assert_eq!(keys.iter().map(|k| (k.host_name.as_str(), k.fingerprint.as_str())).collect::<Vec<_>>(), [("host-1", key.fingerprint().as_str())]);
+    let _ = std::fs::remove_file(&file);
+}
+
+/// A file that can't be read leaves the token read at boot in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_token_file_falls_back_to_the_boot_token() {
+    let c = Controller::start(Mode::Enroll).await;
+    let http = reqwest::Client::new();
+    let r = http.post(format!("{}{TOKENS_PATH}?token={OWNER}", c.base)).body("{}").send().await.unwrap();
+    let boot = serde_json::from_str::<Value>(&r.text().await.unwrap()).unwrap()["token"].as_str().unwrap().to_string();
+    let key = SigningKey::generate().unwrap();
+    let missing = k2_core::test_env::unique_temp_path("no-such-token").to_string_lossy().into_owned();
+    within("enroll", enroll_hello_from(&c.host("host-1", &boot), &key, Some(missing))).await.unwrap();
+}
