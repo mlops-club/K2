@@ -361,6 +361,30 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### Linux gate on wave3 88d1eddc2 (k8s, provisioner, home code)
+
+`lab-runs/gate-debug/2026-10-26T09-26-12Z`, same setup as on 3912ab2ff
+(below), from an emptied target volume at the default 20G free floor
+(22G at start, 20G at the end), the Docker lock held throughout.
+
+| Package | Test binaries | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| k2-core | 17 | 3868 | 0 | 1 (allowlisted) |
+| k2-daemon | 162 | 5311 | 1 | 9 |
+| k2-daemon root-only `cell_egress` | 1 | 1 | 0 | 0 |
+
+GATE RED, with nothing new: every failure is class (b), the same as on
+3912ab2ff.
+
+- Failed: `k2_home_integration`
+  `k2_home_holds_the_whole_k2_home_and_home_stays_empty` (`$HOME` gets
+  `.local/bin/k2`, the `cli_stage.rs` fallback; see below).
+- Ignored but not allowlisted: the same five tests listed below.
+- The 61 new k2-daemon tests and the 1 new k2-core test pass, and there are
+  no compile errors.
+- `k2-ptyd` changed (3 files), but the gate only builds its binary for
+  `ptyd_backend`; the gate doesn't run k2-ptyd's own tests.
+
 ### Linux gate on wave2-preview 3912ab2ff (W5 included)
 
 `lab-runs/gate-debug/2026-10-26T05-09-20Z`, through `scripts/lab/lib/linux_gate.sh`: slot,
