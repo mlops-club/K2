@@ -2,6 +2,7 @@
 # TEST ONLY (P4 T4): the host pool on kind, namespace k2-kind-p4, port 7444.
 #
 #   scripts/kind/p4-up.sh [--daemon-image=k2-daemon:rc1] [--fake-src=../rc1-src]
+#                         [--pool=MIN:MAX (default 2:2)] [--max-awake=N]
 #
 # 1. tags --daemon-image (a build with the pool and home sync: wave3 rc1
 #    or later) as k2-daemon:p4; nothing is compiled here except the fake
@@ -21,12 +22,14 @@
 set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
-daemon_image=k2-daemon:rc1 fake_src="$KIND_REPO/../rc1-src"
+daemon_image=k2-daemon:rc1 fake_src="$KIND_REPO/../rc1-src" pool=2:2 max_awake=
 for a in "$@"; do
     case "$a" in
         --daemon-image=*) daemon_image=${a#--daemon-image=} ;;
         --fake-src=*) fake_src=${a#--fake-src=} ;;
-        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --pool=*) pool=${a#--pool=} ;;
+        --max-awake=*) max_awake=${a#--max-awake=} ;;
+        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "p4-up.sh: unknown argument $a" >&2; exit 2 ;;
     esac
 done
@@ -37,17 +40,20 @@ docker image inspect "$daemon_image" >/dev/null 2>&1 || { echo "p4-up.sh: no ima
 [ -d "$fake_src/tests/fakes/k2-fake-agent" ] || { echo "p4-up.sh: no tests/fakes/k2-fake-agent under $fake_src" >&2; exit 1; }
 docker tag "$daemon_image" k2-daemon:p4
 say "k2-daemon:p4 = $daemon_image ($(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$daemon_image" | cut -c1-9))"
-K2_KIND_FAKE_SRC=$fake_src "$KIND_REPO/scripts/kind/up.sh" --p4 --hosts=2 --max-hosts=2 --host-auth=enroll \
+case "$pool" in [1-9]:[1-9]) ;; *) echo "p4-up.sh: --pool=MIN:MAX" >&2; exit 2 ;; esac
+K2_KIND_FAKE_SRC=$fake_src "$KIND_REPO/scripts/kind/up.sh" --p4 --hosts="${pool%%:*}" --max-hosts="${pool#*:}" ${max_awake:+--max-awake="$max_awake"} --host-auth=enroll \
     --ptyd=1 --provisioner=kubernetes --work-root=/var/lib/k2/work --password-file="$KIND_STATE/owner-password"
 
 kn() { kubectl --kubeconfig "$KIND_KUBECONFIG" -n "$KIND_NS" "$@"; }
 fails=0
 ok() { printf 'ok   %s\n' "$*"; }
 bad() { printf 'FAIL %s\n' "$*"; fails=$((fails + 1)); }
-n0=$(kn get pod k2-host-0 -o jsonpath='{.spec.nodeName}')
-n1=$(kn get pod k2-host-1 -o jsonpath='{.spec.nodeName}')
-[ -n "$n0" ] && [ -n "$n1" ] && [ "$n0" != "$n1" ] && ok "k2-host-0 on $n0, k2-host-1 on $n1" || bad "hosts on '$n0' and '$n1'"
-for h in k2-host-0 k2-host-1; do
+hosts=$(kn get pods -l app.kubernetes.io/name=k2-host -o jsonpath='{.items[*].metadata.name}')
+nodes=$(for h in $hosts; do kn get pod "$h" -o jsonpath='{.spec.nodeName}'; echo; done)
+[ "$(echo "$nodes" | grep -c .)" = "$(echo "$nodes" | sort -u | grep -c .)" ] \
+    && ok "hosts on different nodes: $(for h in $hosts; do printf '%s on %s; ' "$h" "$(kn get pod "$h" -o jsonpath='{.spec.nodeName}')"; done)" \
+    || bad "two hosts share a node: $(echo $nodes)"
+for h in $hosts; do
     kn exec "$h" -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7420/cli/hosts/status | grep -q "\"linked\":true"' \
         && ok "$h linked" || bad "$h not linked"
     [ "$(kn exec "$h" -c k2-host -- stat -c %a /var/lib/k2-host/.k2/host-key.pem 2>/dev/null)" = 600 ] \
