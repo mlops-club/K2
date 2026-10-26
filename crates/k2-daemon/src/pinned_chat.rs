@@ -1123,3 +1123,46 @@ mod tests {
         assert!(result.body.contains("project not registered"), "got: {}", result.body);
     }
 }
+
+#[cfg(test)]
+mod host_unavailable_route_tests {
+    use super::*;
+    use crate::spawn::{SpawnWorkspaceSessionOutcome, SpawnWorkspaceSessionRequest, CONTROLLER_SPAWN};
+
+    fn no_host(_: &SpawnWorkspaceSessionRequest) -> Result<SpawnWorkspaceSessionOutcome, String> {
+        Err(format!("{}no agent host is linked", crate::agent_host::remote::HOST_UNAVAILABLE))
+    }
+
+    fn broken(_: &SpawnWorkspaceSessionRequest) -> Result<SpawnWorkspaceSessionOutcome, String> {
+        Err("exec claude: no such file".into())
+    }
+
+    /// K2-a: ensure-pinned-chat for a workspace no agent host can take
+    /// right now is a retryable 503; any other spawn failure stays a 400.
+    #[test]
+    fn ensure_pinned_chat_no_host_can_take_is_a_503_and_other_failures_a_400() {
+        let home = crate::test_support::TempHome::new();
+        let project = home.path().join("pinned-ws");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.to_string_lossy().into_owned();
+        {
+            let db = k2_core::db::shared();
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO projects (id, name, path, default_agent) VALUES (?1, ?2, ?3, NULL)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), "pinned-ws", project],
+            )
+            .expect("insert project");
+        }
+        let body = serde_json::json!({ "project": project }).to_string();
+        for (answer, status) in [
+            (no_host as crate::spawn::ControllerSpawn, "503 Service Unavailable"),
+            (broken, "400 Bad Request"),
+        ] {
+            CONTROLLER_SPAWN.with(|c| *c.borrow_mut() = Some(answer));
+            let r = handle_ensure_pinned_chat(body.as_bytes());
+            CONTROLLER_SPAWN.with(|c| *c.borrow_mut() = None);
+            assert_eq!(r.status, status, "{}", r.body);
+        }
+    }
+}

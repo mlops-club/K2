@@ -1775,3 +1775,54 @@ mod gap_route_tests {
         assert_eq!(inc.body, "[]", "body={}", inc.body);
     }
 }
+
+#[cfg(test)]
+mod host_unavailable_route_tests {
+    use super::*;
+    use crate::spawn::CONTROLLER_SPAWN;
+
+    fn no_host(_: &SpawnWorkspaceSessionRequest) -> Result<crate::spawn::SpawnWorkspaceSessionOutcome, String> {
+        Err(format!("{}no agent host is linked", crate::agent_host::remote::HOST_UNAVAILABLE))
+    }
+
+    fn broken(_: &SpawnWorkspaceSessionRequest) -> Result<crate::spawn::SpawnWorkspaceSessionOutcome, String> {
+        Err("exec claude: no such file".into())
+    }
+
+    /// This thread's spawns answer as `answer` until it drops.
+    struct Answer;
+    impl Answer {
+        fn set(answer: crate::spawn::ControllerSpawn) -> Self {
+            CONTROLLER_SPAWN.with(|c| *c.borrow_mut() = Some(answer));
+            Answer
+        }
+    }
+    impl Drop for Answer {
+        fn drop(&mut self) {
+            CONTROLLER_SPAWN.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    /// K2-a: a launch no agent host can take right now is a retryable 503;
+    /// any other spawn failure stays a 400.
+    #[test]
+    fn a_launch_no_host_can_take_is_a_503_and_other_failures_a_400() {
+        let home = crate::test_support::TempHome::new();
+        let project = home.path().join("ws");
+        // The agent on disk (the unified-primary layout).
+        std::fs::create_dir_all(project.join(".k2so/agent")).unwrap();
+        std::fs::write(project.join(".k2so/agent/AGENT.md"), "---\nname: k2a\ntype: custom\nrole: test\n---\n\n# k2a\n").unwrap();
+        let project = project.to_string_lossy().into_owned();
+        let params: HashMap<String, String> =
+            [("agent".to_string(), "k2a".to_string()), ("command".to_string(), "claude".to_string())].into();
+        {
+            let _a = Answer::set(no_host);
+            let r = handle_agents_launch(&params, &project);
+            assert_eq!(r.status, "503 Service Unavailable", "{}", r.body);
+            assert!(r.body.contains(crate::agent_host::remote::HOST_UNAVAILABLE), "{}", r.body);
+        }
+        let _a = Answer::set(broken);
+        let r = handle_agents_launch(&params, &project);
+        assert_eq!(r.status, "400 Bad Request", "{}", r.body);
+    }
+}

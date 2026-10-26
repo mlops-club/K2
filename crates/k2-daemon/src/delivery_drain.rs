@@ -212,6 +212,32 @@ impl Direct {
     }
 }
 
+thread_local! {
+    static DIRECT_DELIVERY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The message [`Controller::deliver_gone`] is delivering on this thread,
+/// while it runs: a spawn it wakes the agent with names it (K2-c).
+struct DirectDelivery;
+
+impl DirectDelivery {
+    fn during(msg_id: &str) -> Self {
+        DIRECT_DELIVERY.with(|d| *d.borrow_mut() = Some(msg_id.to_string()));
+        DirectDelivery
+    }
+}
+
+impl Drop for DirectDelivery {
+    fn drop(&mut self) {
+        DIRECT_DELIVERY.with(|d| *d.borrow_mut() = None);
+    }
+}
+
+/// The message the gone rule is delivering on this thread, if any.
+pub(crate) fn direct_delivery_id() -> Option<String> {
+    DIRECT_DELIVERY.with(|d| d.borrow().clone())
+}
+
 /// What the controller does with a `deliver` from a host.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Taken {
@@ -500,7 +526,13 @@ impl Controller {
     /// [`Direct::deliver`] (blocking: it may wake the agent).
     pub fn deliver_gone(&self, r: &Row) {
         let body: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
-        let res = (self.direct.deliver)(&r.recipient, &r.sender, &body);
+        // K2-c: a host may have delivered it before its agent died; the
+        // spawn that wakes the agent carries the id, so that host's seen
+        // table decides before the prompt goes on argv.
+        let res = {
+            let _id = DirectDelivery::during(&r.msg_id);
+            (self.direct.deliver)(&r.recipient, &r.sender, &body)
+        };
         let now = delivery::now_ms();
         let conn = self.db.lock();
         match &res {
@@ -619,9 +651,12 @@ impl Controller {
 pub enum LocalDelivery {
     /// Written into the agent (PTY or inbox): ack `delivered`.
     Delivered,
-    /// Not now (no live session, PTY busy or gone): no ack, the
-    /// controller resends.
+    /// Not now, and nothing was written (no live session, PTY busy): no
+    /// ack, the controller resends.
     Retry(String),
+    /// The inject began and its outcome is unknown (the agent died
+    /// mid-inject): the agent's transcript decides, as after a restart.
+    Interrupted(String),
     /// Never (malformed body): ack `rejected`.
     Rejected(String),
 }
@@ -661,6 +696,9 @@ const REPORTED: &str = "reported again when the host linked";
 enum Settled {
     Delivered(String),
     NotDelivered,
+    /// Not in the transcript yet, and the agent is mid-turn: it may still
+    /// take the prompt. No answer; decided on a later receive or link.
+    Pending,
     Uncertain(String),
 }
 
@@ -669,6 +707,7 @@ enum Settled {
 pub struct TranscriptMark {
     pub provider: Option<String>,
     pub conversation: Option<String>,
+    /// The session's cwd, canonical (`/tmp` and `/private/tmp` are one).
     pub cwd: Option<String>,
     /// Its length now (0 when it doesn't exist yet).
     pub offset: u64,
@@ -677,55 +716,121 @@ pub struct TranscriptMark {
 /// What the transcript says about a written-ahead delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptCheck {
-    /// It holds the message after the write-ahead's offset.
+    /// A user prompt after the write-ahead's offset is the injected text.
     Holds,
-    /// It is there and readable, and doesn't.
+    /// It is there and readable, doesn't, and won't: the agent is idle, or
+    /// took a later prompt.
     Lacks,
-    /// It can't be read (the agent's home is gone, no conversation known).
+    /// Not yet, while the agent is mid-turn.
+    Pending,
+    /// It can't be read (missing, the agent's home is gone, no
+    /// conversation known).
     Unreadable(String),
 }
 
 /// The agents' transcripts, as delivery settles an interrupted inject.
 pub trait Transcripts: Send + Sync {
     fn mark(&self, agent_id: &str) -> TranscriptMark;
-    fn holds(&self, w: &k2_core::delivery::seen::WriteAhead) -> TranscriptCheck;
+    /// The written-ahead conversation's transcript; `Err` when it can't
+    /// be found.
+    fn locate(&self, w: &k2_core::delivery::seen::WriteAhead) -> Result<std::path::PathBuf, String>;
+    /// Is the agent mid-turn (a prompt typed into it may not be recorded
+    /// yet)?
+    fn busy(&self, agent_id: &str) -> bool;
 }
 
-/// The text a `kind=msg` body shows in the agent's transcript.
-fn needle(body: &Value) -> Option<String> {
-    let kind = body.get("kind").and_then(Value::as_str).unwrap_or("msg");
-    if kind != "msg" {
-        return None;
-    }
-    body.get("text").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+/// One user prompt in a transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPrompt {
+    /// The byte offset of its line: one prompt, one claim.
+    pub at: u64,
+    pub text: String,
+    /// When the CLI recorded it, if the line says.
+    pub ts_ms: Option<i64>,
 }
 
-/// Does the transcript at `path` hold `needle` in what follows `offset`?
-/// Every JSON string on each line counts (a prompt's content, whatever the
-/// provider's layout).
-pub fn scan_transcript(path: &std::path::Path, offset: u64, needle: &str) -> TranscriptCheck {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => return TranscriptCheck::Unreadable(format!("{}: {e}", path.display())),
-    };
+/// The user prompts after `offset` in the transcript at `path`: lines whose
+/// `type` or role is `user`, their text (a string, or the text blocks; a
+/// tool result is not a prompt). Claude's and Codex's layouts.
+pub fn scan_user_prompts(path: &std::path::Path, offset: u64) -> Result<Vec<UserPrompt>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if (bytes.len() as u64) < offset {
-        return TranscriptCheck::Unreadable(format!("{} is shorter than before the inject (rewritten)", path.display()));
+        return Err(format!("{} is shorter than before the inject (rewritten)", path.display()));
     }
-    fn strings(v: &Value, needle: &str) -> bool {
-        match v {
-            Value::String(s) => s.contains(needle),
-            Value::Array(a) => a.iter().any(|x| strings(x, needle)),
-            Value::Object(o) => o.values().any(|x| strings(x, needle)),
-            _ => false,
+    fn text_of(content: &Value) -> Option<String> {
+        match content {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(blocks) => {
+                let parts: Vec<&str> = blocks
+                    .iter()
+                    .filter(|b| matches!(b.get("type").and_then(Value::as_str), Some("text" | "input_text")))
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join("\n"))
+            }
+            _ => None,
         }
     }
-    let after = String::from_utf8_lossy(&bytes[offset as usize..]);
-    let hit = after.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).any(|v| strings(&v, needle));
-    if hit {
-        TranscriptCheck::Holds
-    } else {
-        TranscriptCheck::Lacks
+    fn prompt_of(v: &Value) -> Option<String> {
+        let role = |x: &Value| x.get("role").and_then(Value::as_str) == Some("user");
+        // Codex: {"type":"event_msg","payload":{"type":"user_message","message":…}}
+        if let Some(p) = v.get("payload") {
+            if p.get("type").and_then(Value::as_str) == Some("user_message") {
+                return p.get("message").and_then(Value::as_str).map(str::to_string);
+            }
+            if role(p) {
+                return p.get("content").and_then(text_of);
+            }
+        }
+        // Claude: {"type":"user","message":{"role":"user","content":…}}
+        if let Some(m) = v.get("message").filter(|m| m.is_object()) {
+            if role(m) || v.get("type").and_then(Value::as_str) == Some("user") {
+                return m.get("content").and_then(text_of);
+            }
+            return None;
+        }
+        if role(v) {
+            return v.get("content").and_then(text_of);
+        }
+        None
     }
+    let mut out = Vec::new();
+    let mut at = offset;
+    for line in bytes[offset as usize..].split_inclusive(|b| *b == b'\n') {
+        let here = at;
+        at += line.len() as u64;
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+        if let Some(text) = prompt_of(&v) {
+            let ts_ms = v
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp_millis());
+            out.push(UserPrompt { at: here, text, ts_ms });
+        }
+    }
+    Ok(out)
+}
+
+/// A prompt as compared: no ESC (the injector strips it), one newline
+/// style, no surrounding whitespace.
+fn prompt_key(s: &str) -> String {
+    s.replace("\r\n", "\n").chars().filter(|&c| c != '\u{1b}').collect::<String>().trim().to_string()
+}
+
+/// A delivery still pending this long after its inject is uncertain.
+const PENDING_MAX_MS: i64 = 10 * 60 * 1000;
+
+/// The transcript of `conversation`: by the cwd (canonical, then as
+/// given), then by the conversation id alone.
+fn locate_transcript(provider: &str, conversation: &str, cwd: Option<&str>) -> Option<std::path::PathBuf> {
+    let locate = |dir: &str| k2_core::chat_continue::locate_continue_transcript(provider, conversation, dir);
+    let canonical = cwd.and_then(|c| std::fs::canonicalize(c).ok()).map(|p| p.to_string_lossy().into_owned());
+    canonical
+        .as_deref()
+        .and_then(locate)
+        .or_else(|| cwd.filter(|c| Some(*c) != canonical.as_deref()).and_then(locate))
+        .or_else(|| locate(""))
 }
 
 /// The transcripts of this host's agents: the session's CLI, conversation
@@ -740,9 +845,9 @@ impl Transcripts for LiveTranscripts {
         let conversation = crate::activity_transcript::conversation_of(&s.session_id().to_string())
             .map(|(c, _)| c)
             .or_else(|| k2_core::workspace::provider_resume::session_id_from_spawn_argv(&program, &s.args()));
-        let cwd = s.cwd_path().map(|p| p.to_string_lossy().into_owned());
+        let cwd = s.cwd_path().map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().into_owned());
         let offset = match (&provider, &conversation) {
-            (Some(p), Some(c)) => k2_core::chat_continue::locate_continue_transcript(p, c, cwd.as_deref().unwrap_or(""))
+            (Some(p), Some(c)) => locate_transcript(p, c, cwd.as_deref())
                 .and_then(|path| std::fs::metadata(path).ok())
                 .map(|m| m.len())
                 .unwrap_or(0),
@@ -751,24 +856,23 @@ impl Transcripts for LiveTranscripts {
         TranscriptMark { provider, conversation, cwd, offset }
     }
 
-    fn holds(&self, w: &k2_core::delivery::seen::WriteAhead) -> TranscriptCheck {
-        let Some(needle) = w.needle.as_deref() else {
-            return TranscriptCheck::Unreadable("not a message a transcript records".into());
-        };
+    fn locate(&self, w: &k2_core::delivery::seen::WriteAhead) -> Result<std::path::PathBuf, String> {
         let (Some(provider), Some(conv)) = (w.provider.as_deref(), w.conversation.as_deref()) else {
-            return TranscriptCheck::Unreadable("the agent's conversation wasn't known".into());
+            return Err("the agent's conversation wasn't known".into());
         };
-        match k2_core::chat_continue::locate_continue_transcript(provider, conv, w.cwd.as_deref().unwrap_or("")) {
-            Some(path) => scan_transcript(&path, w.offset, needle),
-            // The conversation never wrote a transcript: the CLI never took
-            // the prompt, provided its home is still here.
-            None if provider == "claude" && dirs::home_dir().is_some_and(|h| h.join(".claude").join("projects").is_dir()) => {
-                TranscriptCheck::Lacks
-            }
-            None => TranscriptCheck::Unreadable(format!("no {provider} transcript for conversation {conv} (its home is gone?)")),
-        }
+        // Missing is not "lacks it": a CLI that never wrote the file may
+        // still have the prompt on screen, or its home may be gone.
+        locate_transcript(provider, conv, w.cwd.as_deref())
+            .ok_or_else(|| format!("no {provider} transcript for conversation {conv}"))
+    }
+
+    fn busy(&self, agent_id: &str) -> bool {
+        // A dead CLI takes nothing more, whatever its last activity said.
+        let Some(s) = crate::agent_host::host().find_agent(agent_id).filter(|s| s.is_child_alive()) else { return false };
+        crate::activity_store::with_row(&s.session_id().to_string(), |r| r.display.is_live()).unwrap_or(false)
     }
 }
+
 /// What a host reports on each link: deliveries this recent, this many.
 const RELINK_REPORT_WINDOW_MS: i64 = 10 * 60 * 1000;
 const RELINK_REPORT_MAX: usize = 256;
@@ -786,6 +890,9 @@ pub struct HostSide {
     /// The agents' transcripts: the ground truth for a delivery a restart
     /// interrupted.
     transcripts: Arc<dyn Transcripts>,
+    /// Transcript prompts (file, line offset) already taken as some
+    /// delivery's: one prompt settles one write-ahead row.
+    claimed: Mutex<HashSet<(std::path::PathBuf, u64)>>,
 }
 
 impl HostSide {
@@ -799,6 +906,7 @@ impl HostSide {
             receiving: Mutex::new(()),
             deliver,
             transcripts: Arc::new(LiveTranscripts),
+            claimed: Mutex::default(),
         }
     }
 
@@ -825,6 +933,8 @@ impl HostSide {
                 Settled::Delivered(why) => ack(DeliverStatus::Delivered, Some(why)),
                 Settled::Uncertain(why) => ack(DeliverStatus::Rejected, Some(why)),
                 Settled::NotDelivered => self.deliver_fresh(m, now),
+                // The controller resends; the transcript decides then.
+                Settled::Pending => None,
             },
             Ok(Some(s)) if s == UNCERTAIN => ack(DeliverStatus::Rejected, Some(format!("{UNCERTAIN_REASON}: decided before"))),
             Ok(Some(_)) => ack(DeliverStatus::Duplicate, None),
@@ -862,7 +972,7 @@ impl HostSide {
             conversation: mark.conversation,
             cwd: mark.cwd,
             offset: mark.offset,
-            needle: needle(&m.body),
+            needle: crate::workspace_msg::injected_text(&m.from, &m.body),
             started_ms: now,
         };
         if let Err(e) = seen::write_ahead(&self.db.lock(), &w) {
@@ -880,6 +990,19 @@ impl HostSide {
                 self.record_seen(&m.msg_id, "rejected", now);
                 ack(DeliverStatus::Rejected, Some(why))
             }
+            // K2-c: once written ahead, never a bare retry for an inject
+            // that may have landed; the transcript settles it.
+            LocalDelivery::Interrupted(why) => {
+                log_debug!("[delivery] {} for {} interrupted mid-inject: {why}", m.msg_id, m.agent_id);
+                return match self.settle_interrupted(&m.msg_id, now) {
+                    Settled::Delivered(why) => ack(DeliverStatus::Delivered, Some(why)),
+                    Settled::Uncertain(why) => ack(DeliverStatus::Rejected, Some(why)),
+                    // Forgotten: a resend delivers it.
+                    Settled::NotDelivered => None,
+                    // Kept `delivering`: a resend or the next link decides.
+                    Settled::Pending => None,
+                };
+            }
             LocalDelivery::Retry(why) => {
                 // Nothing reached the agent: a resend delivers it.
                 if let Err(e) = seen::forget(&self.db.lock(), &m.msg_id) {
@@ -894,20 +1017,22 @@ impl HostSide {
     }
 
     /// An id a restart left `delivering`: the transcript decides. Delivered
-    /// (it holds the message): `delivered`. Not delivered (it doesn't): the
-    /// record goes, so the message is delivered normally. Can't tell (the
-    /// agent's home is gone): `uncertain`, which the controller fails with
-    /// a reason (I2: never silently either way).
+    /// (it holds the message): `delivered`. Not delivered (it doesn't, and
+    /// the agent is idle or took a later prompt): the record goes, so the
+    /// message is delivered normally. Pending (not yet, mid-turn): kept as
+    /// it is. Can't tell (the transcript is missing or unreadable):
+    /// `uncertain`, which the controller fails with a reason (I2: never
+    /// silently either way).
     fn settle_interrupted(&self, msg_id: &str, now: i64) -> Settled {
         let w = seen::written_ahead(&self.db.lock(), msg_id).ok().flatten();
         let found = match &w {
-            Some(w) => self.transcripts.holds(w),
+            Some(w) => self.check(w, now),
             None => TranscriptCheck::Unreadable("no write-ahead record".into()),
         };
         let settled = match found {
             TranscriptCheck::Holds => {
                 self.record_seen(msg_id, "delivered", now);
-                Settled::Delivered("found in the agent's transcript after a host restart".into())
+                Settled::Delivered("found in the agent's transcript after an interrupted inject".into())
             }
             TranscriptCheck::Lacks => {
                 if let Err(e) = seen::forget(&self.db.lock(), msg_id) {
@@ -915,14 +1040,100 @@ impl HostSide {
                 }
                 Settled::NotDelivered
             }
+            TranscriptCheck::Pending => {
+                log_debug!("[delivery] {msg_id}: interrupted delivery not in the transcript yet; the agent is mid-turn");
+                return Settled::Pending;
+            }
             TranscriptCheck::Unreadable(why) => {
                 self.record_seen(msg_id, UNCERTAIN, now);
-                Settled::Uncertain(format!("{UNCERTAIN_REASON}: interrupted by a host restart and the agent's transcript can't tell ({why})"))
+                Settled::Uncertain(format!("{UNCERTAIN_REASON}: interrupted mid-inject (a host restart, or the agent died) and the agent's transcript can't tell ({why})"))
             }
         };
         let _ = seen::clear_ahead(&self.db.lock(), msg_id);
         log_debug!("[delivery] {msg_id}: interrupted delivery settled: {settled:?}");
         settled
+    }
+
+    /// Does the transcript hold the written-ahead prompt? Only a user
+    /// prompt after the offset, on the exact injected text, that no other
+    /// row has claimed, counts (an agent's reply quoting it doesn't).
+    fn check(&self, w: &seen::WriteAhead, now: i64) -> TranscriptCheck {
+        let Some(needle) = w.needle.as_deref().map(prompt_key) else {
+            return TranscriptCheck::Unreadable("not a message a transcript records".into());
+        };
+        let path = match self.transcripts.locate(w) {
+            Ok(p) => p,
+            Err(why) => return TranscriptCheck::Unreadable(why),
+        };
+        let prompts = match scan_user_prompts(&path, w.offset) {
+            Ok(p) => p,
+            Err(why) => return TranscriptCheck::Unreadable(why),
+        };
+        let mut claimed = self.claimed.lock();
+        if let Some(p) = prompts.iter().find(|p| prompt_key(&p.text) == needle && !claimed.contains(&(path.clone(), p.at))) {
+            claimed.insert((path, p.at));
+            return TranscriptCheck::Holds;
+        }
+        // A prompt the CLI took after the inject began: ours, typed first,
+        // would be before it.
+        let moved_on = prompts.iter().any(|p| p.ts_ms.is_some_and(|t| t >= w.started_ms));
+        if moved_on || !self.transcripts.busy(&w.agent_id) {
+            TranscriptCheck::Lacks
+        } else if now - w.started_ms > PENDING_MAX_MS {
+            TranscriptCheck::Unreadable(format!("not in the transcript {} s after the inject, the agent still mid-turn", PENDING_MAX_MS / 1000))
+        } else {
+            TranscriptCheck::Pending
+        }
+    }
+
+    /// K2-c: a spawn that puts message `msg_id` on its agent's argv (the
+    /// gone rule's direct path) goes through the same per-id dedup as a
+    /// receive. `spawn(with_prompt)` spawns, with the prompt or without,
+    /// and says whether the prompt went on argv. `Ok((_, true))`: the
+    /// agent had it already (seen, or found in its transcript), so it was
+    /// spawned without it. `Err` when it can't tell (`delivery_uncertain`),
+    /// or the spawn failed.
+    pub fn launch_once<T>(
+        &self,
+        msg_id: &str,
+        now: i64,
+        spawn: impl FnOnce(bool) -> Result<(T, bool), String>,
+    ) -> Result<(T, bool), String> {
+        let _one = self.receiving.lock();
+        let had = match seen::status(&self.db.lock(), msg_id) {
+            Ok(None) => false,
+            Ok(Some(s)) if s == "delivered" => true,
+            Ok(Some(s)) if s == DELIVERING => match self.settle_interrupted(msg_id, now) {
+                Settled::Delivered(_) => true,
+                Settled::NotDelivered => false,
+                Settled::Uncertain(why) => return Err(why),
+                Settled::Pending => return Err(format!("{UNCERTAIN_REASON}: its agent is mid-turn and its transcript doesn't show it yet")),
+            },
+            Ok(Some(s)) if s == UNCERTAIN => return Err(format!("{UNCERTAIN_REASON}: decided before")),
+            // Rejected before: the agent never got it.
+            Ok(Some(_)) => false,
+            Err(e) => return Err(format!("seen check {msg_id}: {e}")),
+        };
+        if had {
+            log_debug!("[delivery] {msg_id}: the agent has it already; spawned without it");
+            return spawn(false).map(|(out, _)| (out, true));
+        }
+        // Written ahead with no transcript place: a kill mid-spawn leaves
+        // it uncertain, never delivered twice.
+        self.record_seen(msg_id, DELIVERING, now);
+        match spawn(true) {
+            Ok((out, true)) => {
+                self.record_seen(msg_id, "delivered", now);
+                Ok((out, false))
+            }
+            other => {
+                // Not on argv (the caller injects it, or the spawn failed).
+                if let Err(e) = seen::forget(&self.db.lock(), msg_id) {
+                    log_debug!("[delivery] ERROR: forget {msg_id}: {e}");
+                }
+                other.map(|(out, _)| (out, false))
+            }
+        }
     }
 
     fn record_seen(&self, msg_id: &str, status: &str, now: i64) {
@@ -980,9 +1191,15 @@ impl HostSide {
         rx
     }
 
-    /// The link to the controller is up and writes to `tx`.
+    /// The link to the controller is up and writes to `tx`. Blocks (the
+    /// transcripts and SQLite): run it off the async workers.
     pub fn linked(&self, tx: mpsc::UnboundedSender<Frame>) {
-        self.report_delivered(&tx, delivery::now_ms());
+        {
+            // A delivery mid-inject holds this: its row is settled by its
+            // own receive, never by the report.
+            let _one = self.receiving.lock();
+            self.report_delivered(&tx, delivery::now_ms());
+        }
         *self.link.lock() = Some(tx);
         self.nudge.notify_one();
     }
@@ -1009,6 +1226,8 @@ impl HostSide {
                     Settled::Uncertain(why) => (DeliverStatus::Rejected, Some(why)),
                     // The controller still has it: it delivers it again.
                     Settled::NotDelivered => continue,
+                    // Decided on its resend, or the next link.
+                    Settled::Pending => continue,
                 }
             } else if status == UNCERTAIN {
                 (DeliverStatus::Rejected, Some(format!("{UNCERTAIN_REASON}: decided before")))
@@ -1083,10 +1302,16 @@ pub fn host_linked(tx: mpsc::UnboundedSender<Frame>) {
     // The drain (S8) needs every turn this host runs from here on.
     crate::hosts::drain::track_turns();
     let h = host_side();
-    h.linked(tx);
+    let report = Arc::clone(h);
+    tokio::task::spawn_blocking(move || report.linked(tx));
     STARTED.get_or_init(|| {
         tokio::spawn(Arc::clone(h).run());
     });
+}
+
+/// [`HostSide::launch_once`] on this host (`link`'s `spawn.workspace`).
+pub fn host_launch_once<T>(msg_id: &str, spawn: impl FnOnce(bool) -> Result<(T, bool), String>) -> Result<(T, bool), String> {
+    host_side().launch_once(msg_id, delivery::now_ms(), spawn)
 }
 
 /// The current link to the controller, if any (the drain's channel).

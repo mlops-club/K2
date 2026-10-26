@@ -610,6 +610,8 @@ pub struct RemoteHost {
     /// P4: bumped on every host hello; a need that got `Wait` (a scale-up)
     /// waits on it, then retries.
     hellos: (std::sync::Mutex<u64>, std::sync::Condvar),
+    /// Needs waiting on `hellos` now.
+    hello_waiters: std::sync::atomic::AtomicUsize,
     /// How long a need waits for a host to come (`K2_PROVISIONER_WAIT`).
     host_wait: Duration,
     /// How long a need waits for a known host to link (`K2_HOST_LINK_GRACE`).
@@ -660,6 +662,7 @@ impl RemoteHost {
             enrolled: Mutex::default(),
             away_forget: AWAY_FORGET,
             hellos: Default::default(),
+            hello_waiters: Default::default(),
             host_wait: HOST_WAIT,
             link_grace: LINK_GRACE,
         }
@@ -1406,14 +1409,29 @@ impl RemoteHost {
         }
     }
 
+    /// How many needs are waiting for a host's hello now.
+    #[cfg(test)]
+    pub(crate) fn hello_waiters(&self) -> usize {
+        self.hello_waiters.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn hello_count(&self) -> u64 {
         *self.hellos.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Wait until a hello after `seen`, or `deadline`. `true` = one came.
     fn wait_for_hello(&self, seen: u64, deadline: Instant) -> bool {
+        use std::sync::atomic::Ordering;
         let (gen, cv) = &self.hellos;
         let mut g = gen.lock().unwrap_or_else(|p| p.into_inner());
+        self.hello_waiters.fetch_add(1, Ordering::SeqCst);
+        struct Left<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Left<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _left = Left(&self.hello_waiters);
         while *g == seen {
             let now = Instant::now();
             if now >= deadline {
@@ -1483,7 +1501,12 @@ impl RemoteHost {
                 why
             }
         })?;
-        let request = serde_json::to_value(req).map_err(|e| format!("encode the spawn request: {e}"))?;
+        let mut request = serde_json::to_value(req).map_err(|e| format!("encode the spawn request: {e}"))?;
+        // K2-c: a spawn carrying a message the gone rule delivers: the host
+        // checks its seen table before the prompt goes on argv.
+        if let Some(msg_id) = crate::delivery_drain::direct_delivery_id() {
+            request["deliveryId"] = msg_id.into();
+        }
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new("ctl.place").agent(agent_id.as_str()).attr("host", host_id.as_str()).attr("epoch", epoch.0)
         });
