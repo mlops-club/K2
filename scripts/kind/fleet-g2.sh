@@ -12,7 +12,8 @@
 #    again with the bootstrap token. Placements, outbox rows and agents
 #    left by earlier runs would otherwise steer placement and the
 #    invariants. The dist-fake app login goes too: `up.sh --dist --fake`
-#    makes it again. --keep-state skips this step;
+#    makes it again. In enroll mode (up.sh --host-auth=enroll) new one-time
+#    tokens are minted before the hosts start. --keep-state skips this step;
 # 1. builds k2-lab-runner:dist-fake (deploy/kind/Dockerfile.lab-runner: the
 #    fake host image plus python3 and kubectl) when missing or when the
 #    host image changed, and loads it into k2lab (Docker lock held);
@@ -66,6 +67,10 @@ replicas=$(kc -n "$KIND_NS" get statefulset k2-host -o jsonpath='{.spec.replicas
     || { echo "fleet-g2.sh: k2-host has $replicas replica(s) but pods '$hosts': run scripts/kind/up.sh --dist --fake --hosts=N first" >&2; exit 1; }
 kc -n "$KIND_NS" get configmap k2-lab-supervise >/dev/null 2>&1 \
     || { echo "fleet-g2.sh: $KIND_NS has no lab supervisor (deploy/kind/dist-fake/lab.yaml): run scripts/kind/up.sh --dist --fake --hosts=N" >&2; exit 1; }
+host_auth=$(kc -n "$KIND_NS" get statefulset k2-controller \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="K2_HOST_AUTH")].value}')
+host_auth=${host_auth:-token}
+say "fleet: controller k2-controller-0, hosts $hosts, K2_HOST_AUTH=$host_auth"
 # ── 0. a fresh fleet ────────────────────────────────────────────────────
 if [ "$fresh" = 1 ]; then
     say "fresh fleet: deleting the controller's and hosts' state volumes in $KIND_NS (--keep-state keeps them)"
@@ -77,11 +82,20 @@ if [ "$fresh" = 1 ]; then
     # shellcheck disable=SC2086
     kc -n "$KIND_NS" delete pvc $pvcs --ignore-not-found --wait=true >&2
     kc -n "$KIND_NS" scale statefulset k2-controller --replicas=1 >&2
+    if [ "$host_auth" = enroll ]; then
+        # A fresh controller knows no host key and fresh hosts have none:
+        # new one-time tokens first (scripts/kind/enroll.py), then the hosts.
+        kc -n "$KIND_NS" rollout status statefulset/k2-controller --timeout=300s >&2
+        kind_wait_ready || exit 1
+        kc -n "$KIND_NS" exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
+            | python3 -I scripts/kind/enroll.py mint --kubeconfig "$KIND_KUBECONFIG" --namespace "$KIND_NS" \
+                --url "http://127.0.0.1:$KIND_PORT" --hosts "$hosts" --deploy-label kind-dist-fake >&2 \
+            || { echo "fleet-g2.sh: minting enrollment tokens failed" >&2; exit 1; }
+    fi
     kc -n "$KIND_NS" scale statefulset k2-host --replicas="$replicas" >&2
 fi
 kc -n "$KIND_NS" rollout status statefulset/k2-controller --timeout=300s >&2
 kc -n "$KIND_NS" rollout status statefulset/k2-host --timeout=300s >&2
-say "fleet: controller k2-controller-0, hosts $hosts"
 
 # ── 1. the runner image ─────────────────────────────────────────────────
 base_id=$(docker image inspect -f '{{.Id}}' "$KIND_IMAGE")

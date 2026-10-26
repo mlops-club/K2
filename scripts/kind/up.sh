@@ -2,7 +2,7 @@
 # K2 on the kind cluster k2lab, ready for the desktop app on this Mac
 # (deploy/kind/README.md has the app steps).
 #
-#   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1]] [--fake] [--rebuild-daemon]
+#   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]] [--fake] [--rebuild-daemon]
 #                      [--reset-password] [--port-forward] [--password-file=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
@@ -35,6 +35,11 @@
 # CPU and memory. Scaling down keeps the removed hosts' volumes.
 # --ptyd=0|1 sets K2_PTYD on the hosts (default KIND_PTYD_DEFAULT in
 # lib.sh, else K2_KIND_PTYD): agent PTYs in k2-ptyd. Changing it rolls them.
+# --host-auth=enroll (test variant only, for now) turns on signed host
+# enrollment (K2_HOST_AUTH=enroll): up.sh mints a one-time token per new
+# host into the Secret k2-host-enroll (scripts/kind/enroll.py; never
+# printed); each host keeps its key on its own volume and relinks by it.
+# Without the flag a run goes back to the bootstrap token (token).
 #
 # Uses only k2lab, through an explicit kubeconfig; never the current kube
 # context. No credential goes into git, an image or a log: the owner signs
@@ -44,7 +49,7 @@ set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd=
+fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -55,7 +60,8 @@ for a in "$@"; do
         --password-file=*) password_file=${a#--password-file=} ;;
         --hosts=*) hosts=${a#--hosts=} ;;
         --ptyd=0|--ptyd=1) ptyd=${a#--ptyd=} ;;
-        -h|--help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --host-auth=token|--host-auth=enroll) host_auth=${a#--host-auth=} ;;
+        -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -65,6 +71,10 @@ if [ "$hosts" != 1 ] && [ "$dist" = 0 ]; then
 fi
 if [ -n "$ptyd" ] && [ "$dist" = 0 ]; then
     echo "up.sh: --ptyd needs --dist" >&2; exit 2
+fi
+if [ "$host_auth" = enroll ] && { [ "$dist" = 0 ] || [ "$fake" = 0 ]; }; then
+    # Not on the owner's k2-kind-dist until the owner says so.
+    echo "up.sh: --host-auth=enroll is for the test variant only for now (--dist --fake)" >&2; exit 2
 fi
 kind_variant_from_flags "$fake" "$dist"
 ptyd=${ptyd:-${K2_KIND_PTYD:-$KIND_PTYD_DEFAULT}}
@@ -117,28 +127,27 @@ for img in $KIND_LOAD; do
 done
 rmdir "$DOCKER_LOCK"; trap - EXIT
 rendered="$KIND_STATE/rendered.yaml"
-overlay="$KIND_REPO/$KIND_OVERLAY"
-if [ "$KIND_DIST" = 1 ]; then
-    # --hosts=N and K2_PTYD: the overlay with k2-host's replicas and env
-    # set, from a throwaway kustomization in the state dir (the overlays in
-    # git keep 1 host and no K2_PTYD). K2_PTYD=1 goes in the pod template,
-    # not the ConfigMap, so turning it on or off rolls the hosts.
+# The overlay to apply: for --dist, a throwaway kustomization in the state
+# dir over the overlay in git (which keeps 1 host, token auth, no K2_PTYD),
+# with k2-host's replicas and the switches set. Each switch goes in the pod
+# templates, not a ConfigMap, so changing it rolls the pods; at its default
+# it adds nothing, so the render is what it was before the switch existed.
+write_overlay() {  # write_overlay <k2-host replicas>
     overlay="$KIND_STATE/overlay"
     rm -rf "$KIND_STATE"/hosts-*
     mkdir -p "$overlay"
-    cat > "$overlay/kustomization.yaml" <<EOF
+    {
+        cat <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - $(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/$KIND_OVERLAY" "$overlay")
 replicas:
-  - {name: k2-host, count: $hosts}
+  - {name: k2-host, count: $1}
 EOF
-    # K2_PTYD=0 adds nothing: the render stays what it was before the
-    # switch, so a host is not rolled for an env entry that changes nothing.
-    if [ "$ptyd" = 1 ]; then
-        cat >> "$overlay/kustomization.yaml" <<EOF
-patches:
+        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ]; then echo "patches:"; fi
+        if [ "$ptyd" = 1 ]; then
+            cat <<EOF
   - target: {kind: StatefulSet, name: k2-host}
     patch: |-
       apiVersion: apps/v1
@@ -151,11 +160,88 @@ patches:
             containers:
               - name: k2-host
                 env:
-                  - {name: K2_PTYD, value: "$ptyd"}
+                  - {name: K2_PTYD, value: "1"}
 EOF
-    fi
+        fi
+        if [ "$host_auth" = enroll ]; then
+            # Signed enrollment (W5): each host reads its own one-time token
+            # from the Secret k2-host-enroll (scripts/kind/enroll.py mints
+            # it) and keeps its key on its own volume
+            # ($HOME/.k2/host-key.pem, 0600, the daemon's default).
+            cat <<EOF
+  - target: {kind: StatefulSet, name: k2-controller}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-controller
+      spec:
+        template:
+          spec:
+            containers:
+              - name: k2-daemon
+                env:
+                  - {name: K2_HOST_AUTH, value: enroll}
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            containers:
+              - name: k2-host
+                env:
+                  - {name: K2_HOST_AUTH, value: enroll}
+                  # Repeated here so it comes before the line that uses it:
+                  # a patch's entries go first, and \$(VAR) expands only
+                  # variables defined earlier in the list.
+                  - name: K2_HOST_NAME
+                    valueFrom: {fieldRef: {fieldPath: metadata.name}}
+                  - {name: K2_HOST_ENROLL_TOKEN_FILE, value: "/run/secrets/k2-enroll/\$(K2_HOST_NAME)"}
+                volumeMounts:
+                  - {name: k2-host-enroll, mountPath: /run/secrets/k2-enroll, readOnly: true}
+            volumes:
+              - name: k2-host-enroll
+                secret: {secretName: k2-host-enroll, optional: true, defaultMode: 0440}
+EOF
+        fi
+    } > "$overlay/kustomization.yaml"
+    kubectl kustomize --load-restrictor LoadRestrictionsNone "$overlay" > "$rendered"
+}
+host_names() { local i; for i in $(seq 0 $(( hosts - 1 ))); do printf 'k2-host-%s\n' "$i"; done; }
+apply_rendered() {  # apply_rendered <what>
+    say "applying $KIND_OVERLAY (namespace $KIND_NS)$( [ "$KIND_DIST" = 1 ] && echo ", $1, K2_PTYD=$ptyd, K2_HOST_AUTH=$host_auth")"
+    kc apply -f "$rendered" >&2
+    # Same tag, new image: each pod template carries its image's id, so a
+    # rebuilt image rolls its pods and an unchanged one does not.
+    local pair sts id
+    for pair in $KIND_ROLLOUT; do
+        sts=${pair%%=*} id=$(docker image inspect -f '{{.Id}}' "${pair#*=}")
+        kc -n "$KIND_NS" patch statefulset "$sts" --type merge -p \
+            "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"k2.dev/image-id\":\"$id\"}}}}}" >&2
+    done
+    for pair in $KIND_ROLLOUT; do
+        kc -n "$KIND_NS" rollout status "statefulset/${pair%%=*}" --timeout=600s >&2
+    done
+}
+# Enroll mode: hosts that have no token in k2-host-enroll yet wait (0
+# replicas) until the controller is up to mint them (after the door, below).
+first_hosts=$hosts
+if [ "$host_auth" = enroll ]; then
+    have=$(kc -n "$KIND_NS" get secret k2-host-enroll -o jsonpath='{.data}' 2>/dev/null || true)
+    for h in $(host_names); do
+        case "$have" in *"\"$h\""*) ;; *) first_hosts=0 ;; esac
+    done
 fi
-kubectl kustomize --load-restrictor LoadRestrictionsNone "$overlay" > "$rendered"
+if [ "$KIND_DIST" = 1 ]; then
+    write_overlay "$first_hosts"
+else
+    overlay="$KIND_REPO/$KIND_OVERLAY"
+    kubectl kustomize --load-restrictor LoadRestrictionsNone "$overlay" > "$rendered"
+fi
 if [ "$KIND_DIST" = 1 ]; then
     # The namespace first, then the bootstrap Secret, so the pods find it.
     kc apply -f "$rendered" -l k2.dev/bootstrap=namespace >&2
@@ -171,18 +257,7 @@ print(json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
         say "created Secret $KIND_NS/k2-secrets (host bootstrap token, not shown)"
     fi
 fi
-say "applying $KIND_OVERLAY (namespace $KIND_NS)$( [ "$KIND_DIST" = 1 ] && echo ", $hosts host(s), K2_PTYD=$ptyd")"
-kc apply -f "$rendered" >&2
-# Same tag, new image: each pod template carries its image's id, so a
-# rebuilt image rolls its pods and an unchanged one does not.
-for pair in $KIND_ROLLOUT; do
-    sts=${pair%%=*} id=$(docker image inspect -f '{{.Id}}' "${pair#*=}")
-    kc -n "$KIND_NS" patch statefulset "$sts" --type merge -p \
-        "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"k2.dev/image-id\":\"$id\"}}}}}" >&2
-done
-for pair in $KIND_ROLLOUT; do
-    kc -n "$KIND_NS" rollout status "statefulset/${pair%%=*}" --timeout=600s >&2
-done
+apply_rendered "$first_hosts host(s)"
 
 # ── 3. the Mac's door ───────────────────────────────────────────────────
 if [ "$door" = proxy ]; then
@@ -194,6 +269,18 @@ fi
 base="http://127.0.0.1:$KIND_PORT"
 kind_wait_ready || exit 1
 say "daemon ready at $base"
+if [ "$host_auth" = enroll ]; then
+    # One-time tokens for hosts with no key on the controller; then the
+    # hosts. The owner token goes to enroll.py on a pipe, never on argv.
+    kc -n "$KIND_NS" exec "$KIND_POD" -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
+        | python3 -I "$KIND_REPO/scripts/kind/enroll.py" mint --kubeconfig "$KIND_KUBECONFIG" --namespace "$KIND_NS" \
+            --url "$base" --hosts "$(host_names | paste -sd, -)" --deploy-label "kind-$KIND_VARIANT" >&2 \
+        || { echo "up.sh: minting enrollment tokens failed" >&2; exit 1; }
+    if [ "$first_hosts" != "$hosts" ]; then
+        write_overlay "$hosts"
+        apply_rendered "$hosts host(s), enrolling"
+    fi
+fi
 
 # ── 4. the app's login ──────────────────────────────────────────────────
 # The owner token stays in this shell: curl gets the URL that carries it as
