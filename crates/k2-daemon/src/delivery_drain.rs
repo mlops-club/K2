@@ -706,6 +706,8 @@ fn host_side() -> &'static Arc<HostSide> {
 /// `link::serve_once`'s hook: the link to the controller is up.
 pub fn host_linked(tx: mpsc::UnboundedSender<Frame>) {
     static STARTED: OnceLock<()> = OnceLock::new();
+    // The drain (S8) needs every turn this host runs from here on.
+    crate::hosts::drain::track_turns();
     let h = host_side();
     h.linked(tx);
     STARTED.get_or_init(|| {

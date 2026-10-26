@@ -6,10 +6,12 @@
 //!    deliveries (the outbox's receiving side leaves them unacked, so the
 //!    controller keeps them queued);
 //! 2. tell the controller: `refused {code: "draining"}` on the link;
-//! 3. wait for each placed agent's turn to end (its activity row stops
-//!    being `Working`, which the Stop hook does), up to `K2_HOST_DRAIN_SECS`
-//!    (default 600, the PRD's grace); an agent still in its turn then is
-//!    released anyway and the log says so;
+//! 3. wait for each placed agent's turn to end: from its `UserPromptSubmit`
+//!    hook to its `Stop` (or `StopFailure`, `SessionEnd`, the CLI exiting),
+//!    followed from the host's hook stream since the host linked
+//!    ([`track_turns`]), or its activity row being `Working`. Up to
+//!    `K2_HOST_DRAIN_SECS` (default 600, the PRD's grace); an agent still in
+//!    its turn then is released anyway and the log says so;
 //! 4. per agent, `released {req: 0}` to the controller, then stop it;
 //! 5. return: the daemon's usual shutdown follows and the process exits.
 //!
@@ -23,7 +25,7 @@
 //! which also ends its resume. Messages for an agent awaiting resume stay
 //! in the outbox and are delivered once it is placed (I2).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -73,6 +75,67 @@ pub fn drain_deadline(get: impl Fn(&str) -> Option<String>) -> Duration {
             }
         },
     }
+}
+
+/// Panes (v2 session ids) whose turn is running, from their own hooks.
+#[derive(Default)]
+pub struct Turns(Mutex<HashMap<String, ()>>);
+
+impl Turns {
+    /// One hook from the pane's owner. A subagent's (`agent_id` set) never
+    /// starts or ends the lead's turn.
+    pub fn note(&self, pane: &str, event: &str, subagent: bool) {
+        if subagent {
+            return;
+        }
+        match event {
+            "UserPromptSubmit" => {
+                self.0.lock().insert(pane.to_string(), ());
+            }
+            "Stop" | "StopFailure" | "SessionEnd" => {
+                self.0.lock().remove(pane);
+            }
+            _ => {}
+        }
+    }
+
+    /// The pane's owner exited.
+    pub fn gone(&self, pane: &str) {
+        self.0.lock().remove(pane);
+    }
+
+    pub fn in_turn(&self, pane: &str) -> bool {
+        self.0.lock().contains_key(pane)
+    }
+}
+
+fn turns() -> &'static Turns {
+    static T: OnceLock<Turns> = OnceLock::new();
+    T.get_or_init(Turns::default)
+}
+
+/// Follow this host's hook stream into [`Turns`] (once per process). The
+/// outbox calls it when the host links, before any agent of this link runs.
+pub fn track_turns() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let mut rx = crate::hook_ingest::subscribe();
+        tokio::spawn(async move {
+            use crate::hook_ingest::IngestEvent;
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match rx.recv().await {
+                    Ok(IngestEvent::Envelope { envelope, .. }) => {
+                        turns().note(&envelope.pane, &envelope.event, envelope.agent_id.is_some())
+                    }
+                    Ok(IngestEvent::OwnerReleased { pane, .. }) => turns().gone(&pane),
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(n)) => log_debug!("[hosts/drain] turn tracker lagged, {n} hook(s) missed"),
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    });
 }
 
 /// The link's hook: the answer to a spawn while `draining`, else `None`.
@@ -178,7 +241,9 @@ impl DrainHost for LiveHost {
     }
 
     fn in_turn(&self, session_id: &str) -> bool {
-        crate::activity_store::with_row(session_id, |r| r.lead.state == k2_core::activity::LeadState::Working).unwrap_or(false)
+        turns().in_turn(session_id)
+            || crate::activity_store::with_row(session_id, |r| r.lead.state == k2_core::activity::LeadState::Working)
+                .unwrap_or(false)
     }
 
     fn send(&self, f: Frame) -> bool {
@@ -307,6 +372,28 @@ mod tests {
         }
         let deliver = Frame::OpenUrl { url: "https://x".into(), source: "t".into() };
         assert_eq!(refuse_while(true, &deliver), None, "only spawns are refused");
+    }
+
+    #[test]
+    fn a_turn_runs_from_the_prompt_to_its_stop_and_subagents_dont_count() {
+        let t = Turns::default();
+        assert!(!t.in_turn("p1"));
+        t.note("p1", "SessionStart", false);
+        assert!(!t.in_turn("p1"));
+        t.note("p1", "UserPromptSubmit", false);
+        assert!(t.in_turn("p1"));
+        t.note("p1", "Stop", true);
+        assert!(t.in_turn("p1"), "a subagent's Stop doesn't end the lead's turn");
+        t.note("p1", "PreToolUse", false);
+        assert!(t.in_turn("p1"));
+        t.note("p1", "Stop", false);
+        assert!(!t.in_turn("p1"));
+        t.note("p2", "UserPromptSubmit", false);
+        t.gone("p2");
+        assert!(!t.in_turn("p2"), "the CLI exited");
+        t.note("p3", "UserPromptSubmit", false);
+        t.note("p3", "StopFailure", false);
+        assert!(!t.in_turn("p3"));
     }
 
     #[test]
