@@ -201,7 +201,9 @@ if [ "$rehearse" = 1 ]; then
 fi
 
 echo "== 7. back up the controller's volume (inside the cluster)"
-backup=$("$KIND_REPO/scripts/kind/backup-controller.sh") || { echo "STOPPED: the backup failed; k2-kind-dist was not rolled" >&2; exit 1; }
+# --leave-down: the nodes' k2-daemon:dist is already wave3's (the
+# rehearsal's kind load); the roll below brings the controller up on it.
+backup=$("$KIND_REPO/scripts/kind/backup-controller.sh" --leave-down) || { echo "STOPPED: the backup failed; k2-kind-dist was not rolled" >&2; exit 1; }
 echo "$backup" > "$OUT/backup-pvc"
 ok "backup PVC $backup"
 

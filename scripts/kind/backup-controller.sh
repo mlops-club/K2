@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Back up (or restore) the owner's controller volume inside the cluster.
 #
-#   scripts/kind/backup-controller.sh                  # back up → prints the backup PVC's name
+#   scripts/kind/backup-controller.sh [--leave-down]   # back up → prints the backup PVC's name
 #   scripts/kind/backup-controller.sh --restore=PVC    # put that backup back
 #
 # In k2-kind-dist only. The controller is scaled to 0 for the copy, so its
@@ -10,7 +10,9 @@
 #   k2-backup-controller-<UTC stamp> (local-path, made on the same node),
 #   with the archive's sha256 and file count next to it. Nothing leaves the
 #   cluster: no copy to the Mac, git or a log; only sizes and the checksum
-#   are printed.
+#   are printed. --leave-down leaves the controller at 0 after a good
+#   backup (the roll that follows brings it up on its new image; after a
+#   `kind load` the old tag already points at the new one on the nodes).
 # - restore: a Job checks the archive's sha256, empties data-k2-controller-0
 #   and untars the archive into it. Then the controller is scaled to 1;
 #   pair it with the images it was backed up with (owner-roll-wave3.sh
@@ -19,10 +21,11 @@
 set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
-restore=
+restore= leave_down=0
 for a in "$@"; do
     case "$a" in
         --restore=*) restore=${a#--restore=} ;;
+        --leave-down) leave_down=1 ;;
         -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "backup-controller.sh: unknown argument $a" >&2; exit 2 ;;
     esac
@@ -97,7 +100,7 @@ EOF
     trap 'scale_controller 1' EXIT
     out=$(job "$name" "$name" 'cd /data && tar -czf /backup/controller.tar.gz . && cd /backup && sha256sum controller.tar.gz > controller.tar.gz.sha256 && tar -tzf controller.tar.gz | wc -l > files.count && echo "archive $(du -h controller.tar.gz | cut -f1), $(cat files.count) entries, sha256 $(cut -c1-16 controller.tar.gz.sha256)…"')
     trap - EXIT
-    scale_controller 1
+    if [ "$leave_down" = 1 ]; then say "the controller stays at 0 (--leave-down)"; else scale_controller 1; fi
     say "backup: $out"
     echo "$name"
 else
