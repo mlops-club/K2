@@ -195,7 +195,11 @@ fn ptyd_bin() -> PathBuf {
 struct Reap(PathBuf);
 impl Drop for Reap {
     fn drop(&mut self) {
-        let _ = Command::new("pkill").arg("-9").arg("-f").arg(self.0.as_os_str()).status();
+        // Never a pattern that matches every process (an empty root, `/`).
+        let root = self.0.to_string_lossy();
+        if root.starts_with("/tmp/k2hp-") || root.contains("/k2home-path") {
+            let _ = Command::new("pkill").arg("-9").arg("-f").arg(self.0.as_os_str()).status();
+        }
     }
 }
 
