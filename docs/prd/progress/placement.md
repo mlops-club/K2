@@ -146,6 +146,7 @@ Usable = linked, not away, not draining. Away (phase A) = a host this process sa
 | – | ptyd's socket path under a long temp dir | `two-process.sh` makes its root under `/tmp` (`LAB_SHORT_TMP`), so `<home>/.k2/run/ptyd/ctl.sock` and ptyd's fallback under the host's `TMPDIR` stay within `sun_path` (104 bytes on macOS) |
 
 `cargo test -p k2-daemon --lib -- provisioner:: hosts:: agent_host::`: **74 passed**, 2 runs.
+After the follow-ups: `three-process-placement.sh` (run `20261026T054717Z`) **6/6 PASS**; `two-process.sh` with the long macOS `$TMPDIR` (run `20261026T054730Z`) **13/13 PASS**, the host's agents under k2-ptyd (socket under the short `/tmp` root).
 
 ## Status
 
