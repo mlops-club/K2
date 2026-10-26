@@ -14,6 +14,8 @@
 # 3. checks: two hosts Running on two different nodes, each linked by its
 #    key, with its own data and work volumes; the PDB allows one
 #    disruption.
+# The app login's password, when up.sh sets one, goes only to
+# $KIND_STATE/owner-password (0600); it is never printed.
 #
 # Only k2lab, through an explicit kubeconfig; only namespace k2-kind-p4.
 set -euo pipefail
@@ -24,7 +26,7 @@ for a in "$@"; do
     case "$a" in
         --daemon-image=*) daemon_image=${a#--daemon-image=} ;;
         --fake-src=*) fake_src=${a#--fake-src=} ;;
-        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "p4-up.sh: unknown argument $a" >&2; exit 2 ;;
     esac
 done
@@ -36,7 +38,7 @@ docker image inspect "$daemon_image" >/dev/null 2>&1 || { echo "p4-up.sh: no ima
 docker tag "$daemon_image" k2-daemon:p4
 say "k2-daemon:p4 = $daemon_image ($(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$daemon_image" | cut -c1-9))"
 K2_KIND_FAKE_SRC=$fake_src "$KIND_REPO/scripts/kind/up.sh" --p4 --hosts=2 --max-hosts=2 --host-auth=enroll \
-    --ptyd=1 --provisioner=kubernetes --work-root=/var/lib/k2/work
+    --ptyd=1 --provisioner=kubernetes --work-root=/var/lib/k2/work --password-file="$KIND_STATE/owner-password"
 
 kn() { kubectl --kubeconfig "$KIND_KUBECONFIG" -n "$KIND_NS" "$@"; }
 fails=0

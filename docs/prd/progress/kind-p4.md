@@ -45,11 +45,46 @@ On the owner's k3s cluster the plan's owner-run steps can use a real
   rc1's default 600 s drain wait: a drain waiting on a long turn would be
   SIGKILLed before its release save. The p4 overlay sets 120 s / 90 s.
 
+## First kind run (2026-10-26, rc1 c59acf7e0): the drain works, the move doesn't
+
+`p4-up.sh`: PASS (two linked hosts on worker2 and worker, each with its
+own data and work volumes, no shared `k2-work`, the PDB allows one).
+
+`drain-demo.sh` (evidence `lab-runs/kind-p4/drain-20261026T124000Z/`):
+checks 1–4 PASS, 5–7 FAIL, on one cause.
+
+- PASS: demo placed on k2-host-0, its fact in MEMORY.md; a 30 s turn in
+  progress; the PDB allowed the eviction; k2-host-0 Pending ("didn't
+  match Pod's node affinity", and its PV's); the controller marked it
+  draining. From the controller's log: the turn ended inside the drain
+  (Stop 28 s after the SIGTERM), snapshot 2 was saved, and the agent was
+  released: "resumed when the host is back or on the next need".
+- FAIL: the next message (`/cli/workspace/msg`, `wake=true`) was only
+  queued. demo was never placed on k2-host-1. It waited 4 minutes, until
+  the "uncordon" let k2-host-0 back, and resumed there (same Claude
+  conversation, epoch + 1).
+
+**Cause, in rc1's daemon (not this branch):** a drain writes the agent's
+resume row with the drained host's name (`agent_host/remote.rs:1866`);
+`resume_due` resumes it only when *that* host links again; while it waits,
+`delivery_drain.rs` holds its messages (`awaiting_resume`). Only
+`move_lost` turns a row into `ANY_HOST`, and it looks only at placements a
+lost host still holds, which a drained host released. So **a drained agent
+whose host doesn't come back waits indefinitely, messages included**: a node
+drained for maintenance, or, likely, a pool scale-down (its host's name
+comes back only if the pool scales up again, and nothing asks it to).
+
+Suggested fix (for the daemon's owner): a portable agent's drain resume
+row whose host has been unlinked for `K2_HOST_MOVE_AFTER` becomes
+`ANY_HOST`, like `move_lost`'s; or a message/wake for an agent awaiting
+resume counts as a need and places it on any usable host. Then
+`drain-demo.sh` checks 5–7 should pass as written.
+
 ## Acceptance (plan T4)
 
 | # | Check | Status |
 |---|---|---|
-| 1 | Drain demo on kind: same session id, `MEMORY.md` sha256 equal, I1–I4; a cast and an evidence bundle | written; kind run pending (needs the Docker lock for the fake agent image) |
+| 1 | Drain demo on kind: same session id, `MEMORY.md` sha256 equal, I1–I4; a cast and an evidence bundle | **FAIL on rc1** (checks 1–4 pass): a drained agent doesn't move to the other host (above). Blocked on the daemon |
 | 2 | The lab's S1–S9 and I1–I4 on the pool through `fleet-g2.sh` (pool mode) | not started: `fleet_kind.py` pool mode |
 | 3 | `prove.sh G4 --topology kind` | not started (with the lab worker) |
 | 4 | k3s: the script and steps for the owner, never run by a worker | not started |
