@@ -114,5 +114,7 @@ the guard from the start.
     `a_message_waits_for_the_spawn_to_answer_and_goes_out_on_its_first_attempt`.
     drain-move.sh now requires one send, and passes 4/4 twice (`20261026T161247Z`,
     `20261026T161413Z`).
+  - **Regression:** `cargo test -p k2-daemon --no-fail-fast` (throwaway
+    HOME): 5341 passed, 0 failed, 6 ignored, across 162 binaries.
 - **lab-g2's S8 resume-elsewhere and G3's S10** can now also cover "drained
   for good": drain a host, never restart it, then send a message.
