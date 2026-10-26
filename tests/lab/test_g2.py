@@ -346,6 +346,10 @@ class Plan(unittest.TestCase):
         calls.clear()
         g2.open_chat(c, sc, "/w/unregistered", "opens")
         self.assertEqual([p for p, _ in calls], ["/cli/workspace/ensure-pinned-chat"])
+        calls.clear()
+        with unittest.mock.patch.dict(os.environ, {"LAB_NO_ACTIVATE": "1"}):
+            g2.open_chat(c, sc, "/w/a", "opens")
+        self.assertEqual([p for p, _ in calls], ["/cli/workspace/ensure-pinned-chat"])
 
     def test_s10_is_fleet_only_and_opt_in(self):
         self.assertIn("S10", g2.FLEET_ONLY)
