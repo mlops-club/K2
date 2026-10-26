@@ -218,14 +218,25 @@ struct Inner {
 /// the host's path, or the one the controller asked for) as the controller
 /// names it and as the host does. The same path relative to each work root
 /// (D2); without the controller's root, one name for both.
-fn workspace_forms(cwd: &Path, host_root: &Path, ctl_root: Option<&Path>) -> (PathBuf, PathBuf) {
-    if let Ok(rel) = cwd.strip_prefix(host_root) {
-        return (ctl_root.map(|c| c.join(rel)).unwrap_or_else(|| cwd.to_path_buf()), cwd.to_path_buf());
+///
+/// Only a workspace counts: a cwd strictly under the host's work root (as
+/// the host names it), or under one of the controller's roots (as the
+/// controller asked for it). Anything else a host reports (`/`, a home
+/// directory) routes nothing (security review H4). `None`: out of scope.
+fn workspace_forms(cwd: &Path, host_root: &Path, ctl_roots: &[PathBuf]) -> Option<(Vec<PathBuf>, PathBuf)> {
+    let strictly = |base: &Path| cwd.strip_prefix(base).ok().filter(|rel| !rel.as_os_str().is_empty()).map(Path::to_path_buf);
+    let ctl_forms = |rel: &Path| -> Vec<PathBuf> {
+        if ctl_roots.is_empty() {
+            vec![cwd.to_path_buf()]
+        } else {
+            ctl_roots.iter().map(|c| c.join(rel)).collect()
+        }
+    };
+    if let Some(rel) = strictly(host_root) {
+        return Some((ctl_forms(&rel), cwd.to_path_buf()));
     }
-    if let Some(rel) = ctl_root.and_then(|c| cwd.strip_prefix(c).ok()) {
-        return (cwd.to_path_buf(), host_root.join(rel));
-    }
-    (cwd.to_path_buf(), cwd.to_path_buf())
+    let rel = ctl_roots.iter().find_map(|c| strictly(c))?;
+    Some((ctl_forms(&rel), host_root.join(rel)))
 }
 
 /// fs-relay: where an fs/git request goes ([`RemoteHost::workspace_route`]).
@@ -1774,7 +1785,7 @@ impl RemoteHost {
     /// ran) in on a host on its own disk, as the host names it, or as the
     /// controller does (the same path under `ctl_root` as under the host's
     /// work root). A placed agent wins over one that ran there before.
-    pub fn workspace_route(&self, paths: &[String], ctl_root: Option<&Path>) -> WorkspaceRoute {
+    pub fn workspace_route(&self, paths: &[String], ctl_roots: &[PathBuf]) -> WorkspaceRoute {
         let inner = self.inner.lock();
         let roots: HashMap<&str, PathBuf> = inner
             .host_labels
@@ -1793,17 +1804,19 @@ impl RemoteHost {
         let mut away: Option<(String, String)> = None;
         for p in paths {
             let p = Path::new(p);
+            // The longest workspace wins; a placed agent only breaks a tie.
             let best = spaces
                 .iter()
                 .filter_map(|(h, cwd, live)| {
-                    let (ctl_form, host_form) = workspace_forms(cwd, &roots[h.as_str()], ctl_root);
-                    [ctl_form, host_form.clone()]
+                    let (ctl_forms, host_form) = workspace_forms(cwd, &roots[h.as_str()], ctl_roots)?;
+                    ctl_forms
                         .into_iter()
+                        .chain(std::iter::once(host_form.clone()))
                         .filter(|from| p.starts_with(from))
-                        .map(|from| (*live, from.components().count(), h.clone(), from, host_form.clone()))
-                        .max_by_key(|(_, n, ..)| *n)
+                        .map(|from| (from.components().count(), *live, h.clone(), from, host_form.clone()))
+                        .max_by_key(|(n, ..)| *n)
                 })
-                .max_by_key(|(live, n, ..)| (*live, *n));
+                .max_by_key(|(n, live, ..)| (*n, *live));
             if let Some((_, _, host, from, to)) = best {
                 if !inner.links.contains_key(&host) {
                     away.get_or_insert((host.clone(), p.to_string_lossy().into_owned()));

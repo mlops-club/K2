@@ -5912,6 +5912,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             }
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there (or refused, never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let p_owned = p.to_string();
             let result = tokio::task::spawn_blocking(move || {
                 crate::git_routes::dispatch_unit4_git_post(&p_owned, &body_bytes)
@@ -6043,6 +6048,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             };
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there (or refused, never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let resp = tokio::task::spawn_blocking(move || {
                 crate::fs_routes::handle_upload_binary_gated(&body_bytes, skin_pass)
             })
@@ -6129,6 +6139,11 @@ async fn handle_one_request(
                     return DispatchOutcome::Done;
                 }
             };
+            // fs-relay: a workspace on an agent host is served there (or refused, never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             if let Some(pass) = skin_pass {
                 let resp = tokio::task::spawn_blocking(move || {
                     crate::fs_routes::handle_upload_chunk_gated(&body_bytes, Some(pass))
@@ -7520,6 +7535,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             };
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there (or refused, never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let resp = tokio::task::spawn_blocking(move || {
                 crate::fs_routes::handle_write_file_gated(&body_bytes, skin_pass)
             })
@@ -7592,6 +7612,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             }
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a workspace on an agent host is served there (or refused, never the copy here).
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let result = dispatch_unit6_post(p, &body_bytes);
             super::http::send_response(&mut *stream, result.status, "application/json", &result.body)
                 .await;

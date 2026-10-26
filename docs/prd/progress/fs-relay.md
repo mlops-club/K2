@@ -133,6 +133,31 @@ sequenceDiagram
    today. That, and project create/add, clone-to unpack and app deploy from
    a folder, are the next phase (they create workspaces, not read them).
 
+## Security review of 25c5c8c78: what changed
+
+An independent review found 6 high, 5 medium and 3 low findings (the merge
+was reverted from wave3). Every high and medium is fixed, each with a test
+named for it in `crates/k2-daemon/src/hosts/fs_relay_tests.rs`:
+
+| Finding | Fix | Test |
+|---|---|---|
+| H1 paths not confined (`..`, an unmapped second path, symlinks, `/tmp` vs `/private/tmp`) | Controller: a `..` in any path is a 400 `bad_path`; every path a request names must be in the workspace it is relayed to (400 `outside_workspace`); the controller's root is matched as given and canonical. Host: every absolute path in the query and the body (any key but the text keys), resolved through symlinks (the nearest existing ancestor for a new file), must be strictly under `K2_WORK_ROOT` (403 `outside_work_root`); names inside a path (`file_path`, `new_name`, `filename`) never hold `..` | `h1_traversal_and_an_unmapped_second_path_are_refused_on_the_controller`, `h1_the_host_confines_every_path_traversal_a_second_path_and_a_symlink_escape`, `a_path_goes_to_the_host_its_agents_workspace_is_on` (both root names) |
+| H2 the allowlist bypassed by `..` / `%2e` | Exact route lists (no prefixes) on both sides; the host refuses a path with `%`, `?`, `#`, `\`, empty, `.` or `..` segments, builds the URL with `Url::set_path` and checks it unchanged after | `h2_dot_segments_and_percent_escapes_never_reach_another_host_route`, `the_relay_carries_exact_file_and_git_routes_…` |
+| H3 the host's token in 502 bodies | The token goes as `Authorization: Bearer` (the daemon folds it into its auth), never in the URL; errors use `without_url()`; no redirects | `h3_the_hosts_token_is_not_in_an_error_body` |
+| H4 a host-reported cwd controls routing | A cwd routes only when it is strictly under its host's `k2.work_root` (or under the controller's root, as the controller asked for it); `/`, a home directory or the root itself route nothing; the longest workspace wins, a placed agent only breaks a tie | `h4_a_malicious_cwd_captures_nothing_and_the_longest_workspace_wins` |
+| H5 every caller becomes the host's owner | The git notes (`/cli/git/notes*`, author-or-Admin checks in the controller's database) are no longer relayed; what is relayed has no per-caller check beyond the role gate and `token_ok`, which the controller runs first | `the_relay_carries_exact_…` |
+| H6 a big POST silently written to the controller's copy | No peeking: the dispatcher's POST arms (git, write-file, the fs arm, both uploads) read the whole body, then ask the relay; a request for a host workspace is relayed or refused (413 over 8 MiB), never served from the controller's copy | `m3_h6_auth_first_and_no_silent_fallback_for_a_big_post` |
+| M1 a big answer kills the link | The host refuses an answer over 8 MiB (413: read by ranges); request bodies are capped the same way | `m1_an_oversize_answer_is_refused_on_the_host_not_sent` |
+| M2 header injection from a host | The status line is rebuilt from its numeric code; the content type comes from a fixed list | `m2_a_hosts_status_and_content_type_cant_inject_headers`, and through the relay in the end-to-end test |
+| M3 work and information before auth | `token_ok` first, before any routing (no `host_away` / `cross_host` to an unauthenticated caller); no peek buffer | `m3_h6_…` |
+| M4 file contents rewritten | Only known path keys are mapped (`path`, `paths`, `dir`, `root`, `sources`, `destination`, …), by string prefix, the rest kept byte for byte; contents, messages and search text never | `m4_only_path_keys_are_mapped_…`, and the commit message in the end-to-end test |
+| M5 notes split across two databases; `open-changes` on the host's bus | Notes and `open-changes` stay on the controller (as before fs-relay) | `the_relay_carries_exact_…` |
+
+The lows (L1 retries and idempotency, L2 transport details, L3 worktree
+paths outside the workspace) are open, for phase 2. Decision 1 above now
+reads: the notes, `open-changes` and `/cli/worktree` (a database setting)
+are not relayed; uploads are. Decision 7 is replaced by H6's fix.
+
 ## Checks
 
 | Check | Result |
