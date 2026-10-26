@@ -4,7 +4,8 @@
 #
 #   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]
 #                             [--provisioner=static|kubernetes [--max-hosts=N]]
-#                             [--work-root=PATH] [--login-from=POD] [--max-awake=N]] [--fake] [--rebuild-daemon]
+#                             [--work-root=PATH] [--login-from=POD] [--max-awake=N]
+#                             [--host-work=shared|own] [--move-after=S]] [--fake] [--rebuild-daemon]
 #                      [--reset-password] [--port-forward] [--password-file=PATH] [--render-only=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
@@ -56,6 +57,14 @@
 # --work-root=PATH sets K2_WORK_ROOT on the hosts (home sync, P3 T1: agents
 # whose cwd is under it are saved on release and restored on spawn). The
 # workspaces volume is mounted at /var/lib/k2/work.
+# --host-work=own gives each host its own workspaces volume (a claim
+# template "work" at /var/lib/k2/work) instead of the shared k2-work, which
+# the controller (and the lab's runner) keep. The hosts stay on the
+# controller's node (the runner mounts their HOME volumes). A claim
+# template can't change on a live StatefulSet: switching needs k2-host
+# deleted first (its PVCs stay). shared (the default) is as before.
+# --move-after=S sets the controller's K2_HOST_MOVE_AFTER (seconds before a
+# lost host's portable agents move; the daemon's default is 300).
 # --max-awake=N sets K2_HOST_MAX_AWAKE on the hosts (the end state's 100):
 # how many awake agents a host takes before the pool adds one.
 # --login-from=POD (e.g. k2-host-0) gives every host an init container that
@@ -84,7 +93,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
-provisioner=static render_to= max_hosts= work_root= login_from= p4=0 max_awake=
+provisioner=static render_to= max_hosts= work_root= login_from= p4=0 max_awake= host_work=shared move_after=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -103,7 +112,9 @@ for a in "$@"; do
         --work-root=*) work_root=${a#--work-root=} ;;
         --login-from=*) login_from=${a#--login-from=} ;;
         --max-awake=*) max_awake=${a#--max-awake=} ;;
-        -h|--help) sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --host-work=shared|--host-work=own) host_work=${a#--host-work=} ;;
+        --move-after=*) move_after=${a#--move-after=} ;;
+        -h|--help) sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -135,6 +146,9 @@ fi
 case "$work_root" in ''|/*) ;; *) echo "up.sh: --work-root takes an absolute path" >&2; exit 2 ;; esac
 case "$max_awake" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) echo "up.sh: --max-awake takes a number from 1" >&2; exit 2 ;; esac
 [ -z "$max_awake" ] || [ "$dist" = 1 ] || { echo "up.sh: --max-awake needs --dist" >&2; exit 2; }
+case "$move_after" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) echo "up.sh: --move-after takes seconds from 1" >&2; exit 2 ;; esac
+{ [ "$host_work" = shared ] && [ -z "$move_after" ]; } || [ "$dist" = 1 ] || { echo "up.sh: --host-work and --move-after need --dist" >&2; exit 2; }
+[ "$host_work" = shared ] || [ "$p4" = 0 ] || { echo "up.sh: --p4 hosts already have their own work volumes" >&2; exit 2; }
 case "$login_from" in ''|k2-host-[0-9]*) ;; *) echo "up.sh: --login-from takes a host pod (k2-host-N)" >&2; exit 2 ;; esac
 if { [ -n "$work_root" ] || [ -n "$login_from" ]; } && [ "$dist" = 0 ]; then
     echo "up.sh: --work-root and --login-from need --dist" >&2; exit 2
@@ -227,7 +241,52 @@ $([ "$provisioner" = kubernetes ] && printf '  - %s\n' "$(python3 -I -c 'import 
 replicas:
   - {name: k2-host, count: $1}
 EOF
-        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ] || [ -n "$max_awake" ]; then echo "patches:"; fi
+        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ] || [ -n "$max_awake" ] \
+            || [ "$host_work" = own ] || [ -n "$move_after" ]; then echo "patches:"; fi
+        if [ "$host_work" = own ]; then
+            # The host's own workspaces volume; data's template is repeated
+            # because a list of claim templates is replaced, not merged.
+            cat <<EOF
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            volumes:
+              - name: work
+                \$patch: delete
+        volumeClaimTemplates:
+          - metadata: {name: data}
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources: {requests: {storage: 10Gi}}
+          - metadata: {name: work}
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources: {requests: {storage: 2Gi}}
+EOF
+        fi
+        if [ -n "$move_after" ]; then
+            cat <<EOF
+  - target: {kind: StatefulSet, name: k2-controller}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-controller
+      spec:
+        template:
+          spec:
+            containers:
+              - name: k2-daemon
+                env:
+                  - {name: K2_HOST_MOVE_AFTER, value: "$move_after"}
+EOF
+        fi
         if [ "$ptyd" = 1 ] || [ -n "$work_root" ] || [ -n "$max_awake" ]; then
             cat <<EOF
   - target: {kind: StatefulSet, name: k2-host}

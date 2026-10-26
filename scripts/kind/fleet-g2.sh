@@ -213,7 +213,12 @@ say "lab: tests/lab and cli/ from $lab_rev; fleet_kind.py from $(git rev-parse -
 
 # ── 4. run ──────────────────────────────────────────────────────────────
 rc=0
-kc -n "$KIND_NS" exec "$RUNNER" -- env NS="$KIND_NS" HOSTS="$hosts" LIVE="$live" POOL="$pool" ONLY="$only" CHAOS="$chaos" KILL="$kill_mode" \
+# The lab's switches the scenarios read (S10, its move delay, home sync).
+lab_env=()
+for v in LAB_S10 LAB_HOST_MOVE_AFTER LAB_HOME_SYNC LAB_S8_RESUME_ELSEWHERE; do
+    [ -n "${!v:-}" ] && lab_env+=("$v=${!v}")
+done
+kc -n "$KIND_NS" exec "$RUNNER" -- env ${lab_env[@]+"${lab_env[@]}"} NS="$KIND_NS" HOSTS="$hosts" LIVE="$live" POOL="$pool" ONLY="$only" CHAOS="$chaos" KILL="$kill_mode" \
     CHAOS_MIN_S="${LAB_CHAOS_MIN_S:-180}" bash /lab/repo/scripts/kind/fleet-g2-runner.sh || rc=$?
 
 # ── 5. the evidence ─────────────────────────────────────────────────────
