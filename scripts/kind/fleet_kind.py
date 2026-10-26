@@ -31,9 +31,14 @@ daemon does not answer, so a client sees "connection refused" there, as on
 a machine whose daemon is down.
 
     fleet_kind.py plan --state F --run-dir D --namespace NS --hosts k2-host-0,k2-host-1 [--kill process|pod]
+                       [--pool MIN:MAX]
     fleet_kind.py forward --state F                  (until SIGTERM)
     fleet_kind.py lab <lab.py args...>               lab.py with this backend
     fleet_kind.py hold|release --state F <proc>      keep a daemon down / let it run
+
+Pool mode (--pool, the controller runs K2_PROVISIONER=kubernetes): --hosts
+names every host the pool may make; one with no pod yet is down, and only
+the pool starts it (`start` refuses at once instead of waiting).
 
 `lab` loads tests/lab/lab.py. When its fleet.py has no hook for an outside
 backend (`backend_module` in the state file), it installs these functions
@@ -152,10 +157,16 @@ def ours(st, pid):
     return bool(snap) and snap[0] == pid
 
 
+def _pod_exists(st, name):
+    return kubectl(st, "get", "pod", st["kind"]["pods"][name], "-o", "name").returncode == 0
+
+
 def start(st, name):
     """Let the daemon run again; returns its new pid (fleet.py then waits
     for it to be ready)."""
     release(st, name)
+    if st["kind"].get("pool") and name != "controller" and not _pod_exists(st, name):
+        raise KindError("%s: no pod; the host pool (%s) makes it when it needs a host" % (name, st["kind"]["pool"]))
     end = time.monotonic() + START_WAIT_S
     while time.monotonic() < end:
         snap = snapshot(st, name, fresh=True)
@@ -263,7 +274,7 @@ def install(fleet):
 
 # ── plan ────────────────────────────────────────────────────────────────
 
-def plan(state_path, run_dir, namespace, hosts, kill_mode):
+def plan(state_path, run_dir, namespace, hosts, kill_mode, pool=None):
     run_dir = os.path.abspath(run_dir)
     os.makedirs(os.path.join(run_dir, "traces"), exist_ok=True)
     st = {"layout": "fleet", "backend": "kind", "backend_module": os.path.abspath(__file__),
@@ -271,7 +282,7 @@ def plan(state_path, run_dir, namespace, hosts, kill_mode):
           "work": "/var/lib/k2/work/lab", "lock": os.path.join(run_dir, "fleet.lock"),
           "controller": "controller", "hosts": [], "procs": {},
           "kind": {"namespace": namespace, "kill": kill_mode, "pods": {}, "containers": {}, "upstream": {},
-                   "pod_home": {}}}
+                   "pod_home": {}, "pool": pool}}
     k = st["kind"]
 
     def proc(name, pod, role, container, upstream, pod_home, port):
@@ -294,6 +305,8 @@ def plan(state_path, run_dir, namespace, hosts, kill_mode):
     for name, p in st["procs"].items():
         if not os.path.isdir(p["home"]):
             raise KindError("%s: %s is not mounted" % (name, p["home"]))
+        # A pool host's fresh volume has no trace directory yet.
+        os.makedirs(os.path.dirname(p["trace"]), exist_ok=True)
         release(st, name)
         snap = snapshot(st, name, fresh=True)
         p["pid"] = snap[0] if snap else None
@@ -429,9 +442,10 @@ def main(argv):
     p.add_argument("--namespace")
     p.add_argument("--hosts")
     p.add_argument("--kill", choices=["process", "pod"], default="process")
+    p.add_argument("--pool")
     a = p.parse_args(argv)
     if a.cmd == "plan":
-        st = plan(a.state, a.run_dir, a.namespace, [h for h in a.hosts.split(",") if h], a.kill)
+        st = plan(a.state, a.run_dir, a.namespace, [h for h in a.hosts.split(",") if h], a.kill, a.pool)
         for name, pr in st["procs"].items():
             print("fleet: %s (%s, pod %s) pid %s port %s" % (name, pr["role"], st["kind"]["pods"][name], pr["pid"],
                                                               pr["port"]))

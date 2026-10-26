@@ -28,7 +28,8 @@ trap cleanup EXIT
 # Rows of this run only: the outboxes live on the pods' volumes and keep
 # earlier runs' rows (judged by those runs).
 START_MS=$(python3 -I -c 'import time; print(int(time.time() * 1000))')
-"${KIND_PY[@]}" plan --state "$STATE" --run-dir "$RUN" --namespace "$NS" --hosts "$HOSTS" --kill "$KILL" \
+LIVE=${LIVE:-$HOSTS}   # pool mode: the hosts running now (HOSTS: every one the pool may make)
+"${KIND_PY[@]}" plan --state "$STATE" --run-dir "$RUN" --namespace "$NS" --hosts "$HOSTS" --kill "$KILL" ${POOL:+--pool "$POOL"} \
     | tee -a "$RUN/fleet-g2.log" || exit 1
 # This run's traces only: the files live on the pods' volumes and are
 # appended to across runs (writers use O_APPEND, so truncating is safe).
@@ -43,6 +44,7 @@ PY
 bg+=($!)
 ports=$(python3 -I -c 'import json,sys; print(" ".join("%s=%s" % (n, p["port"]) for n, p in json.load(open(sys.argv[1]))["procs"].items()))' "$STATE")
 for pair in $ports; do
+    case ",controller,$LIVE," in *",${pair%%=*},"*) ;; *) say "${pair%%=*}: not running (the pool makes it when it needs it)"; continue ;; esac
     for _ in $(seq 1 300); do
         curl -fsS --max-time 2 "http://127.0.0.1:${pair#*=}/boot-status" 2>/dev/null | grep -q '"phase":"ready"' && break
         sleep 0.5
@@ -54,7 +56,7 @@ hosts_status() { curl -fsS --max-time 5 "http://127.0.0.1:$ctl_port/cli/hosts/st
 for _ in $(seq 1 120); do
     hosts_status hosts-status-start.json
     n=$(python3 -I -c 'import json,sys; print(sum(1 for h in json.load(open(sys.argv[1])).get("hosts", []) if h.get("connected", True)))' "$RUN/hosts-status-start.json" 2>/dev/null || echo 0)
-    [ "$n" -ge "$(echo "$HOSTS" | tr ',' '\n' | grep -c .)" ] && break
+    [ "$n" -ge "$(echo "$LIVE" | tr ',' '\n' | grep -c .)" ] && break
     sleep 1
 done
 say "controller /cli/hosts/status: $(head -c 600 "$RUN/hosts-status-start.json")"
@@ -70,8 +72,8 @@ if has S1; then
     # S1 is a one-host scenario (it reads the transcript in one --home): the
     # other hosts are held down while it runs, so the controller places it
     # on the first.
-    first=${HOSTS%%,*}
-    others=$(echo "$HOSTS" | tr ',' '\n' | tail -n +2)
+    first=${LIVE%%,*}
+    others=$(echo "$LIVE" | tr ',' '\n' | tail -n +2)
     # (lab.py's `fleet` takes the proc right after the action.)
     for h in $others; do
         "${LAB[@]}" fleet kill "$h" --state "$STATE" 2>&1 | tee -a "$RUN/fleet-g2.log"
