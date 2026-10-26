@@ -134,7 +134,7 @@ sequenceDiagram
    - A Role grants exactly the rights recovery-off needs.
    - For the `deploy/kubernetes` owner (`controller.yaml`, not T3's):
      - `k2-secrets/stalwart-admin` and `K2_STALWART_ADMIN_FILE` have no reader in the code; the controller reads `k2-mail-recovery` through the API.
-     - Add `K2_STALWART_ALLOWED_IPS` with the cluster's pod CIDR (`10.42.0.0/16` on k3s). Without it, the controller's ApiKey is accepted from any address and mail-ingress is the only boundary.
+     - `K2_STALWART_ALLOWED_IPS` is now in `controller.yaml` (T3 owns `deploy/kubernetes` for this change): the k3s pod CIDR `10.42.0.0/16` by default, to be set per cluster (`10.244.0.0/16` on kind). Empty, the ApiKey is accepted from any address and mail-ingress is the only boundary.
    - **Part 2 done** (0c198cc36, 6b0fc47e7, 8cf46835b, 34150b9aa; `lab-runs/caps/mail-enable-check.log`, PASS on a fresh Stalwart and a fresh controller). `POST /cli/mail/server/enable` on the controller (`K2_CAP_MAIL=external`) sets Stalwart up over `K2_STALWART_URL` (`mail/k8s_enable.rs`), with the native machine's steps, markers and vault:
      - bootstrap with the Secret's recovery password, then a restart into normal mode (the pod is deleted and its replacement waited for);
      - a `k2-daemon` service account and its ApiKey, allowed only from `K2_STALWART_ALLOWED_IPS`; the host keeps its loopback-only key;

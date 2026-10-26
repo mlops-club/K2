@@ -23,6 +23,10 @@ data:
   K2_POSTGRES_PASSWORD_FILE: /run/secrets/pg/password
   K2_CAP_MAIL: external
   K2_STALWART_URL: http://k2-mail:8080
+  # Where Stalwart accepts the controller's ApiKey from: the cluster's pod
+  # CIDR (IPs or CIDRs, comma-separated). Set it per cluster: 10.42.0.0/16
+  # on k3s (the default here), 10.244.0.0/16 on kind. Empty: any address.
+  K2_STALWART_ALLOWED_IPS: 10.42.0.0/16
   K2_STALWART_ADMIN_FILE: /run/secrets/k2/stalwart-admin
   K2_CAP_SEW: external
   K2_SEW_MGMT_URL: http://k2-sew.k2-edge:9090   # Sew lives in namespace k2-edge (host network)
