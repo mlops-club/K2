@@ -289,3 +289,34 @@ Seen during the Docker Desktop restart (VM raised to 14 GB): every proxy contain
 - `up.sh` recreates its own variant's proxy; `forward.sh [--dist] [--fake]` does it without a redeploy.
 - The owner's `k2-kind-proxy` (7440) needs `scripts/kind/forward.sh` or `docker start k2-kind-proxy`.
 - Also, `kind load` re-points a tag on the nodes, so a pod that restarts before its roll comes back on the new image. The owner's controller did this when the VM restarted.
+
+## 2026-10-26: the owner's deployment upgraded to wave2-preview @6e24dd5be
+
+Source: `k2-dist/wave2-preview` @6e24dd5be (wave1, W1, W2, the wake fix, W3 survive), merged into `k2-dist/kind-app` (200e2f6ba); images built at 43efc6471, whose crates are the same.
+
+**Found first, on the test namespace: `K2_HOME` changed meaning.** Since wave1's home task, `K2_HOME` is the state directory itself.
+- The end-state manifests set `K2_HOME=/var/lib/k2` (controller) and `/var/lib/k2-host` (host), while every earlier daemon kept its state in `$HOME/.k2`.
+- With those values the new daemon started fresh state in the volume root. It copied `k2so.db` and a few other files, but not `connect-users.json`, `connect-sessions.json`, `hosts/` or `certs/`. On 7443 that would have lost the app's login and session tokens and the host's enrollment.
+- `deploy/kind/dist` now pins `K2_HOME` to `/var/lib/k2/.k2` and `/var/lib/k2-host/.k2`, where the state is. The lab's compose fleet uses the same layout.
+- Whoever owns `deploy/kubernetes` should decide the end state's value, or a migration that moves the rest.
+- Also found: `deploy/kind/dist/` had never been committed. The root `.gitignore` entry `dist/` hid it. It is force-added now (43efc6471).
+
+Steps:
+1. **Images.** `k2-daemon:dist` was built with `build-daemon.sh` at 6g, 1 job. `k2-daemon:dist-fake` is the same image under the test variant's own tag, so a test build never reaches the owner's pods. Then `k2-agents:dist` and `k2-agents:dist-fake` were built.
+2. **`k2-kind-dist-fake` (7442), one host:**
+   - `s1.sh --dist`: S1, placement and S1 after a host restart all PASS (`lab-runs/kind-dist/2026-10-26T00-04-48Z/`).
+   - `app-check.sh --dist --fake` PASS.
+   - `reconnect-check.sh --dist --fake` PASS: the same token got `hello` again 9.1 s after both pods were deleted.
+3. **`k2-kind-dist` (7443)** was rolled with `up.sh --dist` (the owner had pre-approved restarts).
+   - The password is unchanged.
+   - The three PVCs are the same volumes (`pvc-6ba8beb1…`, `pvc-fa8dd212…`, `pvc-61b28674…`).
+   - Both pods run the new image ids.
+   - The state is used in place: no new `k2so.db` in the volume root, and the daemon publishes to `/var/lib/k2/.k2`.
+   - The owner's Claude login file is present on the host volume, and `hasCompletedOnboarding` is true (only existence and that key were checked).
+   - The daemon resumed the owner's claude session after the roll (W3).
+4. **On 7443:**
+   - `app-check.sh --dist` PASS: `K2CHECK host=k2-host-0 uid=10000 cwd=/var/lib/k2/work/demo`.
+   - `reconnect-check.sh --dist --restart-live` PASS: hello again after 8.1 s with the same token, whoami 200, and the host linked again after 9.1 s.
+   - The login file was still present after that restart.
+
+Note: this Claude Code keeps `theme` in `~/.claude/settings.json` (it is there) and drops the copy `up.sh` seeds in `.claude.json`. The seed is harmless and redundant on this version.
