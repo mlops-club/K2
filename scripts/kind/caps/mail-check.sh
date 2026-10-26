@@ -97,9 +97,15 @@ probe mail-as-controller controller
 probe mail-as-other app
 kn wait --for=condition=Ready pod/mail-as-controller pod/mail-as-other --timeout=120s >/dev/null
 api() {  # api <pod> <curl auth args...> → HTTP code of an x:Bootstrap/get call
-    local pod=$1; shift
-    kn exec "$pod" -- sh -c 'curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$@" -H "Content-Type: application/json" \
-        -d "{\"using\":[\"urn:ietf:params:jmap:core\"],\"methodCalls\":[[\"x:Bootstrap/get\",{},\"0\"]]}" http://k2-mail:8080/jmap/' _ "$@" 2>/dev/null || echo 000
+    # Retries while there is no connection at all (a just-started pod).
+    local pod=$1 code="" i; shift
+    for i in 1 2 3 4 5; do
+        code=$(kn exec "$pod" -- sh -c 'curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$@" -H "Content-Type: application/json" \
+            -d "{\"using\":[\"urn:ietf:params:jmap:core\"],\"methodCalls\":[[\"x:Bootstrap/get\",{},\"0\"]]}" http://k2-mail:8080/jmap/' _ "$@" 2>/dev/null || true)
+        [ "${code:-000}" != 000 ] && break
+        sleep 2
+    done
+    echo "${code:-000}"
 }
 
 echo "== 2. 3. the management API from the controller"

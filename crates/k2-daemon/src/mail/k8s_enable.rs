@@ -212,7 +212,19 @@ pub fn run_enable_k8s(
             if !api.has_session() {
                 authenticate_saved(pod, api, secrets, url)?;
             }
-            sup::rotate_leftover_admins(api, secrets, &default_domain)?;
+            // As natively (iascm): a session that the steps above used
+            // can be refused here; the ApiKey from the api-key step still
+            // opens the management API. Seen live on kind as well.
+            if let Err(e) = sup::rotate_leftover_admins(api, secrets, &default_domain) {
+                if !sup::is_auth_rejected(&e) {
+                    return Err(e);
+                }
+                let key = sup::row_field("api_key_ref")
+                    .and_then(|r| secrets.resolve(&r).ok().flatten())
+                    .ok_or_else(|| format!("{e} (no api-key to retry)"))?;
+                api.authenticate_bearer(url, &key).map_err(|b| format!("{e} | api-key: {b}"))?;
+                sup::rotate_leftover_admins(api, secrets, &default_domain)?;
+            }
             pod.overwrite_recovery_password()
         })()
         .map_err(|e| fail("recovery-off", e))?;

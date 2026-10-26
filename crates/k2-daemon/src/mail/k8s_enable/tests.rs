@@ -47,6 +47,8 @@ struct FakeApi {
     calls: Vec<String>,
     /// One failure of this call name (to test resume).
     fail_once: Option<&'static str>,
+    /// The first rotation is refused as unauthenticated (seen live).
+    rotate_401_once: bool,
 }
 
 impl FakeApi {
@@ -56,6 +58,10 @@ impl FakeApi {
         if self.fail_once == Some(name.as_str()) {
             self.fail_once = None;
             return Err(format!("{name} failed (test)"));
+        }
+        if name == "rotate_admin_secret" && self.rotate_401_once {
+            self.rotate_401_once = false;
+            return Err("POST http://k2-mail:8080/jmap/: HTTP 401 Unauthorized: You have to authenticate first.".into());
         }
         Ok(())
     }
@@ -224,4 +230,19 @@ fn the_hooks_are_inert_unless_mail_is_delegated() {
     // take their native paths; this module's external_url is None.
     let _env = k2_core::test_env::EnvVar::remove("K2_CAP_MAIL");
     assert_eq!(external_url(), None);
+}
+
+#[test]
+fn a_refused_rotation_retries_with_the_api_key() {
+    let _g = crate::mail::mail_server_test_lock();
+    clean_row();
+    let (pod, secrets) = (FakePod::new(), FakeSecrets::default());
+    let mut api = FakeApi { rotate_401_once: true, ..FakeApi::default() };
+    run_enable_k8s(&pod, &mut api, &secrets, URL, "mail.acme.dev").unwrap();
+    let i = api.calls.iter().position(|c| c.starts_with("rotate_admin_secret")).unwrap();
+    assert_eq!(api.calls[i + 1], format!("authenticate_bearer {URL}"), "{:?}", api.calls);
+    assert!(api.calls[i + 2..].iter().any(|c| c == "rotate_admin_secret admin@acme.dev"), "{:?}", api.calls);
+    assert_eq!(sup::current_status().as_deref(), Some("running"));
+    assert_eq!(*pod.recovery.borrow(), "gone");
+    clean_row();
 }
