@@ -27,6 +27,12 @@ pub enum Kind {
     NameBeside(&'static str),
     /// resolve-links' candidates, each checked on its own (`split_links`).
     Candidates,
+    /// A file in transit: one plain name in the host's own transit folder
+    /// (its K2 home, never a workspace), not a symlink.
+    Transit,
+    /// An absolute folder under the work root, or the root itself (where a
+    /// clone lands).
+    Parent,
     /// Not a path: text, a flag, a number, a ref, an id.
     Plain,
 }
@@ -52,6 +58,13 @@ pub enum Derived {
     /// resolve): no link in it to a folder outside the work root (or a
     /// dangling one), which the checkout would write or delete through.
     CheckoutTree,
+    /// A workspace being registered: every file under `path` (registering
+    /// seeds and writes in it).
+    WorkspaceTree,
+    /// A clone's bundle extracted under `dest_parent` (`clone::unpack_bundle`
+    /// keeps its entries there); its CLI memory and sessions go to this
+    /// host's home, by design.
+    CloneUnpack,
 }
 
 #[derive(Debug)]
@@ -159,9 +172,38 @@ pub const SCHEMAS: &[Schema] = &[
     post("/cli/git/unstage", &[("path", Abs), ("filePath", RepoRel("path"))], &[D::Repo]),
 ];
 
-/// The schema of `method path`, when the relay carries it. Exact routes.
+/// What else a host serves its controller (phase 2), never relayed from
+/// the app's routes: a workspace's registration, made on the host that will
+/// hold it, and the relay operations (in process on the host).
+pub const HOST_SCHEMAS: &[Schema] = &[
+    post("/cli/projects/create", &[("name", Plain), ("path", Abs), ("color", Plain)], &[D::Repo, D::WorkspaceTree]),
+    post(
+        "/cli/projects/add-from-path",
+        &[("path", Abs), ("seed_wiki", Plain), ("seedWiki", Plain), ("seed_agents_md", Plain), ("seedAgentsMd", Plain), ("fanout", Plain)],
+        &[D::Repo, D::WorkspaceTree],
+    ),
+    post(
+        "/cli/projects/add-without-git",
+        &[("path", Abs), ("seed_wiki", Plain), ("seedWiki", Plain), ("seed_agents_md", Plain), ("seedAgentsMd", Plain), ("fanout", Plain)],
+        &[D::Repo, D::WorkspaceTree],
+    ),
+    post("/cli/hosts/relay/pack", &[("path", Abs)], &[]),
+    post("/cli/hosts/relay/get", &[("file", Transit), ("offset", Plain), ("len", Plain)], &[]),
+    post("/cli/hosts/relay/put", &[("file", Transit), ("offset", Plain), ("b64", Plain)], &[]),
+    post("/cli/hosts/relay/drop", &[("file", Transit)], &[]),
+    post("/cli/hosts/relay/clone-extract", &[("bundle", Transit), ("dest_parent", Parent)], &[D::CloneUnpack]),
+];
+
+/// The schema of `method path`, when the relay carries it from the app's
+/// routes. Exact routes.
 pub fn schema(method: &str, path: &str) -> Option<&'static Schema> {
     SCHEMAS.iter().find(|s| s.method.eq_ignore_ascii_case(method) && s.route == path)
+}
+
+/// The schema of `method path` when a host serves it for its controller:
+/// a relayed route, a registration, or a relay operation.
+pub fn host_schema(method: &str, path: &str) -> Option<&'static Schema> {
+    schema(method, path).or_else(|| HOST_SCHEMAS.iter().find(|s| s.method.eq_ignore_ascii_case(method) && s.route == path))
 }
 
 // ── host ───────────────────────────────────────────────────────────────
@@ -361,6 +403,25 @@ fn confine_unbudgeted(root: &Path, s: &Schema, query: &[(String, String)], body:
                 inside(root, k, &dir.join(name)).map_err(out)?;
                 v.clone()
             }
+            Transit => {
+                let name = v.as_str().ok_or_else(|| out(format!("{k} is not a name")))?;
+                let f = super::tmp_file(name).map_err(out)?;
+                if std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(out(format!("{k} is a symlink")));
+                }
+                v.clone()
+            }
+            Parent => {
+                let x = v.as_str().ok_or_else(|| out(format!("{k} is not a path")))?;
+                if !x.starts_with('/') || has_dot_dot(x) {
+                    return Err(out(format!("{k}: an absolute path without '..'")));
+                }
+                let r = resolve(Path::new(x)).ok_or_else(|| out(format!("{k} can't be resolved")))?;
+                if !r.starts_with(root) {
+                    return Err(out(format!("{k} is not under this host's work root")));
+                }
+                Value::String(r.to_string_lossy().into_owned())
+            }
             // Checked one by one by `split_links` before this.
             Candidates => {
                 strings(k, v).map_err(out)?;
@@ -458,6 +519,10 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
             }
             Ok(())
         }
+        Derived::WorkspaceTree => tree_inside(root, &path_of("path").ok_or("a registration names its path")?),
+        // `dest_parent` is confined (`Parent`); `unpack_bundle` keeps every
+        // entry under it.
+        Derived::CloneUnpack => Ok(()),
     }
 }
 

@@ -1005,15 +1005,17 @@ async fn r6_off_by_default_the_controller_serves_every_route_itself() {
 #[test]
 fn r6_every_relayed_route_has_one_schema() {
     use schema::Kind;
-    for (i, s) in schema::SCHEMAS.iter().enumerate() {
-        assert!(
-            !schema::SCHEMAS[..i].iter().any(|t| t.route == s.route),
-            "{} has one schema (and one method)",
-            s.route
-        );
-        assert!(relayed(s.method, s.route));
+    let all: Vec<&schema::Schema> = schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).collect();
+    for (i, s) in all.iter().enumerate() {
+        assert!(!all[..i].iter().any(|t| t.route == s.route), "{} has one schema (and one method)", s.route);
+        // Phase 2's registrations and relay operations: a host serves them
+        // for its controller; the app's routes never relay them.
+        let host_only = i >= schema::SCHEMAS.len();
+        assert_eq!(relayed(s.method, s.route), !host_only, "{}", s.route);
+        assert!(host_allows(s.method, s.route), "{}", s.route);
         for (k, kind) in s.keys {
             match kind {
+                Kind::Transit | Kind::Parent => assert!(s.route.starts_with(OPS), "{} {k}: a relay operation's", s.route),
                 Kind::Abs | Kind::Candidates => assert!(PATH_KEYS.contains(k), "{} {k}: a path key the controller maps", s.route),
                 Kind::RepoRel(base) | Kind::NameIn(base) | Kind::NameBeside(base) => {
                     assert_eq!(s.kind(base), Some(Kind::Abs), "{} {k} joins {base}, one of its paths", s.route)
@@ -1233,7 +1235,8 @@ fn match_arm(src: &str, at: usize) -> String {
 fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
     let fs = include_str!("../fs_routes.rs");
     let git = include_str!("../git_routes.rs");
-    let dispatch = [include_str!("../routes/dispatcher.rs"), include_str!("../misc_routes.rs"), git];
+    let db = include_str!("../db_routes.rs");
+    let dispatch = [include_str!("../routes/dispatcher.rs"), include_str!("../misc_routes.rs"), git, db];
     let handlers: &[(&str, &str, &str)] = &[
         ("/cli/fs/read-dir", "fs", "handle_read_dir"),
         ("/cli/fs/read-file", "fs", "handle_read_file"),
@@ -1276,8 +1279,12 @@ fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
         ("/cli/git/stage", "git", "handle_git_stage"),
         ("/cli/git/stage-all", "git", "handle_git_stage_all"),
         ("/cli/git/unstage", "git", "handle_git_unstage"),
+        // Phase 2: a workspace's registration, made on its host.
+        ("/cli/projects/create", "db", "handle_projects_create"),
+        ("/cli/projects/add-from-path", "db", "handle_projects_add_from_path"),
+        ("/cli/projects/add-without-git", "db", "handle_projects_add_without_git"),
     ];
-    for s in schema::SCHEMAS {
+    for s in schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).filter(|s| !s.route.starts_with(OPS)) {
         assert!(handlers.iter().any(|(r, _, _)| *r == s.route), "{}: its handler is scanned", s.route);
     }
     // The scan reads what the handlers read (it isn't vacuous): query keys,
@@ -1291,9 +1298,30 @@ fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
     has(git, "handle_git_create_worktree", &["projectPath", "branch", "projectId", "existingBranch"]);
     has(git, "handle_git_discard", &["path", "files", "includeStaged"]);
     has(fs, "handle_upload_chunk", &["upload_id", "dir", "filename", "offset", "base64", "is_last", "total_bytes"]);
+    has(db, "handle_projects_add_from_path", &["path", "seed_wiki", "seedWiki", "fanout"]);
+    // The relay operations (in process, `host_op`): each arm's `s("…")` and
+    // `args["…"]` reads.
+    let relay = include_str!("fs_relay.rs");
+    let ops = fn_body(relay, "host_op");
+    for s in schema::HOST_SCHEMAS.iter().filter(|s| s.route.starts_with(OPS)) {
+        let name = &s.route[OPS.len()..];
+        let at = ops.find(&format!("\"{name}\" =>")).unwrap_or_else(|| panic!("host_op runs {name}"));
+        let arm = match_arm(ops, at);
+        let mut keys = quoted_after(&arm, "s(\"");
+        keys.extend(quoted_after(&arm, "args[\""));
+        keys.extend(quoted_after(&arm, "args.get(\""));
+        assert!(!keys.is_empty(), "{name}: the scan reads its arm");
+        for k in keys {
+            assert!(s.kind(&k).is_some(), "{}: host_op reads {k}, which its schema doesn't declare", s.route);
+        }
+    }
     for (route, file, handler) in handlers {
-        let s = schema::SCHEMAS.iter().find(|s| s.route == *route).unwrap_or_else(|| panic!("{route} has a schema"));
-        let src = if *file == "fs" { fs } else { git };
+        let s = schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).find(|s| s.route == *route).unwrap_or_else(|| panic!("{route} has a schema"));
+        let src = match *file {
+            "fs" => fs,
+            "git" => git,
+            _ => db,
+        };
         // The daemon dispatches the route to this handler (or to its
         // `_gated` form, whose owner branch is this handler).
         let gated = format!("{handler}_gated(");
@@ -2863,4 +2891,274 @@ fn r13_l3_git_runs_within_a_time_limit() {
     host_git(&d.ws, &["config", "include.path", &fifo.to_string_lossy()]);
     let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
     assert!(r.as_ref().is_err_and(|e| e.contains("longer than")), "{r:?}");
+}
+
+// ── phase 2: workspaces made on hosts, clones, App folders, uploads, spawns ──
+
+/// A controller (work root `ctl-work`) and host-1 on its own disk (the
+/// `HostDisk`), whose link serves `http.relay` with its own daemon.
+struct Rig {
+    d: HostDisk,
+    ctl_root: PathBuf,
+    remote: &'static RemoteHost,
+    _daemon: crate::test_harness::TestDaemon,
+}
+
+async fn rig() -> Rig {
+    let d = host_disk();
+    let ctl_root = d.root.parent().unwrap().join("ctl-work");
+    std::fs::create_dir_all(&ctl_root).unwrap();
+    let daemon = crate::test_harness::start("host-owner").await;
+    set_local_daemon(daemon.port, "host-owner");
+    let ctl_s = ctl_root.to_string_lossy().into_owned();
+    let (remote, url) = controller_at(&[&ctl_s], &[("h1", &d.root)]).await;
+    let mut h1 = host(&url, "h1", &[&format!("k2.work_root={}", d.root.display())]).await;
+    tokio::spawn(async move {
+        while let Some(Ok(m)) = h1.next().await {
+            if let Message::Text(t) = m {
+                if let Ok(Frame::HttpRelay { req, method, path, query, body_b64 }) = Frame::decode(&t) {
+                    let r = serve(req, &method, &path, &query, &body_b64).await;
+                    let _ = h1.send(Message::Text(r.encode())).await;
+                }
+            }
+        }
+    });
+    within("h1 linked", async {
+        while !remote.any_host_on_own_disk() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    Rig { d, ctl_root, remote, _daemon: daemon }
+}
+
+impl Rig {
+    async fn post(&self, path: &str, body: Value) -> Option<(String, Value)> {
+        relay_post_on(self.remote, path, "token=o", "o", body.to_string().as_bytes())
+            .await
+            .map(|a| (a.status, serde_json::from_str(&a.body).unwrap_or(Value::Null)))
+    }
+}
+
+fn code(a: &Option<(String, Value)>) -> (String, Value) {
+    let (st, v) = a.clone().expect("answered");
+    (st, v["code"].clone())
+}
+
+/// (1) A workspace created through the controller is made on the host
+/// that will hold it, and bound there; refused for `..` or outside the
+/// work root, never made on the controller's disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_workspace_is_made_on_its_host_and_bound_there() {
+    let r = rig().await;
+    let ctl = r.ctl_root.join("fresh");
+    let made = r.post(PROJECTS_CREATE, json!({"name": "fresh", "path": ctl})).await;
+    assert_eq!(made, None, "the controller's own handler registers it after");
+    assert!(r.d.root.join("fresh").is_dir(), "made on the host");
+    assert!(!ctl.exists(), "not on the controller's disk");
+    assert!(
+        matches!(r.remote.workspace_route(&[ctl.join("a").to_string_lossy().into_owned()]), WorkspaceRoute::Relay { host, .. } if host == "h1"),
+        "bound to the host"
+    );
+    // Refusals.
+    let dotdot = format!("{}/x/../../../escape", r.ctl_root.display());
+    assert_eq!(code(&r.post(PROJECTS_CREATE, json!({"name": "x", "path": dotdot})).await), ("400 Bad Request".into(), json!("bad_path")));
+    assert_eq!(
+        code(&r.post(PROJECTS_CREATE, json!({"name": "x", "path": "/etc/elsewhere"})).await),
+        ("400 Bad Request".into(), json!("outside_work_root"))
+    );
+    // The host, asked directly for a path outside its root, refuses too.
+    let (st, v) = served("POST", PROJECTS_CREATE, "", Some(json!({"name": "x", "path": "/etc/elsewhere"}))).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")));
+    assert!(!Path::new("/etc/elsewhere").exists());
+}
+
+/// (1) Adding an existing folder: the host that has it checks and seeds
+/// it; the controller registers it (registry only) under its own name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_existing_folder_is_added_from_its_host_and_registered_on_the_controller() {
+    let r = rig().await;
+    let host_ws = r.d.root.join("repo");
+    std::fs::create_dir_all(&host_ws).unwrap();
+    k2_core::git::init_repo(&host_ws.to_string_lossy()).unwrap();
+    let ctl = r.ctl_root.join("repo");
+    let (st, p) = r.post(PROJECTS_ADD, json!({"path": ctl, "seedWiki": false, "seedAgentsMd": false})).await.expect("answered");
+    assert_eq!(st, "200 OK", "{p}");
+    assert_eq!(p["path"], json!(ctl.to_string_lossy()), "the controller's row, its name");
+    // A folder no host has: refused (the host says so), not added here.
+    let (st, _) = r.post(PROJECTS_ADD, json!({"path": r.ctl_root.join("nowhere")})).await.expect("answered");
+    assert!(!st.starts_with('2'), "{st}");
+}
+
+/// (1) `git init` through the controller: the host registers the
+/// workspace, then makes the repository there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_init_through_the_controller_makes_the_repository_on_the_host() {
+    let r = rig().await;
+    std::fs::create_dir_all(r.d.root.join("plain")).unwrap();
+    let ctl = r.ctl_root.join("plain");
+    r.remote.note_relay_space("h1", "", &ctl);
+    let (st, v) = r.post("/cli/git/init", json!({"path": ctl})).await.expect("answered");
+    assert_eq!(st, "200 OK", "{v}");
+    assert!(r.d.root.join("plain/.git").is_dir());
+    // Refused: a key init doesn't take (R6), a path outside the workspace
+    // in the same request (a copy's destination).
+    let both = json!({"path": ctl, "worktree_path": "/etc"});
+    assert_eq!(code(&r.post("/cli/git/init", both).await), ("400 Bad Request".into(), json!("undeclared_key")));
+    let copy = json!({"sources": [ctl.join("a")], "destination": "/etc"});
+    assert_eq!(code(&r.post("/cli/fs/copy", copy).await), ("400 Bad Request".into(), json!("outside_workspace")));
+}
+
+/// (4) Uploads to a workspace on a host land there; a name can't climb
+/// out, and a body too big to relay is a 413.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_to_a_host_workspace_land_there_and_are_confined() {
+    let r = rig().await;
+    r.remote.note_relay_space("h1", "", &r.ctl_root.join("notes"));
+    let ctl_ws = r.ctl_root.join("notes");
+    let up = json!({"dir": ctl_ws, "filename": "up.txt", "base64": base64::engine::general_purpose::STANDARD.encode("uploaded")});
+    let (st, v) = r.post("/cli/fs/upload-binary", up).await.expect("answered");
+    assert_eq!(st, "200 OK", "{v}");
+    assert_eq!(std::fs::read_to_string(r.d.ws.join("up.txt")).unwrap(), "uploaded");
+    let climb = json!({"dir": ctl_ws, "filename": "../../escape.txt", "base64": "eA=="});
+    assert_eq!(code(&r.post("/cli/fs/upload-binary", climb).await), ("403 Forbidden".into(), json!("outside_work_root")));
+    let big = json!({"dir": ctl_ws, "filename": "big", "base64": "A".repeat(MAX_RELAY_BODY)});
+    assert_eq!(code(&r.post("/cli/fs/upload-binary", big).await), ("413 Payload Too Large".into(), json!("too_large")));
+}
+
+/// (3) App deploy from a folder on a host: brought to a mirror on the
+/// controller, regular files only (a link out is left behind); refused for
+/// `..`, and for a workspace whose host is away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_folder_on_a_host_comes_to_a_mirror_without_links() {
+    let r = rig().await;
+    r.remote.note_relay_space("h1", "", &r.ctl_root.join("notes"));
+    let app = r.d.ws.join("app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(app.join("index.html"), "<h1>hi</h1>").unwrap();
+    std::fs::write(app.join("src/main.js"), "1").unwrap();
+    let secret = r.d.root.parent().unwrap().join("controller-secret");
+    std::fs::write(&secret, "SECRET").unwrap();
+    std::os::unix::fs::symlink(&secret, app.join("leak")).unwrap();
+    let ctl_app = r.ctl_root.join("notes/app");
+    let remote = r.remote;
+    let raw = ctl_app.to_string_lossy().into_owned();
+    let m = tokio::task::spawn_blocking(move || folder_from_host_on(remote, &raw)).await.unwrap().unwrap().expect("from the host");
+    assert_eq!(std::fs::read_to_string(m.path.join("index.html")).unwrap(), "<h1>hi</h1>");
+    assert_eq!(std::fs::read_to_string(m.path.join("src/main.js")).unwrap(), "1");
+    assert!(std::fs::symlink_metadata(m.path.join("leak")).is_err(), "no link in the mirror");
+    let dir = m.path.clone();
+    drop(m);
+    assert!(!dir.exists(), "the mirror goes with its handle");
+    // Refusals.
+    let raw = format!("{}/../../x", ctl_app.display());
+    assert!(tokio::task::spawn_blocking(move || folder_from_host_on(remote, &raw)).await.unwrap().is_err());
+    let (st, v) = served("POST", "/cli/hosts/relay/pack", "", Some(json!({"path": r.d.root.parent().unwrap()}))).await;
+    // The op's schema refuses it, as every confined path (R6).
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "pack outside the work root: {v}");
+}
+
+/// (2) Clone-to: the bundle goes to the host in chunks and is extracted
+/// there (the workspace under its work root); the controller gets the
+/// manifest and binds it. Refused outside the work root; the transit
+/// operations take plain names and whole chunks only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clone_is_unpacked_on_its_host_and_the_transit_is_confined() {
+    let r = rig().await;
+    // A bundle, as the source side makes one.
+    let src = r.d.root.parent().unwrap().join("source/Cloned");
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(src.join("README.md"), "# Cloned\n").unwrap();
+    std::fs::write(src.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let src_home = r.d.root.parent().unwrap().join("src-home");
+    std::fs::create_dir_all(&src_home).unwrap();
+    let opts = k2_core::clone::CloneOptions { home_override: Some(src_home), ..Default::default() };
+    let canon = std::fs::canonicalize(&src).unwrap();
+    let inv = k2_core::clone::inventory(&canon.to_string_lossy(), opts.clone()).unwrap();
+    let bundle = r.d.root.parent().unwrap().join("bundle.tar.gz");
+    k2_core::clone::build_bundle(&inv, &opts, "2026-10-26T00:00:00Z".into(), None, None, vec![], &bundle).unwrap();
+    let (remote, ctl_root, b) = (r.remote, r.ctl_root.clone(), bundle.clone());
+    let hu = tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, &b, &ctl_root.to_string_lossy()))
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("on the host");
+    assert_eq!(hu.host, "h1");
+    assert!(hu.host_dest.starts_with(&r.d.root) && hu.host_dest.join("src/main.rs").is_file(), "{}", hu.host_dest.display());
+    assert!(hu.dest_path.starts_with(&r.ctl_root) && !hu.dest_path.exists(), "the controller's name, not its disk");
+    // Refused: a parent outside the work root.
+    let b = bundle.clone();
+    assert!(tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, &b, "/etc")).await.unwrap().is_err());
+    // The transit operations.
+    for name in ["../escape", "/etc/passwd", ".hidden", "a/b", ""] {
+        let (st, v) = served("POST", "/cli/hosts/relay/put", "", Some(json!({"file": name, "offset": 0, "b64": "eA=="}))).await;
+        assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "{name:?}: the schema's Transit");
+    }
+    let (st, v) = served("POST", "/cli/hosts/relay/put", "", Some(json!({"file": "t.bin", "offset": 5, "b64": "eA=="}))).await;
+    assert_eq!(st, "400 Bad Request", "a put that skips bytes: {v}");
+    let (st, v) = served("POST", "/cli/hosts/relay/clone-extract", "", Some(json!({"bundle": "t.bin", "dest_parent": "/etc"}))).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "extract outside the work root: {v}");
+    let (st, _) = served("POST", "/cli/hosts/relay/exec", "", Some(json!({}))).await;
+    assert_eq!(st, "403 Forbidden", "only the listed operations");
+}
+
+/// (5) A spawn with the controller's path runs under the host's work root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_with_the_controllers_path_runs_under_the_hosts_root() {
+    let (remote, url) = controller_at(&["/ctl/work"], &[("h1", &h("/h1/work"))]).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    let mut shared = host(&url, "shared", &[]).await;
+    let cwd_sent = |remote: &'static RemoteHost, host: &'static str, agent: &'static str, cwd: &'static str| {
+        let body = json!({"agent_name": agent, "cwd": cwd, "command": "claude"}).to_string();
+        let _ = host;
+        tokio::spawn(async move { remote.spawn(body.as_bytes()).await })
+    };
+    let spawn = cwd_sent(remote, "h1", "notes", "/ctl/work/notes");
+    match recv(&mut h1).await {
+        Frame::Spawn { req, body, .. } => {
+            assert_eq!(body["cwd"], "/h1/work/notes");
+            let reply = json!({"sessionId": uuid::Uuid::new_v4().to_string(), "reused": false}).to_string();
+            send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body: reply }).await;
+        }
+        other => panic!("{other:?}"),
+    }
+    within("the spawn", spawn).await.unwrap();
+    assert_eq!(remote.host_cwd("h1", Path::new("/elsewhere/x")), pb("/elsewhere/x"), "outside the root: as asked");
+    assert_eq!(remote.host_cwd("shared", Path::new("/ctl/work/notes")), pb("/ctl/work/notes"), "the shared volume: as asked");
+    drop((h1, shared.close(None).await));
+}
+
+/// Phase 2, flag off (`K2_FS_RELAY` unset): a host on its own disk changes
+/// nothing on the controller. A spawn's cwd goes as asked, a registration
+/// is the controller's own, an App folder and a clone stay on its disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase2_off_by_default_every_entry_point_is_the_controllers_own() {
+    let roots = crate::agent_host::remote::HostRoots { default: pb("/h1/work"), per_host: Default::default() };
+    let remote = RemoteHost::new().with_fs_relay(false).with_relay_roots(vec![pb("/ctl/work")], roots);
+    let (remote, url) = serve_controller(Box::leak(Box::new(remote))).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    let body = json!({"agent_name": "notes", "cwd": "/ctl/work/notes", "command": "claude"}).to_string();
+    let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
+    match recv(&mut h1).await {
+        Frame::Spawn { req, body, .. } => {
+            assert_eq!(body["cwd"], "/ctl/work/notes", "the cwd as asked");
+            let reply = json!({"sessionId": uuid::Uuid::new_v4().to_string(), "reused": false}).to_string();
+            send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body: reply }).await;
+        }
+        other => panic!("{other:?}"),
+    }
+    within("the spawn", spawn).await.unwrap();
+    assert_eq!(remote.host_path("h1", Path::new("/ctl/work/notes")), None);
+    for (route, body) in [
+        (PROJECTS_CREATE, json!({"name": "fresh", "path": "/ctl/work/fresh"})),
+        (PROJECTS_ADD, json!({"path": "/ctl/work/notes"})),
+        (PROJECTS_ADD_WITHOUT_GIT, json!({"path": "/ctl/work/notes"})),
+    ] {
+        assert_eq!(relay_post_on(remote, route, "token=o", "o", body.to_string().as_bytes()).await, None, "{route}");
+    }
+    let r = tokio::task::spawn_blocking(move || folder_from_host_on(remote, "/ctl/work/notes/app")).await.unwrap();
+    assert!(matches!(r, Ok(None)), "an App folder: the controller's own");
+    let r = tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, Path::new("/nonexistent.tar.gz"), "/ctl/work")).await.unwrap();
+    assert!(matches!(r, Ok(None)), "a clone: unpacked here, as before");
+    drop(h1);
 }

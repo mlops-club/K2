@@ -29,6 +29,7 @@
 //! about the controller's own machine or its database (git notes, open the
 //! changes tab, the worktree setting).
 
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -64,6 +65,35 @@ const RELAY_DEADLINE: Duration = Duration::from_secs(120);
 /// carries (the link's frames are capped at 16 MiB). Bigger is a 413: send
 /// smaller upload chunks, or read a file by ranges.
 pub const MAX_RELAY_BODY: usize = 8 << 20;
+
+/// The bytes one relay frame carries when a file moves between machines.
+const CHUNK: usize = 1 << 20;
+
+/// The largest folder (tar.gz) an App deploy brings from a host.
+const PACK_CAP: u64 = 256 << 20;
+
+/// The largest file (a clone's bundle) sent to a host.
+const PUT_CAP: u64 = 4 << 30;
+
+/// A host's relay operations: in process on the host, never an HTTP route
+/// (their schemas: [`schema::HOST_SCHEMAS`]).
+pub const OPS: &str = "/cli/hosts/relay/";
+
+pub const PROJECTS_CREATE: &str = "/cli/projects/create";
+pub const PROJECTS_ADD: &str = "/cli/projects/add-from-path";
+pub const PROJECTS_ADD_WITHOUT_GIT: &str = "/cli/projects/add-without-git";
+
+/// A workspace registration: made on the host that will hold it, then
+/// registered on the controller.
+pub fn registration(path: &str) -> bool {
+    matches!(path, PROJECTS_CREATE | PROJECTS_ADD | PROJECTS_ADD_WITHOUT_GIT)
+}
+
+/// What a host runs for a controller, exactly: a route with a schema (the
+/// relayed routes, the registrations, its relay operations).
+fn host_allows(method: &str, path: &str) -> bool {
+    schema::host_schema(method, path).is_some()
+}
 
 /// POSTs the relay doesn't carry yet that act on a workspace's files: for a
 /// workspace on a host they are refused (501), never run on the
@@ -372,7 +402,21 @@ fn exchange(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf)], method
         let pair = format!("{SCOPE_KEY}={}", encode(&ws.to_string_lossy()));
         frame_query = if frame_query.is_empty() { pair } else { format!("{frame_query}&{pair}") };
     }
-    let body_b64 = base64::engine::general_purpose::STANDARD.encode(map_body(body, maps));
+    exchange_raw(remote, host, maps, method, path, frame_query, map_body(body, maps))
+}
+
+/// [`exchange`] of a query and body already in the host's names (`maps`
+/// still maps the answer back).
+fn exchange_raw(
+    remote: &RemoteHost,
+    host: &str,
+    maps: &[(PathBuf, PathBuf)],
+    method: &str,
+    path: &str,
+    frame_query: String,
+    body: Vec<u8>,
+) -> Answer {
+    let body_b64 = base64::engine::general_purpose::STANDARD.encode(body);
     let (m, p) = (method.to_ascii_uppercase(), path.to_string());
     let probe = Frame::HttpRelay { req: u64::MAX, method: m.clone(), path: p.clone(), query: frame_query.clone(), body_b64: body_b64.clone() };
     if probe.encode().len() > MAX_RELAY_FRAME {
@@ -497,7 +541,7 @@ pub async fn relay_post(path: &str, query: &str, owner_token: &str, body: &[u8])
 /// [`relay_post`] over `remote`.
 pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str, owner_token: &str, body: &[u8]) -> Option<Answer> {
     let not_relayed = NOT_RELAYED_POST.contains(&path);
-    if !remote.fs_relay_on() || !(relayed("POST", path) || not_relayed) || !remote.any_host_on_own_disk() {
+    if !remote.fs_relay_on() || !(relayed("POST", path) || not_relayed || registration(path)) || !remote.any_host_on_own_disk() {
         return None;
     }
     if app_pass(query) {
@@ -507,6 +551,12 @@ pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str,
     }
     if !http::token_ok(query, owner_token) {
         return None;
+    }
+    if registration(path) {
+        let (p, q, b) = (path.to_string(), query.to_string(), body.to_vec());
+        return tokio::task::spawn_blocking(move || register(remote, &p, &q, &b))
+            .await
+            .unwrap_or_else(|e| Some(Answer::json("500 Internal Server Error", json!({"error": format!("relay: {e}")}))));
     }
     let (path, query, body) = (path.to_string(), query.to_string(), body.to_vec());
     tokio::task::spawn_blocking(move || post_blocking(remote, &path, &query, &body, not_relayed))
@@ -600,6 +650,281 @@ fn upload_chunk_split(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf
     answer.expect("at least one piece")
 }
 
+fn bad(status: &str, code: &str, error: String) -> Answer {
+    Answer::json(status, json!({"error": error, "code": code}))
+}
+
+/// The host a workspace at `ctl_path` (the controller's name) lives on, and
+/// its name there: the host it is bound to (or an agent runs it on); else,
+/// for a folder that exists (`existing`), the first own-disk host that has
+/// it; else the least placed one. Never the controller's own disk while
+/// hosts are on theirs: no linked one is a 503.
+fn host_for_workspace(remote: &RemoteHost, ctl_path: &str, existing: bool) -> Result<(String, PathBuf), Answer> {
+    if has_dot_dot(ctl_path) || !ctl_path.starts_with('/') {
+        return Err(bad("400 Bad Request", "bad_path", format!("{ctl_path}: an absolute path without '..'")));
+    }
+    match remote.workspace_route(&[ctl_path.to_string()]) {
+        WorkspaceRoute::Relay { host, maps } => return Ok((host, PathBuf::from(map_any(ctl_path, &maps)))),
+        WorkspaceRoute::Local => {}
+        WorkspaceRoute::Away { host, path } => {
+            return Err(bad("503 Service Unavailable", "host_away", format!("{path} is on agent host {host}, which is not linked")))
+        }
+        WorkspaceRoute::Split(hosts) => return Err(bad("501 Not Implemented", "cross_host", format!("on several hosts: {}", hosts.join(", ")))),
+    }
+    let hosts = remote.own_disk_hosts();
+    let in_scope = |h: &String| remote.host_path(h, Path::new(ctl_path)).map(|p| (h.clone(), p));
+    let candidates: Vec<(String, PathBuf)> = hosts.iter().filter_map(in_scope).collect();
+    if hosts.is_empty() {
+        return Err(bad("503 Service Unavailable", "no_host", "no agent host on its own disk is linked; try again when one is".into()));
+    }
+    if candidates.is_empty() {
+        return Err(bad(
+            "400 Bad Request",
+            "outside_work_root",
+            format!("{ctl_path} is not under the work root (K2_WORK_ROOT) where workspaces live on this controller's agent hosts"),
+        ));
+    }
+    if existing {
+        for (h, hp) in &candidates {
+            let q = format!("path={}", encode(&hp.to_string_lossy()));
+            if exchange_raw(remote, h, &[], "GET", "/cli/fs/stat", q, Vec::new()).status.starts_with('2') {
+                return Ok((h.clone(), hp.clone()));
+            }
+        }
+        // A folder to add that no linked host has: never a fresh one made.
+        return Err(bad("404 Not Found", "not_found", format!("{ctl_path} is not a folder on any linked agent host")));
+    }
+    Ok(candidates.into_iter().next().expect("not empty"))
+}
+
+/// Create or add a workspace on the host that will hold it, then register
+/// it here. Create: the host registers it (and makes its folder, and its
+/// CLI's trust), then the controller's own handler runs (`None`). Add: the
+/// host checks and seeds the folder; the controller registers it here,
+/// registry only. The controller authorised the caller before (the role
+/// gate and the arm's token check); the host acts only in its work root.
+fn register(remote: &RemoteHost, path: &str, query: &str, body: &[u8]) -> Option<Answer> {
+    let v: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Some(bad("400 Bad Request", "bad_body", "a JSON body with a path".into())),
+    };
+    let Some(ctl_path) = v.get("path").and_then(Value::as_str).map(|p| p.trim_end_matches('/').to_string()) else {
+        return Some(bad("400 Bad Request", "bad_body", "a JSON body with a path".into()));
+    };
+    if let Some(e) = undeclared(path, query, body) {
+        return Some(bad("400 Bad Request", "undeclared_key", e));
+    }
+    let (host, host_path) = match host_for_workspace(remote, &ctl_path, path != PROJECTS_CREATE) {
+        Ok(h) => h,
+        Err(a) => return Some(a),
+    };
+    let maps = vec![(PathBuf::from(&ctl_path), host_path.clone())];
+    let a = exchange(remote, &host, &maps, "POST", path, query, body);
+    if !a.status.starts_with('2') {
+        return Some(a);
+    }
+    if path == PROJECTS_CREATE {
+        remote.note_relay_space(&host, "", Path::new(&ctl_path));
+        log_debug!("[hosts/fs-relay] workspace {ctl_path} made on host {host} ({})", host_path.display());
+        return None;
+    }
+    let hv: Value = serde_json::from_str(&a.body).unwrap_or(Value::Null);
+    if hv.get("needsGitInit").and_then(Value::as_bool) == Some(true) {
+        return Some(a);
+    }
+    remote.note_relay_space(&host, "", Path::new(&ctl_path));
+    let name = hv.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+        Path::new(&ctl_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ctl_path.clone())
+    });
+    let color = hv.get("color").and_then(Value::as_str);
+    log_debug!("[hosts/fs-relay] workspace {ctl_path} added on host {host} ({}); registered here", host_path.display());
+    Some(match k2_core::projects_ops::projects_create(&name, &ctl_path, color) {
+        Ok(p) => {
+            crate::db_routes::emit_projects_changed();
+            Answer::json("200 OK", serde_json::to_value(&p).unwrap_or(Value::Null))
+        }
+        Err(e) => bad("400 Bad Request", "register", e),
+    })
+}
+
+/// A relay operation on `host`: its answer's JSON, or why not.
+fn op(remote: &RemoteHost, host: &str, name: &str, args: Value) -> Result<Value, String> {
+    let a = exchange_raw(remote, host, &[], "POST", &format!("{OPS}{name}"), String::new(), args.to_string().into_bytes());
+    let v: Value = serde_json::from_str(&a.body).unwrap_or_else(|_| json!({"error": a.body}));
+    if a.status.starts_with('2') {
+        Ok(v)
+    } else {
+        Err(format!("{name} on agent host {host}: {}", v.get("error").and_then(Value::as_str).unwrap_or(&a.status)))
+    }
+}
+
+/// Where a controller keeps what it brings from hosts.
+fn relay_tmp() -> PathBuf {
+    k2_core::paths::k2_home().join("relay-tmp")
+}
+
+/// A folder brought from a host, removed when dropped.
+pub struct Mirror {
+    dir: PathBuf,
+    pub path: PathBuf,
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// App deploy from a folder in a workspace on a host: the folder, brought
+/// to a mirror on the controller (a tar.gz in chunks, capped), where the
+/// Seed is built as today. `Ok(None)`: the folder is the controller's own.
+/// A workspace on an away host is an error, never the controller's copy.
+/// Blocking.
+pub fn folder_from_host(raw: &str) -> Result<Option<Mirror>, String> {
+    if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
+        return Ok(None);
+    }
+    folder_from_host_on(crate::agent_host::remote::global(), raw)
+}
+
+/// [`folder_from_host`] over `remote`.
+pub fn folder_from_host_on(remote: &RemoteHost, raw: &str) -> Result<Option<Mirror>, String> {
+    if !remote.fs_relay_on() || !remote.any_host_on_own_disk() {
+        return Ok(None);
+    }
+    if has_dot_dot(raw) {
+        return Err(format!("{raw}: a path with '..' is not accepted on a controller with agent hosts"));
+    }
+    let (host, maps) = match remote.workspace_route(&[raw.to_string()]) {
+        WorkspaceRoute::Local => return Ok(None),
+        WorkspaceRoute::Relay { host, maps } => (host, maps),
+        WorkspaceRoute::Away { host, path } => return Err(format!("{path} is on agent host {host}, which is not linked")),
+        WorkspaceRoute::Split(hosts) => return Err(format!("on several hosts: {}", hosts.join(", "))),
+    };
+    let packed = op(remote, &host, "pack", json!({"path": map_any(raw, &maps)}))?;
+    let file = packed["file"].as_str().ok_or("pack: no file")?.to_string();
+    let size = packed["size"].as_u64().unwrap_or(0);
+    let dir = relay_tmp().join(uuid::Uuid::new_v4().simple().to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mirror = Mirror { path: dir.join(Path::new(raw).file_name().unwrap_or_default()), dir };
+    let tgz = mirror.dir.join("folder.tar.gz");
+    let fetched = (|| -> Result<(), String> {
+        if size > PACK_CAP {
+            return Err(format!("{raw} packs to {size} bytes, over {PACK_CAP}"));
+        }
+        let mut out = std::fs::File::create(&tgz).map_err(|e| e.to_string())?;
+        let mut at = 0u64;
+        while at < size {
+            let got = op(remote, &host, "get", json!({"file": file, "offset": at, "len": CHUNK}))?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(got["b64"].as_str().unwrap_or("")).map_err(|e| format!("get: {e}"))?;
+            if bytes.is_empty() || bytes.len() > CHUNK {
+                return Err(format!("get: {file} gave {} bytes at {at} of {size}", bytes.len()));
+            }
+            out.write_all(&bytes).map_err(|e| e.to_string())?;
+            at += bytes.len() as u64;
+        }
+        Ok(())
+    })();
+    let _ = op(remote, &host, "drop", json!({"file": file}));
+    fetched?;
+    std::fs::create_dir_all(&mirror.path).map_err(|e| e.to_string())?;
+    let gz = flate2::read::GzDecoder::new(std::fs::File::open(&tgz).map_err(|e| e.to_string())?);
+    let mut archive = tar::Archive::new(gz);
+    // Regular files and folders only, each inside the mirror (`unpack_in`
+    // refuses `..` and absolute names): a link from the host never points
+    // the Seed's build at the controller's own files.
+    let mut skipped = 0usize;
+    for entry in archive.entries().map_err(|e| format!("unpack {}: {e}", tgz.display()))? {
+        let mut entry = entry.map_err(|e| format!("unpack: {e}"))?;
+        match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Directory => {
+                entry.unpack_in(&mirror.path).map_err(|e| format!("unpack: {e}"))?;
+            }
+            _ => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        log_debug!("[hosts/fs-relay] {raw}: {skipped} link(s) or special file(s) left out of the mirror");
+    }
+    let _ = std::fs::remove_file(&tgz);
+    log_debug!("[hosts/fs-relay] folder {raw} brought from host {host} ({size} bytes packed)");
+    Ok(Some(mirror))
+}
+
+/// A clone unpacked on a host: what the controller registers.
+#[derive(Debug)]
+pub struct HostUnpack {
+    pub host: String,
+    /// Where it landed, the controller's name and the host's.
+    pub dest_path: PathBuf,
+    pub host_dest: PathBuf,
+    pub threads_json: Option<Vec<u8>>,
+    pub manifest: k2_core::clone::CloneManifest,
+}
+
+/// Clone-to on a controller whose workspaces live on hosts: the bundle (on
+/// the controller's disk) goes to the host that will hold the workspace,
+/// in chunks, which extracts it (the workspace under its work root; the
+/// CLI's memory and sessions in its own home). The controller then
+/// registers it (registry only, the Threads and the vault carry: its
+/// database). `Ok(None)`: no host on its own disk, unpack here as today.
+/// The clone gate ran on the controller before. Blocking.
+pub fn clone_unpack_on_host(bundle: &Path, dest_parent: &str) -> Result<Option<HostUnpack>, String> {
+    if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
+        return Ok(None);
+    }
+    clone_unpack_on_host_on(crate::agent_host::remote::global(), bundle, dest_parent)
+}
+
+/// [`clone_unpack_on_host`] over `remote`.
+pub fn clone_unpack_on_host_on(remote: &RemoteHost, bundle: &Path, dest_parent: &str) -> Result<Option<HostUnpack>, String> {
+    if !remote.fs_relay_on() || !remote.any_host_on_own_disk() {
+        return Ok(None);
+    }
+    let dest_parent = dest_parent.trim_end_matches('/');
+    let (host, host_parent) = host_for_workspace(remote, dest_parent, false).map_err(|a| {
+        serde_json::from_str::<Value>(&a.body).ok().and_then(|v| v["error"].as_str().map(str::to_string)).unwrap_or(a.body)
+    })?;
+    let size = std::fs::metadata(bundle).map_err(|e| format!("{}: {e}", bundle.display()))?.len();
+    if size > PUT_CAP {
+        return Err(format!("the bundle is {size} bytes, over {PUT_CAP}"));
+    }
+    let file = format!("{}.tar.gz", uuid::Uuid::new_v4().simple());
+    let sent = (|| -> Result<Value, String> {
+        let mut f = std::fs::File::open(bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+        let mut at = 0u64;
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let n = f.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk[..n]);
+            op(remote, &host, "put", json!({"file": file, "offset": at, "b64": b64}))?;
+            at += n as u64;
+        }
+        op(remote, &host, "clone-extract", json!({"bundle": file, "dest_parent": host_parent}))
+    })();
+    let _ = op(remote, &host, "drop", json!({"file": file}));
+    let out = sent?;
+    let host_dest = PathBuf::from(out["dest_path"].as_str().ok_or("clone-extract: no dest_path")?);
+    let rel = host_dest
+        .strip_prefix(&host_parent)
+        .ok()
+        .filter(|r| !r.as_os_str().is_empty() && !r.components().any(|c| !matches!(c, Component::Normal(_))))
+        .ok_or_else(|| format!("clone-extract: {} is not under {}", host_dest.display(), host_parent.display()))?;
+    let dest_path = Path::new(dest_parent).join(rel);
+    let manifest = serde_json::from_value(out["manifest"].clone()).map_err(|e| format!("clone-extract manifest: {e}"))?;
+    let threads_json = out["threads_b64"]
+        .as_str()
+        .map(|t| base64::engine::general_purpose::STANDARD.decode(t))
+        .transpose()
+        .map_err(|e| format!("clone-extract threads: {e}"))?;
+    remote.note_relay_space(&host, "", &dest_path);
+    log_debug!("[hosts/fs-relay] clone unpacked on host {host} at {} ({size} bytes sent)", host_dest.display());
+    Ok(Some(HostUnpack { host, dest_path, host_dest, threads_json, manifest }))
+}
+
 pub mod events {
     /// The controller relayed a request (attrs: host, path, ok).
     pub const CTL_FS_RELAY: &str = "ctl.fs_relay";
@@ -622,7 +947,149 @@ fn plain_route(method: &str, path: &str) -> bool {
     let plain = path.starts_with('/')
         && !path.contains(['%', '?', '#', '\\'])
         && path[1..].split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-    plain && relayed(method, path)
+    plain && host_allows(method, path)
+}
+
+/// Where a host keeps files in transit (its K2 home, never a workspace).
+fn host_tmp() -> PathBuf {
+    k2_core::paths::k2_home().join("relay-tmp")
+}
+
+/// A transit file: one plain name in [`host_tmp`].
+pub(crate) fn tmp_file(name: &str) -> Result<PathBuf, String> {
+    let plain = !name.is_empty()
+        && name.len() <= 80
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && !name.starts_with('.');
+    if !plain {
+        return Err(format!("{name:?} is not a transit file name"));
+    }
+    Ok(host_tmp().join(name))
+}
+
+/// `p` resolved (symlinks) under this host's work root: strictly (a
+/// workspace), or the root itself when `allow_root` (a clone's parent).
+fn under_work_root(root: &Path, p: &str, allow_root: bool) -> Result<PathBuf, String> {
+    if !p.starts_with('/') || has_dot_dot(p) {
+        return Err(format!("{p}: an absolute path without '..'"));
+    }
+    let r = resolve(Path::new(p)).ok_or_else(|| format!("{p} can't be resolved"))?;
+    if !r.starts_with(root) || (r == root && !allow_root) {
+        return Err(format!("{p} is not in a workspace under this host's work root"));
+    }
+    Ok(r)
+}
+
+/// A relay operation, in process (blocking). Each checks its own
+/// arguments: paths under the work root, names in the transit dir, sizes.
+fn host_op(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    std::fs::create_dir_all(host_tmp()).map_err(|e| e.to_string())?;
+    match name {
+        // A folder in a workspace, packed for the controller (symlinks as links).
+        "pack" => {
+            let dir = under_work_root(root, &s("path"), false)?;
+            if !dir.is_dir() {
+                return Err(format!("{} is not a folder on this host", dir.display()));
+            }
+            let file = format!("{}.tar.gz", uuid::Uuid::new_v4().simple());
+            let path = tmp_file(&file)?;
+            let out = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(out, flate2::Compression::fast()));
+            tar.follow_symlinks(false);
+            let packed = tar.append_dir_all(".", &dir).and_then(|_| tar.into_inner()).and_then(|gz| gz.finish());
+            if let Err(e) = packed {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("pack {}: {e}", dir.display()));
+            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if size > PACK_CAP {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("{} packs to {size} bytes, over {PACK_CAP}", dir.display()));
+            }
+            Ok(json!({"file": file, "size": size}))
+        }
+        "get" => {
+            let path = tmp_file(&s("file"))?;
+            let offset = args["offset"].as_u64().unwrap_or(0);
+            let len = args["len"].as_u64().unwrap_or(CHUNK as u64).min(CHUNK as u64) as usize;
+            let mut f = std::fs::File::open(&path).map_err(|e| format!("{name}: {e}"))?;
+            std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; len];
+            let mut n = 0;
+            while n < len {
+                match f.read(&mut buf[n..]).map_err(|e| e.to_string())? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
+            Ok(json!({"b64": base64::engine::general_purpose::STANDARD.encode(&buf[..n])}))
+        }
+        "put" => {
+            let path = tmp_file(&s("file"))?;
+            let offset = args["offset"].as_u64().unwrap_or(0);
+            let have = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if have != offset {
+                return Err(format!("put at {offset}, but the file has {have} bytes"));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD.decode(s("b64")).map_err(|e| format!("put: {e}"))?;
+            if bytes.len() > CHUNK || offset + bytes.len() as u64 > PUT_CAP {
+                return Err(format!("put: over {CHUNK} bytes at once, or {PUT_CAP} in all"));
+            }
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
+            f.write_all(&bytes).map_err(|e| e.to_string())?;
+            Ok(json!({"size": offset + bytes.len() as u64}))
+        }
+        "drop" => {
+            let _ = std::fs::remove_file(tmp_file(&s("file"))?);
+            Ok(json!({}))
+        }
+        // A clone's bundle, extracted here: the workspace under the work
+        // root, the CLI's memory and sessions in this host's home.
+        "clone-extract" => {
+            let bundle = tmp_file(&s("bundle"))?;
+            let parent = under_work_root(root, &s("dest_parent"), true)?;
+            std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+            let home = dirs::home_dir().ok_or("this host has no home directory")?;
+            let (r, manifest) = k2_core::clone::unpack_bundle(&bundle, &parent, &home)?;
+            let _ = std::fs::remove_file(&bundle);
+            if !r.dest_path.starts_with(&parent) {
+                return Err(format!("the clone landed at {}, outside {}", r.dest_path.display(), parent.display()));
+            }
+            Ok(json!({
+                "dest_path": r.dest_path,
+                "threads_b64": r.threads_json.map(|t| base64::engine::general_purpose::STANDARD.encode(t)),
+                "manifest": manifest,
+            }))
+        }
+        other => Err(format!("no relay operation {other:?}")),
+    }
+}
+
+/// Before a relayed request (its paths already confined): a new
+/// workspace's folder is made; `git init` needs the workspace in this
+/// host's registry, so it is registered here first.
+fn prepare_workspace(root: &Path, path: &str, body: &Value) {
+    let Some(p) = body.get("path").and_then(Value::as_str).map(Path::new) else { return };
+    if path == PROJECTS_CREATE || path == PROJECTS_ADD_WITHOUT_GIT {
+        if let Err(e) = std::fs::create_dir_all(p) {
+            log_debug!("[hosts/fs-relay] make {}: {e}", p.display());
+        }
+        return;
+    }
+    if path != "/cli/git/init" {
+        return;
+    }
+    let Some(first) = p.strip_prefix(root).ok().and_then(|rel| rel.components().next()) else { return };
+    let ws = root.join(first);
+    let ws_s = ws.to_string_lossy().into_owned();
+    if ws.is_dir() && crate::git_notes_routes::owning_project(&ws_s).is_none() {
+        let name = first.as_os_str().to_string_lossy().into_owned();
+        match k2_core::projects_ops::projects_create(&name, &ws_s, None) {
+            Ok(_) => log_debug!("[hosts/fs-relay] registered {ws_s} on this host (its controller relays its git)"),
+            Err(e) => log_debug!("[hosts/fs-relay] register {ws_s}: {e}"),
+        }
+    }
 }
 
 /// R8 C: a request's walk budget, on the thread checking it: steps (a
@@ -750,10 +1217,10 @@ fn stray_relative(route: &str, key: &str, v: &str) -> bool {
     !v.is_empty() && !v.starts_with('/') && PATH_KEYS.contains(&key) && !relative_ok
 }
 
-/// R6: a key `route`'s schema doesn't declare (a relayed route only), or a
+/// R6: a key `route`'s schema doesn't declare (a route with one), or a
 /// body that isn't one JSON object.
 fn undeclared(route: &str, query: &str, body: &[u8]) -> Option<String> {
-    let s = schema::SCHEMAS.iter().find(|s| s.route == route)?;
+    let s = schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).find(|s| s.route == route)?;
     if let Some((k, _)) = pairs(query).into_iter().find(|(k, _)| s.kind(k).is_none()) {
         return Some(format!("{route} doesn't take {k}"));
     }
@@ -1225,7 +1692,7 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
         Ok(_) => return reply("413 Payload Too Large", json!({"error": "relay body too large"})),
         Err(e) => return reply("400 Bad Request", json!({"error": format!("relay body: {e}")})),
     };
-    let Some(route) = schema::schema(method, path) else {
+    let Some(route) = schema::host_schema(method, path) else {
         return reply("403 Forbidden", json!({"error": format!("{method} {path} is not relayed to hosts")}));
     };
     let body_json = if body.is_empty() { Value::Null } else { serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null) };
@@ -1246,6 +1713,20 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
         Ok(Err(schema::Refusal::Coded(code, e))) => return reply("403 Forbidden", json!({"error": e, "code": code})),
         Err(e) => return reply("500 Internal Server Error", json!({"error": format!("check: {e}")})),
     };
+    let confined: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap_or(Value::Null) };
+    // A relay operation runs here, in process, on the confined values.
+    if let Some(name) = path.strip_prefix(OPS) {
+        let (name, root) = (name.to_string(), root.clone());
+        let r = tokio::task::spawn_blocking(move || host_op(&root, &name, &confined)).await.unwrap_or_else(|e| Err(e.to_string()));
+        return match r {
+            Ok(v) => reply("200 OK", v),
+            Err(e) => reply("400 Bad Request", json!({"error": e})),
+        };
+    }
+    {
+        let (root, p) = (root.clone(), path.to_string());
+        let _ = tokio::task::spawn_blocking(move || prepare_workspace(&root, &p, &confined)).await;
+    }
     let Some((port, token)) = LOCAL.lock().clone() else {
         return reply("503 Service Unavailable", json!({"error": "this host's daemon address is not known yet"}));
     };

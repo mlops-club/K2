@@ -451,12 +451,33 @@ pub fn handle_clone_unpack(
         vault_out = Some(out);
         copied
     };
-    match unpack_and_register_with_carry(
-        std::path::Path::new(&b.bundle_path),
-        std::path::Path::new(&b.dest_parent),
-        &home,
-        &mut carry_hook,
-    ) {
+    // fs-relay: on a controller whose workspaces live on agent hosts, the
+    // host that will hold it extracts the clone; it is registered here.
+    let on_host = crate::hosts::fs_relay::clone_unpack_on_host(std::path::Path::new(&b.bundle_path), &b.dest_parent);
+    let outcome = match on_host {
+        Ok(Some(hu)) => {
+            remove_unpacked_bundle(std::path::Path::new(&b.bundle_path));
+            register_unpacked(
+                hu.dest_path.to_string_lossy().into_owned(),
+                hu.threads_json.as_deref(),
+                &hu.manifest,
+                None,
+                &mut |dest| {
+                    let name = std::path::Path::new(dest).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    pops::projects_create(&name, dest, None)
+                },
+                &mut carry_hook,
+            )
+        }
+        Ok(None) => unpack_and_register_with_carry(
+            std::path::Path::new(&b.bundle_path),
+            std::path::Path::new(&b.dest_parent),
+            &home,
+            &mut carry_hook,
+        ),
+        Err(e) => Err(e),
+    };
+    match outcome {
         Ok(out) => {
             let threads = out.threads.as_ref();
             let mut resp = serde_json::json!({
@@ -587,13 +608,34 @@ pub fn unpack_and_register_with_carry(
     //    (`add-from-path`); a cloned workspace whose ROOT isn't a git repo
     //    falls back to the git-free registration rather than erroring with
     //    a needs-git-init prompt the remote can't answer.
-    let project = match pops::projects_add_from_path(&dest_path) {
-        Ok(pops::AddFromPathResult::Project(p)) => p,
-        Ok(pops::AddFromPathResult::NeedsGitInit { .. }) => {
-            pops::projects_add_without_git(&dest_path)?
-        }
-        Err(e) => return Err(format!("register project: {e}")),
-    };
+    register_unpacked(
+        dest_path,
+        result.threads_json.as_deref(),
+        &manifest,
+        Some(home),
+        &mut |dest| match pops::projects_add_from_path(dest) {
+            Ok(pops::AddFromPathResult::Project(p)) => Ok(p),
+            Ok(pops::AddFromPathResult::NeedsGitInit { .. }) => pops::projects_add_without_git(dest),
+            Err(e) => Err(format!("register project: {e}")),
+        },
+        carry,
+    )
+}
+
+/// Steps 2 to 6 of an unpack, once the bundle is extracted (here, or on an
+/// agent host by fs-relay): register the folder with `register`, then the
+/// manifest's settings, the clone's identity (its home, when it is this
+/// machine's), the vault carry and the Threads.
+pub fn register_unpacked(
+    dest_path: String,
+    threads_json: Option<&[u8]>,
+    manifest: &clone::CloneManifest,
+    home: Option<&std::path::Path>,
+    register: &mut dyn FnMut(&str) -> Result<Project, String>,
+    carry: &mut dyn FnMut(&Project, &clone::CloneManifest) -> std::collections::HashSet<String>,
+) -> Result<UnpackOutcome, String> {
+    // 2. Register the folder as a project.
+    let project = register(&dest_path)?;
 
     // 3. Apply the manifest's K2 settings to the freshly registered row.
     //    Machine-specific fields (id/path/focus_group_id) are intentionally
@@ -639,7 +681,7 @@ pub fn unpack_and_register_with_carry(
             &conn,
             &project.id,
             &dest_path,
-            Some(home),
+            home,
             &manifest,
         ) {
             log_debug!(
@@ -653,7 +695,7 @@ pub fn unpack_and_register_with_carry(
 
     // 6. Threads (slice B): import `threads/threads.json` under the clone's
     //    pin / sidecar keys / pending key. Never fails the unpack.
-    let (threads, threads_error) = match result.threads_json.as_deref() {
+    let (threads, threads_error) = match threads_json {
         None => (None, None),
         Some(bytes) => match import_threads_for_clone(&project.id, &manifest, bytes, &copied) {
             Ok(rep) => {
