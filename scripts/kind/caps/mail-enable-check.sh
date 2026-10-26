@@ -17,7 +17,8 @@
 #      controller pod with its own token (never printed), then GET
 #      /cli/mail/status until running or error;
 #   5. checks:
-#      - status running, every step marked, api_url http://k2-mail:8080;
+#      - status running, every step marked, the ApiKey limited to the pod
+#        CIDR (K2_STALWART_ALLOWED_IPS, not the loopback);
 #      - the Stalwart pod was replaced and is in normal mode (no
 #        bootstrap-mode line in the new pod's log);
 #      - the original recovery password is refused (401);
@@ -113,7 +114,7 @@ try:
 except ValueError:
     print("?"); sys.exit()
 s = d.get("server") or d
-print(s.get("status") or s.get("state") or "?")' 2>/dev/null || echo "?")
+print(s.get("state") or s.get("status") or "?")' 2>/dev/null || echo "?")
     case "$state" in running|error) break ;; esac
     sleep 4
 done
@@ -121,8 +122,8 @@ printf '%s' "$status" > "$CAPS_REPO/lab-runs/caps/mail-status.json"
 summary=$(printf '%s' "$status" | python3 -I -c 'import json,sys
 d = json.load(sys.stdin); s = d.get("server") or d
 p = s.get("enableProgress") or d.get("enableProgress") or {}
-print("steps=%s api_url=%s last_error=%s placement=%s" % (",".join(sorted((p.get("steps") or {}).keys())), s.get("apiUrl") or s.get("api_url"),
-      s.get("lastError") or s.get("last_error"), p.get("placement")))' 2>/dev/null || echo "unparsed")
+print("steps=%s last_error=%s placement=%s apiKeyAllowedIps=%s" % (",".join(sorted((p.get("steps") or {}).keys())),
+      s.get("lastError") or s.get("last_error"), p.get("placement"), p.get("apiKeyAllowedIps")))' 2>/dev/null || echo "unparsed")
 [ "$state" = running ] && ok "mail status running ($summary)" || bad "mail status $state ($summary)"
 
 echo "== 5. no recovery credential anyone knows"
@@ -134,7 +135,7 @@ c=$(kn exec mail-witness -- sh -c 'curl -s -o /dev/null -w "%{http_code}" --max-
 [ "$(secret_hash)" != "$hash_before" ] && ok "Secret k2-mail-recovery overwritten (value hashes differ; nobody kept the new one)" || bad "the Secret was not overwritten"
 c=$(kn exec mail-witness -- sh -c 'curl -s -o /dev/null -w "%{http_code}" --max-time 5 -H "Content-Type: application/json" -d "{\"using\":[\"urn:ietf:params:jmap:core\"],\"methodCalls\":[[\"Core/echo\",{},\"0\"]]}" http://k2-mail:8080/jmap/' || true)
 [ "$c" = 401 ] && ok "without credentials: 401" || bad "without credentials -> $c (expected 401)"
-health=$(ctl GET "/cli/mail/status" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); s=d.get("server") or d; print(s.get("status") or s.get("state"))' 2>/dev/null || echo "?")
+health=$(ctl GET "/cli/mail/status" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); s=d.get("server") or d; print(s.get("state") or s.get("status"))' 2>/dev/null || echo "?")
 [ "$health" = running ] && ok "the controller's mail health: running (ApiKey ping)" || bad "mail health: $health"
 
 echo

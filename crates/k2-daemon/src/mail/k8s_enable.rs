@@ -20,6 +20,11 @@
 //!   overwrite the Secret with a random value nobody keeps and restart, so
 //!   the recovery credential Stalwart reads is unknown to anyone.
 //!
+//! - **ApiKey**: allowed from `K2_STALWART_ALLOWED_IPS` (IPs or CIDRs,
+//!   normally the pod CIDR), not the loopback: the controller connects
+//!   from its pod IP. Unset, the key takes any address and mail-ingress is
+//!   the only boundary; the progress state records which (`apiKeyAllowedIps`).
+//!
 //! Steady state needs nothing new: the row's `api_url` is
 //! `K2_STALWART_URL` and the vaulted ApiKey works as on a host.
 
@@ -54,6 +59,22 @@ pub fn external_url_from(get: &dyn Fn(&str) -> Option<String>) -> Option<String>
         return None;
     }
     get("K2_STALWART_URL").map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty())
+}
+
+/// `K2_STALWART_ALLOWED_IPS`: comma-separated IPs or CIDRs the ApiKey is
+/// accepted from (empty: any).
+pub fn allowed_ips() -> Vec<String> {
+    allowed_ips_from(&|k| std::env::var(k).ok())
+}
+
+pub fn allowed_ips_from(get: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    get("K2_STALWART_ALLOWED_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// What the Kubernetes path does to Stalwart's pod and its Secret. The
@@ -97,7 +118,9 @@ fn authenticate_retry(pod: &dyn PodOps, api: &mut dyn BootstrapApi, url: &str, u
     Err(format!("management API not reachable at {url}: {last}"))
 }
 
-/// The provisioned admin, else the recovery admin, else the ApiKey.
+/// The provisioned admin, else the recovery admin, else the ApiKey, else
+/// (until recovery-off) the recovery password in the Secret: a run that
+/// stopped after rotating a principal resumes from there.
 fn authenticate_saved(pod: &dyn PodOps, api: &mut dyn BootstrapApi, secrets: &dyn SecretStore, url: &str) -> Result<(), String> {
     let mut errors = Vec::new();
     let resolve = |r: Option<String>| r.and_then(|r| secrets.resolve(&r).ok().flatten());
@@ -119,6 +142,15 @@ fn authenticate_saved(pod: &dyn PodOps, api: &mut dyn BootstrapApi, secrets: &dy
             Err(e) => errors.push(format!("api-key: {e}")),
         }
     }
+    if !sup::step_is_done("recovery-off") {
+        match pod.recovery_password() {
+            Ok(pw) => match api.authenticate(url, "admin", &pw) {
+                Ok(()) => return Ok(()),
+                Err(e) => errors.push(format!("admin (Secret {RECOVERY_SECRET}): {e}")),
+            },
+            Err(e) => errors.push(format!("Secret {RECOVERY_SECRET}: {e}")),
+        }
+    }
     Err(if errors.is_empty() { "no saved mail credential".into() } else { errors.join(" | ") })
 }
 
@@ -130,6 +162,7 @@ pub fn run_enable_k8s(
     secrets: &dyn SecretStore,
     url: &str,
     hostname: &str,
+    allowed_ips: &[String],
 ) -> Result<(), String> {
     // The row needs a legal port plan (a CHECK constraint); `http-01`
     // asks Stalwart for no TLS certificate and no listener is applied on
@@ -196,7 +229,8 @@ pub fn run_enable_k8s(
         sup::set_current("api-key");
         let id = sup::progress_extra("serviceAccountId")
             .ok_or_else(|| fail("api-key", "service account id missing from progress state".into()))?;
-        let key = api.mint_api_key(&id).map_err(|e| fail("api-key", e))?;
+        let key = api.mint_api_key_allowed(&id, allowed_ips).map_err(|e| fail("api-key", e))?;
+        sup::progress_extra_set("apiKeyAllowedIps", &if allowed_ips.is_empty() { "any".to_string() } else { allowed_ips.join(",") });
         let kref = secrets.store("api-key", &key).map_err(|e| fail("api-key", e))?;
         sup::set_row_field("api_key_ref", &kref);
         sup::set_row_field("api_url", url);
@@ -296,7 +330,7 @@ pub(crate) fn handle_enable(hostname: String, url: String) -> crate::cli_respons
     std::thread::spawn(move || {
         let secrets = super::secrets::FileSecretStore::default();
         let mut api = super::jmap::StalwartBootstrap::new();
-        if let Err(e) = run_enable_k8s(&pod, &mut api, &secrets, &target, &hostname) {
+        if let Err(e) = run_enable_k8s(&pod, &mut api, &secrets, &target, &hostname, &allowed_ips()) {
             k2_core::log_debug!("[mail/k8s] enable failed: {e}");
         }
         sup::end_enable();

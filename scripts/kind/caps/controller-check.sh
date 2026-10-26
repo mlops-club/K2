@@ -89,6 +89,7 @@ data:
   K2_POSTGRES_USER_FILE: /run/secrets/pg/username
   K2_CAP_MAIL: external
   K2_STALWART_URL: http://k2-mail:8080
+  K2_STALWART_ALLOWED_IPS: 10.244.0.0/16        # kind's pod CIDR: where the controller calls from
   K2_CAP_SEW: external
   K2_SEW_MGMT_URL: http://k2-sew.k2-edge:9090
   K2_CAP_APPS: kubernetes

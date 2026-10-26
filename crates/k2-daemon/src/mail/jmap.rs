@@ -980,15 +980,24 @@ impl StalwartClient {
     /// Permissions are `Inherit` for now (⚠ list item b in the module
     /// header — a Replace-mode least-privilege list is a follow-up).
     pub fn api_key_create(&self, account_id: &str) -> Result<String, String> {
+        self.api_key_create_allowed(account_id, &["127.0.0.1".to_string()])
+    }
+
+    /// [`Self::api_key_create`] for a client off this machine (the
+    /// Kubernetes controller): `allowed_ips` are IPs or CIDRs, which
+    /// Stalwart enforces alike (✔ live on kind: a matching CIDR answers,
+    /// another one is 403); empty means any address.
+    pub fn api_key_create_allowed(&self, account_id: &str, allowed_ips: &[String]) -> Result<String, String> {
+        let mut key = serde_json::json!({
+            "description": "K2 daemon mail supervisor",
+            "permissions": { "@type": "Inherit" },
+        });
+        if !allowed_ips.is_empty() {
+            key["allowedIps"] = allowed_ips.iter().map(|ip| (ip.clone(), serde_json::Value::Bool(true))).collect();
+        }
         let args = serde_json::json!({
             "accountId": account_id,
-            "create": {
-                CREATE_TAG: {
-                    "description": "K2 daemon mail supervisor",
-                    "permissions": { "@type": "Inherit" },
-                    "allowedIps": { "127.0.0.1": true },
-                }
-            }
+            "create": { CREATE_TAG: key }
         });
         let resp = self.registry_call("x:ApiKey/set", args)?;
         resp["created"][CREATE_TAG]["secret"]
@@ -5337,6 +5346,10 @@ impl crate::mail::supervisor::BootstrapApi for StalwartBootstrap {
 
     fn mint_api_key(&mut self, account_id: &str) -> Result<String, String> {
         self.client()?.api_key_create(account_id)
+    }
+
+    fn mint_api_key_allowed(&mut self, account_id: &str, allowed_ips: &[String]) -> Result<String, String> {
+        self.client()?.api_key_create_allowed(account_id, allowed_ips)
     }
 
     fn rotate_admin_secret(

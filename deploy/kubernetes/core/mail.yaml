@@ -24,6 +24,10 @@
 #     overwrites k2-mail-recovery with a random value it discards, then
 #     restarts the pod. From then on nobody knows a recovery credential.
 #     The Role below is exactly what that needs.
+#   - What remains is the controller's ApiKey, accepted only from
+#     K2_STALWART_ALLOWED_IPS (the controller's env: IPs or CIDRs, normally
+#     the cluster's pod CIDR, e.g. 10.42.0.0/16 on k3s). Unset, the key is
+#     accepted from any address and mail-ingress is the only boundary.
 #
 # The image runs as uid 2000 with `--config /etc/stalwart/config.json`; its
 # data store goes under /var/lib/stalwart (K2's STALWART_DATA_DIR). Both

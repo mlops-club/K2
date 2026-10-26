@@ -207,6 +207,13 @@ pub trait BootstrapApi: Send {
     /// Mint the loopback-allowlisted ApiKey on the service account;
     /// returns the SECRET (shown once by Stalwart).
     fn mint_api_key(&mut self, account_id: &str) -> Result<String, String>;
+    /// The ApiKey for a client that is not on this machine (the
+    /// Kubernetes controller, mail/k8s_enable.rs): `allowed_ips` (IPs or
+    /// CIDRs; empty = any) instead of the loopback.
+    fn mint_api_key_allowed(&mut self, account_id: &str, allowed_ips: &[String]) -> Result<String, String> {
+        let _ = (account_id, allowed_ips);
+        Err("this management client cannot mint an ApiKey for other addresses".into())
+    }
     /// C20/L12: rotate a Stalwart admin-class password (vault + API).
     /// `username` is `admin` (bootstrap recovery principal) or
     /// `admin@domain` (provisioned).
