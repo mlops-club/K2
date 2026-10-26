@@ -20,6 +20,7 @@ pub mod agent_retire;
 pub mod awareness_ws;
 pub mod boot_status;
 pub mod capabilities;
+pub mod k8s;
 pub mod daemon_port;
 pub mod runtime_role;
 pub mod hosts;
