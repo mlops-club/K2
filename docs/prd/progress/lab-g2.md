@@ -186,6 +186,59 @@ tests/lab/run_tests.sh                                            # the lab's ow
 - Next: the compose run (Docker lock), then a Linux gate run to prove the
   gate fixes below.
 
+### G2 matrix on wave2-preview 13e5a5939 (merged as 319e17dbb)
+
+wave2-preview = wave 1 + W1 + W2 outbox + S4 wake fix + W3 survive +
+the outbox recipient-by-workspace-name fix + the fake-agent line fix.
+`prove.sh G2 --topology fleet --parity none` (procs), then `--chaos`:
+
+| | no chaos `00-23-13Z` | seed 4117 `00-32-23Z` | seed 7 `00-38-58Z` | seed 2026 `00-45-33Z` |
+|---|---|---|---|---|
+| S1 spawn, attach, type | PASS | PASS | PASS | PASS |
+| S2 hooks on the right agent | PASS | PASS | PASS | PASS |
+| S3 k2 msg across hosts | PASS | PASS | PASS | PASS |
+| S4 message wakes a sleeping agent | PASS | PASS | PASS | PASS |
+| S5 heartbeat on a sleeping agent | PASS | PASS | PASS | PASS |
+| S6 inbox survives restarts | PASS | PASS | PASS | PASS |
+| S7 CLI killed mid-turn, resumes | PASS | FAIL (K2 placement) | PASS | FAIL (K2 placement) |
+| S8 host killed mid-turn | FAIL (drain) | FAIL (drain) | FAIL (drain; crash: lab, fixed) | FAIL (drain) |
+| S9 controller restart | PASS | PASS | PASS | PASS |
+| S12 | NOT RUN (no client) | | | |
+| I1 one live placement, epochs | pass | pass | pass | pass |
+| I2 every message final | FAIL: S8's message queued | same | same | same |
+| I3 resume keeps session, memory | pass | pass | pass | pass |
+| I4 one writer host per home | pass | pass | pass | pass |
+
+Reds, classified:
+
+- **S8 drain (K2, spec)**: S8 has two halves (`g2.py` `s8`). The crash half
+  is dist-link W3's definition (SIGKILL: host reported lost, the agent not
+  placed elsewhere (I1), the grid ends, on return it spawns again resuming
+  its conversation, the interrupted prompt in the transcript): it passes.
+  The drain half is the PRD failure table's row for S8 ("SIGTERM starts a
+  drain: … wait for each turn's Stop hook … The replacement resumes agents
+  that were awake"): the host exits at once on SIGTERM, the turn never ends,
+  nothing resumes the agent, and the message sent meanwhile stays queued
+  (the I2 red). Not built by W3; for the owner to decide whether S8 needs it.
+- **S7 under chaos (K2, placement)**: when the app reopens an agent whose CLI
+  died, the controller places the resume by load only. In seeds 4117 and
+  2026 it chose the other host, where the conversation does not exist (each
+  host has its own home): the CLI started with `--resume <id>` and exited 1
+  at once, while `ensure-pinned-chat` answered 200; the client's attach got
+  `session … not found in v2 session map`. Without chaos it happens to pick
+  the same host. The transcript probe (W1) knows which host ran a project;
+  placement does not use it. Portable homes (P3) would also cover it.
+- **S8 crash in seed 7 (lab, fixed e3bc70e98)**: S8 killed the host 56 ms
+  after the turn started, before the agent recorded the prompt (the fake
+  agent writes it after its UserPromptSubmit hook, slower while chaos
+  restarts the controller). S8 now crashes only once the prompt is recorded.
+
+Lab changes for this tree: S3 and I2 accept the controller's traced direct
+delivery (`ctl.msg_accept` delivered, no outbox row, since the S4 fix) as
+final (e74d18e1f); I1 treats the same placement traced again (a spawn
+refused while its host is lost) as one placement (aaec7c10b); a spawn
+refused because no host is linked is asked again once one is (b6f1177b8).
+
 ### Daemon gaps the lab found (for the owners)
 
 | Gap | Scenario | Evidence |
