@@ -401,7 +401,23 @@ deleted), `LAB_S10=1`, `LAB_S8_RESUME_ELSEWHERE=1`:
 | `2026-10-26T13-46-26Z` | procs | 2026, 1 round (7 kills, 15 skipped) | **S1–S10 PASS, I1–I4 pass** |
 | `2026-10-26T13-50-31Z` | compose | none | **S1–S10 PASS, I1–I4 pass** |
 
-The compose S8 red, not reproduced (K2 candidate, seen once): after the
+The compose S8 red, resolved: a lab bug (class c), not the relay. S8
+alone on wave3 8da963442 (`LAB_G2_ONLY=S8`, `LAB_G2_ROUNDS`, 9f4ec1ccd):
+procs 0/20 red (`2026-10-26T14-17-34Z`), compose 6/10 (`14-27-15Z`). With
+`grid_wait` now logging what it applied, every red had the frames (2
+snapshots, 3-4 deltas) and the banner, wrapped:
+`[from lab-g2 · m_…] s8-while-down-…k2-fake-agent (as claude) · ses` /
+`sion <id> · resumed`. On compose the queued message reaches the resumed
+CLI's PTY before its banner, which starts mid-row and wraps at 80 columns
+over "session <id>"; the lab matched on rows joined by newlines. The agent
+answered every time. Fixed by `Grid.has` (a needle split by a soft wrap
+counts; c8add7d98): compose 10/10 green (`14-51-31Z`). The relay path,
+checked on the way: `agent_host/remote.rs:1799` `open_grid` →
+`hosts/link.rs:396` `GridOpen` → `local_grid` (`link.rs:660`, every local
+grid message forwarded in order as `GridData`) → `remote.rs:946`
+`on_frame` → `hosts/hub.rs:174` `serve_grid`.
+
+The first sighting (seen once, before the repro): after the
 drain, the need resumed the agent on host-1 (`--resume`, same session; one
 live CLI when host-2 returned; the waiting message delivered once), but the
 lab, attached through the controller at 13:42:13.47, got the stream's
