@@ -265,8 +265,8 @@ body=$(kn exec k2-controller-0 -c k2-daemon -- curl -s --max-time 5 "http://$ins
 case "$body" in "hello from notes uid=20001 cwd=/app") ok "the controller reaches the App: '$body'" ;; *) bad "from the controller: '$body'" ;; esac
 w=$(kn exec "$pod" -c app -- sh -c 'touch /app/x 2>&1 || true' | tail -1)
 case "$w" in *"Read-only"*) ok "/app is read-only in the App" ;; *) bad "/app writable? '$w'" ;; esac
-state=$(ctl GET "/cli/app/inspect?app=notes" | field runtime.state)
-note "App state per the controller: ${state:-?}"
+state=$(ctl GET "/cli/app/inspect?app=notes" | field app.state)
+case "$state" in running|live) ok "the controller has the App $state" ;; *) bad "the controller has the App '${state:-?}'" ;; esac
 
 echo "== 4. the App's policy, and its database"
 # A neighbour that is not the controller, on the App's own (pinned) image,
