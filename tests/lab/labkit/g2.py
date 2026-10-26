@@ -1085,11 +1085,31 @@ def s8_drain(c, sc, attempt=1):
             # LAB_S8_RESUME_ELSEWHERE=1 (default under LAB_HOST_PTYD=1): a
             # need comes first, while the host is still down, and places the
             # agent the usual way, on the other host.
+            # LAB_S8_NO_RETURN=1 (outbox's variant): the drained host is not
+            # restarted and no app need comes; the waiting message alone
+            # must resume the agent elsewhere (drain-move: a message the
+            # outbox holds for a drained agent is a need).
             elsewhere = os.environ.get("LAB_S8_RESUME_ELSEWHERE", os.environ.get("LAB_HOST_PTYD", "0")) == "1"
-            if not elsewhere:
+            mode = "message" if os.environ.get("LAB_S8_NO_RETURN") == "1" else ("need" if elsewhere else "back")
+            sc.info["s8_mode"] = mode
+            if mode == "back":
                 t_restart = now_iso()
                 c.fleet.start(host)
-        if elsewhere:
+        if mode == "message":
+            t_restart = t_exit
+            resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
+                                          if e.get("host") not in (None, host) and (e.get("attrs") or {}).get("resumed")
+                                          and (e.get("ts") or "") >= t_exit], gone_wait_s()) or []
+            sc.info["resumed_on"] = resumed[0].get("host") if resumed else None
+            sc.check("drain: with %s kept down and no app need, the waiting message alone resumed the agent on the other host"
+                     " (same session, --resume)" % host,
+                     bool(resumed) and "--resume" in ((resumed[0].get("attrs") or {}).get("argv") or []),
+                     "resumed cli.exec of %s after %s: %s" % (csid, t_exit, json.dumps(resumed[:1])[:250]))
+            wait_until(lambda: c.replied(cwd, n3), gone_wait_s())
+            with c.fleet.control():
+                c.fleet.start(host)  # only now, for the scenarios after this one
+            s8_one_live(c, sc, csid, host)
+        elif mode == "need":
             t_need = now_iso()
             b = open_chat(c, sc, cwd, "drain: a need (the app) opens the agent while %s is down" % host)
             if b:
@@ -1103,16 +1123,7 @@ def s8_drain(c, sc, attempt=1):
             with c.fleet.control():
                 t_restart = now_iso()
                 c.fleet.start(host)  # waits for its link
-            # The controller's resume loop runs when the drained host links
-            # back: it must not place the agent a second time.
-            most, live = 0, []
-            end = time.monotonic() + 15
-            while time.monotonic() < end:
-                live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
-                most = max(most, len(live))
-                time.sleep(0.5)
-            sc.check("drain: once %s is back, one live CLI for the agent (not placed twice)" % host, most == 1,
-                     "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
+            s8_one_live(c, sc, csid, host)
         else:
             resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
                                           if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], gone_wait_s())
@@ -1138,6 +1149,19 @@ def s8_drain(c, sc, attempt=1):
         if sock:
             sock.close()
         c.close(pid)
+
+
+def s8_one_live(c, sc, csid, host):
+    """The controller's resume loop runs when the drained host links back:
+    it must not place the agent a second time (one live CLI over 15 s)."""
+    most, live = 0, []
+    end = time.monotonic() + 15
+    while time.monotonic() < end:
+        live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
+        most = max(most, len(live))
+        time.sleep(0.5)
+    sc.check("drain: once %s is back, one live CLI for the agent (not placed twice)" % host, most == 1,
+             "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
 
 
 # ── S9 ──────────────────────────────────────────────────────────────────

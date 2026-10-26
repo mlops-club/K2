@@ -181,6 +181,13 @@ tests/lab/run_tests.sh                                            # the lab's ow
 
 ## Status
 
+- Latest, wave3 d34b7292c (drain-move, K2-d): G2 is green with and without
+  app activation, under chaos seed 4117, and on the new S8 variant where the
+  drained host never returns.
+- Linux gate on cfcb1e387: 1 class (b) failure (k2_home), 1 class (a)
+  failure (fixed in the gate), and 1 class (c) failure, a T2 race where a
+  delivery can beat the resume spawn.
+
 - Milestones: diagrams written; first working slice (fleet procs: S1, S2,
   S3, S5 green; S4 red on a daemon gap); chaos runs classified; G2 on solo;
   G2 on wave2-preview 13e5a5939 (procs, chaos, compose).
@@ -360,6 +367,79 @@ Both failures were the gate container, not the code (20dfc130d):
   calls `/usr/bin/uuidgen`; `gate.Dockerfile` adds `uuid-runtime`
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
+
+### G2 on wave3 d34b7292c (drain-move, K2-d)
+
+Throwaway branch `k2-dist/lab-g2-wave3e-run` (d34b7292c + lab-g2 ba2c0240a,
+deleted after). All runs are on procs, with `LAB_S10=1` and
+`LAB_S8_RESUME_ELSEWHERE=1`.
+
+| Run | `lab-runs/G2/` | Result |
+|---|---|---|
+| No chaos | `2026-10-26T21-54-44Z` | S1–S10 PASS; I1–I4 pass |
+| No chaos, `LAB_NO_ACTIVATE=1` (K2-d: no app activation; no `projects/activate` in the run) | `2026-10-26T22-03-26Z` | S1–S10 PASS; I1–I4 pass |
+| Chaos seed 4117 | `2026-10-26T22-05-48Z` | S1–S10 PASS, S3–S10 over 2 rounds; I1 (425 samples, 38 CLIs, 40 placements), I2 (12 messages), I3 (10 resumes), I4 pass |
+| S8 only, `LAB_S8_NO_RETURN=1 LAB_NO_ACTIVATE=1`, 3 rounds | `2026-10-26T22-10-07Z` | S8 PASS in 3/3 rounds (`s8_mode: message`); I1–I4 pass |
+
+The new S8 variant (outbox's suggestion, 1d3b21ff7) checks the following:
+
+1. The drained host stays down, and no app need comes.
+2. The message sent while the host is down resumes the agent on the other
+   host by itself, in the same session with `--resume` (drain-move: a waiting
+   message is a need).
+3. That message is delivered once.
+4. Only then does the host come back, and one CLI stays live for the agent.
+
+With K2-d in, S10 without app activation is green. Before drain-move, the
+reaper closed those chats mid-turn.
+
+### Linux gate on wave3 cfcb1e387 (k2-ptyd step, home sync, T2, chaos fixes)
+
+`lab-runs/gate-debug/2026-10-26T15-18-14Z`:
+
+- It ran from an emptied target volume with `K2_GATE_MIN_FREE_GB=12` (as
+  approved) and `K2_GATE_LOW_MEMORY=1`.
+- The VM had 17G free at the start and 14G at the end.
+- The Docker lock was held throughout.
+- The Mac hibernated mid-run, and the run survived it.
+
+| Package | Test binaries | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| k2-core | 17 | 3882 | 0 | 1 |
+| k2-daemon | 161 | 5346 | 2 | 9 |
+| k2-daemon root-only `cell_egress` | 1 | 1 | 0 | 0 |
+| k2-ptyd (first time in the gate) | 5 | 42 | 0 | 0 (+1 target that didn't run, below) |
+
+GATE RED. All 10 ignored tests are on the allowlist now, including the five
+added with reasons. Each failure, classified:
+
+- (b) pre-existing: `k2_home_integration`
+  `k2_home_holds_the_whole_k2_home_and_home_stays_empty`. It's the same as on
+  88d1eddc2 and sits with outbox.
+- (a) the gate: `-p k2-ptyd --bin k2-ptyd-test-agent` (`unknown mode
+  "--test-threads=3"`).
+  - The batched step passed `--bins`, which also runs a bin marked
+    `test = false`. That bin is the fake agent, and it refuses harness flags.
+  - Fixed in ba2c0240a: the gate now passes `--bin` for each bin that has
+    tests, from `cargo metadata`, and leaves out bins with required-features,
+    as `--bins` did. Checked in the gate image: k2-core `contract-gen`,
+    k2-daemon `k2-mail-helper k2-power-helper`, k2-ptyd `k2-ptyd`.
+- (c) new, from P3 T2, for the hosts/outbox owner:
+  `hosts::placement_tests::a_portable_agent_on_a_lost_host_moves_resumes_elsewhere_and_its_message_follows`
+  (`placement_tests.rs:518`) failed with "expected bob's spawn, got Deliver
+  { … epoch: Some(2) … }". host-b got the waiting message before bob's resume
+  spawn.
+  - `RemoteHost::spawn` reserves the new placement (`remote.rs:1191–1196`,
+    `reserve_for`) before it sends the `Spawn` frame (`remote.rs:1218–1220`).
+  - The outbox drain (`delivery_drain.rs:658`) delivers to any placement,
+    including a reserved one whose spawn hasn't been answered.
+  - A real host answers such a `Deliver` with "no agent … here", and a
+    rejection fails the message for good (an I2 risk).
+  - Suggested fix: the drain should wait for a placement's spawn to be
+    answered before delivering to it.
+  - The test is unchanged on d34b7292c. There it passed 30/30 on the Mac,
+    so the race shows only on the slower Linux gate. No G2 run has shown it
+    yet.
 
 ### G2 + S10 on wave3 0c6d3c9f7 (P3 T2 turn-end snapshots)
 
