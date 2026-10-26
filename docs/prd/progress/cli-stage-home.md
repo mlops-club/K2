@@ -32,6 +32,7 @@ failed as an unprivileged user, because `$HOME` got `.local/bin/k2`.
 |---|---|
 | `cargo test -p k2-core --lib -- cli_stage:: open_shim:: terminal::daemon_pty::` | 74 passed. New: `under_k2_home_the_cli_is_staged_only_inside_it` (Linux and not; an empty `K2_HOME` is unset), `a_staged_cli_under_a_k2_home_is_current_and_executable` |
 | `cargo test -p k2-daemon --test k2_home_integration` | **4 passed**. `k2_home_holds_the_whole_k2_home_and_home_stays_empty` is kept and now also requires `bin/k2` in `K2_HOME`. New: `an_agent_sessions_path_resolves_k2_to_the_cli_staged_in_k2_home` and `an_agent_session_on_k2_ptyd_resolves_k2_to_the_cli_staged_in_k2_home`. In each, a real daemon under `K2_HOME` spawns an agent through `/cli/sessions/v2/spawn`; in its PTY the agent records `command -v k2` and its PATH. Both are `$K2_HOME/bin/k2`, with `$K2_HOME/bin` first. The ptyd test asserts the session ran on k2-ptyd, and `$HOME` stays empty |
+| `cargo test -p k2-core --no-fail-fast` and `cargo test -p k2-daemon --no-fail-fast` (throwaway HOME) | k2-core **3904 passed, 0 failed**; k2-daemon **5333 passed, 0 failed**, 6 ignored, 162 binaries |
 | `scripts/lab/topology/two-process.sh` (host agents on k2-ptyd), `lab-runs/dist-link/20261026T122610Z` | **PASS**: every check, including W1 via the controller, wake by `k2 msg` (S4): 25 passed, 0 failed. The host log shows `k2 CLI staged: …/host/home/.k2/bin/k2` |
 
 These ran on macOS. On Linux the path through `stage_plan` is the same
