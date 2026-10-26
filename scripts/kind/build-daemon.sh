@@ -19,7 +19,8 @@
 #      registry and target dir in named volumes (incremental next time)
 #   3. docker build -f deploy/kind/Dockerfile.daemon-prebuilt → <tag>
 #
-# Holds the k2-dist Docker lock and a cargo slot for the whole run.
+# Takes the k2-dist Docker lock first (holding nothing else while it
+# waits), then a cargo slot for the compile; both are released when it ends.
 # K2_KIND_BUILD_MEMORY, K2_KIND_BUILD_CPUS and CARGO_BUILD_JOBS override the
 # caps (lower them if the compile is OOM-killed; never raise the memory).
 set -euo pipefail
@@ -34,14 +35,23 @@ mem=${K2_KIND_BUILD_MEMORY:-4g} cpus=${K2_KIND_BUILD_CPUS:-2} jobs=${CARGO_BUILD
 toolchain=k2-kind-toolchain:1.99.1
 out="${TMPDIR:-/tmp}/k2-kind/build/${tag//[:\/]/-}"
 
-# The cargo slot first (it may wait), then the Docker lock.
-if [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && [ -z "${K2_KIND_IN_SLOT:-}" ]; then
-    K2_KIND_IN_SLOT=1 exec "$HOME/.cache/k2-dist-cargo-slot.sh" "$0" "$@"
+# The Docker lock first: waiting for it never holds a cargo slot that other
+# workers' cargo runs need. Then the slot, for the compile only, in a child
+# (not exec, so this process's trap still releases the lock). The child
+# (K2_KIND_LOCK_HELD=1) takes neither again.
+if [ -z "${K2_KIND_LOCK_HELD:-}" ]; then
+    DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
+    mkdir -p "$HOME/.cache"
+    until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
+    echo "build-daemon $tag $$ $(date +%s)" > "$DOCKER_LOCK/owner"
+    trap 'rm -f "$DOCKER_LOCK/owner"; rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
+    export K2_KIND_LOCK_HELD=1
+    if [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ]; then
+        rc=0
+        "$HOME/.cache/k2-dist-cargo-slot.sh" "$0" "$@" || rc=$?
+        exit "$rc"
+    fi
 fi
-DOCKER_LOCK="$HOME/.cache/k2-dist-docker.lock"
-mkdir -p "$HOME/.cache"
-until mkdir "$DOCKER_LOCK" 2>/dev/null; do say "waiting for $DOCKER_LOCK"; sleep 20; done
-trap 'rmdir "$DOCKER_LOCK" 2>/dev/null' EXIT
 
 if ! docker image inspect "$toolchain" >/dev/null 2>&1; then
     say "building $toolchain (deploy/kind/Dockerfile.toolchain)"
