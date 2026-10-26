@@ -2,8 +2,8 @@
 # K2 on the kind cluster k2lab, ready for the desktop app on this Mac
 # (deploy/kind/README.md has the app steps).
 #
-#   scripts/kind/up.sh [--dist [--hosts=N]] [--fake] [--rebuild-daemon] [--reset-password]
-#                      [--port-forward] [--password-file=PATH]
+#   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1]] [--fake] [--rebuild-daemon]
+#                      [--reset-password] [--port-forward] [--password-file=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
 #    compile, then a runtime-only image) when it is missing, or always with
@@ -33,6 +33,8 @@
 # shared workspaces volume (k2-work), which is ReadWriteOnce: every pod must
 # be on the controller's node (podAffinity), so N hosts share one node's
 # CPU and memory. Scaling down keeps the removed hosts' volumes.
+# --ptyd=0|1 sets K2_PTYD on the hosts (default KIND_PTYD_DEFAULT in
+# lib.sh, else K2_KIND_PTYD): agent PTYs in k2-ptyd. Changing it rolls them.
 #
 # Uses only k2lab, through an explicit kubeconfig; never the current kube
 # context. No credential goes into git, an image or a log: the owner signs
@@ -42,7 +44,7 @@ set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
 
-fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1
+fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -52,7 +54,8 @@ for a in "$@"; do
         --port-forward) door=port-forward ;;
         --password-file=*) password_file=${a#--password-file=} ;;
         --hosts=*) hosts=${a#--hosts=} ;;
-        -h|--help) sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --ptyd=0|--ptyd=1) ptyd=${a#--ptyd=} ;;
+        -h|--help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -60,7 +63,12 @@ case "$hosts" in ''|*[!0-9]*|0) echo "up.sh: --hosts=N takes a number from 1" >&
 if [ "$hosts" != 1 ] && [ "$dist" = 0 ]; then
     echo "up.sh: --hosts=N needs --dist (the solo pod is its own host)" >&2; exit 2
 fi
+if [ -n "$ptyd" ] && [ "$dist" = 0 ]; then
+    echo "up.sh: --ptyd needs --dist" >&2; exit 2
+fi
 kind_variant_from_flags "$fake" "$dist"
+ptyd=${ptyd:-${K2_KIND_PTYD:-$KIND_PTYD_DEFAULT}}
+case "$ptyd" in 0|1) ;; *) echo "up.sh: K2_PTYD must be 0 or 1 (got $ptyd)" >&2; exit 2 ;; esac
 user=${K2_KIND_USER:-owner}
 for t in docker kind kubectl curl python3; do
     command -v "$t" >/dev/null || { echo "up.sh: $t is not installed" >&2; exit 1; }
@@ -111,13 +119,41 @@ rmdir "$DOCKER_LOCK"; trap - EXIT
 rendered="$KIND_STATE/rendered.yaml"
 overlay="$KIND_REPO/$KIND_OVERLAY"
 if [ "$KIND_DIST" = 1 ]; then
-    # --hosts=N: the overlay with k2-host's replicas set, from a throwaway
-    # kustomization in the state dir (the overlays in git keep 1).
-    overlay="$KIND_STATE/hosts-$hosts"
+    # --hosts=N and K2_PTYD: the overlay with k2-host's replicas and env
+    # set, from a throwaway kustomization in the state dir (the overlays in
+    # git keep 1 host and no K2_PTYD). K2_PTYD=1 goes in the pod template,
+    # not the ConfigMap, so turning it on or off rolls the hosts.
+    overlay="$KIND_STATE/overlay"
+    rm -rf "$KIND_STATE"/hosts-*
     mkdir -p "$overlay"
-    printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - %s\nreplicas:\n  - {name: k2-host, count: %s}\n' \
-        "$(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/$KIND_OVERLAY" "$overlay")" \
-        "$hosts" > "$overlay/kustomization.yaml"
+    cat > "$overlay/kustomization.yaml" <<EOF
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - $(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/$KIND_OVERLAY" "$overlay")
+replicas:
+  - {name: k2-host, count: $hosts}
+EOF
+    # K2_PTYD=0 adds nothing: the render stays what it was before the
+    # switch, so a host is not rolled for an env entry that changes nothing.
+    if [ "$ptyd" = 1 ]; then
+        cat >> "$overlay/kustomization.yaml" <<EOF
+patches:
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            containers:
+              - name: k2-host
+                env:
+                  - {name: K2_PTYD, value: "$ptyd"}
+EOF
+    fi
 fi
 kubectl kustomize --load-restrictor LoadRestrictionsNone "$overlay" > "$rendered"
 if [ "$KIND_DIST" = 1 ]; then
@@ -135,7 +171,7 @@ print(json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
         say "created Secret $KIND_NS/k2-secrets (host bootstrap token, not shown)"
     fi
 fi
-say "applying $KIND_OVERLAY (namespace $KIND_NS)$( [ "$KIND_DIST" = 1 ] && echo ", $hosts host(s)")"
+say "applying $KIND_OVERLAY (namespace $KIND_NS)$( [ "$KIND_DIST" = 1 ] && echo ", $hosts host(s), K2_PTYD=$ptyd")"
 kc apply -f "$rendered" >&2
 # Same tag, new image: each pod template carries its image's id, so a
 # rebuilt image rolls its pods and an unchanged one does not.

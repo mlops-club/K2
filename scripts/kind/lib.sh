@@ -6,6 +6,11 @@
 # or changed.
 
 KIND_CLUSTER=k2lab
+# K2_PTYD on the --dist agent hosts (W3b: agent PTYs in k2-ptyd, whose byte
+# ring outlives a daemon restart). The images ship /usr/bin/k2-ptyd; the
+# daemon finds it beside itself. Flip to 1 once W3b is in the dist build;
+# `up.sh --ptyd=0|1` overrides it for one run. Changing it rolls the hosts.
+KIND_PTYD_DEFAULT=0
 KIND_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 # Variant (each has its own namespace, port and state dir):

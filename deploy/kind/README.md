@@ -270,6 +270,17 @@ memory, not more machines. Scaling down (`--hosts=1`) stops the extra pods
 and keeps their volumes, logins included. Re-running `up.sh` without
 `--hosts` sets the count back to 1.
 
+### Agent PTYs in k2-ptyd (`--ptyd=1`, for W3b)
+
+`K2_PTYD=1` on a host makes it run agent PTYs in `k2-ptyd`, a separate
+process whose byte ring outlives a daemon restart. The images ship
+`/usr/bin/k2-ptyd`, and the daemon finds it beside itself. The default
+is `KIND_PTYD_DEFAULT` in `scripts/kind/lib.sh`, now 0, so neither
+variant sets it yet. `up.sh --dist --ptyd=1`, or `K2_KIND_PTYD=1`,
+overrides it for one run. The value goes into the `k2-host` pod template,
+so turning it on or off rolls the hosts. At 0 the render is unchanged
+from before the switch existed, so nothing rolls.
+
 ### The lab's G2 scenarios on kind (`--dist --fake`, test only)
 
 ```sh
