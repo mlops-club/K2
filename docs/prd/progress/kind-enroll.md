@@ -113,10 +113,38 @@ Daemon: `k2-daemon:dist-fake` from 613b95202 (wave2-preview 3912ab2ff). The owne
 - k2-host-1 was restarted twice by the scenarios (held for S1, killed in S6). Each time it relinked on a signed hello: `ctl.host_admitted` ×2, and no `ctl.host_refused` in the run.
 - 13 placements: 6 on k2-host-0, 7 on k2-host-1.
 
+## Switching the owner's `k2-kind-dist` to enroll mode (next owner roll)
+
+The owner decided on 2026-10-26: switch, but only in the next owner roll, after the S7/S8 G2 fixes and W3b are merged, so the owner reconnects once. The owner's overlay renders correctly in enroll mode: the env is in order, the Secret volume is present, and token mode is still identical to the last applied render.
+
+1. **Build and rehearse on the test variant with the roll's exact images.**
+   - `build-daemon.sh . k2-daemon:dist` (6g, jobs=1), then `docker tag k2-daemon:dist k2-daemon:dist-fake`.
+   - `up.sh --dist --fake --hosts=2 --host-auth=enroll`, then `enroll-check.sh`, `fleet-g2.sh`, `s1.sh --dist`, `app-check.sh --dist --fake` and `reconnect-check.sh --dist --fake`. All must pass.
+   - If W3b is in: also with `--ptyd=1`.
+2. **Allow enroll on the owner's variant.** Remove the `--host-auth=enroll is for the test variant only` guard in `up.sh` (one commit, which names the owner's decision).
+3. **Before-snapshot of `k2-kind-dist`.**
+   - Pods, PVC names and image ids.
+   - That the login file is present and `hasCompletedOnboarding` is set.
+   - That `/var/lib/k2/.k2` has `connect-users.json`, `connect-sessions.json` and `hosts/`.
+   - That `k2-host-enroll` doesn't exist yet.
+4. **The roll:** `scripts/kind/up.sh --dist --host-auth=enroll` (add `--ptyd=1` if decided). No `--reset-password` and no `--password-file`. What it does, in order:
+   1. Applies with k2-host at 0 replicas, because the Secret `k2-host-enroll` doesn't exist yet. `k2-host-0` stops: its agents drain on SIGTERM.
+   2. Rolls the controller with `K2_HOST_AUTH=enroll` and the new image. **The owner's app reconnects here, once.**
+   3. Mints one token for `k2-host-0` (the controller has no host keys yet) into `k2-host-enroll`.
+   4. Applies k2-host at 1 replica. `k2-host-0` starts on its old volume, so the Claude login is kept. It makes `/var/lib/k2-host/.k2/host-key.pem` (0600), enrolls with the token and links on a signed hello.
+5. **Checks on 7443.**
+   - `enroll.py keys` lists `k2-host-0` as enrolled.
+   - The host's `/cli/hosts/status` says `linked: true`.
+   - The key file has mode 600.
+   - `app-check.sh --dist` passes.
+   - `reconnect-check.sh --dist --restart-live` passes: both pods restart, and the host relinks by key with no new token (the Secret's resourceVersion is unchanged).
+   - The login file and `hasCompletedOnboarding` are as before.
+   - **Never run `enroll-check.sh` here**: it revokes a host (it is pinned to the test variant).
+6. **Rollback if anything fails:** `up.sh --dist`, without the flag. Both sides go back to token mode and the host links with the bootstrap token again. The key file and `k2-host-enroll` are left, unused.
+
 ## Status
 
 - MILESTONE: kind-enroll green. Enroll mode on `k2-kind-dist-fake` with 2 hosts; enroll-check PASS; S1–S7 and I1–I4 PASS.
 - The owner's `k2-kind-dist` is untouched: token mode, `k2-daemon:dist` 6e24dd5be.
-- Next, when the owner decides:
-  - allow `--host-auth=enroll` on `k2-kind-dist`. Switching an existing deployment needs a token for `k2-host-0`, minted on the first enroll-mode run, while the host keeps its volume and makes a key on first start;
-  - the `k2` CLI verbs for mint, list and revoke (W5 has none yet).
+- Decided: `k2-kind-dist` switches to enroll mode in the next owner roll (steps above).
+- Later: the `k2` CLI verbs for mint, list and revoke (W5 has none yet).
