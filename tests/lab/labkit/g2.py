@@ -419,24 +419,32 @@ class Client:
 
     def grid_wait(self, sock, grid, needle, deadline=DEADLINE_S):
         end = time.monotonic() + deadline
-        while needle not in grid.text():
+        frames = {}  # grid event -> count, for the evidence when it fails
+
+        def missed(why):
+            # What the stream did carry: no frame at all (the relay) or
+            # frames without the needle (what the host rendered).
+            tail = [r for r in grid.text().splitlines() if r.strip()][-6:]
+            self.log("%s; grid frames applied %s; grid text tail %r" % (why, frames or "none", tail))
+            return False
+
+        while not grid.has(needle):
             left = end - time.monotonic()
             if left <= 0:
-                self.log("deadline waiting for %r on the grid" % needle)
-                return False
+                return missed("deadline waiting for %r on the grid" % needle)
             sock.settimeout(left)
             try:
                 kind, data = sock.recv()
             except (OSError, wslib.WsError) as e:
-                self.log("grid stream error: %s" % e)
-                return False
+                return missed("grid stream error: %s" % e)
             if kind == "close":
-                self.log("grid stream closed")
-                return False
+                return missed("grid stream closed")
             if kind != "text":
                 continue
             msg = json.loads(data)
-            if not grid.apply(msg):
+            if grid.apply(msg):
+                frames[msg.get("event")] = frames.get(msg.get("event"), 0) + 1
+            else:
                 self.log("ws event: %s" % data[:300])
                 if msg.get("event") in ("error", "child_exit"):
                     return False
@@ -1453,10 +1461,13 @@ def run(state_path, out, only, min_seconds=0):
     the set in rounds (out/round-<k>/) until that long has passed, and write
     each scenario's verdict over all rounds to out/<S>.json: pass only if
     every round passed. The message ledger is always out/messages.jsonl."""
-    if not min_seconds:
+    # LAB_G2_ROUNDS=N: exactly N rounds (a repro loop, e.g. S8 alone with
+    # LAB_G2_ONLY=S8), with or without chaos.
+    want = int(os.environ.get("LAB_G2_ROUNDS") or 0)
+    if not min_seconds and not want:
         return run_once(state_path, out, only, out)
     start, rounds, k = time.monotonic(), [], 0
-    while k == 0 or time.monotonic() - start < min_seconds:
+    while k == 0 or (k < want if want else time.monotonic() - start < min_seconds):
         k += 1
         rounds.append(run_once(state_path, os.path.join(out, "round-%d" % k), only, out))
     results = {}

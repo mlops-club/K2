@@ -351,6 +351,22 @@ class Plan(unittest.TestCase):
             g2.open_chat(c, sc, "/w/a", "opens")
         self.assertEqual([p for p, _ in calls], ["/cli/workspace/ensure-pinned-chat"])
 
+    def test_lab_g2_rounds_runs_exactly_n_rounds_without_chaos(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d, \
+                unittest.mock.patch.object(g2, "run_once", lambda st, out, only, led: calls.append(out) or {}), \
+                unittest.mock.patch.dict(os.environ, {"LAB_G2_ROUNDS": "3"}):
+            g2.run("state", d, ["S8"])
+        self.assertEqual([os.path.basename(c) for c in calls], ["round-1", "round-2", "round-3"])
+
+    def test_a_needle_split_by_a_soft_wrap_is_on_the_grid(self):
+        from labkit import s1
+        g = s1.Grid()
+        g.rows = ["[from lab-g2 · m_x] s8-while-down-1k2-fake-agent (as claude) · ses",
+                  "sion 645f43a8 · resumed", ">"]
+        self.assertTrue(g.has("session 645f43a8"))
+        self.assertFalse(g.has("session 999"))
+
     def test_s10_is_fleet_only_and_opt_in(self):
         self.assertIn("S10", g2.FLEET_ONLY)
         self.assertIn("S10", g2.SCENARIOS)
