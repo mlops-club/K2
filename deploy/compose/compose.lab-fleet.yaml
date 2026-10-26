@@ -40,6 +40,7 @@ x-host-env: &host-env
   K2_FAKE_AGENT_TURN_MS: ${LAB_TURN_MS:-300}
   K2_FAKE_AGENT_SEED: ${LAB_SEED:-0}
   K2_DELIVERY_GONE_GRACE_SECS: ${LAB_GONE_GRACE_S:-}
+  K2_WORK_ROOT: ${LAB_WORK_ROOT:-}   # P3 home sync (LAB_HOME_SYNC=1); empty = off
 
 services:
   controller:

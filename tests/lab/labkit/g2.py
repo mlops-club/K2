@@ -279,8 +279,10 @@ class Client:
         return [e for e in self.fleet.fake_events(event) if session is None or e.get("session_id") == session]
 
     def exec_of(self, session):
+        # The newest by ts: fake_events is in file order per host, so the
+        # last one is host-2's latest even when host-1 exec'd it since.
         evs = self.fake("cli.exec", session)
-        return evs[-1] if evs else None
+        return max(evs, key=lambda e: e.get("ts", "")) if evs else None
 
     def transcripts(self, cwd):
         slug = s1.claude_project_slug(cwd)
