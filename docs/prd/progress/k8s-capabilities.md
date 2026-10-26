@@ -122,27 +122,33 @@ sequenceDiagram
   - `gateway-check.sh --uninstall` removes Envoy Gateway, its CRDs and the class.
 - **Pod Security**: `k2-p4-caps` enforces `baseline` and warns on `restricted`, exactly like namespace `k2` in `deploy/kubernetes/namespaces.yaml`. Spilo and Stalwart need more than `restricted`.
 
-## Decisions asked of the coordinator (2026-10-26)
+## Decisions (coordinator, owner AFK, per recommendation, 2026-10-26)
 
-Found by reading the code (`apps/`, `sql/`, `capabilities.rs`) against the plan.
+1. **Databases:** the per-workspace databases (`/cli/db`) become Kubernetes-native through the operator (`preparedDatabases`; owner and writer roles for migrator and agent). Per-App databases wait for S21.
+2. **App code:** the App's Deployment fetches its code archive (the Seed) from the controller with a per-App token. **This revises D6: no registry** (recorded in `p4-plan.md`).
+3. **Routing:** minimal edits in `apps/router.rs` and `tunnel_tls_listener.rs`: an optional upstream host, default unchanged, with tests proving `K2_ROLE=all` and local are byte for byte the same.
+4. **Mail, a security fix, first:** T3 now owns `deploy/kubernetes/core/mail.yaml`. A config Secret with a generated admin credential, never in git; no bootstrap or open admin; K2's mail code wired to `K2_STALWART_URL` and those credentials.
+   - **Part 1 done** (4e513f659): `STALWART_RECOVERY_ADMIN` comes from the generated Secret `k2-mail-recovery`, so Stalwart never invents or logs an admin and answers 401 without credentials.
+   - The volume now sits at the image's real paths: the declared `/opt/stalwart` doesn't exist in the image, so nothing used to persist.
+   - The image's uid 2000 runs with `runAsNonRoot`.
+   - A Role grants exactly the rights recovery-off needs.
+   - For the `deploy/kubernetes` owner: `k2-secrets/stalwart-admin` and `K2_STALWART_ADMIN_FILE` have no reader in the code; the controller reads `k2-mail-recovery` through the API.
+   - **Part 2:** the controller's mail supervisor completes setup over `K2_STALWART_URL`, then runs recovery-off.
 
-1. **There is no per-App Postgres database yet.**
-   - Only workspace databases exist (`sql/ops.rs`, through the root helper's psql). The App side is a stub: `db_port: None`, "Lane 3 (S21) fills the App's database door" (`apps/guarded.rs:749`).
-   - **A (recommended):** make the workspace databases Kubernetes-native through `preparedDatabases`, with the owner and writer roles standing in for migrator and agent. The App door waits for S21.
-   - **B:** T3 builds the App door too.
-2. **No per-App image.**
-   - Every App runs a pinned base image (`node24`) with its code as a hash-named Seed tar at `/app`.
-   - **A (recommended):** the Deployment uses the same base image; an init container fetches the Seed by hash from the controller with a per-App token. No registry is needed, which revises D6.
-   - **B:** keep D6's registry, which needs per-App image builds.
-3. **App routing assumes loopback.**
-   - `router::Backend` is a port only; the front door connects to `127.0.0.1:<port>` (`apps/router.rs:162`, `tunnel_tls_listener.rs:954`).
-   - **A (recommended):** add an optional host (default loopback, so current paths are unchanged) as a listed hook.
-   - **B:** whoever owns `apps/` makes the change.
+## What T3 installed on k2lab, and how to remove it
 
-4. **Stalwart's configuration on Kubernetes.**
-   - `deploy/kubernetes/core/mail.yaml` mounts no config, so Stalwart runs in bootstrap mode (unauthenticated, with a temporary admin in its log). The mail driver also has to change: no code reads `K2_STALWART_URL`; the mail supervisor manages a local Stalwart.
-   - **A (recommended):** the end state adds a config Secret (`config.toml`, with the admin from `k2-secrets/stalwart-admin`) to `mail.yaml`, made with the `deploy/kubernetes` owner; T3 points the mail supervisor's JMAP client at `K2_STALWART_URL` with that admin. The acceptance item becomes "configured, not in bootstrap mode; `/jmap/session` 401 without credentials, 200 with the admin".
-   - **B:** mail on Kubernetes moves to a later task; T3 records it as not available.
+All of it is through `$TMPDIR/k2-kind/caps/kubeconfig` (`kind get kubeconfig --name k2lab`); nothing is in `k2-kind`, `k2-kind-dist`, `agent-sandbox-system` or any node's configuration. Set `KC="kubectl --kubeconfig $TMPDIR/k2-kind/caps/kubeconfig"`.
+
+| what | where | remove with |
+|---|---|---|
+| namespace `k2-p4-caps`: `postgresql k2-pg` (Spilo pod, PVC, the operator's Secrets), Secret `k2-mail-recovery`, while kept: `k2-mail`, the controller, the RBAC, policies | namespace `k2-p4-caps` | `$KC -n k2-p4-caps delete postgresql k2-pg --wait=true && $KC delete namespace k2-p4-caps` |
+| Envoy Gateway 1.9.2 (Helm release `eg`: Deployment, Services, ServiceAccounts, cluster-scoped ClusterRoles and bindings) | namespace `envoy-gateway-system` plus cluster scope | `helm --kubeconfig $TMPDIR/k2-kind/caps/kubeconfig -n envoy-gateway-system uninstall eg` |
+| Envoy Gateway's 8 CRDs (`*.gateway.envoyproxy.io`: backends, backendtrafficpolicies, clienttrafficpolicies, envoyextensionpolicies, envoypatchpolicies, envoyproxies, httproutefilters, securitypolicies) | cluster scope | `$KC delete crd backends.gateway.envoyproxy.io backendtrafficpolicies.gateway.envoyproxy.io clienttrafficpolicies.gateway.envoyproxy.io envoyextensionpolicies.gateway.envoyproxy.io envoypatchpolicies.gateway.envoyproxy.io envoyproxies.gateway.envoyproxy.io httproutefilters.gateway.envoyproxy.io securitypolicies.gateway.envoyproxy.io` |
+| GatewayClass `k2-p4-eg` and EnvoyProxy `k2-p4-eg` | cluster scope; `envoy-gateway-system` | `$KC delete gatewayclass k2-p4-eg && $KC delete namespace envoy-gateway-system` |
+| image `k2-daemon:caps` | the kind nodes' image store (`kind load`), and the Mac's Docker | Mac: `docker rmi k2-daemon:caps`. Nodes: left alone (removing it means exec'ing into the node containers; an unused image does nothing) |
+| image `stalwartlabs/stalwart:v0.16.25` | pulled by a kind node (the kubelet) | left alone, as above |
+
+`scripts/kind/caps/gateway-check.sh --uninstall` runs the Envoy Gateway rows. The Gateway API CRDs (v1.6.3) were there before and were never changed (checked by resourceVersion).
 
 ## Status
 
