@@ -168,11 +168,14 @@ g2_scenarios() {
     local only="S2,S3,S4,S5,S6,S7,S8,S9"
     # S10 (P3 T2, a lost host's agent moves) is opt-in: LAB_S10=1.
     [ "${LAB_S10:-0}" = 1 ] && only="$only,S10"
+    # LAB_G2_ONLY=S8 (with LAB_G2_ROUNDS=N): a repro loop of some scenarios
+    # after S2; the invariants still judge the whole run.
+    [ -n "${LAB_G2_ONLY:-}" ] && only="S2,$LAB_G2_ONLY"
     say "fleet monitor: samples.jsonl (live daemons and agent CLIs every 0.5 s)"
     python3 -I tests/lab/lab.py fleet monitor --state "$LAB_FLEET_STATE" --out "$RUN/samples.jsonl" &
     MONITOR_PID=$!
     say "scenario S2: hook events land on the right agent"
-    python3 -I tests/lab/lab.py g2 --state "$LAB_FLEET_STATE" --out "$RUN/scenarios" --only S2 | tee -a "$RUN/prove.log"
+    LAB_G2_ROUNDS="" python3 -I tests/lab/lab.py g2 --state "$LAB_FLEET_STATE" --out "$RUN/scenarios" --only S2 | tee -a "$RUN/prove.log"
     if [ -n "$CHAOS" ]; then
         say "chaos ${CHAOS}: on for S3 to S9 (chaos.log)"
         python3 -I tests/lab/lab.py chaos --state "$LAB_FLEET_STATE" --seed "${CHAOS#seed=}" --out "$RUN/chaos.log" \
