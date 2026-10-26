@@ -17,6 +17,7 @@ pub mod byte_ring;
 pub mod drain;
 pub mod enroll;
 pub mod gate;
+pub mod health;
 pub mod hub;
 pub mod link;
 pub mod proto;
@@ -95,9 +96,18 @@ pub fn host_config(get: impl Fn(&str) -> Option<String>) -> Result<HostConfig, S
         .filter(|v| !v.is_empty())
         .or_else(machine_hostname)
         .unwrap_or_else(|| "host".to_string());
-    let labels = get(HOST_LABELS_VAR)
+    let mut labels: Vec<String> = get(HOST_LABELS_VAR)
         .map(|v| v.split(',').map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
         .unwrap_or_default();
+    // P3: capacity travels as a label (the protocol doesn't change).
+    let max_awake_var = crate::provisioner::MAX_AWAKE_VAR;
+    if let Some(v) = get(max_awake_var).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        let n: u32 = v.parse().map_err(|_| format!("{max_awake_var}={v:?} is not a whole number"))?;
+        let label = crate::provisioner::LABEL_MAX_AWAKE;
+        if !labels.iter().any(|l| l.split('=').next().map(str::trim) == Some(label)) {
+            labels.push(format!("{label}={n}"));
+        }
+    }
     Ok(HostConfig { attach_url, token, host_name, labels })
 }
 
@@ -153,6 +163,19 @@ pub fn start() {
             k2_core::log_debug!("[hosts] K2_ROLE=controller: waiting for agent hosts on {}", proto::ATTACH_PATH);
             // Transcripts are on the agents' hosts: the resume decision asks them.
             k2_core::transcript_probe::set(Some(controller_transcript_probe));
+            // P3: enrolled hosts count for placement (away until they link).
+            tokio::task::spawn_blocking(|| match enroll::controller_registry() {
+                Ok(reg) => enroll::sync_enrolled(&reg, crate::agent_host::remote::global()),
+                Err(e) => k2_core::log_debug!("[hosts] enroll registry: {e}"),
+            });
+            // The provisioner's idle tick (Kubernetes: scale the pool down).
+            tokio::spawn(async {
+                let mut tick = tokio::time::interval(IDLE_TICK);
+                loop {
+                    tick.tick().await;
+                    let _ = tokio::task::spawn_blocking(|| crate::agent_host::remote::global().idle_tick(std::time::Instant::now())).await;
+                }
+            });
         }
         crate::runtime_role::Role::All => {}
     }
@@ -175,6 +198,9 @@ fn host_ptyd_ring(session_id: &str, from: u64, max: usize) -> Result<byte_ring::
     let (start, end, bytes) = owner.read_ring(session_id, from, max).map_err(|e| e.to_string())?;
     Ok(byte_ring::RingRead { start, end, bytes })
 }
+
+/// How often a controller asks its provisioner whether to scale down.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The controller's `k2_core::transcript_probe`.
 fn controller_transcript_probe(provider: &str, session_id: &str, project_path: &str) -> Option<bool> {
@@ -250,6 +276,18 @@ mod config_tests {
             host_config(getter(&[(ENROLL_TOKEN_FILE_VAR, tok.clone())])),
             Err("K2_ROLE=host needs K2_CONTROLLER_URL (for example ws://controller:7420)".into())
         );
+        // P3: K2_HOST_MAX_AWAKE is sent as the k2.max_awake label.
+        let with = |max: &str, labels: &str| {
+            host_config(getter(&[
+                (CONTROLLER_URL_VAR, "ws://ctl:7420".into()),
+                (ENROLL_TOKEN_FILE_VAR, tok.clone()),
+                (HOST_LABELS_VAR, labels.into()),
+                (crate::provisioner::MAX_AWAKE_VAR, max.into()),
+            ]))
+        };
+        assert_eq!(with("2", "k2.kind=laptop").unwrap().labels, vec!["k2.kind=laptop", "k2.max_awake=2"]);
+        assert_eq!(with("2", "k2.max_awake=5").unwrap().labels, vec!["k2.max_awake=5"], "an explicit label wins");
+        assert_eq!(with("lots", "").unwrap_err(), "K2_HOST_MAX_AWAKE=\"lots\" is not a whole number");
         assert_eq!(
             host_config(getter(&[(CONTROLLER_URL_VAR, "http://ctl".into()), (ENROLL_TOKEN_FILE_VAR, tok)])),
             Err("K2_CONTROLLER_URL=\"http://ctl\" must start with ws:// or wss://".into())

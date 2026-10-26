@@ -137,6 +137,7 @@ pub fn run() {
 /// `daemon_port`, `capabilities`, `k2_core::trace`).
 fn boot_settings_check() -> Result<(), String> {
     crate::runtime_role::set_current(crate::runtime_role::from_env()?);
+    crate::provisioner::select(crate::runtime_role::current(), std::env::var(crate::provisioner::PROVISIONER_VAR).ok().as_deref())?;
     crate::daemon_port::from_env()?;
     crate::capabilities::overrides_from_env()?;
     k2_core::trace::boot_check().map_err(|e| e.to_string())?;
@@ -163,6 +164,7 @@ fn early_cli_dispatch(args: &[String]) -> Option<i32> {
                 print_daemon_help();
                 return Some(0);
             }
+            crate::hosts::health::FLAG => return Some(crate::hosts::health::run()),
             _ => {}
         }
     }
@@ -176,6 +178,7 @@ fn print_daemon_help() {
            k2-daemon                 Boot the daemon (normally via systemd/launchd)\n\
            k2-daemon --version | -V  Print version and exit (does NOT boot)\n\
            k2-daemon --help | -h     Show this help and exit\n\
+           k2-daemon --host-health   Exit 0 when this agent host is linked to its controller\n\
            k2-daemon --llm-worker <payload_path>\n\
                                      Internal: one-shot LLM worker child\n\
            k2-daemon --skin-gateway --listen 127.0.0.1:N --upstream http://127.0.0.1:DAEMON [--root DIR]\n\

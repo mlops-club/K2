@@ -591,7 +591,10 @@ pub fn answer(
         ENROLL_PATH => match serde_json::from_value::<EnrollRequest>(body) {
             Err(e) => ("400 Bad Request", json!({"error": format!("enroll body: {e}"), "code": "bad_request"})),
             Ok(req) => match reg.enroll(&req, now) {
-                Ok(k) => ("200 OK", json!({"enrolled": k, "mode": format!("{:?}", reg.mode()).to_lowercase()})),
+                Ok(k) => {
+                    sync_enrolled(reg, remote);
+                    ("200 OK", json!({"enrolled": k, "mode": format!("{:?}", reg.mode()).to_lowercase()}))
+                }
                 Err(r) => (refusal_status(r.code), json!({"error": r.message, "code": r.code})),
             },
         },
@@ -614,6 +617,7 @@ pub fn answer(
             }
             match reg.revoke(who, reason, now) {
                 Ok(k) => {
+                    sync_enrolled(reg, remote);
                     // A linked host is cut off now, not at its next hello.
                     let kicked = remote
                         .send_frame(&k.host_name, Frame::Refused { code: "revoked_host_key".into(), message: revoked(&k, now).message })
@@ -624,6 +628,19 @@ pub fn answer(
             }
         }
         _ => forbidden,
+    }
+}
+
+/// P3: tell placement which hosts are enrolled (keys not revoked), so an
+/// enrolled host that isn't linked counts as away. Enroll mode only: a
+/// token-mode controller knows hosts by their links.
+pub fn sync_enrolled(reg: &Registry, remote: &RemoteHost) {
+    if reg.mode() != Mode::Enroll {
+        return;
+    }
+    match reg.keys() {
+        Ok(keys) => remote.set_enrolled(keys.into_iter().filter(|k| k.revoked_ms.is_none()).map(|k| k.host_name).collect()),
+        Err(e) => log_debug!("[hosts] enrolled hosts unreadable: {e}"),
     }
 }
 
