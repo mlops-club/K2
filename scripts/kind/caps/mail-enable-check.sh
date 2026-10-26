@@ -61,7 +61,10 @@ cleanup() {
 trap cleanup EXIT
 secret_hash() { kn get secret k2-mail-recovery -o jsonpath='{.data.password}' | shasum -a 256 | cut -c1-16; }
 
-echo "== 1. Stalwart, fresh"
+echo "== 1. Stalwart and the controller, fresh"
+kn delete pod mail-witness --ignore-not-found --wait=true >/dev/null 2>&1 || true
+kn delete statefulset k2-controller --ignore-not-found --wait=true >/dev/null 2>&1 || true
+kn delete pvc data-k2-controller-0 --ignore-not-found --wait=true >/dev/null 2>&1 || true  # its DB holds any earlier enable
 kn delete statefulset k2-mail --ignore-not-found --wait=true >/dev/null 2>&1 || true
 kn delete pvc data-k2-mail-0 --ignore-not-found --wait=true >/dev/null 2>&1 || true
 kn delete secret k2-mail-recovery --ignore-not-found >/dev/null 2>&1 || true
