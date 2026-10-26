@@ -299,6 +299,15 @@ pub fn ensure_controller_drain() -> Arc<Controller> {
     c
 }
 
+/// `RemoteHost`'s hook when a spawn answers: the agent has a live session
+/// now, so what waits for it goes out at once (a resume after a drain or a
+/// move, a wake), not at the next tick.
+pub fn spawned(remote: &RemoteHost) {
+    if let Some(c) = controller_for(remote) {
+        c.nudge.notify_one();
+    }
+}
+
 /// `RemoteHost::unplace`'s hook (K2-d): `agent` was closed mid-turn with
 /// `msg_ids` delivered to it and not answered.
 pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String]) {
@@ -659,6 +668,12 @@ impl Controller {
                 gone.extend(self.after_gone(&conn, &r, now, &mut needs));
                 continue;
             };
+            // Reserved, its spawn not answered yet: the host has no live
+            // session to deliver into ("not yet", and a backoff). Wait; the
+            // spawn's answer nudges this drain ([`spawned`]).
+            if p.session_id.is_none() {
+                continue;
+            }
             let attempt = r.attempts + 1;
             let mut frame = deliver_frame(&r, Some(p.epoch.0), attempt);
             if let Frame::Deliver { agent_id, .. } = &mut frame {

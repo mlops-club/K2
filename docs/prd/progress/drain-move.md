@@ -104,8 +104,15 @@ the guard from the start.
 
 ## Follow-ups
 
-- **The first send after a resume** reaches the host before the session is
-  live, and the host answers "not yet". The second send, 2 s later, lands.
-  The resume loop could nudge the outbox once its spawn answers.
+- **The first send after a resume**: done on `k2-dist/resume-nudge`.
+  - **The fix:** the outbox no longer sends to a placement whose spawn
+    hasn't answered (reserved, no session yet), and no attempt is spent.
+    Every spawn that answers nudges the outbox (`delivery_drain::spawned`),
+    so a waiting message goes out at once on its first send.
+  - **Which spawns:** a resume after a drain or a move, a wake, the app.
+  - **Evidence:** the unit test
+    `a_message_waits_for_the_spawn_to_answer_and_goes_out_on_its_first_attempt`.
+    drain-move.sh now requires one send, and passes 4/4 twice (`20261026T161247Z`,
+    `20261026T161413Z`).
 - **lab-g2's S8 resume-elsewhere and G3's S10** can now also cover "drained
   for good": drain a host, never restart it, then send a message.
