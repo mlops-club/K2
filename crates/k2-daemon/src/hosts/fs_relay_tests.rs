@@ -699,8 +699,12 @@ async fn n7_git_never_reaches_past_the_work_root() {
     let d = host_disk();
     let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
     let q = |p: &Path| format!("path={}", encode(&p.to_string_lossy()));
-    // No .git in the workspace: nothing is looked for above it.
+    // No .git in the workspace, a repository above the work root: the one
+    // git would open is outside, refused.
+    let above = d.root.parent().unwrap().to_path_buf();
+    k2_core::git::init_repo(&above.to_string_lossy()).unwrap();
     assert!(refused(served("GET", "/cli/git/changes", &q(&d.ws), None).await));
+    std::fs::remove_dir_all(above.join(".git")).unwrap();
     // A gitfile pointing out of the work root.
     let elsewhere = d.root.parent().unwrap().join("elsewhere-repo");
     std::fs::create_dir_all(&elsewhere).unwrap();
@@ -759,14 +763,94 @@ async fn n6_resolve_links_refuses_a_bad_link_not_the_batch() {
     std::fs::create_dir_all(&outside).unwrap();
     std::os::unix::fs::symlink(&outside, d.ws.join("out-link")).unwrap();
     k2_core::projects_ops::projects_create("notes", &d.ws.to_string_lossy(), None).unwrap();
-    let body = json!({"workspace": d.ws, "paths": ["a.md", "/etc/passwd", "~/x", "out-link/y"]});
+    let body = json!({"workspace": d.ws, "paths": ["a.md", "/etc/passwd", "~/x", "out-link/y", "docs/../a.md"]});
     let (st, v) = served("POST", "/cli/fs/resolve-links", "", Some(body)).await;
     assert_eq!(st, "200 OK", "{v}");
     let links = v["links"].as_array().unwrap();
-    assert_eq!(links.len(), 4, "{v}");
+    assert_eq!(links.len(), 5, "{v}");
     assert_eq!(links[0]["input"], "a.md");
     assert_eq!(links[0]["linkable"], true, "{v}");
-    for (i, input) in [(1, "/etc/passwd"), (2, "~/x"), (3, "out-link/y")] {
+    for (i, input) in [(1, "/etc/passwd"), (2, "~/x"), (3, "out-link/y"), (4, "docs/../a.md")] {
         assert_eq!((links[i]["input"].as_str(), links[i]["linkable"].as_bool()), (Some(input), Some(false)), "{v}");
     }
+}
+
+// ── round 4 ────────────────────────────────────────────────────────────
+
+fn host_git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=lab", "-c", "user.email=lab@example.invalid"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// N7 (round 4): a nested repository whose `core.worktree` is outside the
+/// work root, and a one-line `[core] worktree = …` config: the repository
+/// git would open is checked, not a text parse of one file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n7_a_nested_repo_and_a_one_line_config_cant_reach_out() {
+    let d = host_disk();
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let q = |p: &Path| format!("path={}&file_path=id_ed25519&sides=1", encode(&p.to_string_lossy()));
+    let outside = d.root.parent().unwrap().join("home-k2");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("id_ed25519"), "KEY").unwrap();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    // Nested: ws/sub/.git, its work tree outside.
+    let sub = d.ws.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    k2_core::git::init_repo(&sub.to_string_lossy()).unwrap();
+    host_git(&sub, &["config", "core.worktree", &outside.to_string_lossy()]);
+    assert!(refused(served("GET", "/cli/git/diff-file", &q(&sub), None).await), "the nested repository");
+    std::fs::remove_dir_all(&sub).unwrap();
+    // One line: `[core] worktree = <outside>`.
+    {
+        use std::io::Write;
+        let mut cfg = std::fs::OpenOptions::new().append(true).open(d.ws.join(".git/config")).unwrap();
+        writeln!(cfg, "[core] worktree = {}", outside.display()).unwrap();
+    }
+    assert!(refused(served("GET", "/cli/git/diff-file", &q(&d.ws), None).await), "the one-line config");
+}
+
+/// N7 (round 4): the worktree routes name their repository `projectPath`;
+/// they pass the check (a 403 before), and run on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n7_the_worktree_routes_pass_with_project_path() {
+    let d = host_disk();
+    let daemon = crate::test_harness::start("host-owner").await;
+    set_local_daemon(daemon.port, "host-owner");
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::write(d.ws.join("a.md"), "a").unwrap();
+    host_git(&d.ws, &["add", "-A"]);
+    host_git(&d.ws, &["commit", "-qm", "first"]);
+    let project = k2_core::projects_ops::projects_create("notes", &d.ws.to_string_lossy(), None).unwrap();
+    let body = json!({"projectPath": d.ws, "branch": "relay-wt", "projectId": project.id});
+    let (st, v) = served("POST", "/cli/git/create-worktree", "", Some(body)).await;
+    assert_eq!(st, "200 OK", "{v}");
+    let (st, v) = served("POST", "/cli/git/prune-worktrees", "", Some(json!({"projectPath": d.ws, "projectId": project.id}))).await;
+    assert_eq!(st, "200 OK", "{v}");
+    // A projectPath outside the work root is refused before anything runs.
+    let (st, _) = served("POST", "/cli/git/prune-worktrees", "", Some(json!({"projectPath": "/etc", "projectId": project.id}))).await;
+    assert_eq!(st, "403 Forbidden");
+}
+
+/// N3 (round 4): a database made before `relay_space.agent_id` gets it.
+#[test]
+fn n3_an_older_relay_space_table_gets_its_agent_column() {
+    let path = k2_core::test_env::unique_temp_path("relay-space-old.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE relay_space (rel TEXT PRIMARY KEY, host_id TEXT NOT NULL, touched_ms INTEGER NOT NULL); INSERT INTO relay_space VALUES ('notes', 'h1', 1);").unwrap();
+    }
+    let db = std::sync::Arc::new(parking_lot::ReentrantMutex::new(rusqlite::Connection::open(&path).unwrap()));
+    let store = crate::agent_host::remote::PlacementStore::open(db).unwrap();
+    store.relay_space("tasks", "h2", 2, "agent-t").unwrap();
+    let rows = store.load_relay_spaces().unwrap();
+    assert!(rows.contains(&("notes".into(), "h1".into(), 1, String::new())), "{rows:?}");
+    assert!(rows.contains(&("tasks".into(), "h2".into(), 2, "agent-t".into())), "{rows:?}");
+    let _ = std::fs::remove_file(&path);
 }

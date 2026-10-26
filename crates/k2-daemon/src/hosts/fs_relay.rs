@@ -455,7 +455,8 @@ pub async fn route_on(
         return false;
     }
     let answer = if app_pass(query) {
-        if !app_pass_to_host(remote, query, b"") {
+        let q = query.to_string();
+        if !tokio::task::spawn_blocking(move || app_pass_to_host(remote, &q, b"")).await.unwrap_or(false) {
             return false;
         }
         app_pass_refused()
@@ -727,7 +728,9 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
     let mut kept = Vec::new();
     let mut refused = Vec::new();
     for (i, p) in paths.into_iter().enumerate() {
-        let candidate = if p.starts_with('/') {
+        let candidate = if has_dot_dot(&p) {
+            None
+        } else if p.starts_with('/') {
             Some(PathBuf::from(&p))
         } else if p.starts_with('~') {
             None
@@ -762,64 +765,45 @@ fn merge_links(answer: &str, refused: &[(usize, String)]) -> Option<String> {
     Some(v.to_string())
 }
 
-/// N7: a relayed git request works on its workspace's own repository: a
-/// `.git` at the workspace root (nothing is looked for above it), whose
-/// git dir (a gitfile's target) and `core.worktree` are under the work
-/// root. K2's own git commands run without hooks here (`set_no_hooks`).
+/// N7: a relayed git request works on repositories inside the work root.
+/// For every git path it names (`path`, `projectPath`, `worktreePath`, …),
+/// the repository K2's git code (and the git CLI, from that directory)
+/// would open is opened the same way, and its git dir, common dir and work
+/// tree must resolve under the work root: a nested repository, a gitfile,
+/// `core.worktree` in any config syntax, or a repository above the
+/// workspace all fail. K2's own git commands run without hooks here
+/// (`set_no_hooks`).
 fn git_precheck(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), String> {
-    let base = query
-        .iter()
-        .find(|(k, _)| k == "path")
-        .map(|(_, v)| v.clone())
-        .or_else(|| body.get("path").and_then(Value::as_str).map(str::to_string))
-        .ok_or("a git request names its path")?;
-    let resolved = resolve(Path::new(&base)).ok_or_else(|| format!("{base} can't be resolved"))?;
-    let first = resolved.strip_prefix(root).ok().and_then(|r| r.components().next()).ok_or_else(|| format!("{base} is not in a workspace"))?;
-    let ws = root.join(first);
-    let inside = |p: &Path| resolve(p).is_some_and(|r| r.starts_with(root));
-    let dotgit = ws.join(".git");
-    let md = std::fs::symlink_metadata(&dotgit).map_err(|_| format!("no git repository at {} (none is looked for above a workspace)", ws.display()))?;
-    let git_dir = if md.is_dir() {
-        dotgit
-    } else {
-        // A gitfile (a worktree, a submodule): `gitdir: <path>`.
-        let text = std::fs::read_to_string(&dotgit).map_err(|e| format!("{}: {e}", dotgit.display()))?;
-        let target = text.lines().find_map(|l| l.strip_prefix("gitdir:")).map(str::trim).ok_or("a .git file without gitdir")?;
-        let t = Path::new(target);
-        if t.is_absolute() { t.to_path_buf() } else { ws.join(t) }
-    };
-    if !inside(&git_dir) {
-        return Err(format!("the repository's git dir {} is outside this host's work root", git_dir.display()));
+    const GIT_PATH_KEYS: &[&str] = &["path", "projectPath", "project_path", "worktreePath", "worktree_path", "repo_root", "repoRoot"];
+    let mut paths: Vec<String> =
+        query.iter().filter(|(k, v)| GIT_PATH_KEYS.contains(&k.as_str()) && v.starts_with('/')).map(|(_, v)| v.clone()).collect();
+    for k in GIT_PATH_KEYS {
+        if let Some(v) = body.get(*k).and_then(Value::as_str).filter(|v| v.starts_with('/')) {
+            paths.push(v.to_string());
+        }
     }
-    for config in [git_dir.join("config"), git_dir.join("commondir")] {
-        let config = if config.ends_with("commondir") {
-            match std::fs::read_to_string(&config) {
-                Ok(c) => {
-                    let common = git_dir.join(c.trim());
-                    if !inside(&common) {
-                        return Err("the repository's common dir is outside this host's work root".into());
-                    }
-                    common.join("config")
-                }
-                Err(_) => continue,
+    if paths.is_empty() {
+        return Err("a git request names its repository's path".into());
+    }
+    let inside = |p: &Path| resolve(p).is_some_and(|r| r.starts_with(root) && r != root);
+    for p in paths {
+        // A path that doesn't exist yet (a worktree to create) opens its
+        // nearest existing folder, as git would from there.
+        let mut open_at = PathBuf::from(&p);
+        while !open_at.exists() {
+            if !open_at.pop() {
+                break;
             }
-        } else {
-            config
+        }
+        let (git_dir, common, work) = match k2_core::git::repo_dirs(&open_at.to_string_lossy()) {
+            Ok(d) => d,
+            // No repository at all: nothing git can reach; the route answers.
+            Err(_) => continue,
         };
-        let Ok(text) = std::fs::read_to_string(&config) else { continue };
-        let mut in_core = false;
-        for line in text.lines() {
-            let l = line.trim();
-            if l.starts_with('[') {
-                in_core = l.trim_start_matches('[').trim_end_matches(']').trim().eq_ignore_ascii_case("core");
-                continue;
-            }
-            let Some((k, v)) = l.split_once('=') else { continue };
-            if in_core && k.trim().eq_ignore_ascii_case("worktree") {
-                let w = Path::new(v.trim().trim_matches('"'));
-                let w = if w.is_absolute() { w.to_path_buf() } else { git_dir.join(w) };
-                if !inside(&w) {
-                    return Err(format!("the repository's core.worktree {} is outside this host's work root", w.display()));
+        for (what, dir) in [("git dir", Some(git_dir)), ("common dir", Some(common)), ("work tree", work)] {
+            if let Some(dir) = dir {
+                if !inside(&dir) {
+                    return Err(format!("the repository for {p} has its {what} {} outside this host's work root", dir.display()));
                 }
             }
         }

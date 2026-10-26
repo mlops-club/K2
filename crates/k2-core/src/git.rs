@@ -12,6 +12,24 @@ pub fn set_no_hooks(on: bool) {
     NO_HOOKS.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// fs-relay (N7): the repository K2's git code opens for `path` (as
+/// `Repository::discover` does, and the git CLI from that directory): its
+/// git dir, common dir, and work tree (none when bare). The caller checks
+/// they are where it allows.
+pub fn repo_dirs(path: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Option<std::path::PathBuf>), String> {
+    let repo = Repository::discover(path).map_err(|e| format!("no git repository for {path}: {}", e.message()))?;
+    let git_dir = repo.path().to_path_buf();
+    // A linked worktree's git dir names its common dir in `commondir`.
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(c) => {
+            let c = Path::new(c.trim());
+            if c.is_absolute() { c.to_path_buf() } else { git_dir.join(c) }
+        }
+        Err(_) => git_dir.clone(),
+    };
+    Ok((git_dir, common, repo.workdir().map(Path::to_path_buf)))
+}
+
 /// `git`, with `-c core.hooksPath=/dev/null` once [`set_no_hooks`] is on.
 fn git_cli() -> Command {
     let mut c = Command::new("git");

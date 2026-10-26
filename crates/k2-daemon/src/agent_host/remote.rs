@@ -349,6 +349,15 @@ impl PlacementStore {
                 );",
             )
             .map_err(|e| format!("host placement tables: {e}"))?;
+            // A database made by 16253180b has relay_space without agent_id.
+            let has_agent = c
+                .prepare("SELECT 1 FROM pragma_table_info('relay_space') WHERE name = 'agent_id'")
+                .and_then(|mut st| st.exists([]))
+                .unwrap_or(true);
+            if !has_agent {
+                c.execute("ALTER TABLE relay_space ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''", [])
+                    .map_err(|e| format!("relay_space agent_id: {e}"))?;
+            }
         }
         Ok(Self { db })
     }

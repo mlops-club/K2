@@ -199,6 +199,19 @@ Accepted for now (documented, coordinator's decision):
   restarts the transfer. An upload chunk must carry its numeric `offset`
   (a missing one is a 400, not taken as 0).
 
+## Round 4 review of 0c491e05a: what changed
+
+N1, N3 and N6 were confirmed fixed (N1 against the real filesystem: every
+attack refused). N7 was partial:
+
+| Finding | Fix | Test |
+|---|---|---|
+| N7 a nested repository; a one-line `[core] worktree = …` | No text parsing: for every git path a relayed request names (`path`, `projectPath`, `worktreePath`, …), the host opens the repository K2's git code would open (`Repository::discover`, as the git CLI from that folder) and requires its git dir, common dir and work tree to resolve under the work root (`k2_core::git::repo_dirs`). A nested repo, a gitfile, `core.worktree` in any syntax and a repository above the workspace all fail; one that doesn't exist yet opens its nearest existing folder | `n7_a_nested_repo_and_a_one_line_config_cant_reach_out`, `n7_git_never_reaches_past_the_work_root` (a repository above the work root, a gitfile, `core.worktree`) |
+| N7 regression: the worktree routes got 403 | They name their repository `projectPath`: every git path key is checked, none required to be `path` | `n7_the_worktree_routes_pass_with_project_path` (create and prune through the host; `/etc` refused) |
+| N6 edge: `docs/../README.md` failed the batch | `split_links` answers a candidate with `..` `linkable: false` in its place | `n6_resolve_links_refuses_a_bad_link_not_the_batch` |
+| N6 nit: `resolve_pass` on an async worker | The App-pass check runs on the blocking pool at the gate too | |
+| N3: `agent_id` on dev databases | `PlacementStore::open` adds the column to a `relay_space` made without it | `n3_an_older_relay_space_table_gets_its_agent_column` |
+
 ## Checks
 
 | Check | Result |
