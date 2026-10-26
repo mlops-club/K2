@@ -184,8 +184,12 @@ tests/lab/run_tests.sh                                            # the lab's ow
 - Milestones: diagrams written; first working slice (fleet procs: S1, S2,
   S3, S5 green; S4 red on a daemon gap); chaos runs classified; G2 on solo;
   G2 on wave2-preview 13e5a5939 (procs, chaos, compose).
-- Next: the compose run (Docker lock), then a Linux gate run to prove the
-  gate fixes below.
+- Linux gate on wave2-preview 3912ab2ff: k2-core 3867/0, k2-daemon 5250/1
+  (the one failure and five ignored tests are class (b), pre-existing; see
+  below). Both wave-1 gate failures are fixed.
+- Next: G2 with chaos on wave2-preview 18a13dbda merged with lab-g2
+  (`K2_DELIVERY_GONE_GRACE_SECS=30` under chaos), then the hosts on
+  `K2_PTYD=1` (no chaos, seed 4117).
 
 ### G2 matrix on wave2-preview 13e5a5939 (merged as 319e17dbb)
 
@@ -311,7 +315,42 @@ Both failures were the gate container, not the code (20dfc130d):
 - `sidecar_cli_integration` `resume_after_restart_cursor_agent`: its fake CLI
   calls `/usr/bin/uuidgen`; `gate.Dockerfile` adds `uuid-runtime`
   (`k2-lab-gate:3`).
-- Not yet proven by a gate run (next, under the Docker lock).
+- Proven: both pass in the gate run below.
+
+### Linux gate on wave2-preview 3912ab2ff (W5 included)
+
+`lab-runs/gate-debug/2026-10-26T05-09-20Z`, through `scripts/lab/lib/linux_gate.sh`: slot,
+then the Docker lock; `k2-lab-gate:3` at `--memory=10g`, 3 CPUs;
+`K2_GATE_LOW_MEMORY=1` (1 build job, 256 codegen units); `K2_GATE_BATCH=20`;
+tests as `k2gate`, the root-only allowlisted run as root.
+
+| Package | Test binaries | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| k2-core | 17 | 3867 | 0 | 1 (allowlisted) |
+| k2-daemon | 162 | 5250 | 1 | 9 |
+| k2-daemon root-only `cell_egress` | 1 | 1 | 0 | 0 |
+
+- `root_helper::cli_refresh::...inspect_names_a_linked_or_writable_directory`
+  and `sidecar_cli_integration` `resume_after_restart_cursor_agent` (the
+  wave-1 gate's two failures) pass.
+- Failed, class (b) pre-existing: `k2_home_integration`
+  `k2_home_holds_the_whole_k2_home_and_home_stays_empty`: `$HOME` gets
+  `.local/bin/k2`. On Linux the daemon stages the `k2` CLI at
+  `/usr/local/bin/k2` and falls back to `$HOME/.local/bin/k2` when that is
+  not writable (`k2-core/src/cli_stage.rs`, `stage_cli`, since 33b8f82ec),
+  even under `K2_HOME`. As root (every earlier gate) the canonical path is
+  writable, so the fallback never ran; as an unprivileged user it does. The
+  code and the test are unchanged since the wave base 2987a7576. For the
+  owner: under `K2_HOME`, stage the fallback inside `K2_HOME` or skip it.
+- Ignored but not allowlisted, class (b): the five tests listed below.
+
+Three gate bugs found on the way (all class (a), fixed in this branch):
+
+| Try | What happened | Fix |
+|---|---|---|
+| 1 | the k2-daemon lib-test rustc was SIGKILLed at 10g, compiled in parallel with the integration tests | `LAB_GATE_LOW_MEMORY=1` (fewer jobs; the cap is unchanged) |
+| 2 | `ld: final link failed: No space left on device`: `cargo test -p k2-daemon` links all 157 integration binaries before it runs one (target volume 34G, Docker VM disk 94G shared) | `K2_GATE_BATCH=N` runs the lib and bins, then N integration targets per step, then the doctests, and removes the linked executables after each step; same tests, same flags (33efc28d2). The end-of-run trim (ab4996747) keeps the volume at ~12G between runs |
+| 3 | 115 test binaries and every spawned test daemon aborted on a stack overflow: low-memory mode built at opt-level 0, where k2-daemon's async stacks outgrow the thread stack (the profile says 1) | low-memory mode keeps the profile's opt-level and cuts only jobs and codegen units (b21e9fde6) |
 
 Class (b), pre-existing, for the owner: ignored tests that are not on the
 gate's allowlist (each is ignored on base; the allowlist is unchanged since
