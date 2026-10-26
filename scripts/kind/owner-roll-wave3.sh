@@ -83,7 +83,9 @@ snapshot() {  # snapshot <file>: read-only facts, no file contents
         echo "# pods"
         kd get pods -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,IMAGE:.status.containerStatuses[0].imageID --no-headers
         echo "# pvcs"
-        kd get pvc -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,SIZE:.spec.resources.requests.storage --no-headers
+        # The deployment's own PVCs (a roll adds its k2-backup-controller-* one).
+        kd get pvc -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,SIZE:.spec.resources.requests.storage --no-headers \
+            | grep -v '^k2-backup-' | awk '{print $1, $2, $3}'   # widths follow the longest name
         echo "# statefulsets"
         kd get statefulset -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,SERVICE:.spec.serviceName --no-headers
         echo "# host login (present size mtime; onboarding flag)"
