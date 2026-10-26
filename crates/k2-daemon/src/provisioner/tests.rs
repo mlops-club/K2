@@ -102,6 +102,16 @@ fn choice_order_with_labels() {
 }
 
 #[test]
+fn a_pinned_agent_whose_host_drains_waits_and_says_why() {
+    let mut drain = host("eric-mbp", 0, &["k2.kind=laptop"]);
+    drain.draining = true;
+    let n = need("notes", Mode::Pinned { host: "eric-mbp".into() }, Some("eric-mbp"));
+    let r = Static.choose(&n, &[drain, host("host-1", 0, &[])]).unwrap_err();
+    assert_eq!(r, Refusal::PinnedDraining { agent: "notes".into(), host: "eric-mbp".into() });
+    assert!(r.message().contains("draining (SIGTERM)"), "{}", r.message());
+}
+
+#[test]
 fn away_and_draining_hosts_are_skipped() {
     let mut drain = host("host-1", 0, &[]);
     drain.draining = true;

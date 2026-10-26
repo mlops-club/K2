@@ -24,6 +24,12 @@
 #      (its agent released: asleep) and the pool shrinks back to 1 pod
 #   7. I1: no agent ever placed on two hosts at once (controller log)
 #
+# K2_P4_REAL=1: the variant with the real agents image (Claude Code in the
+# host image, kind-app's Dockerfile.agents): one wake of a plain `sh`
+# terminal (not an agent CLI) makes the provisioner create k2-host-0; the
+# pod enrolls and turns Ready; `claude` is installed and resolvable on its
+# PATH. Nothing runs `claude` (ground rule: no real agent CLIs from scripts).
+#
 # Only k2lab, through an explicit kubeconfig; tokens are read into files
 # (0600) under the run dir's private tmp, never printed.
 set -uo pipefail
@@ -234,6 +240,30 @@ ctl /cli/hosts/status > "$RUN/status-0.json"
 check "the controller runs K2_PROVISIONER=kubernetes; the pool starts at 0 hosts" \
     "$(python3 -I -c 'import json,sys; s=json.load(open(sys.argv[1])); print(1 if s.get("provisioner")=="kubernetes" and s["hosts"]==[] else 0)' "$RUN/status-0.json" 2>/dev/null)" \
     "$(cat "$RUN/status-0.json") replicas $(replicas)"
+
+if [ "${K2_P4_REAL:-0}" = 1 ]; then
+    term() { # a plain shell terminal: the wake that makes the provisioner act
+        curl -s --max-time 300 -o "$PRIV/spawn.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            "http://127.0.0.1:$PORT/cli/sessions/v2/spawn?token=$(cat "$PRIV/token")" \
+            -d "{\"agent_name\":\"$1\",\"cwd\":\"/var/lib/k2-host\",\"command\":\"sh\",\"args\":[]}"
+        echo " $(head -c 300 "$PRIV/spawn.out")"
+    }
+    r=$(term t1)
+    kn wait --for=condition=Ready pod -l app.kubernetes.io/name=k2-host --timeout=180s > "$RUN/wait-ready.txt" 2>&1
+    ctl /cli/hosts/keys > "$RUN/keys.json"
+    check "real agents image: a wake makes the provisioner create k2-host-0, enrolled by key and linked" \
+        "$(echo "$r" | grep -q '^200 ' && [ "$(replicas)" = 1 ] && grep -q '"k2-host-0"' "$RUN/keys.json" && echo 1)" "wake $r; replicas $(replicas); pods $(pods)"
+    ready=$(kn get pod k2-host-0 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
+    check "the provisioned pod is Ready through k2-daemon --host-health" "$([ "$ready" = True ] && echo 1)" "Ready=$ready"
+    have=$(kn exec k2-host-0 -- sh -c 'p=$(command -v claude) && test -x "$p" && echo "$p"' 2>&1)
+    img=$(kn get pod k2-host-0 -o jsonpath='{.spec.containers[0].image}')
+    check "claude is installed and resolvable on the host's PATH (not run)" "$(echo "$have" | grep -q '/claude$' && echo 1)" "$have in $img"
+    kn logs k2-controller-0 > "$RUN/controller.log" 2>&1
+    kn get statefulset,pods -o wide > "$RUN/pool.txt"
+    echo "evidence: $RUN"
+    if [ "$FAILS" = 0 ]; then echo "kind-pool-accept (real agents): PASS"; else echo "kind-pool-accept (real agents): $FAILS check(s) failed"; exit 1; fi
+    exit 0
+fi
 
 # 2. six wakes
 codes=""

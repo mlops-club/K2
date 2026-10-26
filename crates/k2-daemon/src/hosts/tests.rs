@@ -1676,3 +1676,24 @@ async fn kubernetes_idle_drains_the_highest_ordinal_releases_its_agents_then_sca
     assert_eq!(step, crate::provisioner::IdleStep::ScaledDown { host: "k2-host-1".into(), to: 1 });
     assert_eq!(api.state.lock().replicas["k2-host"], 1);
 }
+
+// ── P3 follow-up 2: a host's S8 drain reaches placement ──────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_says_it_is_draining_gets_no_new_agent() {
+    let c = Controller::start().await;
+    let mut a = fake_host(&c, "h-a").await;
+    let mut b = fake_host(&c, "h-b").await;
+    c.wait_hosts(2).await;
+    // h-a (as empty as h-b, and first by name) starts its SIGTERM drain.
+    send(&mut a, &Frame::Refused { code: super::drain::DRAINING_CODE.into(), message: "host is draining (SIGTERM)".into() }).await;
+    within("h-a draining", async {
+        while c.remote.status_json()["hosts"].as_array().unwrap().iter().all(|h| !(h["host_id"] == "h-a" && h["draining"] == true)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // A new agent goes to h-b, never to the draining h-a.
+    place(&c, &mut b, "fresh", &uuid::Uuid::new_v4().to_string()).await;
+    assert_eq!(c.remote.placement("fresh").unwrap().host_id, "h-b");
+}

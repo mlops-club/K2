@@ -25,6 +25,9 @@ impl Provisioner for Static {
             return match hosts.iter().find(|h| &h.host_id == host).filter(|h| h.usable()) {
                 Some(h) if h.has_room() => Ok(Choice { host: host.clone(), why: Why::Pinned }),
                 Some(h) => Err(Refusal::PinnedFull { agent: need.agent.clone(), host: host.clone(), max_awake: h.max_awake.unwrap_or(0) }),
+                None if hosts.iter().any(|h| &h.host_id == host && h.linked && h.draining) => {
+                    Err(Refusal::PinnedDraining { agent: need.agent.clone(), host: host.clone() })
+                }
                 None => Err(Refusal::PinnedAway { agent: need.agent.clone(), host: host.clone() }),
             };
         }

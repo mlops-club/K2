@@ -149,6 +149,8 @@ pub enum Refusal {
     NoHosts,
     /// Pinned to a host that is away: the agent waits for it, never moves.
     PinnedAway { agent: String, host: String },
+    /// Pinned to a host that is linked but draining (SIGTERM, S8).
+    PinnedDraining { agent: String, host: String },
     /// Pinned to a host that is linked but at `k2.max_awake`.
     PinnedFull { agent: String, host: String, max_awake: u32 },
     /// Every usable host is at `k2.max_awake`.
@@ -168,6 +170,9 @@ impl Refusal {
             Refusal::NoHosts => crate::agent_host::remote::NO_HOSTS.to_string(),
             Refusal::PinnedAway { agent, host } => {
                 format!("agent {agent} is pinned to host {host}, which is away; it waits for {host} to link again (it is never placed elsewhere)")
+            }
+            Refusal::PinnedDraining { agent, host } => {
+                format!("agent {agent} is pinned to host {host}, which is draining (SIGTERM); it waits for {host} to come back (it is never placed elsewhere)")
             }
             Refusal::PinnedFull { agent, host, max_awake } => format!(
                 "agent {agent} is pinned to host {host}, which has {max_awake} agents awake (k2.max_awake, {MAX_AWAKE_VAR} on the host)"
