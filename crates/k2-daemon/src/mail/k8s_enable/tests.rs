@@ -319,3 +319,12 @@ fn a_run_that_stopped_mid_rotation_resumes_with_the_secret() {
     assert_eq!(*pod.recovery.borrow(), "gone", "the Secret is overwritten after the resume");
     clean_row();
 }
+
+#[test]
+fn a_delegated_stalwart_has_no_systemd_truth() {
+    // Seen live: /cli/mail/status showed a finished enable as `stopped`
+    // ("systemd reports the stalwart unit is 'unknown'").
+    let _a = k2_core::test_env::EnvVar::set("K2_CAP_MAIL", "external");
+    let _b = k2_core::test_env::EnvVar::set("K2_STALWART_URL", URL);
+    assert_eq!(sup::systemd_ground_truth(), None);
+}

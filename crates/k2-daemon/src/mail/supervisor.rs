@@ -982,6 +982,10 @@ fn probe_tls_endpoint(sni: &str, addrs: &[std::net::SocketAddr], offer_http_alpn
 /// Overlay SQLite with systemd when we have a unit observation.
 /// `None` = leave the row as-is (non-Linux / tests without a seam).
 pub fn systemd_ground_truth() -> Option<String> {
+    // P4 T3: Stalwart in its own pod has no unit here; the row stands.
+    if super::k8s_enable::external_url().is_some() {
+        return None;
+    }
     #[cfg(test)]
     {
         return test_unit_state_override();

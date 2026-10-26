@@ -103,11 +103,11 @@ ctl() {  # ctl <method> <path> [body]: the controller's own API, its token read 
         'curl -sS --max-time 30 -X "$1" -H "Content-Type: application/json" ${3:+-d "$3"} "http://127.0.0.1:7420$2?token=$(cat /var/lib/k2/.k2/daemon.token)"' \
         _ "$@" 2>&1
 }
-resp=$(ctl POST /cli/mail/server/enable '{"hostname":"mail.k2.test"}')
+resp=$(ctl POST /cli/mail/server/enable '{"hostname":"mail.k2.test"}' || true)
 printf '     enable -> %s\n' "$(printf '%s' "$resp" | cut -c1-240)"
 state="" status=""
 for _ in $(seq 1 150); do
-    status=$(ctl GET /cli/mail/status)
+    status=$(ctl GET /cli/mail/status || true)  # a failed exec is a retry, not the end
     state=$(printf '%s' "$status" | python3 -I -c 'import json,sys
 try:
     d = json.load(sys.stdin)
