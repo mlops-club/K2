@@ -25,6 +25,12 @@
 //! conversation. A need first (the app, a wake) places it the usual way,
 //! which also ends its resume. Messages for an agent awaiting resume stay
 //! in the outbox and are delivered once it is placed (I2).
+//!
+//! P3 T2 (S10), a host that dies without a drain (`kill -9`, a lost node):
+//! the same loop moves each portable agent of a host lost for
+//! `K2_HOST_MOVE_AFTER` (default 300 s; `RemoteHost::move_lost`). It then
+//! resumes on the next host that can take it, from the home its last turn
+//! saved (`hosts::turn_save`). A pinned agent waits for its host.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +57,11 @@ const POLL: Duration = Duration::from_millis(200);
 pub const SETTLE: Duration = Duration::from_secs(2);
 /// How often the controller's resume loop looks for linked hosts.
 const RESUME_TICK: Duration = Duration::from_secs(1);
+/// Controller: how long a host may be lost before its portable agents move.
+pub const MOVE_AFTER_VAR: &str = "K2_HOST_MOVE_AFTER";
+pub const DEFAULT_MOVE_AFTER: Duration = Duration::from_secs(300);
+/// A resume row's host for a moved agent: any host that can take it.
+pub const ANY_HOST: &str = "*";
 
 pub mod events {
     pub const HOST_DRAIN_START: &str = "host.drain_start";
@@ -59,6 +70,8 @@ pub mod events {
     pub const CTL_HOST_DRAINING: &str = "ctl.host_draining";
     pub const CTL_DRAIN_RELEASE: &str = "ctl.drain_release";
     pub const CTL_RESUME: &str = "ctl.resume";
+    /// A lost host's portable agent moves (T2, S10).
+    pub const CTL_MOVE: &str = "ctl.move_decision";
 }
 
 static DRAINING: AtomicBool = AtomicBool::new(false);
@@ -77,6 +90,21 @@ pub fn drain_deadline(get: impl Fn(&str) -> Option<String>) -> Duration {
             Err(_) => {
                 log_debug!("[hosts/drain] {DRAIN_SECS_VAR}={v:?} is not a number of seconds; using {}", DEFAULT_DRAIN.as_secs());
                 DEFAULT_DRAIN
+            }
+        },
+    }
+}
+
+/// `K2_HOST_MOVE_AFTER` through `get`, in seconds; a bad value is the
+/// default, logged.
+pub fn move_after(get: impl Fn(&str) -> Option<String>) -> Duration {
+    match get(MOVE_AFTER_VAR).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        None => DEFAULT_MOVE_AFTER,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => Duration::from_secs(n),
+            Err(_) => {
+                log_debug!("[hosts/drain] {MOVE_AFTER_VAR}={v:?} is not a number of seconds; using {}", DEFAULT_MOVE_AFTER.as_secs());
+                DEFAULT_MOVE_AFTER
             }
         },
     }
@@ -306,8 +334,10 @@ pub fn ensure_controller_resumes_with(remote: &'static RemoteHost, resumer: Resu
         s.push(key);
     }
     let inflight: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let after = move_after(|k| std::env::var(k).ok());
     tokio::spawn(async move {
         loop {
+            remote.move_lost(Instant::now(), after);
             for r in remote.resume_due() {
                 if !inflight.lock().insert(r.agent_id.clone()) {
                     continue;
@@ -421,6 +451,15 @@ mod tests {
         assert_eq!(drain_deadline(get("")), DEFAULT_DRAIN);
         assert_eq!(drain_deadline(get("soon")), DEFAULT_DRAIN);
         assert_eq!(drain_deadline(|_| None), DEFAULT_DRAIN);
+    }
+
+    #[test]
+    fn the_move_delay_comes_from_the_env() {
+        let get = |v: &'static str| move |k: &str| (k == MOVE_AFTER_VAR).then(|| v.to_string());
+        assert_eq!(move_after(get("3")), Duration::from_secs(3));
+        assert_eq!(move_after(get("0")), Duration::ZERO);
+        assert_eq!(move_after(get("later")), DEFAULT_MOVE_AFTER);
+        assert_eq!(move_after(|_| None), DEFAULT_MOVE_AFTER);
     }
 
     #[test]

@@ -1301,6 +1301,8 @@ pub fn host_linked(tx: mpsc::UnboundedSender<Frame>) {
     static STARTED: OnceLock<()> = OnceLock::new();
     // The drain (S8) needs every turn this host runs from here on.
     crate::hosts::drain::track_turns();
+    // P3 T2: and each turn's end saves the agent's home.
+    crate::hosts::turn_save::start();
     let h = host_side();
     let report = Arc::clone(h);
     tokio::task::spawn_blocking(move || report.linked(tx));

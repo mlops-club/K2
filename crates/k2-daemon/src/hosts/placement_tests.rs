@@ -502,3 +502,153 @@ async fn an_uncertain_delivery_fails_visibly_with_delivery_uncertain() {
     assert_eq!(r.state, State::Failed);
     assert!(r.reason.as_deref().unwrap_or("").starts_with(UNCERTAIN_REASON), "{:?}", r.reason);
 }
+
+// ── T2 (S10): a lost host's agents move ────────────────────────────────
+
+/// `host`'s next frame is `agent`'s spawn: answer it with `session`.
+/// Returns the spawn's epoch and body.
+async fn answer_spawn(host: &mut Ws, agent: &str, session: &str) -> (u64, Value) {
+    match recv(host).await {
+        Frame::Spawn { req, agent_id, epoch, body } => {
+            assert_eq!(agent_id, agent);
+            send(host, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": session, "reused": false}).to_string() })
+                .await;
+            (epoch, body)
+        }
+        other => panic!("expected {agent}'s spawn, got {other:?}"),
+    }
+}
+
+/// `host-a` links again, still running `agent` at `epoch` (hello.resume).
+async fn back_with(url: &str, agent: &str, epoch: u64) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
+    let resume = super::proto::ResumePlacement {
+        agent_id: agent.into(),
+        session_id: sid(1),
+        epoch,
+        ring: None,
+        child_alive: true,
+        cwd: Some(format!("/w/{agent}")),
+        program: Some("claude".into()),
+        args: vec![],
+        label: None,
+    };
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: "host-a".into(), token: TOKEN.into(), labels: vec![], resume: vec![resume] })
+        .await;
+    assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
+    ws
+}
+
+async fn wait_lost(remote: &RemoteHost, host: &str) {
+    within("the host to be lost", async {
+        while remote.status_json()["lost"] != json!([host]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_portable_agent_on_a_lost_host_moves_resumes_elsewhere_and_its_message_follows() {
+    use crate::delivery_drain::{start_controller, Direct};
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| panic!("a moving agent's message never takes the direct path")),
+        },
+    );
+    outbox.set_gone_grace(Duration::ZERO);
+    super::drain::ensure_controller_resumes_with(remote, Arc::new(super::drain::resume_v2));
+    let mut a = fake_host(&url, "host-a").await;
+    let body = json!({"agent_name": "bob", "cwd": "/w/bob", "command": "claude", "args": ["--session-id", "conv-1"]}).to_string();
+    let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
+    let (e1, _) = answer_spawn(&mut a, "bob", &sid(1)).await;
+    assert_eq!(within("spawn", spawn).await.unwrap().0, "200 OK");
+    let mut b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+
+    // kill -9 host-a: its link drops, no drain, no release.
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    let id = outbox.send("agent:alice", "bob", json!({"kind": "msg", "text": "after the crash"})).unwrap();
+    let now = std::time::Instant::now();
+    assert_eq!(remote.move_lost(now, Duration::from_secs(3600)), Vec::<String>::new(), "not lost long enough");
+    assert_eq!(remote.placement("bob").unwrap().host_id, "host-a", "kept, lost (W3)");
+    assert_eq!(outbox.get(&id).unwrap().state, State::Queued);
+
+    // Lost past K2_HOST_MOVE_AFTER: bob moves, and resumes on host-b at a
+    // new epoch, the same conversation.
+    assert_eq!(remote.move_lost(now, Duration::ZERO), vec!["bob"]);
+    let (e2, body) = answer_spawn(&mut b, "bob", &sid(2)).await;
+    assert!(e2 > e1, "a new epoch: {e2} after {e1}");
+    assert_eq!(body["args"], json!(["--resume", "conv-1"]));
+    match recv(&mut b).await {
+        Frame::Deliver { msg_id, agent_id, .. } => {
+            assert_eq!((msg_id.as_str(), agent_id.as_str()), (id.as_str(), "bob"));
+            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the waiting message on host-b, got {other:?}"),
+    }
+    assert_eq!(wait_final(&outbox, &id).await.state, State::Delivered);
+    assert_eq!(remote.placement("bob").unwrap().host_id, "host-b");
+    assert!(!remote.awaiting_resume("bob"));
+
+    // host-a comes back still running its copy (a partition, not a crash):
+    // told to release it (I1); bob stays on host-b.
+    let mut a = back_with(&url, "bob", e1).await;
+    match recv(&mut a).await {
+        Frame::Release { agent_id, epoch, .. } => assert_eq!((agent_id.as_str(), epoch), ("bob", e1)),
+        other => panic!("expected a release of the stale copy, got {other:?}"),
+    }
+    assert_eq!(remote.placement("bob").unwrap().host_id, "host-b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_agent_on_a_lost_host_waits_for_it() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "lap", "/w/lap", &sid(1)).await;
+    remote.policy().set_mode("lap", &crate::provisioner::Mode::Pinned { host: "host-a".into() }).unwrap();
+    let _b = fake_host(&url, "host-b").await;
+    wait_hosts(remote, 2).await;
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), Vec::<String>::new());
+    assert_eq!(remote.placement("lap").unwrap().host_id, "host-a", "pinned: never placed elsewhere");
+    assert!(remote.resume_due().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_back_with_an_agent_that_moved_meanwhile_is_told_to_release_it() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "eve", "/w/eve", &sid(1)).await;
+    let e1 = remote.placement("eve").unwrap().epoch.0;
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    // No other host: eve moves, and waits for any host.
+    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["eve"]);
+    assert!(remote.placement("eve").is_none());
+    assert!(remote.awaiting_resume("eve"));
+    // host-a is back with its old copy: not adopted (it would write an old
+    // home and a second CLI); released. eve then resumes from its snapshot.
+    let mut a = back_with(&url, "eve", e1).await;
+    match recv(&mut a).await {
+        Frame::Release { agent_id, epoch, reason, .. } => {
+            assert_eq!((agent_id.as_str(), epoch), ("eve", e1));
+            assert!(reason.contains("moved"), "{reason}");
+        }
+        other => panic!("expected a release, got {other:?}"),
+    }
+    assert!(remote.placement("eve").is_none(), "the stale copy is not adopted");
+    assert_eq!(remote.resume_due().iter().map(|r| r.agent_id.as_str()).collect::<Vec<_>>(), vec!["eve"]);
+}

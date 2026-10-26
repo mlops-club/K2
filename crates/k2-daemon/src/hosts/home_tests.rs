@@ -183,7 +183,6 @@ async fn the_fence_follows_the_placement_then_the_last_host() {
     assert_eq!(f("host-a", e, None), Ok(()));
     assert!(f("host-a", e - 1, None).unwrap_err().contains("may not write"));
     assert!(f("host-b", e, None).unwrap_err().contains("placed on host-a"));
-    gone(&mut a, remote, "dave").await;
     let newest = k2_core::agent_home::Latest {
         seq: 3,
         epoch: e,
@@ -193,6 +192,12 @@ async fn the_fence_follows_the_placement_then_the_last_host() {
         files: 0,
         bytes: 0,
     };
+    // T2: even its live placement never writes under a newer writer's
+    // snapshot (a host adopted again after its agent moved and came back).
+    let newer = k2_core::agent_home::Latest { seq: 4, epoch: e + 1, host: "host-b".into(), ..newest.clone() };
+    assert_eq!(f("host-a", e, Some(&newest)), Ok(()), "a turn's save from the live placement");
+    assert!(f("host-a", e, Some(&newer)).unwrap_err().contains("older than"));
+    gone(&mut a, remote, "dave").await;
     assert_eq!(f("host-a", e, Some(&newest)), Ok(()), "the last host, after the placement ended");
     assert!(f("host-b", e + 1, Some(&newest)).unwrap_err().contains("not the host that last ran"));
     assert!(f("host-a", e - 1, Some(&newest)).unwrap_err().contains("older than"));

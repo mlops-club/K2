@@ -1827,16 +1827,87 @@ impl RemoteHost {
         self.inner.lock().resume.contains_key(agent_id)
     }
 
-    /// The drained agents whose host is linked (and not draining) now.
+    /// The drained agents whose host is linked (and not draining) now, and
+    /// the moved ones (host [`crate::hosts::drain::ANY_HOST`]) while any
+    /// host is.
     pub fn resume_due(&self) -> Vec<StoredPlacement> {
         let inner = self.inner.lock();
+        let usable = |h: &String| inner.links.contains_key(h) && !inner.draining.contains(h);
+        let any = inner.links.keys().any(usable);
         inner
             .resume
             .values()
-            .filter(|r| inner.links.contains_key(&r.host_id) && !inner.draining.contains(&r.host_id))
+            .filter(|r| if r.host_id == crate::hosts::drain::ANY_HOST { any } else { usable(&r.host_id) })
             .filter(|r| !inner.placements.contains_key(&r.agent_id))
             .cloned()
             .collect()
+    }
+
+    /// P3 T2 (S10): a portable agent whose host has been lost (its link
+    /// down, no drain) for `after` moves. Its placement is dropped and it
+    /// waits to resume on any host ([`Self::resume_due`]): the resume loop
+    /// places it the usual way, at a new epoch, and its new host restores
+    /// its newest snapshot (the last turn's end) before it resumes the
+    /// conversation. A pinned agent waits for its host. Its old host, if it
+    /// links again still running it, is told to release it ([`Self::adopt`]).
+    /// A host lost before this process saw it (a controller restart) counts
+    /// from the first call. The agents moved.
+    pub fn move_lost(&self, now: Instant, after: Duration) -> Vec<String> {
+        let mut inner = self.inner.lock();
+        let holding: BTreeSet<String> = inner.placements.values().map(|p| p.host_id.clone()).collect();
+        for h in &holding {
+            if !inner.links.contains_key(h) {
+                inner.seen_hosts.entry(h.clone()).or_insert(Some(now));
+            }
+        }
+        let lost: HashMap<String, Duration> = holding
+            .iter()
+            .filter(|h| !inner.links.contains_key(*h))
+            .filter_map(|h| inner.seen_hosts.get(h).copied().flatten().map(|t| (h.clone(), now.saturating_duration_since(t))))
+            .filter(|(_, d)| *d >= after)
+            .collect();
+        let candidates: Vec<RemotePlacement> =
+            inner.placements.values().filter(|p| lost.contains_key(&p.host_id)).cloned().collect();
+        let mut moved = Vec::new();
+        for p in candidates {
+            if let crate::provisioner::Mode::Pinned { host } = self.policy.need(&p.agent_id).mode {
+                log_debug!("[hosts] agent {} is pinned to {host}, lost: it waits for it", p.agent_id);
+                continue;
+            }
+            inner.placements.remove(&p.agent_id);
+            self.forget(&p.agent_id, p.epoch);
+            let Some(s) = inner.sessions.remove(&p.agent_id) else {
+                // Reserved, but its spawn never answered: nothing to resume.
+                continue;
+            };
+            let mut row = Self::stored(&s);
+            row.host_id = crate::hosts::drain::ANY_HOST.to_string();
+            if let Some(store) = &self.store {
+                if let Err(e) = store.add_resume(&row) {
+                    log_debug!("[hosts] {e}");
+                }
+            }
+            inner.resume.insert(p.agent_id.clone(), row);
+            s.exited(None);
+            let lost_for = lost.get(&p.host_id).copied().unwrap_or_default();
+            log_debug!(
+                "[hosts] host {} lost for {:?}: agent {} (epoch {}) moves to the next host that can take it",
+                p.host_id,
+                lost_for,
+                p.agent_id,
+                p.epoch.0
+            );
+            k2_core::trace::emit(|| {
+                k2_core::trace::Event::new(crate::hosts::drain::events::CTL_MOVE)
+                    .agent(p.agent_id.as_str())
+                    .attr("from", p.host_id.as_str())
+                    .attr("epoch", p.epoch.0)
+                    .attr("lost_ms", lost_for.as_millis() as u64)
+            });
+            moved.push(p.agent_id);
+        }
+        moved.sort();
+        moved
     }
 
     /// The protocol the link to `host_id` speaks, if it is linked.
@@ -1878,6 +1949,19 @@ impl RemoteHost {
                         "controller holds agent {} at epoch {} on host {}; host resumed epoch {}",
                         r.agent_id, p.epoch.0, p.host_id, r.epoch
                     )),
+                    // T2: it moved while this host was lost (and is not
+                    // placed now, or waits to resume elsewhere): this copy
+                    // is stale.
+                    None if inner.resume.get(&r.agent_id).is_some_and(|m| m.host_id == crate::hosts::drain::ANY_HOST)
+                        || inner.last_host_for_agent.get(&r.agent_id).is_some_and(|h| h != host_id) =>
+                    {
+                        AdoptDecision::Released(format!(
+                            "agent {} moved while host {host_id} was lost (last ran on {}); host resumed epoch {}",
+                            r.agent_id,
+                            inner.last_host_for_agent.get(&r.agent_id).map(String::as_str).unwrap_or("no host yet"),
+                            r.epoch
+                        ))
+                    }
                     None => {
                         self.adopt_unknown(&mut inner, host_id, r);
                         AdoptDecision::Adopted
