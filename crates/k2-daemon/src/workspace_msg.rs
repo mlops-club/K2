@@ -1646,12 +1646,32 @@ pub fn send_message_to_session_with_command(
     })
 }
 
-/// K2_ROLE=host: deliver a message the controller sent for `agent_id`, an
-/// agent running on this host (`crate::delivery_drain`). `kind: "msg"`
-/// injects `[from <label>] text` into its live session like `k2 msg`;
-/// `kind: "inbox"` composes into the inbox of the workspace it runs in.
-/// Never spawns: an agent with no live session here is retried by the
-/// controller.
+/// The ids a `k2 msg` / inbox address may be placed under on a controller
+/// (`delivery_drain::Direct::aliases`), resolved as `K2_ROLE=all`
+/// resolves it ([`resolve_msg_target`]): a workspace name or path gives its
+/// project id (how the app and `ensure-pinned-chat` place it), the name a
+/// wake spawns it under, and its saved session ids; a session id gives
+/// itself. A sidecar or an unknown address gives none.
+pub(crate) fn placement_aliases(recipient: &str) -> Vec<String> {
+    let path = match resolve_msg_target(recipient) {
+        Some(MsgTarget::WorkspaceCanonical { path }) => path,
+        Some(MsgTarget::Session { session_id }) => return vec![session_id],
+        Some(MsgTarget::Sidecar { .. }) | None => return Vec::new(),
+    };
+    let db = k2_core::db::shared();
+    let conn = db.lock();
+    let Some(project_id) = resolve_project_id(&conn, &path) else { return Vec::new() };
+    let row = WorkspaceSession::get(&conn, &project_id).ok().flatten();
+    let mode = Project::get(&conn, &project_id).ok().map(|p| p.agent_mode).unwrap_or_else(|| "off".to_string());
+    let mut out = vec![project_id, resolve_spawn_name(&path, &mode)];
+    if let Some(r) = row {
+        out.extend([r.active_terminal_id, r.session_id].into_iter().flatten());
+    }
+    out.retain(|a| !a.is_empty());
+    out.dedup();
+    out
+}
+
 /// The controller's direct delivery of a `kind=msg` body a host sent up
 /// for a recipient it resolves but that isn't placed
 /// (`delivery_drain::Direct`): today's cascade, `wake` from the body.
@@ -1675,6 +1695,12 @@ pub(crate) fn deliver_for_controller(recipient: &str, from: &str, body: &serde_j
     }
 }
 
+/// K2_ROLE=host: deliver a message the controller sent for `agent_id`, an
+/// agent running on this host (`crate::delivery_drain`). `kind: "msg"`
+/// injects `[from <label>] text` into its live session like `k2 msg`;
+/// `kind: "inbox"` composes into the inbox of the workspace it runs in.
+/// Never spawns: an agent with no live session here is retried by the
+/// controller.
 pub(crate) fn deliver_to_local_agent(
     agent_id: &str,
     from: &str,
@@ -2792,6 +2818,36 @@ fn wake_and_fire(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workspace_address_gives_its_project_id_spawn_name_and_sessions_as_placement_aliases() {
+        k2_core::test_isolation::assert_no_prod_env();
+        let _db = k2_core::db::init_for_tests();
+        let dir = k2_core::test_env::unique_temp_path("alias-ws").join("bob-alias-ws");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let id = "p-alias-7f3e";
+        {
+            let db = k2_core::db::shared();
+            let conn = db.lock();
+            conn.execute(
+                "INSERT OR REPLACE INTO projects (id, path, name, agent_mode) VALUES (?1, ?2, 'bob-alias-ws', 'custom')",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_sessions (id, project_id, session_id, active_terminal_id, harness, owner, status, created_at) \
+                 VALUES ('wsr-alias-7f3e', ?1, 'sess-saved', 'term-live', 'claude', 'user', 'running', unixepoch())",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let want: Vec<String> = [id, "bob-alias-ws", "term-live", "sess-saved"].map(String::from).to_vec();
+        assert_eq!(placement_aliases("bob-alias-ws"), want, "by workspace name");
+        assert_eq!(placement_aliases(&path), want, "by path");
+        assert!(placement_aliases("no-such-workspace-7f3e").is_empty());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn an_outbox_failure_keeps_todays_reason_when_the_controller_gave_one() {
