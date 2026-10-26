@@ -2,7 +2,9 @@
 # The owner's second roll: k2-kind-dist (port 7443) from wave3 853157fee
 # onto the release candidate k2-dist/wave3 c59acf7e0 (images :rc1, built and
 # verified by dist-link), with home sync (K2_WORK_ROOT on the hosts, P3 T1)
-# and turn-end snapshots (P3 T2), and a pool that may grow to two hosts.
+# and turn-end snapshots (P3 T2), and a pool whose ceiling is POOL_MAX
+# (default 1: the coordinator's hold until k2-dist/drain-move lands, since
+# a drained agent doesn't move off its host in rc1; 2 after it).
 #
 #   scripts/kind/owner-roll-rc1.sh [--dry-run]     (the default)
 #   scripts/kind/owner-roll-rc1.sh --go [--skip-rehearsal]
@@ -14,7 +16,7 @@
 #      never its contents), and the images the pods run (the StatefulSets'
 #      k2.dev/image-id), which are the rollback images;
 #   2. renders the roll (up.sh --render-only: 1 host, enroll, K2_PTYD=1,
-#      K2_PROVISIONER=kubernetes with MIN=1 MAX=2, K2_WORK_ROOT=/var/lib/k2/work,
+#      K2_PROVISIONER=kubernetes with MIN=1 MAX=POOL_MAX, K2_WORK_ROOT=/var/lib/k2/work,
 #      --login-from=k2-host-0);
 #   3. checks the render:
 #      (a) k2-host keeps its name, serviceName and claim template, so
@@ -82,7 +84,9 @@ done
 kind_variant dist
 kind_kubeconfig
 NS=$KIND_NS PORT=$KIND_PORT
-ROLL_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=2
+POOL_MAX=${POOL_MAX:-1}
+case "$POOL_MAX" in 1|2) ;; *) echo "owner-roll-rc1.sh: POOL_MAX is 1 or 2" >&2; exit 2 ;; esac
+ROLL_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts="$POOL_MAX"
     --work-root=/var/lib/k2/work --login-from=k2-host-0)
 PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes)   # wave3's roll
 RC_COMMIT=${RC_COMMIT:-c59acf7e02af4b2237e175546f6b1f7c76073068}   # k2-dist/wave3, the release candidate
@@ -135,8 +139,8 @@ echo "== 2. render the roll"
 "$KIND_REPO/scripts/kind/up.sh" "${ROLL_FLAGS[@]}" --render-only="$OUT/render.yaml" 2>&1 | sed 's/^/     /'
 
 echo "== 3. the hard requirements on the render"
-python3 -I - "$OUT/render.yaml" "$KIND_KUBECONFIG" "$NS" <<'PY' > "$OUT/requirements.txt"
-import json, subprocess, sys
+POOL_MAX=$POOL_MAX python3 -I - "$OUT/render.yaml" "$KIND_KUBECONFIG" "$NS" <<'PY' > "$OUT/requirements.txt"
+import json, os, subprocess, sys
 render, kubeconfig, ns = sys.argv[1:4]
 text = subprocess.run(["kubectl", "--kubeconfig", kubeconfig, "create", "--dry-run=client", "-o", "json", "-f", render],
                       capture_output=True, text=True, check=True).stdout
@@ -161,7 +165,7 @@ same = claims(host) == claims(live) and host["spec"]["serviceName"] == live["spe
 print(("ok  " if same else "FAIL") + " (a) k2-host keeps its claim template %s, serviceName %s and mount %s: k2-host-0 reuses data-k2-host-0" % (claims(host), host["spec"]["serviceName"], mount(host)))
 ctl = find("StatefulSet", "k2-controller")
 env = {e["name"]: e.get("value") for c in ctl["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
-floor = env.get("K2_PROVISIONER") == "kubernetes" and env.get("K2_PROVISIONER_MIN_HOSTS") == "1" and env.get("K2_PROVISIONER_MAX_HOSTS") == "2" and host["spec"]["replicas"] == 1
+floor = env.get("K2_PROVISIONER") == "kubernetes" and env.get("K2_PROVISIONER_MIN_HOSTS") == "1" and env.get("K2_PROVISIONER_MAX_HOSTS") == os.environ["POOL_MAX"] and host["spec"]["replicas"] == 1
 print(("ok  " if floor else "FAIL") + " (b) K2_PROVISIONER=%s, MIN_HOSTS=%s, MAX_HOSTS=%s; k2-host replicas %s" % (
     env.get("K2_PROVISIONER"), env.get("K2_PROVISIONER_MIN_HOSTS"), env.get("K2_PROVISIONER_MAX_HOSTS"), host["spec"]["replicas"]))
 stray = ["%s/%s" % (d["kind"], d["metadata"]["name"]) for d in docs if d["kind"] != "Namespace" and d["metadata"].get("namespace") != ns]
@@ -328,7 +332,8 @@ kd exec k2-host-0 -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7
 python3 -I "$KIND_REPO/scripts/kind/owner-proof.py" --port "$PORT" --password-file "$OWNER_PW" \
     --kubeconfig "$KIND_KUBECONFIG" --namespace "$NS" | tee "$OUT/owner-proof.txt" | sed 's/^/     /'
 grep -q "^PASS owner-proof" "$OUT/owner-proof.txt" && ok "the owner's path (owner-proof.py)" || bad "the owner's path (owner-proof.py)"
-[ "$fails" = 0 ] && second_host "$NS" "$PORT"
+# The second host only when the pool may have one (POOL_MAX=2).
+if [ "$POOL_MAX" = 2 ] && [ "$fails" = 0 ]; then second_host "$NS" "$PORT"; else note "POOL_MAX=1: no k2-host-1 on $NS"; fi
 c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/boot-status" || true)
 [ "$c" = 200 ] && ok "127.0.0.1:$PORT answers" || bad "127.0.0.1:$PORT -> ${c:-no answer}"
 echo
