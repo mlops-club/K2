@@ -89,7 +89,8 @@
 # --login-from=POD (e.g. k2-host-0) gives every host an init container that
 # mounts POD's HOME volume (data-POD) read-only and, when the host has no
 # Claude login of its own yet, copies POD's (.claude/.credentials.json,
-# 0600, and .claude.json) onto the host's own volume. Inside the cluster
+# 0600, and .claude.json when the host's has no onboarding flag; the old one
+# is kept as .claude.json.k2-prev) onto the host's own volume. Inside the cluster
 # only: nothing is read out or printed. A host that has a login keeps it;
 # POD itself is skipped. The volumes are ReadWriteOnce, which works because
 # every host sits on the controller's node (above).
@@ -397,7 +398,11 @@ EOF
                     cp /login-src/.claude/.credentials.json /var/lib/k2-host/.claude/.credentials.json.tmp
                     chmod 600 /var/lib/k2-host/.claude/.credentials.json.tmp
                     mv /var/lib/k2-host/.claude/.credentials.json.tmp /var/lib/k2-host/.claude/.credentials.json
-                    if [ ! -e /var/lib/k2-host/.claude.json ] && [ -s /login-src/.claude.json ]; then
+                    # .claude.json holds the onboarding flag. A host volume used
+                    # before it had a login may have one without the flag: keep
+                    # it aside and take the source's.
+                    if [ -s /login-src/.claude.json ] && ! grep -q '"hasCompletedOnboarding": *true' /var/lib/k2-host/.claude.json 2>/dev/null; then
+                      [ -e /var/lib/k2-host/.claude.json ] && mv /var/lib/k2-host/.claude.json /var/lib/k2-host/.claude.json.k2-prev
                       cp /login-src/.claude.json /var/lib/k2-host/.claude.json
                     fi
                     echo "login-seed: copied $login_from's login"

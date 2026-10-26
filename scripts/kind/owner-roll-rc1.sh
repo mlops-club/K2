@@ -233,15 +233,16 @@ OWNER_PW=${K2_KIND_PASSWORD_FILE:-$HOME/.local/state/k2-kind/dist/owner-password
 FAKE_PW=${K2_KIND_FAKE_PASSWORD_FILE:-${TMPDIR:-/tmp}/k2-kind/dist-fake/owner-password}
 [ -r "$OWNER_PW" ] || { echo "owner-roll-rc1.sh: no owner password file at $OWNER_PW" >&2; exit 1; }
 
-# second_host <namespace> <port> [keep]: a token for k2-host-1 (as the pool
-# mints before it scales), k2-host at 2, k2-host-1 linked with k2-host-0's
-# login copied in, then back to 1 (unless keep). Facts only, never contents.
+# second_host <namespace> <port> [keep [renew]]: a token for k2-host-1 (as
+# the pool mints before it scales; --renew for a name whose old key was
+# revoked), k2-host at 2, k2-host-1 linked with k2-host-0's login copied
+# in, then back to 1 (unless keep). Facts only, never contents.
 second_host() {
-    local kcfg=$KIND_KUBECONFIG ns=$1 port=$2 keep=${3:-} log
+    local kcfg=$KIND_KUBECONFIG ns=$1 port=$2 keep=${3:-} renew=${4:-} log
     k() { kubectl --kubeconfig "$kcfg" -n "$ns" "$@"; }
     k exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
         | python3 -I "$KIND_REPO/scripts/kind/enroll.py" mint --kubeconfig "$kcfg" --namespace "$ns" \
-            --url "http://127.0.0.1:$port" --hosts k2-host-0,k2-host-1 >&2 || { bad "$ns: mint k2-host-1"; return; }
+            --url "http://127.0.0.1:$port" --hosts k2-host-0,k2-host-1 ${renew:+--renew k2-host-1} >&2 || { bad "$ns: mint k2-host-1"; return; }
     k scale statefulset k2-host --replicas=2 >&2
     k rollout status statefulset/k2-host --timeout=600s >&2 || { bad "$ns: k2-host-1 not ready"; return; }
     log=$(k logs k2-host-1 -c login-seed 2>&1 | tail -1)
@@ -273,11 +274,23 @@ if [ "$rehearse" = 1 ]; then
     "$KIND_REPO/scripts/kind/up.sh" --fake "${ROLL_FLAGS[@]}" --password-file="$FAKE_PW" >&2 && ok "rehearsal: rolled" || bad "rehearsal: up.sh"
     # A dummy login on the test host-0 when it has none: not a credential.
     kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake exec k2-host-0 -c k2-host -- sh -c '
-        [ -e /var/lib/k2-host/.claude/.credentials.json ] && exit 0
         umask 077; mkdir -p /var/lib/k2-host/.claude
-        echo "{\"dummy\":\"rehearsal, not a credential\"}" > /var/lib/k2-host/.claude/.credentials.json
-        [ -e /var/lib/k2-host/.claude.json ] || echo "{\"hasCompletedOnboarding\": true}" > /var/lib/k2-host/.claude.json' >&2
-    second_host k2-kind-dist-fake 7442 keep
+        [ -e /var/lib/k2-host/.claude/.credentials.json ] \
+            || echo "{\"dummy\":\"rehearsal, not a credential\"}" > /var/lib/k2-host/.claude/.credentials.json
+        # Like the owner'"'"'s host-0: onboarding done (the fake agent may have left a .claude.json without it).
+        grep -q "\"hasCompletedOnboarding\": *true" /var/lib/k2-host/.claude.json 2>/dev/null \
+            || echo "{\"hasCompletedOnboarding\": true}" > /var/lib/k2-host/.claude.json' >&2
+    # k2-host-1 as the owner's would first come: a new volume, no login.
+    # Its old volume (and the key on it) goes; the old key is revoked, so
+    # the name can enroll a new one (--renew, as enroll-check.sh restores).
+    kf() { kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake "$@"; }
+    kf scale statefulset k2-host --replicas=1 >&2
+    kf wait --for=delete pod/k2-host-1 --timeout=180s >&2 2>/dev/null || true
+    kf delete pvc data-k2-host-1 --ignore-not-found --wait=true >&2
+    kf exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
+        | python3 -I "$KIND_REPO/scripts/kind/enroll.py" revoke --url http://127.0.0.1:7442 --host k2-host-1 \
+            --reason "rc1 rehearsal: a fresh k2-host-1 volume" >&2 || true
+    second_host k2-kind-dist-fake 7442 keep renew
     "$KIND_REPO/scripts/kind/enroll-check.sh" >&2 && ok "rehearsal: enroll-check (k2-host-1)" || bad "rehearsal: enroll-check"
     kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake scale statefulset k2-host --replicas=1 >&2
     "$KIND_REPO/scripts/kind/app-check.sh" --dist --fake --password-file="$FAKE_PW" >&2 && ok "rehearsal: app-check" || bad "rehearsal: app-check"
