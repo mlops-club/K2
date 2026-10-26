@@ -330,7 +330,11 @@ The PRD's working recommendation (section 5) is host pods by default and Sandbox
 
 ## Decisions for the owner
 
-| # | Decision | Options | Recommendation |
+**Decided 2026-10-26: D1–D10 as recommended (coordinator, owner AFK, per recommendation).** Two were made more precise:
+- **D5**: gVisor goes on a throwaway cluster `k2lab-sbx`. **k2lab's nodes are never touched.**
+- **D7 (a)**: cloud-provider-kind and Envoy Gateway are installed only in their own namespaces, reversibly.
+
+| # | Decision | Options | Recommendation (decided) |
 |---|---|---|---|
 | D1 | Kubernetes API client in the daemon | (a) `kube-rs` + `k8s-openapi`; (b) a small typed REST client on the daemon's existing HTTP stack, in-cluster ServiceAccount, about 12 calls (scale, pods get/list/watch, Sandbox CRUD, Deployment/Service/NetworkPolicy CRUD, patch `postgresql`, patch Secret) | **(b)** keeps the dependency tree and compile time down on a shared machine; watch is one streaming GET. Move to (a) if P5 needs informers and caches |
 | D2 | Pool sizing | (a) fixed replicas set by the owner; (b) the controller scales between a minimum and a maximum | **(b)**: min 1, max set by the owner (default 3), scale up on demand, scale down the highest ordinal after 15 min with spare room. Node autoscaling stays P5 |
@@ -495,5 +499,6 @@ Ground rules for every task:
 
 ## Status
 
+- D1–D10 decided as recommended (coordinator, owner AFK). T3 `k8s-capabilities` started on `k2-dist/k8s-capabilities`, namespace `k2-p4-caps`.
 - MILESTONE: p4-plan written. Design, ten owner decisions with recommendations, five worker tasks with owned files, dependencies and acceptance on kind.
 - Nothing runs or changes on any cluster in this task: k2lab was only read, and the owner's k3s cluster was not touched.
