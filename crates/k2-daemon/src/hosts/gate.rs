@@ -26,7 +26,6 @@ pub const CONTROLLER_NOT_IMPLEMENTED: &[&str] = &[
     "/cli/skin/wallet/login/cancel",
     "/cli/skin/wallet/login/input",
     "/cli/skin/wallet/login/status",
-    "/cli/sessions/bytes",
     "/cli/sessions/subscribe",
     "/cli/sessions/v2/refresh",
     "/cli/terminal/",
@@ -41,6 +40,8 @@ pub enum ControllerRoute {
     Spawn,
     Close,
     Grid,
+    /// `/cli/sessions/bytes`: relayed from the session's host (W3b).
+    Bytes,
     NotImplemented,
     /// The dispatcher's usual handling.
     Local,
@@ -51,6 +52,7 @@ pub fn controller_route(path: &str) -> ControllerRoute {
         "/cli/sessions/v2/spawn" => ControllerRoute::Spawn,
         "/cli/sessions/v2/close" => ControllerRoute::Close,
         "/cli/sessions/grid" => ControllerRoute::Grid,
+        "/cli/sessions/bytes" => ControllerRoute::Bytes,
         p if CONTROLLER_NOT_IMPLEMENTED
             .iter()
             .any(|r| if r.ends_with('/') { p.starts_with(r) } else { p == *r }) =>
@@ -186,6 +188,34 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
             super::hub::serve_grid(&mut *stream, remote::global(), &session, client).await;
             true
         }
+        ControllerRoute::Bytes => {
+            // Raw bytes are read-only: the grid's clients, viewers included.
+            let client = match grid_client(query, owner_token) {
+                Ok(c) => c,
+                Err(GridRefusal::Skin) => {
+                    let _ = stream.read(buf).await;
+                    let r = crate::skin_routes::skin_terminal_forbidden();
+                    http::send_response(stream, r.status, r.content_type, &r.body).await;
+                    return true;
+                }
+                Err(GridRefusal::StreamToken) => {
+                    reply(stream, buf, "403 Forbidden", STREAM_TOKEN_REFUSED).await;
+                    return true;
+                }
+                Err(GridRefusal::BadToken) => {
+                    reply(stream, buf, "403 Forbidden", r#"{"error":"invalid or missing token"}"#).await;
+                    return true;
+                }
+            };
+            let params = http::parse_params(path, query);
+            let session = params.get("session").cloned().unwrap_or_default();
+            let Ok(from) = params.get("from").map_or(Ok(0), |f| f.parse::<u64>()) else {
+                reply(stream, buf, "400 Bad Request", r#"{"error":"'from' query param must be a non-negative integer"}"#).await;
+                return true;
+            };
+            super::hub::serve_bytes(&mut *stream, remote::global(), &session, from, client).await;
+            true
+        }
     }
 }
 
@@ -200,7 +230,7 @@ mod tests {
         assert_eq!(controller_route("/cli/sessions/grid"), ControllerRoute::Grid);
         assert_eq!(controller_route("/cli/terminal/write"), ControllerRoute::NotImplemented);
         assert_eq!(controller_route("/cli/llm/accounts/login"), ControllerRoute::NotImplemented);
-        assert_eq!(controller_route("/cli/sessions/bytes"), ControllerRoute::NotImplemented);
+        assert_eq!(controller_route("/cli/sessions/bytes"), ControllerRoute::Bytes);
         // Exact entries are not prefixes.
         assert_eq!(controller_route("/cli/llm/accounts/list"), ControllerRoute::Local);
         assert_eq!(controller_route("/cli/sessions/events"), ControllerRoute::Local);

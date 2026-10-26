@@ -78,6 +78,11 @@ pub enum GridEvent {
     Data(String),
     /// The host ended the stream (or the link dropped).
     Closed(String),
+    /// A byte stream's `bytes.ack` (W3b): bytes follow from `start`; `end`
+    /// is the ring's end; `error` = no byte stream.
+    BytesAck { start: u64, end: u64, error: Option<String> },
+    /// Output bytes of a byte stream at absolute `offset`.
+    Bytes { offset: u64, data: Vec<u8> },
 }
 
 /// A grid stream opened on a host ([`RemoteHost::open_grid`]). Dropping
@@ -106,6 +111,32 @@ impl RemoteGrid {
 }
 
 impl Drop for RemoteGrid {
+    fn drop(&mut self) {
+        self.close("client gone");
+    }
+}
+
+/// A byte stream opened on a host ([`RemoteHost::open_bytes`]). Dropping
+/// it closes the stream on the host.
+pub struct RemoteBytes {
+    pub stream: u64,
+    pub host_id: String,
+    pub events: mpsc::UnboundedReceiver<GridEvent>,
+    tx: mpsc::UnboundedSender<Frame>,
+    closed: bool,
+}
+
+impl RemoteBytes {
+    /// Close the stream on the host (idempotent).
+    pub fn close(&mut self, reason: &str) {
+        if !self.closed {
+            self.closed = true;
+            let _ = self.tx.send(Frame::BytesClose { stream: self.stream, reason: reason.to_string() });
+        }
+    }
+}
+
+impl Drop for RemoteBytes {
     fn drop(&mut self) {
         self.close("client gone");
     }
@@ -643,9 +674,31 @@ impl RemoteHost {
                     let _ = s.send(GridEvent::Data(text));
                 }
             }
-            Frame::GridClose { stream, reason } => {
+            Frame::GridClose { stream, reason } | Frame::BytesClose { stream, reason } => {
                 if let Some(s) = inner.links.get_mut(host_id).and_then(|l| l.streams.remove(&stream)) {
                     let _ = s.send(GridEvent::Closed(reason));
+                }
+            }
+            Frame::BytesAck { stream, start, end, error } => {
+                if let Some(s) = inner.links.get(host_id).and_then(|l| l.streams.get(&stream)) {
+                    let _ = s.send(GridEvent::BytesAck { start, end, error });
+                }
+            }
+            Frame::BytesData { stream, offset, b64 } => {
+                use base64::Engine;
+                let Some(s) = inner.links.get(host_id).and_then(|l| l.streams.get(&stream)) else { return };
+                match base64::engine::general_purpose::STANDARD.decode(&b64) {
+                    Ok(data) => {
+                        let _ = s.send(GridEvent::Bytes { offset, data });
+                    }
+                    Err(e) => {
+                        // A torn stream is worse than a closed one: end it.
+                        let _ = s.send(GridEvent::Closed(format!("bad bytes.data from the host: {e}")));
+                        if let Some(l) = inner.links.get_mut(host_id) {
+                            l.streams.remove(&stream);
+                            let _ = l.tx.send(Frame::BytesClose { stream, reason: "bad bytes.data".into() });
+                        }
+                    }
                 }
             }
             Frame::Hook { pane, event, at_ms, epoch, .. } => {
@@ -1207,6 +1260,35 @@ impl RemoteHost {
             return Err(format!("agent host {} link is closing", p.host_id));
         }
         Ok(RemoteGrid { stream, host_id: p.host_id, events: erx, tx, closed: false })
+    }
+
+    /// Open a byte stream of `session_id`'s output from offset `from` on
+    /// its host (W3b; protocol 2). The first event is the host's
+    /// [`GridEvent::BytesAck`].
+    pub fn open_bytes(&self, session_id: &str, from: u64) -> Result<RemoteBytes, String> {
+        let stream = self.id();
+        let mut inner = self.inner.lock();
+        let Some(p) = inner.placements.values().find(|p| p.session_id.as_deref() == Some(session_id)).cloned() else {
+            return Err(format!("session {session_id} is not placed on any agent host"));
+        };
+        let Some(link) = inner.links.get_mut(&p.host_id) else {
+            return Err(format!(
+                "agent host {} is lost (its link is down); the session stays placed there until it returns",
+                p.host_id
+            ));
+        };
+        if link.protocol < 2 {
+            return Err(format!("agent host {} speaks protocol {} (update k2 on the host)", p.host_id, link.protocol));
+        }
+        let (etx, erx) = mpsc::unbounded_channel();
+        link.streams.insert(stream, etx);
+        let tx = link.tx.clone();
+        let open = Frame::BytesOpen { stream, session_id: session_id.to_string(), epoch: p.epoch.0, from };
+        if tx.send(open).is_err() {
+            link.streams.remove(&stream);
+            return Err(format!("agent host {} link is closing", p.host_id));
+        }
+        Ok(RemoteBytes { stream, host_id: p.host_id, events: erx, tx, closed: false })
     }
 
     // ── protocol 2 stubs (wave 2) ──────────────────────────────────────

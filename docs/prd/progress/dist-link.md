@@ -379,6 +379,43 @@ W3 results:
 | `K2_ROLE=all` regression after W3: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: **5204 passed, 0 failed**, 6 ignored |
 | `cargo test -p k2-core -- --test-threads=3` (W3 adds `db::shared_path`), throwaway HOME | 17 test binaries: **3866 passed, 0 failed**, 1 ignored (fork_tab_repair green since `d543108d5`) |
 
+## W3b: byte streams through the controller (in progress)
+
+`/cli/sessions/bytes?session&from` on a controller is relayed to the
+session's host (it was a 501). Same client protocol as under
+`K2_ROLE=all`: a `session:ack` text event (`fromOffset`,
+`currentFrontOffset` = the first byte sent, above `fromOffset` when the
+ring had dropped some, `currentBackOffset` = the ring's end), then binary
+messages in offset order, then live output. A client that kept its offset
+reconnects after a controller restart with `from` = its next byte and gets
+exactly the bytes it missed. When the host ends the stream (link lost,
+session gone, ring overrun) an `error` event names why and the offset
+reached; a chunk out of order is never passed on. `/cli/sessions/grid`
+keeps its snapshot replay as the fallback.
+
+Frames (protocol 2): `bytes.open {stream, session_id, epoch, from}`,
+`bytes.ack {stream, start, end, error?}`, `bytes.data {stream, offset,
+b64}`, `bytes.close {stream, reason}` (either way). The host serves them
+from `hosts::byte_ring`, a process-wide ring source: 32 KiB per
+`bytes.data`, a 50 ms look for new output once caught up, and on a ring
+overrun the stream ends with the dropped range rather than skipping it.
+
+Open (blocked on a decision outside my files): v2 sessions have no byte
+ring to install as the source. k2-ptyd keeps one per session, but its only
+read is `Attach`, and ptyd allows one data stream per session, which the
+daemon's own IO loop holds. Options: A2 a read-only `ReadRing{sid, from,
+max}` in k2-ptyd plus `Owner::read_ring` in k2-core (recommended); A3 a
+tee in k2-core's ptyd IO loop into a `BytesRing`; B K2's own reader on
+the alacritty path. Either A needs `K2_PTYD=1` and the k2-ptyd binary on
+hosts.
+
+| Check | Result |
+|---|---|
+| `hosts::tests::a_byte_stream_relays_the_hosts_ring_from_the_clients_offset` | fake host: ack and bytes from the client's offset; out of order → error, closed on the host; no ring → error; link lost → error; lost host → 400 |
+| `hosts::tests::a_reconnecting_byte_client_gets_exactly_the_bytes_it_missed` | real host link, test ring: read, the link drops while the agent prints, relink, reconnect with `from`: exactly the session's bytes, once each, in order |
+| `hosts::tests::a_ring_overrun_ends_the_byte_stream_instead_of_skipping` | the ring drops unsent bytes: the stream ends naming `[10, 20)`; a reconnect's ack shows the gap |
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host::` | 42 passed, 3 runs |
+
 ## Env contract
 
 Names follow `deploy/README.md` and `deploy/compose/compose.yaml`. The task

@@ -417,9 +417,21 @@ fn handle(
                 let _ = s.send(text);
             }
         }
-        Frame::GridClose { stream, .. } => {
+        Frame::GridClose { stream, .. } | Frame::BytesClose { stream, .. } => {
             // Dropping the sender ends the local stream.
             streams.lock().remove(&stream);
+        }
+        Frame::BytesOpen { stream, session_id, from, .. } => {
+            let (ctx, crx) = mpsc::unbounded_channel();
+            streams.lock().insert(stream, ctx);
+            let tx = tx.clone();
+            let streams = Arc::clone(streams);
+            tokio::spawn(async move {
+                let reason = local_bytes(stream, &session_id, from, crx, &tx).await;
+                log_debug!("[hosts/link] bytes stream {stream} session {session_id} ended: {reason}");
+                streams.lock().remove(&stream);
+                let _ = tx.send(Frame::BytesClose { stream, reason });
+            });
         }
         Frame::SpawnWorkspace { req, agent_id, epoch, request } => {
             placed.lock().epochs.insert(agent_id.clone(), epoch);
@@ -554,6 +566,77 @@ fn handle(
 /// accepted peer must be our own socket, so no other local process can
 /// take the stream. The handler sees an owner connection (its token is a
 /// fresh random one); the controller already authorised the client.
+/// Bytes per `bytes.data` frame.
+const BYTES_CHUNK: usize = 32 * 1024;
+/// How often a caught-up byte stream looks for new output.
+const BYTES_POLL: Duration = Duration::from_millis(50);
+
+/// Serve one `bytes.open`: `bytes.ack`, then the ring from the ack's start
+/// as `bytes.data`, then new output as it lands. Returns why it ended:
+/// the controller closed it (`closed` disconnected), the link went, the
+/// session's ring is gone, or the ring dropped bytes this stream hadn't
+/// sent yet (an overrun: the stream ends rather than skip them, and the
+/// client's reconnect sees the gap in its ack).
+async fn local_bytes(
+    stream: u64,
+    session_id: &str,
+    from: u64,
+    mut closed: mpsc::UnboundedReceiver<String>,
+    tx: &mpsc::UnboundedSender<Frame>,
+) -> String {
+    use base64::Engine;
+    let read = |at: u64| {
+        let sid = session_id.to_string();
+        async move {
+            tokio::task::spawn_blocking(move || super::byte_ring::read(&sid, at, BYTES_CHUNK))
+                .await
+                .unwrap_or_else(|e| Err(format!("ring read: {e}")))
+        }
+    };
+    let mut r = match read(from).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(Frame::BytesAck { stream, start: from, end: from, error: Some(e.clone()) });
+            return e;
+        }
+    };
+    k2_core::trace::emit(|| {
+        k2_core::trace::Event::new(super::proto::trace_events::BYTES_REPLAY)
+            .pane(session_id)
+            .attr("stream", stream)
+            .attr("from", from)
+            .attr("start", r.start)
+            .attr("end", r.end)
+    });
+    let _ = tx.send(Frame::BytesAck { stream, start: r.start, end: r.end, error: None });
+    let mut next = r.start;
+    loop {
+        if r.start != next {
+            return format!("ring overrun: bytes [{next}, {}) were dropped before they were sent", r.start);
+        }
+        let caught_up = r.bytes.is_empty() || next + r.bytes.len() as u64 >= r.end;
+        if !r.bytes.is_empty() {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&r.bytes);
+            if tx.send(Frame::BytesData { stream, offset: next, b64 }).is_err() {
+                return "host link closed".into();
+            }
+            next += r.bytes.len() as u64;
+        }
+        if caught_up {
+            tokio::select! {
+                _ = closed.recv() => return "closed by the controller".into(),
+                _ = tokio::time::sleep(BYTES_POLL) => {}
+            }
+        } else if matches!(closed.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)) {
+            return "closed by the controller".into();
+        }
+        r = match read(next).await {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+    }
+}
+
 pub(crate) async fn local_grid(
     session_id: &str,
     mut from_ctl: mpsc::UnboundedReceiver<String>,

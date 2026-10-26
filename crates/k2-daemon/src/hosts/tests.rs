@@ -29,8 +29,8 @@ const TOKEN: &str = "test-bootstrap-token";
 /// The controller daemon's owner token in these tests.
 const OWNER_TOKEN: &str = "test-controller-owner-token";
 
-/// A controller on loopback: `/cli/hosts/attach` and `/cli/sessions/grid`
-/// served by `hub` over one shared `RemoteHost`.
+/// A controller on loopback: `/cli/hosts/attach`, `/cli/sessions/grid`
+/// and `/cli/sessions/bytes` served by `hub` over one shared `RemoteHost`.
 struct Controller {
     remote: &'static RemoteHost,
     attach_url: String,
@@ -63,10 +63,14 @@ impl Controller {
                     let n = s.peek(&mut peek).await.unwrap();
                     let head = String::from_utf8_lossy(&peek[..n]).to_string();
                     let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("").to_string();
-                    let params = crate::routes::http::parse_params("/cli/sessions/grid", &query);
+                    let (path, query) = target.split_once('?').map(|(p, q)| (p.to_string(), q.to_string())).unwrap_or_default();
+                    let params = crate::routes::http::parse_params(&path, &query);
                     let session = params.get("session").cloned().unwrap_or_default();
                     match super::gate::grid_client(&query, OWNER_TOKEN) {
+                        Ok(client) if path == "/cli/sessions/bytes" => {
+                            let from = params.get("from").and_then(|f| f.parse().ok()).unwrap_or(0);
+                            hub::serve_bytes(s, remote, &session, from, client).await
+                        }
                         Ok(client) => hub::serve_grid(s, remote, &session, client).await,
                         Err(why) => {
                             use tokio::io::AsyncWriteExt;
@@ -89,6 +93,11 @@ impl Controller {
 
     async fn attach_grid_with(&self, session: &str, token: &str) -> Result<Ws, String> {
         let url = format!("ws://{}/cli/sessions/grid?session={session}&token={token}", self.grid_addr);
+        tokio_tungstenite::connect_async(url).await.map(|r| r.0).map_err(|e| e.to_string())
+    }
+
+    async fn attach_bytes(&self, session: &str, from: u64) -> Result<Ws, String> {
+        let url = format!("ws://{}/cli/sessions/bytes?session={session}&from={from}&token={OWNER_TOKEN}", self.grid_addr);
         tokio_tungstenite::connect_async(url).await.map(|r| r.0).map_err(|e| e.to_string())
     }
 
@@ -1173,4 +1182,218 @@ async fn a_real_host_resumes_its_agents_after_a_link_drop() {
 fn grid_frames_carry_their_version_as_the_ring_offset() {
     assert_eq!(link::frame_version(r#"{"event":"delta","payload":{"rows":24,"version":4211,"damagedRows":[]}}"#), Some(4211));
     assert_eq!(link::frame_version(r#"{"event":"label_initial","payload":{"label":"x"}}"#), None);
+}
+
+// ── W3b: byte streams ────────────────────────────────────────────────────
+
+/// The next message of a `/cli/sessions/bytes` client: `Ok(text)` for a
+/// text event, `Err(bytes)` for a binary chunk, `None` once closed.
+async fn bytes_next(ws: &mut Ws) -> Option<Result<Value, Vec<u8>>> {
+    within("a bytes message", async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(t))) => return Some(Ok(serde_json::from_str(&t).expect("json event"))),
+                Some(Ok(Message::Binary(b))) => return Some(Err(b)),
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+}
+
+/// The end of a byte stream from the host's side: the `error` event that
+/// names why, then the close. Returns the message.
+async fn bytes_end(ws: &mut Ws) -> String {
+    let why = match bytes_next(ws).await {
+        Some(Ok(v)) if v["event"] == "error" => v["payload"]["message"].as_str().unwrap().to_string(),
+        other => panic!("expected the error event that ends the stream, got {other:?}"),
+    };
+    assert!(bytes_next(ws).await.is_none(), "closed after: {why}");
+    why
+}
+
+/// Read binary chunks until `want` bytes arrived.
+async fn bytes_until(ws: &mut Ws, want: usize) -> Vec<u8> {
+    let mut got = Vec::new();
+    while got.len() < want {
+        match bytes_next(ws).await {
+            Some(Err(b)) => got.extend(b),
+            other => panic!("expected bytes ({} of {want} so far), got {other:?}", got.len()),
+        }
+    }
+    got
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_byte_stream_relays_the_hosts_ring_from_the_clients_offset() {
+    use base64::Engine;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let c = Controller::start().await;
+    let mut host = fake_host(&c, "h-bytes").await;
+    c.wait_hosts(1).await;
+    let (session, epoch) = place_on(&c, &mut host, "agent-bytes").await;
+
+    // From offset 5: the host acks the ring range, the bytes follow in order.
+    let mut client = c.attach_bytes(&session, 5).await.expect("bytes upgrade");
+    let stream = match recv(&mut host).await {
+        Frame::BytesOpen { stream, session_id, epoch: e, from } => {
+            assert_eq!((session_id.as_str(), e, from), (session.as_str(), epoch, 5));
+            stream
+        }
+        other => panic!("expected bytes.open, got {other:?}"),
+    };
+    send(&mut host, &Frame::BytesAck { stream, start: 5, end: 11, error: None }).await;
+    let ack = bytes_next(&mut client).await.unwrap().unwrap();
+    assert_eq!(
+        ack,
+        json!({"event": "session:ack", "payload": {"sessionId": session, "fromOffset": 5, "currentFrontOffset": 5, "currentBackOffset": 11}})
+    );
+    send(&mut host, &Frame::BytesData { stream, offset: 5, b64: b64(b"world!") }).await;
+    send(&mut host, &Frame::BytesData { stream, offset: 11, b64: b64(b"\x1b[1mlive") }).await;
+    assert_eq!(bytes_until(&mut client, 14).await, b"world!\x1b[1mlive");
+    // A chunk out of order is never passed on: the stream ends, on the host too.
+    send(&mut host, &Frame::BytesData { stream, offset: 100, b64: b64(b"skipped") }).await;
+    let err = bytes_next(&mut client).await.unwrap().unwrap();
+    assert!(err["payload"]["message"].as_str().unwrap().contains("reconnect with from=19"), "{err}");
+    assert!(bytes_next(&mut client).await.is_none());
+    assert!(matches!(recv(&mut host).await, Frame::BytesClose { stream: s, .. } if s == stream));
+
+    // A host without a byte ring: an error event, then the close.
+    let mut client = c.attach_bytes(&session, 0).await.expect("bytes upgrade");
+    let stream = match recv(&mut host).await {
+        Frame::BytesOpen { stream, .. } => stream,
+        other => panic!("expected bytes.open, got {other:?}"),
+    };
+    send(&mut host, &Frame::BytesAck { stream, start: 0, end: 0, error: Some(super::byte_ring::NO_RING.into()) }).await;
+    let err = bytes_next(&mut client).await.unwrap().unwrap();
+    assert_eq!(err["payload"]["message"], super::byte_ring::NO_RING);
+    assert!(bytes_next(&mut client).await.is_none());
+    assert!(matches!(recv(&mut host).await, Frame::BytesClose { stream: s, .. } if s == stream));
+
+    // The host's link drops: the open stream ends, and a new one is refused
+    // before the upgrade (the session stays placed, the host is lost).
+    let mut client = c.attach_bytes(&session, 0).await.expect("bytes upgrade");
+    assert!(matches!(recv(&mut host).await, Frame::BytesOpen { .. }));
+    drop(host);
+    assert!(bytes_end(&mut client).await.contains("host link closed"));
+    within("lost", async {
+        while c.remote.status_json()["lost"] != json!(["h-bytes"]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let refused = c.attach_bytes(&session, 0).await.expect_err("refused before the upgrade");
+    assert!(refused.contains("400"), "{refused}");
+}
+
+/// The test ring: per session, the offset of its first byte and the bytes.
+/// Process-wide (the source is), so it answers only its own sessions.
+static TEST_RING: parking_lot::Mutex<Option<std::collections::HashMap<String, (u64, Vec<u8>)>>> = parking_lot::Mutex::new(None);
+
+fn test_ring(session: &str, from: u64, max: usize) -> Result<super::byte_ring::RingRead, String> {
+    let g = TEST_RING.lock();
+    let Some((front, data)) = g.as_ref().and_then(|m| m.get(session)) else {
+        return Err(super::byte_ring::NO_RING.to_string());
+    };
+    let end = front + data.len() as u64;
+    let start = from.max(*front).min(end);
+    let lo = (start - front) as usize;
+    let hi = (lo + max).min(data.len());
+    Ok(super::byte_ring::RingRead { start, end, bytes: data[lo..hi].to_vec() })
+}
+
+fn ring_append(session: &str, bytes: &[u8]) {
+    TEST_RING.lock().get_or_insert_with(Default::default).entry(session.to_string()).or_default().1.extend_from_slice(bytes);
+}
+
+/// S9 for bytes: a client reads a session's output, the controller side of
+/// the link goes (as on a controller restart) while the agent keeps
+/// printing, the host links again, and the client, reconnecting with
+/// `from` = its next byte, gets exactly the bytes it missed, then the live
+/// tail: no gap, no duplicate. Real host link (`link::serve_once`); the
+/// ring is the test's (the host's byte-ring source).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnecting_byte_client_gets_exactly_the_bytes_it_missed() {
+    super::byte_ring::set(Some(test_ring));
+    let session = uuid::Uuid::new_v4().to_string();
+    ring_append(&session, b"\x1b[2Jbanner\r\n> ");
+    let c = Controller::start().await;
+    let host_name = format!("w3b-{}", &session[..8]);
+    let cfg = HostConfig { attach_url: c.attach_url.clone(), token: TOKEN.into(), host_name: host_name.clone(), labels: vec![] };
+    let link_cfg = cfg.clone();
+    let link1 = tokio::spawn(async move { link::serve_once(&link_cfg, &link::Timings::PRODUCTION, || {}).await });
+    c.wait_hosts(1).await;
+    // Placed on that host (adopted, as after a controller restart).
+    c.remote.adopt(&host_name, &[resumed("agent-w3b", &session, 7)]);
+
+    let mut client = c.attach_bytes(&session, 0).await.expect("bytes upgrade");
+    let ack = bytes_next(&mut client).await.unwrap().unwrap();
+    assert_eq!((ack["payload"]["currentFrontOffset"].as_u64(), ack["payload"]["currentBackOffset"].as_u64()), (Some(0), Some(14)));
+    let mut seen = bytes_until(&mut client, 14).await;
+    ring_append(&session, b"w3b prompt\r\n");
+    seen.extend(bytes_until(&mut client, 12).await);
+
+    // The controller side goes; the agent keeps printing.
+    link1.abort();
+    let _ = link1.await;
+    let why = bytes_end(&mut client).await;
+    assert!(why.contains("byte stream ended at offset 26"), "the stream ends with the link: {why}");
+    ring_append(&session, b"[k2-fake-agent] reply #1: w3b prompt\r\n> ");
+    let link2 = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
+    within("relinked", async {
+        while c.remote.status_json()["lost"] != json!([]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // The real host doesn't run this session, so its hello drops it (gone);
+    // place it again as an adopting controller would.
+    c.remote.adopt(&host_name, &[resumed("agent-w3b", &session, 7)]);
+
+    let from = seen.len() as u64;
+    let mut client = c.attach_bytes(&session, from).await.expect("bytes upgrade");
+    let ack = bytes_next(&mut client).await.unwrap().unwrap();
+    assert_eq!(ack["payload"]["fromOffset"].as_u64(), Some(from));
+    assert_eq!(ack["payload"]["currentFrontOffset"].as_u64(), Some(from), "no gap: the ring still has every byte after {from}");
+    let missed = b"[k2-fake-agent] reply #1: w3b prompt\r\n> ";
+    seen.extend(bytes_until(&mut client, missed.len()).await);
+    ring_append(&session, b"after");
+    seen.extend(bytes_until(&mut client, 5).await);
+    let all = TEST_RING.lock().as_ref().unwrap()[&session].1.clone();
+    assert_eq!(seen, all, "exactly the session's bytes, once each, in order");
+    drop(client);
+    link2.abort();
+}
+
+/// The ring dropped bytes a stream hadn't sent: the stream ends with the
+/// gap named, never skipping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ring_overrun_ends_the_byte_stream_instead_of_skipping() {
+    super::byte_ring::set(Some(test_ring));
+    let session = uuid::Uuid::new_v4().to_string();
+    ring_append(&session, b"0123456789");
+    let c = Controller::start().await;
+    let host_name = format!("w3b-{}", &session[..8]);
+    let cfg = HostConfig { attach_url: c.attach_url.clone(), token: TOKEN.into(), host_name: host_name.clone(), labels: vec![] };
+    let link = tokio::spawn(async move { link::serve_once(&cfg, &link::Timings::PRODUCTION, || {}).await });
+    c.wait_hosts(1).await;
+    c.remote.adopt(&host_name, &[resumed("agent-overrun", &session, 3)]);
+    let mut client = c.attach_bytes(&session, 0).await.expect("bytes upgrade");
+    assert!(matches!(bytes_next(&mut client).await, Some(Ok(_))));
+    assert_eq!(bytes_until(&mut client, 10).await, b"0123456789");
+    // The ring moves past what was sent: its front is now 20.
+    {
+        let mut g = TEST_RING.lock();
+        let e = g.as_mut().unwrap().get_mut(&session).unwrap();
+        *e = (20, b"KLMN".to_vec());
+    }
+    let why = bytes_end(&mut client).await;
+    assert!(why.contains("ring overrun: bytes [10, 20) were dropped"), "{why}");
+    // Reconnecting from 10 shows the gap in the ack: bytes resume at 20.
+    let mut client = c.attach_bytes(&session, 10).await.expect("bytes upgrade");
+    let ack = bytes_next(&mut client).await.unwrap().unwrap();
+    assert_eq!((ack["payload"]["fromOffset"].as_u64(), ack["payload"]["currentFrontOffset"].as_u64()), (Some(10), Some(20)));
+    assert_eq!(bytes_until(&mut client, 4).await, b"KLMN");
+    link.abort();
 }

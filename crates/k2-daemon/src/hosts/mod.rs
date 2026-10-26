@@ -13,6 +13,7 @@
 //! The wire protocol is [`proto`]; the env contract and the table of
 //! frames are in `docs/prd/progress/dist-link.md`.
 
+pub mod byte_ring;
 pub mod gate;
 pub mod hub;
 pub mod link;
