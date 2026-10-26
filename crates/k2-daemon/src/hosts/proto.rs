@@ -378,6 +378,22 @@ pub enum Frame {
         session_id: String,
         project_path: String,
     },
+    /// fs-relay: serve this `/cli/fs/*` or `/cli/git/*` request from the
+    /// host's own disk (its daemon's route, its own token). Sent only to a
+    /// host with a `k2.work_root` label. Answered with `http.reply`.
+    #[serde(rename = "http.relay")]
+    HttpRelay {
+        req: u64,
+        method: String,
+        path: String,
+        /// The query string, paths mapped to the host's, without `token`.
+        query: String,
+        /// The request body, base64.
+        #[serde(default)]
+        body_b64: String,
+    },
+    #[serde(rename = "http.reply")]
+    HttpReply { req: u64, status: String, content_type: String, body: String },
     #[serde(rename = "op.result")]
     OpResult {
         req: u64,
@@ -529,6 +545,8 @@ impl Frame {
             Frame::Op { .. } => "op",
             Frame::OpResult { .. } => "op.result",
             Frame::TranscriptExists { .. } => "transcript.exists",
+            Frame::HttpRelay { .. } => "http.relay",
+            Frame::HttpReply { .. } => "http.reply",
             Frame::Deliver { .. } => "deliver",
             Frame::DeliverAck { .. } => "deliver.ack",
             Frame::Inject { .. } => "inject",
@@ -550,6 +568,8 @@ impl Frame {
             | Frame::Op { .. }
             | Frame::OpResult { .. }
             | Frame::TranscriptExists { .. }
+            | Frame::HttpRelay { .. }
+            | Frame::HttpReply { .. }
             | Frame::Deliver { .. }
             | Frame::DeliverAck { .. }
             | Frame::Inject { .. }
@@ -745,6 +765,8 @@ mod tests {
             Frame::Op { req: Some(6), session_id: "s1".into(), epoch: 41, op: SessionOp::Pin { dims: Some((80, 24)), set_by: Some("o".into()) } },
             Frame::OpResult { req: 5, value: json!(["row"]), error: None },
             Frame::TranscriptExists { req: 7, provider: "claude".into(), session_id: "c1".into(), project_path: "/w".into() },
+            Frame::HttpRelay { req: 8, method: "GET".into(), path: "/cli/fs/read-dir".into(), query: "path=%2Fw".into(), body_b64: String::new() },
+            Frame::HttpReply { req: 8, status: "200 OK".into(), content_type: "application/json".into(), body: "{}".into() },
             Frame::OpResult { req: 6, value: serde_json::Value::Null, error: Some("not placed".into()) },
         ] {
             assert_eq!(f.min_protocol(), 2, "{}", f.kind());

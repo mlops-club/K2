@@ -1316,7 +1316,7 @@ async fn handle_one_request(
 
     // K2_ROLE=controller / host (dist-link): `/cli/hosts/*`, and on a
     // controller the S1 relays and the 501s. Falls through under `all`.
-    if crate::hosts::gate::route(&mut *stream, &mut buf, &path, &query, state.token.as_str()).await {
+    if crate::hosts::gate::route(&mut *stream, &mut buf, &method, &path, &query, state.token.as_str()).await {
         return DispatchOutcome::Done;
     }
 

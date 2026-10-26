@@ -1514,7 +1514,7 @@ async fn async_main() {
     // 30 days later). Headless: runs with no client attached.
     crate::person_wallet_runtime::spawn_loop();
     // K2_ROLE=host: dial the controller (dist-link). No-op for `all`.
-    crate::hosts::start();
+    crate::hosts::start(port, &token);
 
     // Published services: boot reattach/respawn of desired=running
     // rows. Own process group / Job Object — stop_tunnel / Active
