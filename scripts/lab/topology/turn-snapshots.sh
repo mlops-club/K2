@@ -100,7 +100,7 @@ down() {
         kill -9 "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     done
-    pkill -9 -f "$ROOT/" 2>/dev/null || true
+    [ -n "${ROOT:-}" ] && pkill -9 -f "$ROOT/" 2>/dev/null || true
     rm -rf "$ROOT"
 }
 trap down EXIT
@@ -201,7 +201,7 @@ print(len(ev), a.get("seq","none"), a.get("sent_objects","none"), a.get("hashed"
 }
 saves_with() { python3 -I -c '
 import json,sys
-print(sum(1 for l in open(sys.argv[1]) if "host.home_saved" in l and json.loads(l).get("attrs",{}).get("trigger")==sys.argv[2]))' "$RUN/$1.trace.jsonl" 2>/dev/null || echo 0; }
+print(sum(1 for l in open(sys.argv[1]) if "host.home_saved" in l and json.loads(l).get("attrs",{}).get("trigger")==sys.argv[2]))' "$RUN/$1.trace.jsonl" "$2" 2>/dev/null || echo 0; }
 # The last host.home_restored on a host: "seq fetched".
 last_restore() {
     python3 -I -c '
@@ -218,8 +218,8 @@ for l in open(sys.argv[1]):
     if e.get("event")=="cli.exec" and ((e.get("attrs") or {}).get("cwd") or "").startswith(sys.argv[2]):
         print(json.dumps(e))' "$FT" "$1" 2>/dev/null
 }
-turn_starts() { grep -c '"event":"cli.turn.start"' "$FT" 2>/dev/null || echo 0; }
-turn_ends() { grep -c '"event":"cli.turn.end"' "$FT" 2>/dev/null || echo 0; }
+turn_starts() { grep -c '"event":"cli.turn.start"' "$FT" 2>/dev/null || true; }
+turn_ends() { grep -c '"event":"cli.turn.end"' "$FT" 2>/dev/null || true; }
 
 memory_of() { find "$ROOT/$1/home/.claude/projects" -path '*-notes/memory/MEMORY.md' 2>/dev/null | head -1; }
 transcript_of() { find "$ROOT/$1/home/.claude/projects" -path '*-notes/*' -name "$SESSION.jsonl" 2>/dev/null | head -1; }
@@ -330,7 +330,7 @@ resumed2=$(echo "$EX2" | python3 -I -c '
 import json,sys
 e=json.loads(sys.stdin.read() or "{}"); a=e.get("attrs") or {}
 print(1 if a.get("resumed") and e.get("session_id")==sys.argv[1] and "--resume" in (a.get("argv") or []) else 0)' "$SESSION")
-moved=$(grep -c "\"event\":\"ctl.move_decision\"" "$RUN/controller.trace.jsonl" 2>/dev/null || echo 0)
+moved=$(grep -c "\"event\":\"ctl.move_decision\"" "$RUN/controller.trace.jsonl" 2>/dev/null || true)
 EPOCH2=$(placed_epoch)
 check "the controller moves notes after host-1 is lost for ${MOVE_AFTER}s; host-2 restores the last turn's snapshot (fetched > 0) and resumes the same session at a new epoch" \
     "$([ "$moved" -ge 1 ] && [ "$(placed_on)" = host-2 ] && [ "$EPOCH2" -gt "$EPOCH1" ] && [ "$rseq" = "$seq2" ] && [ "$rfetched" -gt 0 ] && [ "$resumed2" = 1 ] && echo 1)" \
@@ -340,7 +340,7 @@ check "the controller moves notes after host-1 is lost for ${MOVE_AFTER}s; host-
 ws_state "$WS2" > "$RUN/workspace-on-host-2.txt"
 M2h2=$(memory_of h2); T2h2=$(transcript_of h2)
 mem_prefix=$(head -c "$MEM2_BYTES" "$M2h2" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
-tr_two=$(grep -c "turn two" "$T2h2" 2>/dev/null || echo 0)
+tr_two=$(grep -c "turn two" "$T2h2" 2>/dev/null || true)
 check "host-2 has the second turn's home byte for byte (workspace, MEMORY.md, transcript); the killed turn's change is not there" \
     "$(cmp -s "$RUN/workspace-after-turn-two.txt" "$RUN/workspace-on-host-2.txt" && [ ! -e "$WS2/turn3-wip.txt" ] && [ -f "$WS2/turn2.txt" ] && [ "$mem_prefix" = "$MEM2_SHA" ] && [ "$tr_two" -ge 1 ] && echo 1)" \
     "workspace $(cmp -s "$RUN/workspace-after-turn-two.txt" "$RUN/workspace-on-host-2.txt" && echo same || echo DIFFERENT); turn3-wip.txt $([ -e "$WS2/turn3-wip.txt" ] && echo PRESENT || echo absent); MEMORY.md (first $MEM2_BYTES bytes) $mem_prefix vs $MEM2_SHA; transcript mentions turn two $tr_two time(s)"
