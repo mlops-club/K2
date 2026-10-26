@@ -44,6 +44,10 @@ pub const DEFAULT_DRAIN: Duration = Duration::from_secs(600);
 pub const DRAINING_CODE: &str = "draining";
 /// How often the drain looks at its agents' turns.
 const POLL: Duration = Duration::from_millis(200);
+/// Before the first look: hooks already on their way in (a prompt
+/// submitted just before the SIGTERM; its `UserPromptSubmit` is still
+/// running) land, so a turn that just started isn't taken for idle.
+pub const SETTLE: Duration = Duration::from_secs(2);
 /// How often the controller's resume loop looks for linked hosts.
 const RESUME_TICK: Duration = Duration::from_secs(1);
 
@@ -182,8 +186,9 @@ pub struct Drained {
     pub cut: Vec<String>,
 }
 
-/// Run a drain on `h`, waiting at most `deadline` for turns to end.
-pub fn drain(h: &dyn DrainHost, deadline: Duration) -> Drained {
+/// Run a drain on `h`: let in-flight hooks land for `settle`, then wait at
+/// most `deadline` for turns to end.
+pub fn drain(h: &dyn DrainHost, settle: Duration, deadline: Duration) -> Drained {
     h.start();
     let linked = h.send(Frame::Refused {
         code: DRAINING_CODE.into(),
@@ -193,6 +198,7 @@ pub fn drain(h: &dyn DrainHost, deadline: Duration) -> Drained {
     log_debug!("[hosts/drain] draining {} agent(s), up to {:?} (controller told: {linked})", left.len(), deadline);
     k2_core::trace::emit(|| k2_core::trace::Event::new(events::HOST_DRAIN_START).attr("agents", left.len()));
     let start = Instant::now();
+    std::thread::sleep(settle.min(deadline));
     let mut out = Drained::default();
     let release = |agent: &str, session: &str, cut: bool| {
         // The controller records the resume before it can see the session go.
@@ -262,7 +268,7 @@ pub async fn on_sigterm() {
         return;
     }
     let deadline = drain_deadline(|k| std::env::var(k).ok());
-    let _ = tokio::task::spawn_blocking(move || drain(&LiveHost, deadline)).await;
+    let _ = tokio::task::spawn_blocking(move || drain(&LiveHost, SETTLE, deadline)).await;
     // Let the link write the last `released` frames before the process goes.
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
@@ -454,7 +460,7 @@ mod tests {
     fn a_drain_releases_each_agent_after_its_turn_and_cuts_one_still_running_at_the_deadline() {
         let h = Fake { log: Mutex::default(), in_turn: Mutex::new(["s-busy".to_string(), "s-stuck".to_string()].into()) };
         // The deadline only bounds `stuck`; `busy` ends well before it.
-        let out = drain(&h, Duration::from_secs(2));
+        let out = drain(&h, Duration::ZERO, Duration::from_secs(2));
         assert_eq!(out, Drained { after_turn: vec!["idle".into(), "busy".into()], cut: vec!["stuck".into()] });
         let log: Vec<String> = h.log.lock().iter().filter(|l| !l.starts_with("look")).cloned().collect();
         assert_eq!(
