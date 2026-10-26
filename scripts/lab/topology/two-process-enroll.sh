@@ -69,7 +69,7 @@ stop() { # pid
 
 down() {
     stop "$BAD_PID"; stop "$H1_PID"; stop "$CTL_PID"
-    pkill -9 -f "$ROOT/" 2>/dev/null || true
+    [ -n "${ROOT:-}" ] && pkill -9 -f "$ROOT/" 2>/dev/null || true
     rm -rf "$ROOT"
 }
 trap down EXIT
