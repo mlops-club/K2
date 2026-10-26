@@ -499,9 +499,7 @@ impl Session {
             "pid": std::process::id(),
             "attrs": attrs,
         });
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
-        }
+        let _ = append_line(path, &line.to_string());
     }
 
     fn payload(&self, event: &str, extra: Value) -> Value {
@@ -552,12 +550,7 @@ impl Session {
             "timestamp": now(),
         });
         let path = self.transcript();
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
-        writeln!(f, "{line}").map_err(|e| format!("write {}: {e}", path.display()))?;
+        append_line(&path, &line.to_string()).map_err(|e| format!("write {}: {e}", path.display()))?;
         self.last_uuid = Some(uuid);
         Ok(())
     }
@@ -579,7 +572,7 @@ impl Session {
         if fresh {
             f.write_all(b"# Memory\n\n").map_err(|e| e.to_string())?;
         }
-        writeln!(f, "- {}", text.trim()).map_err(|e| e.to_string())
+        f.write_all(format!("- {}\n", text.trim()).as_bytes()).map_err(|e| e.to_string())
     }
 
     /// One turn: UserPromptSubmit, the timed "thinking", the reply on `out`,
@@ -608,6 +601,19 @@ impl Session {
         self.fire("Stop", None, json!({ "stop_hook_active": false }));
         Ok(reply)
     }
+}
+
+/// Append `line` and a newline to `path` (created if missing) with ONE
+/// `write_all` on an O_APPEND file. `writeln!` on a `File` may issue several
+/// writes, and the lab's trace file is shared by every agent of a host (and
+/// a transcript by a CLI and its resumer): lines from concurrent writers
+/// would then interleave and tear. One append write per line keeps each
+/// line whole.
+pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    OpenOptions::new().create(true).append(true).open(path)?.write_all(&buf)
 }
 
 fn fork_transcript(from: &Path, to: &Path, new_id: &str) -> Result<(), String> {

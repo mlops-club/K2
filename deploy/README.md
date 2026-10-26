@@ -36,6 +36,7 @@ Every mode runs the same two programs.
 | `K2_ROLE` | new | `all` or `controller` |
 | `K2_LISTEN=lan` | existing | Bind `0.0.0.0` instead of loopback |
 | `K2_DAEMON_PORT` | new | Fixed port instead of the sticky one in `daemon.port` |
+| `K2_TRACE_FILE` | new (P1) | Absolute path; the daemon appends one JSON line per trace event (the lab's format). Unset is off; a relative or unwritable path refuses to start (exit 2) |
 | `K2_HOSTS=1` | new | Turns on host routes, as `K2_COMPUTE=1` does for compute nodes |
 | `K2_HOST_BOOTSTRAP_TOKEN_FILE` | new | Hosts presenting this token enroll without the confirmation-code step |
 | `K2_PROVISIONER` | new | `static` (hosts enroll themselves) or `kubernetes` (scale `StatefulSet/k2-host`, create Sandboxes) |

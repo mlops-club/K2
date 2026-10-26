@@ -5,11 +5,11 @@
 #
 #   tests/lab/scenarios/g1_solo.sh            # the G1 trace check
 #   tests/lab/scenarios/g1_solo.sh --bench 9  # spawn latency, trace off vs on
+#   G1_BASE_DAEMON=<base k2-daemon> ... --bench 9   # and vs the base commit
 #
 # Reuses the lab unchanged: scripts/lab/lib/toolchain.sh,
-# scripts/lab/topology/solo.sh, tests/lab/labkit. solo.sh starts the daemon
-# under `env -i`, so the daemon binary it is given is a two-line wrapper
-# that sets K2_TRACE_FILE and execs the real binary (same pid).
+# scripts/lab/topology/solo.sh, tests/lab/labkit. solo.sh sets K2_TRACE_FILE
+# from LAB_DAEMON_TRACE (empty: trace off).
 # Output: lab-runs/G1-trace/<ts>/ (trace.jsonl, flows.json, logs).
 set -uo pipefail
 
@@ -45,14 +45,8 @@ export LAB_FAKE_AGENT_BIN
 up() {
     local dir=$1 trace=$2
     mkdir -p "$dir"
-    if [ -n "$trace" ]; then
-        printf '#!/bin/sh\nK2_TRACE_FILE=%s exec %s "$@"\n' "$trace" "$RUN/bin/k2-daemon" > "$dir/k2-daemon"
-        chmod +x "$dir/k2-daemon"
-        LAB_DAEMON_BIN="$dir/k2-daemon"
-    else
-        LAB_DAEMON_BIN="$RUN/bin/k2-daemon"
-    fi
-    export LAB_DAEMON_BIN
+    LAB_DAEMON_BIN="$RUN/bin/k2-daemon" LAB_DAEMON_TRACE=$trace
+    export LAB_DAEMON_BIN LAB_DAEMON_TRACE
     topo_up "$dir" || { say "solo did not come up ($dir/daemon.log)"; return 1; }
     LAB_CRASH_CWD="$LAB_HOME/work/lab-crash"
     mkdir -p "$LAB_CRASH_CWD"
@@ -73,23 +67,42 @@ kit() {
 trap 'topo_down' EXIT
 
 if [ "$BENCH" -gt 0 ]; then
+    # Phases: this build with the trace off and on, and (with
+    # G1_BASE_DAEMON=<k2-daemon built from the base commit>) the base.
     rc=0
-    for phase in off on; do
+    phases="off on"
+    [ -n "${G1_BASE_DAEMON:-}" ] && phases="base off on"
+    for phase in $phases; do
         dir="$RUN/bench-$phase"
         trace=""
         [ "$phase" = on ] && trace="$dir/daemon.trace.jsonl"
-        up "$dir" "$trace" || exit 1
-        say "S1 x$BENCH, trace $phase"
+        if [ "$phase" = base ]; then
+            cp "$G1_BASE_DAEMON" "$RUN/bin/k2-daemon-base"
+            mkdir -p "$dir"
+            LAB_DAEMON_BIN="$RUN/bin/k2-daemon-base" LAB_DAEMON_TRACE=
+            export LAB_DAEMON_BIN LAB_DAEMON_TRACE
+            topo_up "$dir" || { say "solo did not come up ($dir/daemon.log)"; exit 1; }
+            LAB_CRASH_CWD="$LAB_HOME/work/lab-crash"
+            printf '%s' "$LAB_TOKEN" > "$dir/token"
+        else
+            up "$dir" "$trace" || exit 1
+        fi
+        say "S1 x$BENCH, $phase"
         kit "$dir" --bench "$BENCH" | tee "$dir/bench.txt" || rc=1
         topo_down
     done
-    python3 -I -B - "$RUN/bench-off/out/bench.json" "$RUN/bench-on/out/bench.json" <<'EOF' || rc=1
-import json, sys
-off, on = (json.load(open(p))["median"] for p in sys.argv[1:3])
-delta = (on - off) / off * 100
-print("g1: spawn_to_banner_ms median: trace off %.1f, trace on %.1f, %+.1f%% (NFR1: within 5%%)" % (off, on, delta))
-sys.exit(0 if delta <= 5 else 1)
-EOF
+    python3 -I -B - "$RUN" $phases <<'EOF2' || rc=1
+import json, os, sys
+run, phases = sys.argv[1], sys.argv[2:]
+m = {p: json.load(open(os.path.join(run, "bench-" + p, "out", "bench.json")))["median"] for p in phases}
+ref = m.get("base", m["off"])
+for p in phases:
+    print("g1: spawn_to_banner_ms median %-4s %7.1f  %+5.1f%% vs %s" % (p, m[p], (m[p] - ref) / ref * 100,
+                                                                     "base" if "base" in m else "off"))
+worst = max((m[p] - ref) / ref * 100 for p in phases)
+print("g1: NFR1 (within 5%%): %s" % ("PASS" if worst <= 5 else "FAIL"))
+sys.exit(0 if worst <= 5 else 1)
+EOF2
     exit $rc
 fi
 

@@ -165,16 +165,71 @@ HOME=$(mktemp -d) cargo test -p k2-core --lib -- trace::
 
 # The runner's flow logic on hand-written traces (no daemon)
 python3 -I -B tests/lab/scenarios/test_g1_solo.py
+
+# Spawn latency (NFR1): S1 x9 with the trace off and on, and against a
+# k2-daemon built from the base commit when G1_BASE_DAEMON names one
+G1_BASE_DAEMON=/path/to/base/k2-daemon tests/lab/scenarios/g1_solo.sh --bench 9
 ```
+
+Output lands in `lab-runs/G1-trace/<ts>/` (gitignored): `solo/out/trace.jsonl`
+(daemon, fake agent and lab events merged), `solo/out/flows.json` (the G1
+verdicts and every flow on the whole trace), `S1/`, `S7.json`,
+`solo/daemon.trace.jsonl` (the daemon's own trace).
 
 ## Status
 
-- **Milestone:** first working slice. `tests/lab/scenarios/g1_solo.sh`
-  on solo: S1 PASS, S7 PASS, and the checker passes `spawn` (7 of 8
-  steps; `placement.choose` is not in solo), `hook` (5 of 5) and `crash`
-  (11 of 11). Sink unit tests: 11 passed.
-- **Next:** `cargo test -p k2-core` and `-p k2-daemon` (all `K2_*` unset,
-  temp HOME), clippy on the changed files, spawn latency trace off vs on.
+- **Milestone:** done (2026-10-25); integrated on `k2-dist/wave1`
+  (`b1a5c311a`) the same day: rebased, boot check wired, solo sets
+  `K2_TRACE_FILE`.
+- **After the rebase and integration commit (2026-10-25):**
+  - `g1_solo.sh`: G1 solo trace PASS; `spawn` 7 of 8 (`placement.choose`
+    not in solo), `hook` 5 of 5, `crash` 11 of 11, with `solo.sh` setting
+    `K2_TRACE_FILE` (no wrapper). Bundle `lab-runs/G1-trace/2026-10-25T20-42-57Z`.
+  - Boot check, built daemon under `env -i` and a temp HOME: a relative
+    path, a directory, a missing parent and a read-only directory each
+    exit 2 with `[daemon/boot] FATAL: K2_TRACE_FILE="…" …` before
+    `daemon.port` exists; unset boots to `ready`.
+  - Sink unit tests (`trace::`): 12 passed. Lab suite: 28 OK.
+  - Clippy: nothing on changed lines; the same 3 pre-existing `k2-daemon`
+    deny errors as below.
+  - The one rebase conflict: agenthost moved `inject_framed_locked`'s
+    write loop behind `agent_host().inject`; the `host.inject` line now
+    sits just before that call.
+- **Checks before the rebase:**
+- **Checks (all on this Mac, temp HOME, every `K2_*` unset, 3 jobs, 3
+  threads):**
+  - `tests/lab/scenarios/g1_solo.sh`: S1 PASS, S7 PASS; `spawn` PASS
+    (7 of 8 steps, `placement.choose` not in solo), `hook` PASS (5 of 5),
+    `crash` PASS (11 of 11). Bundle `lab-runs/G1-trace/2026-10-25T15-06-24Z`.
+  - Sink unit tests (`trace::`): 11 passed (12 with the boot-check test).
+  - `cargo test -p k2-core`: all pass (lib 3676 + 1 ignored, every
+    integration binary). Two environment notes: `tests/ptyd_backend.rs`
+    needs `cargo build -p k2-ptyd --bin k2-ptyd` first (8/8 then), and
+    `macos_keychain_tests` needs a short `$HOME` (the `security -i` line
+    carries the keychain path; 18/18 under `/tmp`). The keychain test is
+    macOS-only; neither touches trace code.
+  - `cargo test -p k2-daemon`: lib 4344 passed, 0 failed (5 ignored);
+    162 binaries, 5143 passed. Two failed in that run, which a
+    coordinator SIGSTOP froze for 3 h and which ran at load 140 to 170:
+    `heartbeat_daemon_tick::headless_daemon_fires_with_no_external_ticker_within_150s`
+    passes alone; `connect_login_edge::anonymous_app_spray_closes_only_anonymous_app_logins`
+    failed alone at load 165 (65 of 65 anonymous app logins got 401, the
+    60-failure ceiling never refused one) and passes on this branch 3 of 3
+    at low load and on the base commit at low load. Not reproducible since;
+    no trace line is on the login path, and with `K2_TRACE_FILE` unset none
+    runs. Worth a soak under load by whoever owns login throttling.
+  - Clippy (`-p k2-core -p k2-daemon --all-targets`): 0 findings on any
+    added line, 0 in `trace/`. Pre-existing: 6 deny-level errors in
+    `k2-core` (`deprecated/delegate.rs`, `terminal/grid_snapshot.rs`) and 3
+    in `k2-daemon` (`compute_admin/tests.rs`, `llm_routes.rs`,
+    `mail/external_imap.rs`) fail clippy on base too; run with
+    `-A clippy::deprecated_semver -A clippy::while_immutable_condition` to
+    see the rest.
+  - NFR1, `g1_solo.sh --bench 9` (S1 `spawn_to_banner_ms` median): base
+    commit 56.1 ms, this branch trace off 54.6 ms (-2.7%), trace on
+    57.2 ms (+2.0%). Within 5%.
+  - Lab suite `tests/lab/run_tests.sh`: 28 Python + fake-agent tests OK;
+    `extract_flows.py --check`: 11 flows in sync; `test_g1_solo.py`: 6 OK.
 - **Answered:** `crash.json` lives in `docs/prd/flows/` (coordinator,
   2026-10-24); the lab's `3105385e6` (cherry-picked here, drops out at
   rebase) lets `test_flows.py` accept flow files beyond the 11 PRD ones.
@@ -188,12 +243,12 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
 - `K2_TRACE_FILE`: absolute path; the daemon appends one JSONL event per
   line. Unset or empty means off: no trace work at all. Set but not
   absolute, or not openable for append, is an error, never a silent off
-  (coordinator, 2026-10-24): `k2_core::trace::boot_check()` returns it so
-  the daemon can refuse to start, and the first use logs
-  `[trace] ERROR: K2_TRACE_FILE="…" …` to stderr. **Integration:**
-  `daemon_main.rs` (not mine) should call `k2_core::trace::boot_check()`
-  at boot and exit non-zero on `Err`, as it does for a relative `K2_HOME`.
-  For `deploy/README.md` at integration.
+  (coordinator, 2026-10-24): `daemon_main.rs`'s `boot_settings_check()`
+  calls `k2_core::trace::boot_check()` next to `K2_ROLE` and
+  `K2_DAEMON_PORT`, so the daemon exits 2 before anything starts. The
+  check opens and closes the file and starts no thread (it runs before
+  `handoff::capture_process_context()`, which wants no threads yet); the
+  sink starts on the first emission. In `deploy/README.md` as *new (P1)*.
 
 ### Decisions inside owned files
 
@@ -234,6 +289,33 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
   `cargo build -p k2-daemon --bin k2-daemon -p k2-fake-agent` builds only
   the bin named `k2-daemon`, so the fake agent was never built.
 
+### Hand-off: `prove.sh G1 --topology solo` (lab worker)
+
+1. `scripts/lab/topology/solo.sh` now starts the daemon with
+   `K2_TRACE_FILE=$run_dir/daemon.trace.jsonl` (`LAB_DAEMON_TRACE`
+   overrides it; empty runs the trace off, as the bench's off phase does).
+2. Merge `daemon.trace.jsonl`, `fake-agent.trace.jsonl` and the
+   scenarios' lab events, sorted by `ts` (the checker sorts too).
+3. Run S7 as `tests/lab/scenarios/g1_solo.py`'s `Crash` does: register the
+   workspace (`/cli/projects/add-from-path`), spawn a `tab-<uuid>` agent
+   with `--session-id X --turn-ms 30000`, type, wait for the prompt in the
+   transcript, `kill -9` the CLI pid (`cli.exec`'s `pid`), wait for
+   `host.agent_exit` on that pane, then spawn the same agent with no
+   command. Or call `Crash(...).run()` and `check_g1(...)` directly.
+4. Judge `spawn`, `hook` and `crash` on their solo steps:
+   `g1_solo.NOT_IN_SOLO` lists the step to show as "not in solo"
+   (`spawn` step 2, `placement.choose`). Check each flow on its
+   scenario's events (`g1_solo.scoped`), so another agent's events never
+   complete it.
+5. Done at integration: the boot check in `daemon_main.rs` and
+   `K2_TRACE_FILE` in `deploy/README.md`.
+
+### Flow steps that exist only with remote hosts (P2)
+
+- `spawn` step 2, `placement.choose`. Every other step of `spawn`, `hook`
+  and `crash` has a solo emission point (table above). In P2 the `host.*`,
+  `cell.*` and `ptyd.*` events move to `src: "k2-host"` / `"k2-ptyd"`.
+
 ### Rebase notes (lines in files other workers own)
 
 - `crates/k2-daemon/src/v2_spawn.rs`: one line, first line of `spawn_session`.
@@ -241,3 +323,9 @@ python3 -I -B tests/lab/scenarios/test_g1_solo.py
   `serve_session_grid_connection`.
 - `crates/k2-core/src/terminal/daemon_pty.rs`: trace lines only, plus
   `write` converts `bytes` once (to count them) and passes the `Cow` on.
+- `crates/k2-daemon/src/workspace_msg.rs`: one line, before
+  `agent_host().inject` in `inject_framed_locked`.
+- `crates/k2-daemon/src/daemon_main.rs`: one line in
+  `boot_settings_check()` (integration commit).
+- The cherry-picked lab commits (`3105385e6`, `9cb30dde7`) dropped out at
+  the rebase onto `k2-dist/wave1` (`git cherry` marked them upstream).

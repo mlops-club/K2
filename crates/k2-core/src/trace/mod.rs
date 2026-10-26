@@ -116,11 +116,22 @@ fn global() -> Option<&'static Sink> {
     }
 }
 
-/// Boot check: opens the trace (when `K2_TRACE_FILE` is set) and returns
-/// the error for a set but unusable value, so the daemon can refuse to
-/// start, as it does for a relative `K2_HOME`. Unset is `Ok(())`.
+/// Boot check: returns the error for a set but unusable `K2_TRACE_FILE`
+/// (relative, or not openable for append), so the daemon can refuse to
+/// start. Unset is `Ok(())`. It opens and closes the file but starts no
+/// thread (the daemon calls it before any thread exists); the sink itself
+/// starts on the first emission.
 pub fn boot_check() -> Result<(), ConfigError> {
-    global_state().as_ref().map(|_| ()).map_err(Clone::clone)
+    check_from(std::env::var_os(ENV_VAR))
+}
+
+/// [`boot_check`] on an explicit value.
+pub fn check_from(value: Option<OsString>) -> Result<(), ConfigError> {
+    let Some(path) = config_from(value)? else { return Ok(()) };
+    OpenOptions::new().create(true).append(true).open(&path).map(drop).map_err(|e| ConfigError::Open {
+        path: path.to_string_lossy().into_owned(),
+        error: e.to_string(),
+    })
 }
 
 /// True when this process writes a trace.

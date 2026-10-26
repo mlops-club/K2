@@ -32,7 +32,7 @@ where
 
 /// `GET /cli/hosts/attach`: handshake, then frames both ways until either
 /// end closes. `token` is the controller's bootstrap token.
-pub async fn serve_attach<S>(stream: S, remote: &RemoteHost, token: &str)
+pub async fn serve_attach<S>(stream: S, remote: &'static RemoteHost, token: &str)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -71,7 +71,8 @@ where
     };
     let (conn, host_id, mut out) = remote.connect(&host_name, protocol);
     log_debug!("[hosts] host {host_id} protocol {protocol} labels {labels:?}");
-    if !resume.is_empty() {
+    if protocol >= 2 {
+        // W3: reconcile what this host still runs with the table (S9).
         remote.adopt(&host_id, &resume);
     }
     let welcome = Frame::Welcome {
