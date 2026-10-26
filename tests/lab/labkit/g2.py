@@ -16,6 +16,7 @@ Each scenario writes DIR/<S>.json ({"scenario", "title", "status", "checks":
 appended to DIR/messages.jsonl (the I2 ledger).
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -146,6 +147,18 @@ def chaos_killed(host, pid):
         if e.get("kind") == "cli" and e.get("action") == "SIGKILL" and e.get("pid") == pid and e.get("host") == host:
             return e
     return None
+
+
+def chaos_hit(host, pid, since):
+    """chaos.log entries since `since` (ISO) in which --chaos itself
+    SIGKILLed the agent CLI `pid` on `host`, or `host` itself."""
+    path = os.environ.get("LAB_CHAOS_LOG")
+    if not (os.environ.get("LAB_CHAOS") and path and host and os.path.isfile(path)):
+        return []
+    return [e for e in fleetlib.read_jsonl(path)
+            if (e.get("ts") or "") >= since and e.get("action") == "SIGKILL"
+            and ((e.get("kind") == "cli" and e.get("host") == host and e.get("pid") == pid)
+                 or (e.get("kind") == "host" and e.get("target", e.get("host")) == host))]
 
 
 def send_waiting_for_daemon(make_req, log=None, method="POST", path=""):
@@ -343,6 +356,22 @@ class Client:
                           deadline, 0.3) or self.final_state(msg_id)
 
     # ── grid ────────────────────────────────────────────────────────────
+    def reattach(self, sc, sid, sock):
+        """The grid stream through the controller closed under us (a
+        restart): wait until the controller answers and attach again, as the
+        app does. Counted in the scenario's info. Returns (sock, grid) or
+        (None, None)."""
+        sc.info["reattached_after_stream_close"] = sc.info.get("reattached_after_stream_close", 0) + 1
+        sc.log("the grid stream closed; reattaching once the controller answers")
+        with contextlib.suppress(OSError):
+            sock.close()
+        wait_until(lambda: fleetlib.http_json(self.fleet.port, "/cli/hosts/status"), DAEMON_BACK_S, 0.5)
+        try:
+            return self.attach(sid)
+        except (OSError, wslib.WsError) as e:
+            self.log("reattach failed: %s" % e)
+            return None, None
+
     def attach(self, session):
         end = time.monotonic() + DAEMON_BACK_S
         while True:
@@ -769,7 +798,15 @@ def ask_chat(c, sc, cwd, a, text, n=None, tries=3):
             if n or wait_until(lambda: c.replied(cwd, text)):
                 return True, a
         if c.fleet.cli_alive((c.exec_of(csid) or {}).get("host"), (c.exec_of(csid) or {}).get("pid")):
-            return False, a  # the CLI lives: a real failure, no retry
+            if c.stream_end(sock, 1) is None:
+                return False, a  # the CLI lives and the stream is open: a real failure, no retry
+            sock, grid = c.reattach(sc, sid, sock)
+            if not sock:
+                return False, a
+            a = (sid, csid, reused, sock, grid)
+            if not wait_until(lambda: c.prompts_with(cwd, text), 5):
+                c.type(sock, text)  # the prompt never reached the agent
+            return bool(wait_until(lambda: c.replied(cwd, text), DEADLINE_S)), a
         sc.info["retries_after_cli_death"] = sc.info.get("retries_after_cli_death", 0) + 1
         sc.log("the CLI died before answering %r (attempt %d): the next need reopens it" % (text, attempt))
         sock.close()
@@ -1031,9 +1068,18 @@ def s8_drain(c, sc):
         wait_until(lambda: c.replied(cwd, n3), gone_wait_s())
         seen3 = c.prompts_with(cwd, n3)
         state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
-        sc.check("drain: the message sent while it was down was delivered exactly once",
-                 len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered"),
-                 "in transcripts %d time(s); outbox state %s" % (len(seen3), state))
+        # PRD failure table: when --chaos killed the resumed CLI before the
+        # message landed, the gone rule failing it loudly is the right end.
+        killed = [e for x in c.fake("cli.exec", csid) if (x.get("ts") or "") >= t_restart
+                  for e in chaos_hit(x.get("host"), x.get("pid"), t_restart) if e.get("kind") == "cli"]
+        lost_to_chaos = bool(killed) and state == "failed" and not seen3
+        if lost_to_chaos:
+            sc.info["s8_msg_lost_to_chaos"] = [(e["ts"], e.get("host"), e.get("pid")) for e in killed]
+        sc.check("drain: the message sent while it was down was delivered exactly once"
+                 " (or failed with a reason after --chaos killed the resumed CLI)",
+                 (len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered")) or lost_to_chaos,
+                 "in transcripts %d time(s); outbox state %s; chaos kills of the resumed CLI %s"
+                 % (len(seen3), state, sc.info.get("s8_msg_lost_to_chaos", [])))
     finally:
         if sock:
             sock.close()
@@ -1048,8 +1094,20 @@ def s9(c, sc):
     (chaos.log) the attempt shows nothing: it is redone with a fresh agent
     (at most 3 attempts, each one counted in info)."""
     for attempt in (1, 2, 3):
-        if s9_attempt(c, sc, attempt) != "redo":
+        mark, since = len(sc.checks), now_iso()
+        if s9_attempt(c, sc, attempt) == "redo":
+            continue
+        failed = [x["name"] for x in sc.checks[mark:] if not x["ok"]]
+        hits = chaos_hit(sc.info.get("host"), sc.info.get("cli_pid"), since) if failed else []
+        if not hits or attempt == 3:
             return
+        # --chaos killed this agent's CLI or its host: what failed after it
+        # says nothing about the controller restart. Kept in log and info.
+        sc.info.setdefault("redone_after_chaos", []).append(
+            {"attempt": attempt, "failed": failed, "chaos": [(e["ts"], e.get("kind"), e.get("pid")) for e in hits]})
+        sc.log("--chaos killed S9's agent (%s) during attempt %d; its failed checks %s are dropped; redoing S9"
+               % ([(e["ts"], e.get("kind")) for e in hits], attempt, failed))
+        del sc.checks[mark:]
 
 
 def s9_attempt(c, sc, attempt):
@@ -1066,6 +1124,11 @@ def s9_attempt(c, sc, attempt):
         n1 = "s9 long %s [[turn-ms=6000]]" % uuid.uuid4().hex[:6]
         c.type(sock, n1)
         started = wait_until(lambda: c.turn_events(csid, "cli.turn.start"), 30)
+        if not started and c.fleet.cli_alive(host, cli_pid) and c.stream_end(sock, 1) is not None:
+            sock, grid = c.reattach(sc, sid, sock)
+            if sock:
+                c.type(sock, n1)
+                started = wait_until(lambda: c.turn_events(csid, "cli.turn.start"), 30)
         if not sc.check("a long turn started", started, ""):
             return
         sock.close()

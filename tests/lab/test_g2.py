@@ -239,6 +239,21 @@ class ChaosKilled(unittest.TestCase):
                 os.environ.pop("LAB_CHAOS", None)
                 self.assertIsNone(g2.chaos_killed("host-2", 3302), "no chaos in this run")
 
+    def test_chaos_hit_counts_the_agents_cli_or_its_host_since_a_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "chaos.log")
+            with open(log, "w") as fh:
+                for e in ({"ts": "2026-01-01T00:00:01Z", "kind": "cli", "host": "host-1", "pid": 7, "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:02Z", "kind": "host", "target": "host-2", "pid": 9, "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:03Z", "kind": "controller", "target": "controller", "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:04Z", "kind": "host", "target": "host-2", "action": "started"}):
+                    fh.write(json.dumps(e) + "\n")
+            with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS": "seed=1", "LAB_CHAOS_LOG": log}):
+                self.assertEqual(len(g2.chaos_hit("host-1", 7, "2026-01-01T00:00:00Z")), 1)
+                self.assertEqual(g2.chaos_hit("host-1", 7, "2026-01-01T00:00:02Z"), [], "before the attempt")
+                self.assertEqual([e["kind"] for e in g2.chaos_hit("host-2", 5, "2026")], ["host"])
+                self.assertEqual(g2.chaos_hit("controller", None, "2026"), [], "a controller restart is S9's own test")
+
 
 class Plan(unittest.TestCase):
     def test_fleet_plan_follows_the_env_contract(self):
