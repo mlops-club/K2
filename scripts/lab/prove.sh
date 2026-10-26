@@ -61,6 +61,10 @@ case "$LAB_LINUX_GATE" in hold|run) ;; *) echo "prove.sh: --linux-gate is hold o
 export LAB_LINUX_GATE
 export LAB_TEST_THREADS=${LAB_TEST_THREADS:-3}
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
+# Under chaos a host is gone often; the outbox's gone grace (default 120 s)
+# would outlast the scenario waits, so chaos runs set it to 30 s on every
+# daemon (K2_DELIVERY_GONE_GRACE_SECS) and S8 waits grace + 30 s.
+[ -n "$CHAOS" ] && export LAB_GONE_GRACE_S=${LAB_GONE_GRACE_S:-30}
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 case "$GATE/$TOPOLOGY" in
     G0/solo|G2/solo|G2/fleet) ;;
@@ -113,6 +117,7 @@ run_set gate "$GATE" topology "$TOPOLOGY" sha "$LAB_SHA" branch "$(git rev-parse
 if [ -n "$(git status --porcelain --untracked-files=no -- . ':!lab-runs')" ]; then
     NOTES+=("The working tree has uncommitted changes. Solo and the local suites ran on the working tree; the Linux gate ran on the committed sha $LAB_SHA.")
 fi
+[ -n "$CHAOS" ] && NOTES+=("--chaos: K2_DELIVERY_GONE_GRACE_SECS=$LAB_GONE_GRACE_S on every daemon (the outbox gone rule; default 120 s).")
 if [ -n "$CHAOS" ] && [ "$GATE" = G0 ]; then
     NOTES+=("--chaos $CHAOS recorded; G0 has no chaos scenarios (chaos applies to S3 to S10).")
 fi

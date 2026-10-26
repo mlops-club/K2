@@ -148,6 +148,10 @@ def _base_env(root, name, home):
         "K2_RUNTIME_DIR": "",
         "USER": os.environ.get("USER") or subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip(),
         "LANG": "en_US.UTF-8",
+        # The outbox's gone rule (a message for an agent whose host is gone
+        # is failed after this grace); empty = the daemon's default (120 s).
+        # prove.sh sets LAB_GONE_GRACE_S=30 under --chaos.
+        "K2_DELIVERY_GONE_GRACE_SECS": os.environ.get("LAB_GONE_GRACE_S", ""),
     }
 
 

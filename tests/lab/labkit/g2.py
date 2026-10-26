@@ -34,6 +34,17 @@ from . import s1
 from . import ws as wslib
 
 DEADLINE_S = 90
+
+
+def gone_wait_s():
+    """A wait that outlasts the outbox's gone grace (LAB_GONE_GRACE_S, else
+    the daemon's 120 s) by 30 s, so a message the gone rule settles is seen
+    settled, not still queued."""
+    try:
+        grace = int(os.environ.get("LAB_GONE_GRACE_S") or 120)
+    except ValueError:
+        grace = 120
+    return max(60, grace + 30)
 HTTP_TIMEOUT_S = 120
 REPLY_MARKER = s1.REPLY_MARKER
 BANNER = "k2-fake-agent (as claude)"
@@ -951,12 +962,12 @@ def s8_drain(c, sc):
             t_restart = now_iso()
             c.fleet.start(host)
         resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
-                                      if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], 60)
+                                      if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], gone_wait_s())
         sc.check("drain: the replacement host resumed the agent that was awake (same session, no re-spawn by the lab)",
                  bool(resumed), "resumed cli.exec of %s after %s: %d" % (csid, t_restart, len(resumed or [])))
-        wait_until(lambda: c.replied(cwd, n3), 60)
+        wait_until(lambda: c.replied(cwd, n3), gone_wait_s())
         seen3 = c.prompts_with(cwd, n3)
-        state = c.wait_final(msg_id, 60) if msg_id else None
+        state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
         sc.check("drain: the message sent while it was down was delivered exactly once",
                  len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered"),
                  "in transcripts %d time(s); outbox state %s" % (len(seen3), state))

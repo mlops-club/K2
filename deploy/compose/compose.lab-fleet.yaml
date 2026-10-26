@@ -39,6 +39,7 @@ x-host-env: &host-env
   K2_TEST_AGENT_SHIM_DIR: /opt/k2-shim
   K2_FAKE_AGENT_TURN_MS: ${LAB_TURN_MS:-300}
   K2_FAKE_AGENT_SEED: ${LAB_SEED:-0}
+  K2_DELIVERY_GONE_GRACE_SECS: ${LAB_GONE_GRACE_S:-}
 
 services:
   controller:
@@ -51,6 +52,7 @@ services:
       K2_HOME: ${LAB_ROOT:?}/controller/home/.k2
       TMPDIR: /tmp
       K2_ROLE: controller
+      K2_DELIVERY_GONE_GRACE_SECS: ${LAB_GONE_GRACE_S:-}
       K2_LISTEN: lan
       K2_HOSTS: "1"
       K2_HOST_BOOTSTRAP_TOKEN_FILE: ${LAB_ROOT:?}/host-token
