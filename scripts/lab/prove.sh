@@ -166,6 +166,8 @@ finish() {
 # ── G2: scenarios S2 to S9, chaos, invariants (topology up) ─────────────
 g2_scenarios() {
     local only="S2,S3,S4,S5,S6,S7,S8,S9"
+    # S10 (P3 T2, a lost host's agent moves) is opt-in: LAB_S10=1.
+    [ "${LAB_S10:-0}" = 1 ] && only="$only,S10"
     say "fleet monitor: samples.jsonl (live daemons and agent CLIs every 0.5 s)"
     python3 -I tests/lab/lab.py fleet monitor --state "$LAB_FLEET_STATE" --out "$RUN/samples.jsonl" &
     MONITOR_PID=$!

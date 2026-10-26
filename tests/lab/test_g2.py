@@ -322,6 +322,23 @@ class Plan(unittest.TestCase):
             c.outbox = lambda proc=None, msg_id=None, resp=resp: resp
             self.assertEqual(c.final_state("m"), want, (evs, row, resp_ok))
 
+    def test_host_move_after_reaches_the_controller_only_and_is_20_s_under_s10(self):
+        for env, want in (({}, ""), ({"LAB_S10": "1"}, "20"), ({"LAB_S10": "1", "LAB_HOST_MOVE_AFTER": "7"}, "7"),
+                          ({"LAB_HOST_MOVE_AFTER": "9"}, "9")):
+            with unittest.mock.patch.dict(os.environ, env):
+                for k in ("LAB_S10", "LAB_HOST_MOVE_AFTER"):
+                    if k not in env:
+                        os.environ.pop(k, None)
+                st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
+                self.assertEqual(g2.move_after_s(), int(want) if want else None)
+            self.assertEqual(st["procs"]["controller"]["env"]["K2_HOST_MOVE_AFTER"], want, env)
+            self.assertNotIn("K2_HOST_MOVE_AFTER", st["procs"]["host-1"]["env"])
+
+    def test_s10_is_fleet_only_and_opt_in(self):
+        self.assertIn("S10", g2.FLEET_ONLY)
+        self.assertIn("S10", g2.SCENARIOS)
+        self.assertIn("S10", g2.TITLES)
+
     def test_gone_grace_reaches_every_daemon_only_when_the_lab_sets_it(self):
         with unittest.mock.patch.dict(os.environ, {"LAB_GONE_GRACE_S": "30"}):
             st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")

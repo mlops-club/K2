@@ -200,7 +200,9 @@ def plan(layout, root, run_dir, daemon_bin, fake_bin):
     proc("controller", "controller", {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                                       "K2_HOME": os.path.join(root, "controller", "home", ".k2"),
                                       "K2_ROLE": "controller", "K2_HOSTS": "1",
-                                      "K2_HOST_BOOTSTRAP_TOKEN_FILE": token_file})
+                                      "K2_HOST_BOOTSTRAP_TOKEN_FILE": token_file,
+                                      # P3 T2: a lost host's portable agents move after this (S10).
+                                      "K2_HOST_MOVE_AFTER": host_move_after()})
     ctl_port = st["procs"]["controller"]["port"]
     st["controller"] = "controller"
     st["hosts"] = []
@@ -223,6 +225,12 @@ def plan(layout, root, run_dir, daemon_bin, fake_bin):
         st["hosts"].append({"name": h, "proc": h, "home": st["procs"][h]["home"],
                             "fake_trace": extra["K2_FAKE_AGENT_TRACE"]})
     return st
+
+
+def host_move_after():
+    """The controller's K2_HOST_MOVE_AFTER: LAB_HOST_MOVE_AFTER, 20 s when
+    S10 runs (LAB_S10=1), else empty (the daemon's own 300 s)."""
+    return os.environ.get("LAB_HOST_MOVE_AFTER") or ("20" if os.environ.get("LAB_S10") == "1" else "")
 
 
 def home_sync_on():
@@ -483,6 +491,7 @@ def up_compose(run_dir, state_path, root, image, project, compose_file):
         "LAB_CTL_PORT": str(st["procs"]["controller"]["port"]),
         "LAB_H1_PORT": str(st["procs"]["host-1"]["port"]), "LAB_H2_PORT": str(st["procs"]["host-2"]["port"]),
         "LAB_TURN_MS": os.environ.get("LAB_TURN_MS", "300"), "LAB_SEED": os.environ.get("LAB_SEED", "0")}}
+    st["compose"]["env"]["LAB_HOST_MOVE_AFTER"] = host_move_after()
     if home_sync_on():
         st["compose"]["env"]["LAB_WORK_ROOT"] = st["work"]
         st["home_sync"] = True
