@@ -701,6 +701,14 @@ pub const ROUTES: &[Route] = &[
     // credential (the handler checks the bootstrap token in `hello`);
     // status is the probe, role and link state only, no secrets.
     get("/cli/hosts/attach", Public),
+    // Host enrollment (host-enroll, FR2): the nonce and the enroll call are
+    // public (the one-time token and the key's signature are the
+    // credential); minting, listing and revoking take the owner token.
+    get("/cli/hosts/challenge", Public),
+    post("/cli/hosts/enroll", Public),
+    post("/cli/hosts/enroll-tokens", NoLogin),
+    get("/cli/hosts/keys", NoLogin),
+    post("/cli/hosts/keys/revoke", NoLogin),
     get("/cli/hosts/status", Public),
     get("/cli/inbox", Member),
     post("/cli/inbox/archive", Member),

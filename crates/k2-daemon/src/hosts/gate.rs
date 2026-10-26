@@ -139,6 +139,9 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
         }
         return true;
     }
+    if super::enroll::route(stream, buf, path, query, owner_token).await {
+        return true;
+    }
     if role != Role::Controller {
         return false;
     }

@@ -54,8 +54,8 @@ pub fn parse(raw: Option<&str>) -> Result<Role, String> {
 pub fn check_settings(role: Role, get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     match role {
         Role::All => Ok(()),
-        Role::Controller => crate::hosts::controller_config(get).map(drop),
-        Role::Host => crate::hosts::host_config(get).map(drop),
+        Role::Controller => crate::hosts::controller_config(&get).and_then(|_| crate::hosts::enroll::auth_mode(&get)).map(drop),
+        Role::Host => crate::hosts::host_config(&get).and_then(|_| crate::hosts::enroll::auth_mode(&get)).map(drop),
     }
 }
 
