@@ -4,7 +4,7 @@
 #
 #   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]
 #                             [--provisioner=static|kubernetes [--max-hosts=N]]
-#                             [--work-root=PATH] [--login-from=POD]] [--fake] [--rebuild-daemon]
+#                             [--work-root=PATH] [--login-from=POD] [--max-awake=N]] [--fake] [--rebuild-daemon]
 #                      [--reset-password] [--port-forward] [--password-file=PATH] [--render-only=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
@@ -56,6 +56,8 @@
 # --work-root=PATH sets K2_WORK_ROOT on the hosts (home sync, P3 T1: agents
 # whose cwd is under it are saved on release and restored on spawn). The
 # workspaces volume is mounted at /var/lib/k2/work.
+# --max-awake=N sets K2_HOST_MAX_AWAKE on the hosts (the end state's 100):
+# how many awake agents a host takes before the pool adds one.
 # --login-from=POD (e.g. k2-host-0) gives every host an init container that
 # mounts POD's HOME volume (data-POD) read-only and, when the host has no
 # Claude login of its own yet, copies POD's (.claude/.credentials.json,
@@ -82,7 +84,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
-provisioner=static render_to= max_hosts= work_root= login_from= p4=0
+provisioner=static render_to= max_hosts= work_root= login_from= p4=0 max_awake=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -100,6 +102,7 @@ for a in "$@"; do
         --max-hosts=*) max_hosts=${a#--max-hosts=} ;;
         --work-root=*) work_root=${a#--work-root=} ;;
         --login-from=*) login_from=${a#--login-from=} ;;
+        --max-awake=*) max_awake=${a#--max-awake=} ;;
         -h|--help) sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
@@ -130,6 +133,8 @@ if [ "$max_hosts" -lt "$hosts" ]; then
     echo "up.sh: --max-hosts=$max_hosts is below --hosts=$hosts" >&2; exit 2
 fi
 case "$work_root" in ''|/*) ;; *) echo "up.sh: --work-root takes an absolute path" >&2; exit 2 ;; esac
+case "$max_awake" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) echo "up.sh: --max-awake takes a number from 1" >&2; exit 2 ;; esac
+[ -z "$max_awake" ] || [ "$dist" = 1 ] || { echo "up.sh: --max-awake needs --dist" >&2; exit 2; }
 case "$login_from" in ''|k2-host-[0-9]*) ;; *) echo "up.sh: --login-from takes a host pod (k2-host-N)" >&2; exit 2 ;; esac
 if { [ -n "$work_root" ] || [ -n "$login_from" ]; } && [ "$dist" = 0 ]; then
     echo "up.sh: --work-root and --login-from need --dist" >&2; exit 2
@@ -172,8 +177,14 @@ if [ -z "$render_to" ]; then
     slot=()
     [ -x "$HOME/.cache/k2-dist-cargo-slot.sh" ] && slot=("$HOME/.cache/k2-dist-cargo-slot.sh")
     say "building $KIND_IMAGE ($KIND_DOCKERFILE)"
+    # The revision label is the K2 inside (the daemon it is built FROM), so
+    # it can be trusted for what is deployed; this tree's HEAD (the kind
+    # scripts, the Dockerfile) is k2.dev/kind-revision.
+    base_rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$KIND_BASE_IMAGE")
+    [ -n "$base_rev" ] || { echo "up.sh: $KIND_BASE_IMAGE has no revision label" >&2; exit 1; }
     build=(docker build -q -f "$KIND_DOCKERFILE" -t "$KIND_IMAGE" --build-arg "BASE_IMAGE=$KIND_BASE_IMAGE"
-        --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" "$KIND_CONTEXT")
+        --label "org.opencontainers.image.revision=$base_rev" --label "k2.dev/kind-revision=$(git rev-parse HEAD)" \
+        --label "k2.dev/base-image-id=$(docker image inspect -f '{{.Id}}' "$KIND_BASE_IMAGE")" "$KIND_CONTEXT")
     case "$KIND_DOCKERFILE" in *fake*) build=(${slot[@]+"${slot[@]}"} "${build[@]}") ;; esac   # its cargo stage
     DOCKER_BUILDKIT=1 "${build[@]}" >/dev/null
     if [ "$door" = proxy ]; then
@@ -216,8 +227,8 @@ $([ "$provisioner" = kubernetes ] && printf '  - %s\n' "$(python3 -I -c 'import 
 replicas:
   - {name: k2-host, count: $1}
 EOF
-        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ]; then echo "patches:"; fi
-        if [ "$ptyd" = 1 ] || [ -n "$work_root" ]; then
+        if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ] || [ -n "$max_awake" ]; then echo "patches:"; fi
+        if [ "$ptyd" = 1 ] || [ -n "$work_root" ] || [ -n "$max_awake" ]; then
             cat <<EOF
   - target: {kind: StatefulSet, name: k2-host}
     patch: |-
@@ -234,6 +245,7 @@ EOF
 EOF
             [ "$ptyd" = 1 ] && echo '                  - {name: K2_PTYD, value: "1"}'
             [ -n "$work_root" ] && echo "                  - {name: K2_WORK_ROOT, value: \"$work_root\"}"
+            [ -n "$max_awake" ] && echo "                  - {name: K2_HOST_MAX_AWAKE, value: \"$max_awake\"}"
         fi
         if [ -n "$login_from" ]; then
             # The variant's agents image by its own name: the base's images:
