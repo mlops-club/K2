@@ -277,7 +277,11 @@ fn is_post(path: &str) -> bool {
 }
 
 async fn write_reply(stream: &mut TcpStream, (status, ct, body): Reply) {
-    let head = format!("HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n{frame}\r\n",
+        body.len(),
+        frame = k2_core::frame_policy::CONNECT_HEADER_LINES,
+    );
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(&body).await;
 }

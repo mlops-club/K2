@@ -200,12 +200,15 @@ fn latest_in(db: &Connection, agent: &str) -> Result<Option<Latest>, String> {
     .map_err(|e| format!("index: {e}"))
 }
 
+/// A commit's writer check (I4), as [`Store::commit`] takes it.
+pub type FenceFn<'a> = Box<dyn Fn(&Fence) -> Result<(), String> + 'a>;
+
 /// The store as one host's [`Remote`], in process, with the caller's
 /// fence (tests; a controller's own use).
 pub struct InProcess<'a> {
     pub store: &'a Store,
     pub host: String,
-    pub fence: Box<dyn Fn(&Fence) -> Result<(), String> + 'a>,
+    pub fence: FenceFn<'a>,
 }
 
 impl Remote for InProcess<'_> {

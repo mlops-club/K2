@@ -58,9 +58,12 @@ fn travels(class: Class, rel: &str) -> bool {
     !(parts.get(git + 1) == Some(&"hooks") && !name.ends_with(".sample"))
 }
 
-/// The files of `project_path`'s home, each with its source path, sorted;
-/// and the files left out as secrets.
-pub fn collect(project_path: &str, opts: &Options) -> Result<(String, String, Vec<(Entry, PathBuf)>, Vec<String>), String> {
+/// What [`collect`] found: the resolved project path, its slug, every file
+/// with its source path (sorted), and the files left out as secrets.
+pub type Collected = (String, String, Vec<(Entry, PathBuf)>, Vec<String>);
+
+/// The files of `project_path`'s home.
+pub fn collect(project_path: &str, opts: &Options) -> Result<Collected, String> {
     let inv = inventory(
         project_path,
         CloneOptions { include_all_history: true, carry_secrets: false, home_override: Some(opts.home.clone()) },
