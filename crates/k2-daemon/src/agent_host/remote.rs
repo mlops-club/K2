@@ -26,7 +26,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::provisioner::policy::PolicyStore;
-use crate::provisioner::{HostView, Provisioner, Refusal};
+use crate::provisioner::{Ensure, HostView, IdleStep, Provisioner};
 use k2_core::log_debug;
 use k2_core::session::SessionId;
 use k2_core::terminal::{AlacEvent, DaemonPtyConfig, LabelSource};
@@ -484,10 +484,18 @@ pub struct RemoteHost {
     enrolled: Mutex<BTreeSet<String>>,
     /// P3: how long a host seen only on a link stays away after unlinking.
     away_forget: Duration,
+    /// P4: bumped on every host hello; a need that got `Wait` (a scale-up)
+    /// waits on it, then retries.
+    hellos: (std::sync::Mutex<u64>, std::sync::Condvar),
+    /// How long a need waits for a host to come (`K2_PROVISIONER_WAIT`).
+    host_wait: Duration,
 }
 
 /// Default for `K2_HOST_AWAY_FORGET`.
 pub const AWAY_FORGET: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Default for `K2_PROVISIONER_WAIT`: a pod's start, enroll and hello.
+pub const HOST_WAIT: Duration = Duration::from_secs(120);
 
 impl Default for RemoteHost {
     fn default() -> Self {
@@ -512,6 +520,8 @@ impl RemoteHost {
             policy: Arc::new(PolicyStore::in_memory()),
             enrolled: Mutex::default(),
             away_forget: AWAY_FORGET,
+            hellos: Default::default(),
+            host_wait: HOST_WAIT,
         }
     }
 
@@ -525,6 +535,11 @@ impl RemoteHost {
     /// placement while not linked (away), until revoked.
     pub fn set_enrolled(&self, hosts: BTreeSet<String>) {
         *self.enrolled.lock() = hosts;
+    }
+
+    /// How long a need waits for a host that is coming (a scale-up).
+    pub fn with_host_wait(self, host_wait: Duration) -> Self {
+        Self { host_wait, ..self }
     }
 
     /// P3: place with `provisioner`, keeping policies in `policy`.
@@ -650,6 +665,15 @@ impl RemoteHost {
             Self::fail_link(old);
         }
         log_debug!("[hosts] host {host_id} linked (conn {conn})");
+        // P4: a scale-up may wait for exactly this hello; any waiting need retries.
+        if self.provisioner.on_hello(&host_id) {
+            log_debug!("[hosts] host {host_id} is the one a scale-up waited for");
+        }
+        {
+            let (gen, cv) = &self.hellos;
+            *gen.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+            cv.notify_all();
+        }
         k2_core::trace::emit(|| k2_core::trace::Event::new("ctl.host_linked").attr("host", host_id.as_str()));
         (conn, host_id, rx)
     }
@@ -893,29 +917,6 @@ impl RemoteHost {
             .collect()
     }
 
-    /// The host for `agent_id`'s new placement (the provisioner's `choose`
-    /// over every known host, with the agent's policy).
-    fn choose_host(&self, inner: &Inner, agent_id: &str) -> Result<String, Refusal> {
-        let need = self.policy.need(agent_id);
-        let views = self.host_views(inner);
-        match self.provisioner.choose(&need, &views) {
-            Ok(c) => {
-                k2_core::trace::emit(|| {
-                    k2_core::trace::Event::new("ctl.choose")
-                        .agent(agent_id)
-                        .attr("host", c.host.as_str())
-                        .attr("why", format!("{:?}", c.why))
-                        .attr("provisioner", self.provisioner.kind())
-                });
-                Ok(c.host)
-            }
-            Err(r) => {
-                log_debug!("[hosts] no host for {agent_id}: {}", r.message());
-                Err(r)
-            }
-        }
-    }
-
     /// `agent_id` got a session on `host_id`: its policy's last host (and,
     /// for a new agent, its mode from the host's kind).
     fn record_placement(&self, inner: &Inner, agent_id: &str, host_id: &str) {
@@ -944,39 +945,17 @@ impl RemoteHost {
         if agent_id.is_empty() {
             return answer("400 Bad Request", json!({"error": "agent_name required"}));
         }
-        let (host_id, epoch) = {
-            let mut inner = self.inner.lock();
-            match inner.placements.get(&agent_id) {
-                Some(p) => (p.host_id.clone(), p.epoch),
-                None => {
-                    let host_id = match self.choose_host(&inner, &agent_id) {
-                        Ok(h) => h,
-                        Err(r) => {
-                            log_debug!("[hosts] spawn {agent_id} refused: {}", r.message());
-                            return answer(r.status(), json!({"error": r.message()}));
-                        }
-                    };
-                    let epoch = match self.epochs.next() {
-                        Ok(e) => PlacementEpoch(e),
-                        Err(e) => {
-                            log_debug!("[hosts] spawn {agent_id} refused: can't persist the placement epoch: {e}");
-                            return answer(
-                                "500 Internal Server Error",
-                                json!({"error": format!("can't persist the placement epoch: {e}")}),
-                            );
-                        }
-                    };
-                    k2_core::trace::emit(|| {
-                        k2_core::trace::Event::new(trace_events::CTL_EPOCH).agent(agent_id.as_str()).attr("epoch", epoch.0)
-                    });
-                    // Reserve the placement now so a concurrent spawn of the
-                    // same agent lands on the same host.
-                    inner.placements.insert(
-                        agent_id.clone(),
-                        RemotePlacement { agent_id: agent_id.clone(), host_id: host_id.clone(), session_id: None, epoch, hooks: 0 },
-                    );
-                    (host_id, epoch)
-                }
+        let reserved = match tokio::runtime::Handle::try_current() {
+            Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.reserve_for(&agent_id))
+            }
+            _ => self.reserve_for(&agent_id),
+        };
+        let (host_id, epoch) = match reserved {
+            Ok(r) => r,
+            Err((status, why)) => {
+                log_debug!("[hosts] spawn {agent_id} refused: {why}");
+                return answer(&status, json!({"error": why}));
             }
         };
         k2_core::trace::emit(|| {
@@ -1106,20 +1085,93 @@ impl RemoteHost {
     }
 
     /// Reserve `agent_id`'s placement: its current host and epoch, or a
-    /// new placement on the provisioner's choice at a new epoch.
-    fn reserve(&self, agent_id: &str) -> Result<(String, PlacementEpoch), String> {
-        let mut inner = self.inner.lock();
-        if let Some(p) = inner.placements.get(agent_id) {
-            return Ok((p.host_id.clone(), p.epoch));
+    /// new placement on the provisioner's host at a new epoch. Blocks: the
+    /// provisioner runs off `inner` (Kubernetes calls, minting through the
+    /// shared DB), and a `Wait` (a scale-up) holds the need until a host's
+    /// hello, up to `host_wait`, then retries. `Err` is (status, reason).
+    fn reserve_for(&self, agent_id: &str) -> Result<(String, PlacementEpoch), (String, String)> {
+        let unavailable = |why: String| ("503 Service Unavailable".to_string(), why);
+        let deadline = Instant::now() + self.host_wait;
+        loop {
+            let (views, seen) = {
+                let inner = self.inner.lock();
+                if let Some(p) = inner.placements.get(agent_id) {
+                    return Ok((p.host_id.clone(), p.epoch));
+                }
+                (self.host_views(&inner), self.hello_count())
+            };
+            let need = self.policy.need(agent_id);
+            match self.provisioner.ensure_host(&need, &views) {
+                Ensure::Ready(host_id) => {
+                    let mut inner = self.inner.lock();
+                    if let Some(p) = inner.placements.get(agent_id) {
+                        return Ok((p.host_id.clone(), p.epoch)); // a concurrent spawn won
+                    }
+                    if !inner.links.contains_key(&host_id) {
+                        continue; // it unlinked meanwhile: choose again
+                    }
+                    let epoch = PlacementEpoch(self.epochs.next().map_err(|e| {
+                        ("500 Internal Server Error".to_string(), format!("can't persist the placement epoch: {e}"))
+                    })?);
+                    k2_core::trace::emit(|| {
+                        k2_core::trace::Event::new("ctl.choose")
+                            .agent(agent_id)
+                            .attr("host", host_id.as_str())
+                            .attr("provisioner", self.provisioner.kind())
+                    });
+                    k2_core::trace::emit(|| k2_core::trace::Event::new(trace_events::CTL_EPOCH).agent(agent_id).attr("epoch", epoch.0));
+                    // Reserved now, so a concurrent spawn of the same agent
+                    // lands on the same host.
+                    inner.placements.insert(
+                        agent_id.to_string(),
+                        RemotePlacement { agent_id: agent_id.to_string(), host_id: host_id.clone(), session_id: None, epoch, hooks: 0 },
+                    );
+                    return Ok((host_id, epoch));
+                }
+                Ensure::Wait(why) => {
+                    log_debug!("[hosts] {agent_id} waits: {why}");
+                    if !self.wait_for_hello(seen, deadline) {
+                        return Err(unavailable(format!("{why}; no host came within {:?}", self.host_wait)));
+                    }
+                }
+                Ensure::Refused(why) => return Err(unavailable(why)),
+            }
         }
-        let host_id = self.choose_host(&inner, agent_id).map_err(|r| r.message())?;
-        let epoch = PlacementEpoch(self.epochs.next().map_err(|e| format!("can't persist the placement epoch: {e}"))?);
-        k2_core::trace::emit(|| k2_core::trace::Event::new(trace_events::CTL_EPOCH).agent(agent_id).attr("epoch", epoch.0));
-        inner.placements.insert(
-            agent_id.to_string(),
-            RemotePlacement { agent_id: agent_id.to_string(), host_id: host_id.clone(), session_id: None, epoch, hooks: 0 },
-        );
-        Ok((host_id, epoch))
+    }
+
+    fn hello_count(&self) -> u64 {
+        *self.hellos.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Wait until a hello after `seen`, or `deadline`. `true` = one came.
+    fn wait_for_hello(&self, seen: u64, deadline: Instant) -> bool {
+        let (gen, cv) = &self.hellos;
+        let mut g = gen.lock().unwrap_or_else(|p| p.into_inner());
+        while *g == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            g = cv.wait_timeout(g, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        true
+    }
+
+    /// One idle tick of the provisioner (Kubernetes: scale down). A host it
+    /// drains has its agents released (they sleep; their next wake goes
+    /// elsewhere). Blocking: run it on a blocking thread.
+    pub fn idle_tick(&self, now: Instant) -> IdleStep {
+        let views = self.host_views(&self.inner.lock());
+        let step = self.provisioner.idle(now, &views);
+        if let IdleStep::Drain(host) = &step {
+            let agents: Vec<String> =
+                self.inner.lock().placements.values().filter(|p| &p.host_id == host).map(|p| p.agent_id.clone()).collect();
+            log_debug!("[hosts] draining {host} for a scale-down: releasing {} agent(s)", agents.len());
+            for a in agents {
+                let _ = super::AgentHost::unplace(self, &a);
+            }
+        }
+        step
     }
 
     /// Drop a reservation whose spawn failed (only if it is still ours and
@@ -1143,7 +1195,7 @@ impl RemoteHost {
         req: &crate::spawn::SpawnWorkspaceSessionRequest,
     ) -> Result<(SpawnedSession, AgentSession), String> {
         let agent_id = crate::spawn::canonical_key_for_request(req);
-        let (host_id, epoch) = self.reserve(&agent_id)?;
+        let (host_id, epoch) = self.reserve_for(&agent_id).map_err(|(_, why)| why)?;
         let request = serde_json::to_value(req).map_err(|e| format!("encode the spawn request: {e}"))?;
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new("ctl.place").agent(agent_id.as_str()).attr("host", host_id.as_str()).attr("epoch", epoch.0)
@@ -2004,7 +2056,14 @@ pub fn global() -> &'static RemoteHost {
                 AWAY_FORGET
             }),
         };
-        host.with_placement(provisioner, Arc::new(policy)).with_away_forget(forget)
+        let wait = match std::env::var("K2_PROVISIONER_WAIT").ok().filter(|v| !v.trim().is_empty()) {
+            None => HOST_WAIT,
+            Some(v) => v.trim().parse().map(Duration::from_secs).unwrap_or_else(|_| {
+                log_debug!("[provisioner] K2_PROVISIONER_WAIT={v:?} is not a number of seconds; using {HOST_WAIT:?}");
+                HOST_WAIT
+            }),
+        };
+        host.with_placement(provisioner, Arc::new(policy)).with_away_forget(forget).with_host_wait(wait)
     });
     RESTORED.call_once(|| {
         r.restore();

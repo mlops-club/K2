@@ -9,8 +9,8 @@
 //! RBAC this needs (namespace-scoped, `deploy/kubernetes/core/rbac.yaml`
 //! plus D8's rule): get/patch `statefulsets/scale` on `k2-host`, get/list/
 //! watch `pods`, patch the Secret `k2-host-enroll`.
-
-pub mod pool;
+//!
+//! The host pool that uses it is `provisioner::kubernetes`.
 
 #[cfg(test)]
 pub(crate) mod fake;
@@ -149,19 +149,34 @@ pub enum PodEvent {
 }
 
 pub struct Client {
-    http: reqwest::blocking::Client,
+    /// Built on the first call, which runs on a blocking thread: a blocking
+    /// `reqwest` client owns a runtime, and building or dropping one on an
+    /// async worker panics. A `Client` lives as long as the provisioner.
+    http: std::sync::OnceLock<reqwest::blocking::Client>,
+    ca: Option<reqwest::Certificate>,
     cfg: Config,
 }
 
 impl Client {
+    /// Checks the CA now; connects on the first call.
     pub fn new(cfg: Config) -> Result<Client, String> {
-        let mut b = reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(None::<Duration>);
-        if let Some(pem) = &cfg.ca_pem {
-            let ca = reqwest::Certificate::from_pem(pem).map_err(|e| format!("cluster CA: {e}"))?;
-            b = b.tls_built_in_root_certs(false).add_root_certificate(ca);
+        let ca = match &cfg.ca_pem {
+            Some(pem) => Some(reqwest::Certificate::from_pem(pem).map_err(|e| format!("cluster CA: {e}"))?),
+            None => None,
+        };
+        Ok(Client { http: std::sync::OnceLock::new(), ca, cfg })
+    }
+
+    fn http(&self) -> Result<&reqwest::blocking::Client, Error> {
+        if let Some(h) = self.http.get() {
+            return Ok(h);
         }
-        let http = b.build().map_err(|e| format!("Kubernetes client: {e}"))?;
-        Ok(Client { http, cfg })
+        let mut b = reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(None::<Duration>);
+        if let Some(ca) = &self.ca {
+            b = b.tls_built_in_root_certs(false).add_root_certificate(ca.clone());
+        }
+        let built = b.build().map_err(|e| Error::Transport(format!("Kubernetes client: {e}")))?;
+        Ok(self.http.get_or_init(|| built))
     }
 
     pub fn namespace(&self) -> &str {
@@ -179,7 +194,7 @@ impl Client {
     }
 
     fn request(&self, method: reqwest::Method, path: &str, body: Option<(&str, Value)>, timeout: Option<Duration>) -> Result<reqwest::blocking::Response, Error> {
-        let mut r = self.http.request(method, format!("{}{path}", self.cfg.base)).header("Accept", "application/json");
+        let mut r = self.http()?.request(method, format!("{}{path}", self.cfg.base)).header("Accept", "application/json");
         if let Some(t) = timeout {
             r = r.timeout(t);
         }

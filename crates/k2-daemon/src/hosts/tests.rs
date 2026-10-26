@@ -1560,3 +1560,115 @@ async fn adopted_agents_from_before_the_table_are_portable_on_servers_pinned_on_
     let laptop = c.remote.policy().get("old-laptop").expect("adopted");
     assert_eq!(laptop.mode, crate::provisioner::Mode::Pinned { host: "eric-mbp".into() });
 }
+
+// ── P4 T1: the Kubernetes provisioner through RemoteHost ─────────────────
+
+/// Mints `k2e_test_<n>`; nothing is enrolled.
+#[derive(Default)]
+struct TestEnroll(parking_lot::Mutex<Vec<String>>);
+
+impl crate::provisioner::kubernetes::Enroller for TestEnroll {
+    fn enrolled(&self, _host_name: &str) -> bool {
+        false
+    }
+    fn mint(&self, _ttl_ms: i64) -> Result<String, String> {
+        let t = format!("k2e_test_{}", self.0.lock().len());
+        self.0.lock().push(t.clone());
+        Ok(t)
+    }
+}
+
+/// A controller whose provisioner is `kubernetes` on the fake API server,
+/// `replicas` pods in `k2-host`, at most `max`.
+async fn k8s_controller(replicas: u32, max: u32, idle_after: Duration) -> (Controller, crate::k8s::fake::FakeApi) {
+    use crate::provisioner::kubernetes::{K8sPool, Kubernetes, PoolSettings};
+    let api = crate::k8s::fake::FakeApi::start();
+    api.state.lock().replicas.insert("k2-host".into(), replicas);
+    api.state.lock().secrets.insert("k2-host-enroll".into(), Default::default());
+    let settings = PoolSettings { max_hosts: max, idle_after, ..PoolSettings::default() };
+    let pool = K8sPool { client: api.client(), statefulset: "k2-host".into(), enroll_secret: "k2-host-enroll".into() };
+    let k = Kubernetes::new(settings, Box::new(pool), std::sync::Arc::new(TestEnroll::default()));
+    let remote: &'static RemoteHost = Box::leak(Box::new(
+        RemoteHost::new()
+            .with_placement(Box::new(k), std::sync::Arc::new(crate::provisioner::policy::PolicyStore::in_memory()))
+            .with_host_wait(DEADLINE),
+    ));
+    (Controller::start_on(remote).await, api)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubernetes_a_third_wake_scales_up_and_lands_on_the_new_hosts_hello() {
+    let (c, api) = k8s_controller(1, 2, Duration::from_secs(900)).await;
+    let mut h0 = fake_host_labeled(&c, "k2-host-0", &["k2.max_awake=2"]).await;
+    c.wait_hosts(1).await;
+    place(&c, &mut h0, "a1", &uuid::Uuid::new_v4().to_string()).await;
+    place(&c, &mut h0, "a2", &uuid::Uuid::new_v4().to_string()).await;
+    // The third wake: k2-host-0 is at k2.max_awake=2.
+    let remote = c.remote;
+    let third = tokio::spawn(async move { remote.spawn(br#"{"agent_name":"a3","command":"claude"}"#).await });
+    within("the scale-up", async {
+        while api.state.lock().replicas["k2-host"] != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let calls = api.calls();
+    let secret = calls.iter().position(|(m, p)| m == "PATCH" && p.ends_with("/secrets/k2-host-enroll")).expect("token put");
+    let scale = calls.iter().position(|(m, p)| m == "PATCH" && p.ends_with("/statefulsets/k2-host/scale")).expect("scaled");
+    assert!(secret < scale, "the token before the scale: {calls:?}");
+    assert!(api.state.lock().secrets["k2-host-enroll"].contains_key("k2-host-1"));
+    // The pod reads Ready: the need is not retried on that.
+    api.state.lock().pods = vec![crate::k8s::fake::pod_json("k2-host-1", "Running", true, Some("node-b"))];
+    assert!(c.remote.placement("a3").is_none());
+    // k2-host-1's hello: the waiting need is placed there.
+    let mut h1 = fake_host_labeled(&c, "k2-host-1", &["k2.max_awake=2"]).await;
+    let req = match recv(&mut h1).await {
+        Frame::Spawn { req, agent_id, .. } => {
+            assert_eq!(agent_id, "a3");
+            req
+        }
+        other => panic!("expected the waiting spawn on k2-host-1, got {other:?}"),
+    };
+    let session = uuid::Uuid::new_v4().to_string();
+    send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body: json!({"sessionId": session, "reused": false}).to_string() }).await;
+    let (st, body) = within("the third wake", third).await.unwrap();
+    assert_eq!(st, "200 OK", "{body}");
+    assert_eq!(c.remote.placement("a3").unwrap().host_id, "k2-host-1");
+    // At the maximum (2 hosts, both full after a4): refused naming the limit.
+    place(&c, &mut h1, "a4", &uuid::Uuid::new_v4().to_string()).await;
+    let (st, body) = c.remote.spawn(br#"{"agent_name":"a5","command":"claude"}"#).await;
+    assert_eq!(st, "503 Service Unavailable", "{body}");
+    assert!(body.contains("K2_PROVISIONER_MAX_HOSTS=2"), "{body}");
+    assert_eq!(api.state.lock().replicas["k2-host"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kubernetes_idle_drains_the_highest_ordinal_releases_its_agents_then_scales_down() {
+    // An idle window of 0: the first tick with spare room drains.
+    let (c, api) = k8s_controller(2, 3, Duration::ZERO).await;
+    let mut h0 = fake_host_labeled(&c, "k2-host-0", &["k2.max_awake=2"]).await;
+    let mut h1 = fake_host_labeled(&c, "k2-host-1", &["k2.max_awake=2"]).await;
+    c.wait_hosts(2).await;
+    place(&c, &mut h0, "a0", &uuid::Uuid::new_v4().to_string()).await;
+    place(&c, &mut h1, "a1", &uuid::Uuid::new_v4().to_string()).await;
+    // a1 fits on k2-host-0: drain k2-host-1, which releases a1 (a close).
+    let remote = c.remote;
+    let tick = tokio::task::spawn_blocking(move || remote.idle_tick(std::time::Instant::now()));
+    let req = match recv(&mut h1).await {
+        Frame::Close { req, agent_id, .. } => {
+            assert_eq!(agent_id, "a1");
+            req
+        }
+        other => panic!("expected a1's release, got {other:?}"),
+    };
+    send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body: json!({"closed": true}).to_string() }).await;
+    assert_eq!(within("the drain", tick).await.unwrap(), crate::provisioner::IdleStep::Drain("k2-host-1".into()));
+    assert!(c.remote.placement("a1").is_none());
+    assert_eq!(api.state.lock().replicas["k2-host"], 2, "not before its agents are gone");
+    // While draining it takes nothing new: a1's wake goes to k2-host-0.
+    place(&c, &mut h0, "a1", &uuid::Uuid::new_v4().to_string()).await;
+    let remote = c.remote;
+    let step = tokio::task::spawn_blocking(move || remote.idle_tick(std::time::Instant::now())).await.unwrap();
+    assert_eq!(step, crate::provisioner::IdleStep::ScaledDown { host: "k2-host-1".into(), to: 1 });
+    assert_eq!(api.state.lock().replicas["k2-host"], 1);
+}

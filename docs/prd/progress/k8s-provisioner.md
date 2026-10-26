@@ -115,7 +115,7 @@ kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-p4-pool get statefulset,po
 | Piece | Where | Notes |
 |---|---|---|
 | D1 client | `crates/k2-daemon/src/k8s/mod.rs` | In-cluster config (`KUBERNETES_SERVICE_HOST`/`_PORT`, the ServiceAccount's `namespace`, `ca.crt`, `token`; the token re-read on every call since projected tokens rotate). Blocking `reqwest` + rustls already in the daemon, no new dependency: `get_scale`/`set_replicas` (merge patch of `statefulsets/<name>/scale`), `list_pods`/`get_pod`/`watch_pods` (410 → `Expired`), `put_secret_key`/`remove_secret_key` (merge patch of one `data` key; the Secret must exist, RBAC is by name). Errors keep the API's `Status` reason and message. Calls block: run them on a blocking thread |
-| Pool scaler | `crates/k2-daemon/src/k8s/pool.rs` | P3's `ensure_host` and `idle` for `kubernetes`, over `PoolApi` (the client) and `Enroller` (W5 `Registry`: `mint_token` inside the controller, no HTTP). Settings `K2_PROVISIONER_MIN_HOSTS` (1), `_MAX_HOSTS` (3), `_IDLE_AFTER` seconds (900), `_STATEFULSET` (`k2-host`), `K2_HOST_ENROLL_SECRET` (`k2-host-enroll`). Moves to `provisioner/kubernetes.rs` behind P3's trait when it exists (P3 owns `provisioner/mod.rs`; no add/add conflict meanwhile) |
+| Pool scaler | `crates/k2-daemon/src/provisioner/kubernetes.rs` | P3's `ensure_host` and `idle` for `kubernetes`, over `PoolApi` (the client) and `Enroller` (W5 `Registry`: `mint_token` inside the controller, no HTTP). Settings `K2_PROVISIONER_MIN_HOSTS` (1), `_MAX_HOSTS` (3), `_IDLE_AFTER` seconds (900), `_STATEFULSET` (`k2-host`), `K2_HOST_ENROLL_SECRET` (`k2-host-enroll`). Behind P3's `Provisioner` trait (`k2-dist/p3-provisioner`): `choose` is `Static`'s on hosts it isn't draining; `ensure_host` scales up only for a portable agent when no host has room; `idle` and `on_hello` drive the pool. `K2_PROVISIONER=kubernetes` selects it (`Kubernetes::in_cluster`; boot fails outside a pod). `K2_PROVISIONER_STATEFULSET` became deploy/'s `K2_PROVISIONER_HOST_STATEFULSET` |
 | `--host-health` (D10) | `crates/k2-daemon/src/hosts/health.rs`, one line in `daemon_main.rs`'s early dispatch | Never boots a daemon. GETs the local `/cli/hosts/status` on `K2_DAEMON_PORT` (else the `daemon.port` file through `k2_core::paths`): exit 0 only for `role: host` with `linked: true`, else 1 with the reason |
 
 Rules the pool keeps:
@@ -129,7 +129,7 @@ Rules the pool keeps:
 |---|---|
 | `cargo test -p k2-daemon --lib -- k8s:: hosts::health` | 19 passed, 2 runs |
 | `k8s::tests::*` (6) | in-cluster config (IPv6 brackets, missing token); scale get and patch body; 403 `Forbidden` reason kept, nothing listening is a transport error; a rotated token file is picked up on the next call; Secret key put (base64) and removed, other keys kept, a missing Secret is 404; pods list (selector encoded), get, watch (`MODIFIED`, a terminating pod, 410 → `Expired`) |
-| `k8s::pool::tests::with_max_awake_2_a_third_wake_scales_1_to_2_minting_the_token_first` | `Wait` naming `k2-host-1`, replicas 2, the Secret's `k2-host-1` holds the minted token, and the Secret PATCH precedes the scale PATCH in the API log |
+| `provisioner::kubernetes::tests::with_max_awake_2_a_third_wake_scales_1_to_2_minting_the_token_first` | `Wait` naming `k2-host-1`, replicas 2, the Secret's `k2-host-1` holds the minted token, and the Secret PATCH precedes the scale PATCH in the API log |
 | `…the_need_is_retried_on_the_new_hosts_hello_never_on_pod_ready` | the pod Running and Ready changes nothing (no API call, no second scale); another host's hello doesn't count; `k2-host-1`'s does, then `Ready(k2-host-1)` |
 | `…a_pod_without_a_hello_is_waited_for_not_added_to` | replicas 2 with one hello: wait for `k2-host-1`, no mint, no scale |
 | `…at_the_maximum_the_refusal_names_the_limit` | `K2_PROVISIONER_MAX_HOSTS=3 reached … k2.max_awake` |
@@ -138,9 +138,34 @@ Rules the pool keeps:
 | `…never_below_the_minimum`, `…a_draining_or_away_host_is_never_chosen_and_never_scaled` | min respected; an away host's room doesn't count (a new host comes instead) and it is never scaled down; a SIGTERM-draining host likewise |
 | `hosts::health::tests::*` (2) | 0 only for a linked host; not linked (with the last error), a controller, a `K2_ROLE=all` 404, nothing listening, no port: 1 |
 
+### Through `RemoteHost` (rebased onto P3 phase A)
+
+- Both paths that place a new agent (`spawn`, the workspace spawn) call one
+  blocking `reserve_for`: the provisioner's `ensure_host` runs **off**
+  `RemoteHost::inner` (Kubernetes calls; minting takes the shared DB lock,
+  which other threads hold while they call `host()`: W3's deadlock shape).
+  `Ready` reserves (re-checking a racing spawn and that the host is still
+  linked); `Wait` blocks the request until the next host hello (a counter
+  and a condvar bumped in `connect`, after `provisioner.on_hello`), up to
+  `K2_PROVISIONER_WAIT` (default 120 s), then retries; `Refused` is a 503.
+  A pinned agent whose host is away is refused at once (`Static`'s
+  `ensure_host`), never held or scaled for.
+- `RemoteHost::idle_tick`, every 30 s on a controller (`hosts::start`, on a
+  blocking thread): a `Drain(host)` releases that host's agents (`unplace`:
+  a close on the host); the next tick scales down once it has none.
+- The blocking `reqwest` client is built on the first API call, on a
+  blocking thread: building or dropping it on an async worker panics (both
+  new tests caught it; `remote::global()` can first run inside a route).
+
+| Check | Result |
+|---|---|
+| `hosts::tests::kubernetes_a_third_wake_scales_up_and_lands_on_the_new_hosts_hello` | `k2-host-0` at `k2.max_awake=2`: the third spawn waits; replicas 1 → 2 with the Secret patched first; the pod Ready changes nothing; `k2-host-1`'s hello → the waiting spawn arrives on `k2-host-1` and answers 200; at `MAX_HOSTS=2` with both full → 503 naming `K2_PROVISIONER_MAX_HOSTS=2` |
+| `hosts::tests::kubernetes_idle_drains_the_highest_ordinal_releases_its_agents_then_scales_down` | idle tick → `Drain(k2-host-1)`, a close of its agent on `k2-host-1`; replicas stay 2 meanwhile; the agent's wake goes to `k2-host-0`; next tick → `ScaledDown{to: 1}` |
+| `cargo test -p k2-daemon --lib -- provisioner:: hosts:: agent_host:: k8s::` | **93 passed**, 2 runs |
+
 ## Status
 
-- Milestones: diagrams written; unit acceptance (pool, client, `--host-health`).
+- Milestones: diagrams written; unit acceptance (pool, client, `--host-health`); behind P3's trait, through `RemoteHost`.
 - Dependencies not on `wave2-preview` @3912ab2ff:
   - P3 T2 phase A (`provisioner/` trait, `agent_placement`): no branch yet;
   - S8 SIGTERM drain: in progress on `k2-dist/g2-fixes` (outbox worker).

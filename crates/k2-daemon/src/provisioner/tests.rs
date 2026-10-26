@@ -61,8 +61,9 @@ fn a_pinned_agent_waits_for_its_away_host_and_is_never_placed_elsewhere() {
     let r = Static.choose(&n, &hosts).unwrap_err();
     assert_eq!(r, Refusal::PinnedAway { agent: "notes".into(), host: "eric-mbp".into() });
     assert!(r.message().contains("never placed elsewhere"), "{}", r.message());
-    // ensure_host makes that a wait (retried when eric-mbp says hello).
-    assert!(matches!(Static.ensure_host(&n, &hosts), Ensure::Wait(_)));
+    // ensure_host refuses now: the agent waits for its host, the request
+    // doesn't (no scale-up, no hold).
+    assert!(matches!(Static.ensure_host(&n, &hosts), Ensure::Refused(m) if m.contains("pinned to host eric-mbp")));
     // Linked again: it goes there, even with less room than elsewhere.
     let hosts = [host("eric-mbp", 1, &["k2.kind=laptop", "k2.max_awake=2"]), host("host-1", 0, &[])];
     assert_eq!(Static.choose(&n, &hosts).unwrap(), Choice { host: "eric-mbp".into(), why: Why::Pinned });
@@ -152,7 +153,9 @@ fn k2_provisioner_by_role() {
     assert!(select(Role::All, Some("static")).err().unwrap().contains("K2_ROLE=controller"));
     assert_eq!(select(Role::Controller, None).unwrap().kind(), "static");
     assert_eq!(select(Role::Controller, Some("static")).unwrap().kind(), "static");
-    assert_eq!(select(Role::Controller, Some("kubernetes")).unwrap().kind(), "static", "until P4 lands");
+    // Outside a pod: a clear boot error (tests never run in one).
+    let e = select(Role::Controller, Some("kubernetes")).err().unwrap();
+    assert!(e.contains("KUBERNETES_SERVICE_HOST"), "{e}");
     assert!(select(Role::Controller, Some("local")).is_err());
     assert!(select(Role::Controller, Some("k8s")).err().unwrap().contains("use local, static or kubernetes"));
     assert_eq!(select(Role::Host, Some("static")).unwrap().kind(), "local");

@@ -7,12 +7,14 @@
 //!
 //! - [`Local`]: `K2_ROLE=all`, the in-process host. Nothing changes (I5).
 //! - [`static_::Static`]: the hosts that enroll and link (VMs, laptops).
-//! - Kubernetes (P4): the same rules plus scaling the host pool.
+//! - [`kubernetes::Kubernetes`] (P4): the same rules plus scaling the host
+//!   pool (`K2_PROVISIONER=kubernetes`, in a pod).
 //!
 //! Every new placement writes the agent's [`policy`] row: its mode (pinned
 //! to a host, or portable) and its last host, so a wake goes back to the
 //! host that holds its home (phase A: sticky wakes; home sync is T1).
 
+pub mod kubernetes;
 pub mod policy;
 pub mod static_;
 
@@ -206,10 +208,12 @@ pub trait Provisioner: Send + Sync {
     fn choose(&self, need: &Need, hosts: &[HostView]) -> Result<Choice, Refusal>;
 
     /// [`Self::choose`], or make a host appear (Kubernetes: scale up).
+    /// `Wait` holds the request until a host's hello, then it is retried; a
+    /// pinned agent whose host is away is refused now (the agent waits for
+    /// its host, the request doesn't).
     fn ensure_host(&self, need: &Need, hosts: &[HostView]) -> Ensure {
         match self.choose(need, hosts) {
             Ok(c) => Ensure::Ready(c.host),
-            Err(r @ Refusal::PinnedAway { .. }) => Ensure::Wait(r.message()),
             Err(r) => Ensure::Refused(r.message()),
         }
     }
@@ -240,8 +244,8 @@ impl Provisioner for Local {
 }
 
 /// The provisioner `K2_PROVISIONER` names for this role. Unset: `local`
-/// under `K2_ROLE=all`, `static` on a controller. `kubernetes` is P4's;
-/// until this build has it, a controller uses `static` and says so.
+/// under `K2_ROLE=all`, `static` on a controller. `kubernetes` needs the
+/// pod's ServiceAccount (it fails boot outside a pod).
 pub fn select(role: crate::runtime_role::Role, raw: Option<&str>) -> Result<Box<dyn Provisioner>, String> {
     use crate::runtime_role::Role;
     let v = raw.map(str::trim).filter(|v| !v.is_empty());
@@ -251,8 +255,7 @@ pub fn select(role: crate::runtime_role::Role, raw: Option<&str>) -> Result<Box<
         (Role::Host, _) => Ok(Box::new(Local)),
         (Role::Controller, None | Some("static")) => Ok(Box::new(static_::Static)),
         (Role::Controller, Some("kubernetes")) => {
-            k2_core::log_debug!("[provisioner] {PROVISIONER_VAR}=kubernetes: not in this build (P4); placing on the linked hosts (static)");
-            Ok(Box::new(static_::Static))
+            kubernetes::Kubernetes::in_cluster().map(|k| Box::new(k) as Box<dyn Provisioner>).map_err(|e| format!("{PROVISIONER_VAR}=kubernetes: {e}"))
         }
         (Role::Controller, Some("local")) => Err(format!("{PROVISIONER_VAR}=local: a controller runs no agents; use static or kubernetes")),
         (_, Some(other)) => Err(format!("{PROVISIONER_VAR}={other:?}: use local, static or kubernetes")),

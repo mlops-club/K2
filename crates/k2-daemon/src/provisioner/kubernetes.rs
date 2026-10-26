@@ -1,28 +1,35 @@
-//! The host pool's scaler (P4 T1, `docs/prd/progress/p4-plan.md` section
-//! 1): the `ensure_host` and `idle` halves of P3's `Provisioner` for
-//! `K2_PROVISIONER=kubernetes`. It moves behind P3's trait in
-//! `provisioner/kubernetes.rs` once that exists; `choose` stays P3's.
+//! `Kubernetes`: the host pool (P4 T1, `docs/prd/progress/p4-plan.md`
+//! section 1). Placement is [`Static`]'s; on top of it the pool scales the
+//! StatefulSet `k2-host`:
 //!
 //! - **Scale up**: when no usable host has room under `k2.max_awake`, mint
 //!   a one-time enroll token for the next ordinal (unless that ordinal is
 //!   already enrolled: its key is on its volume), put it in the Secret
-//!   `k2-host-enroll`, *then* raise the StatefulSet's replicas, and answer
-//!   `Wait`. The need is retried when the new host's signed hello arrives
-//!   ([`Pool::on_hello`]), never when its pod reads Ready.
+//!   `k2-host-enroll`, *then* raise the replicas, and answer `Wait`. The
+//!   need is retried when the new host's signed hello arrives
+//!   ([`Provisioner::on_hello`]), never when its pod reads Ready.
 //! - **Limit**: at `K2_PROVISIONER_MAX_HOSTS` the answer is a refusal that
 //!   names the limit.
 //! - **Scale down**: StatefulSets shrink from the highest ordinal only. When
 //!   that host's agents have fit in the others' spare room for
-//!   `K2_PROVISIONER_IDLE_AFTER`, it is marked draining (never chosen), its
-//!   agents are released by the caller (P3 sleep, home snapshot), and once
-//!   it has none the replicas go down by one. Its volume and key stay.
-//! - **Never** below `K2_PROVISIONER_MIN_HOSTS`, and never a host that is
-//!   away or draining on its own (SIGTERM, S8).
+//!   `K2_PROVISIONER_IDLE_AFTER`, it is marked draining (never chosen), the
+//!   controller releases its agents, and once it has none the replicas go
+//!   down by one. Its volume and key stay.
+//! - **Never** below `K2_PROVISIONER_MIN_HOSTS`, never a host that is away
+//!   or draining on its own (SIGTERM, S8), and never a scale-up for a pinned
+//!   agent (it waits for its own host).
+//!
+//! Kubernetes and enroll calls block and may take the daemon's shared DB
+//! lock (minting): `RemoteHost` calls the provisioner off its own lock.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+
+use super::static_::Static;
+use super::{Choice, Ensure, HostView, IdleStep, Mode, Need, Provisioner, Refusal};
+use crate::k8s;
 
 /// `K2_PROVISIONER_*` and the pool's object names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +66,7 @@ impl PoolSettings {
             }
         };
         let s = PoolSettings {
-            statefulset: get("K2_PROVISIONER_STATEFULSET").filter(|v| !v.is_empty()).unwrap_or(d.statefulset),
+            statefulset: get("K2_PROVISIONER_HOST_STATEFULSET").filter(|v| !v.is_empty()).unwrap_or(d.statefulset),
             enroll_secret: get("K2_HOST_ENROLL_SECRET").filter(|v| !v.is_empty()).unwrap_or(d.enroll_secret),
             min_hosts: num("K2_PROVISIONER_MIN_HOSTS", d.min_hosts as u64)? as u32,
             max_hosts: num("K2_PROVISIONER_MAX_HOSTS", d.max_hosts as u64)? as u32,
@@ -85,7 +92,7 @@ pub trait PoolApi: Send + Sync {
 
 /// [`PoolApi`] on the real API: the StatefulSet's scale and the enroll Secret.
 pub struct K8sPool {
-    pub client: super::Client,
+    pub client: k8s::Client,
     pub statefulset: String,
     pub enroll_secret: String,
 }
@@ -119,44 +126,18 @@ impl Enroller for crate::hosts::enroll::Registry {
     }
 }
 
-/// What the pool needs to know of a host the controller has seen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostView {
-    pub host_id: String,
-    /// Its link is up (it said hello).
-    pub linked: bool,
-    /// Its link is down; its agents keep their placement there (W3).
-    pub away: bool,
-    /// It said it is draining (SIGTERM, S8).
-    pub draining: bool,
-    pub awake: u32,
-    /// `k2.max_awake` from its hello labels.
-    pub max_awake: u32,
-}
+/// The controller's own registry, looked up at each call: it is reached
+/// through `remote::global()`, which is still being built when the
+/// provisioner is.
+pub struct ControllerEnroll;
 
-impl HostView {
-    fn free(&self) -> u32 {
-        self.max_awake.saturating_sub(self.awake)
+impl Enroller for ControllerEnroll {
+    fn enrolled(&self, host_name: &str) -> bool {
+        crate::hosts::enroll::controller_registry().is_ok_and(|r| Enroller::enrolled(r.as_ref(), host_name))
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ensure {
-    /// A usable host with room: the most free one.
-    Ready(String),
-    /// A host is coming; retry the need when [`Pool::on_hello`] says so.
-    Wait(String),
-    Refused(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdleStep {
-    Nothing,
-    /// Release this host's agents (P3 sleep, home snapshot); it is draining
-    /// and is never chosen again until it is gone.
-    Drain(String),
-    /// Replicas went down to `to`; `host` is gone (its volume and key stay).
-    ScaledDown { host: String, to: u32 },
+    fn mint(&self, ttl_ms: i64) -> Result<String, String> {
+        Enroller::mint(crate::hosts::enroll::controller_registry()?.as_ref(), ttl_ms)
+    }
 }
 
 #[derive(Default)]
@@ -169,16 +150,25 @@ struct PoolState {
     draining: Option<String>,
 }
 
-pub struct Pool {
+pub struct Kubernetes {
     pub settings: PoolSettings,
     api: Box<dyn PoolApi>,
     enroll: Arc<dyn Enroller>,
     st: Mutex<PoolState>,
 }
 
-impl Pool {
-    pub fn new(settings: PoolSettings, api: Box<dyn PoolApi>, enroll: Arc<dyn Enroller>) -> Pool {
-        Pool { settings, api, enroll, st: Mutex::default() }
+impl Kubernetes {
+    pub fn new(settings: PoolSettings, api: Box<dyn PoolApi>, enroll: Arc<dyn Enroller>) -> Kubernetes {
+        Kubernetes { settings, api, enroll, st: Mutex::default() }
+    }
+
+    /// In a pod: the ServiceAccount's client, `K2_PROVISIONER_*`, and the
+    /// controller's enroll registry.
+    pub fn in_cluster() -> Result<Kubernetes, String> {
+        let settings = PoolSettings::from_env(|k| std::env::var(k).ok())?;
+        let client = k8s::Client::new(k8s::Config::in_cluster()?)?;
+        let api = K8sPool { client, statefulset: settings.statefulset.clone(), enroll_secret: settings.enroll_secret.clone() };
+        Ok(Kubernetes::new(settings, Box::new(api), Arc::new(ControllerEnroll)))
     }
 
     /// `k2-host-N`: the pod's name, and its `K2_HOST_NAME`.
@@ -190,28 +180,30 @@ impl Pool {
         host_id.strip_prefix(&self.settings.statefulset)?.strip_prefix('-')?.parse().ok()
     }
 
-    /// True for a host this pool is draining: `choose` must skip it.
+    /// True for a host this pool is draining: never chosen.
     pub fn is_draining(&self, host_id: &str) -> bool {
         self.st.lock().draining.as_deref() == Some(host_id)
     }
 
-    /// Hosts a need can go to: linked, not away, not draining (on their own
-    /// or for this pool's scale-down).
-    fn usable<'a>(hosts: &'a [HostView], draining: Option<&str>) -> Vec<&'a HostView> {
-        hosts.iter().filter(|h| h.linked && !h.away && !h.draining && Some(h.host_id.as_str()) != draining).collect()
+    /// `hosts` with this pool's draining mark applied.
+    fn marked(&self, hosts: &[HostView]) -> Vec<HostView> {
+        let draining = self.st.lock().draining.clone();
+        hosts
+            .iter()
+            .cloned()
+            .map(|mut h| {
+                if draining.as_deref() == Some(h.host_id.as_str()) {
+                    h.draining = true;
+                }
+                h
+            })
+            .collect()
     }
 
-    /// A host for one more awake agent, or a scale-up and `Wait`, or the
-    /// limit. Blocking (Kubernetes calls): run it on a blocking thread.
-    pub fn ensure_host(&self, hosts: &[HostView]) -> Ensure {
+    /// No usable host has room: scale up by one (or wait for a pod that has
+    /// no hello yet), or refuse at the limit.
+    fn scale_up(&self, hosts: &[HostView]) -> Ensure {
         let mut st = self.st.lock();
-        let best = Self::usable(hosts, st.draining.as_deref())
-            .into_iter()
-            .filter(|h| h.free() > 0)
-            .max_by_key(|h| (h.free(), std::cmp::Reverse(h.host_id.clone())));
-        if let Some(h) = best {
-            return Ensure::Ready(h.host_id.clone());
-        }
         if let Some(n) = &st.scaling {
             return Ensure::Wait(format!("scaling up: waiting for {n}'s signed hello"));
         }
@@ -245,26 +237,34 @@ impl Pool {
         if let Err(e) = self.api.set_replicas(replicas + 1) {
             return Ensure::Refused(format!("can't scale {} to {}: {e}", self.settings.statefulset, replicas + 1));
         }
-        k2_core::log_debug!("[k8s/pool] scaled {} {replicas} -> {}: waiting for {name}'s hello", self.settings.statefulset, replicas + 1);
+        k2_core::log_debug!("[provisioner] scaled {} {replicas} -> {}: waiting for {name}'s hello", self.settings.statefulset, replicas + 1);
         k2_core::trace::emit(|| k2_core::trace::Event::new("ctl.pool_scale").attr("host", name.as_str()).attr("replicas", replicas + 1));
         st.scaling = Some(name.clone());
         st.spare_since = None;
         Ensure::Wait(format!("scaling up: waiting for {name}'s signed hello"))
     }
+}
 
-    /// A host's signed hello. `true` when a scale-up was waiting for it:
-    /// retry the needs that got `Wait`.
-    pub fn on_hello(&self, host_id: &str) -> bool {
-        let mut st = self.st.lock();
-        if st.scaling.as_deref() == Some(host_id) {
-            st.scaling = None;
-            return true;
-        }
-        false
+impl Provisioner for Kubernetes {
+    fn kind(&self) -> &'static str {
+        "kubernetes"
     }
 
-    /// One idle tick at `now` over the hosts the controller sees.
-    pub fn idle(&self, now: Instant, hosts: &[HostView]) -> IdleStep {
+    fn choose(&self, need: &Need, hosts: &[HostView]) -> Result<Choice, Refusal> {
+        Static.choose(need, &self.marked(hosts))
+    }
+
+    fn ensure_host(&self, need: &Need, hosts: &[HostView]) -> Ensure {
+        let hosts = self.marked(hosts);
+        match Static.choose(need, &hosts) {
+            Ok(c) => Ensure::Ready(c.host),
+            // Room in the pool is the answer only for a portable agent.
+            Err(Refusal::NoHosts | Refusal::Full { .. }) if matches!(need.mode, Mode::Portable) => self.scale_up(&hosts),
+            Err(r) => Ensure::Refused(r.message()),
+        }
+    }
+
+    fn idle(&self, now: Instant, hosts: &[HostView]) -> IdleStep {
         let mut st = self.st.lock();
         if st.scaling.is_some() {
             st.spare_since = None;
@@ -291,17 +291,21 @@ impl Pool {
                 return IdleStep::Nothing; // its agents are being released
             }
             if let Err(e) = self.api.set_replicas(replicas - 1) {
-                k2_core::log_debug!("[k8s/pool] scale {} down to {}: {e}", self.settings.statefulset, replicas - 1);
+                k2_core::log_debug!("[provisioner] scale {} down to {}: {e}", self.settings.statefulset, replicas - 1);
                 return IdleStep::Nothing;
             }
-            k2_core::log_debug!("[k8s/pool] scaled {} {replicas} -> {}: {highest} gone", self.settings.statefulset, replicas - 1);
+            k2_core::log_debug!("[provisioner] scaled {} {replicas} -> {}: {highest} gone", self.settings.statefulset, replicas - 1);
             k2_core::trace::emit(|| k2_core::trace::Event::new("ctl.pool_scale").attr("host", highest.as_str()).attr("replicas", replicas - 1));
             st.draining = None;
             st.spare_since = None;
             return IdleStep::ScaledDown { host: highest, to: replicas - 1 };
         }
-        let room_elsewhere: u32 = Self::usable(hosts, None).into_iter().filter(|h| h.host_id != highest).map(HostView::free).sum();
-        if top.awake > room_elsewhere {
+        let room_elsewhere: u64 = hosts
+            .iter()
+            .filter(|h| h.usable() && h.host_id != highest)
+            .map(|h| h.room().map(u64::from).unwrap_or(u64::from(u32::MAX)))
+            .sum();
+        if u64::from(top.awake) > room_elsewhere {
             st.spare_since = None;
             return IdleStep::Nothing;
         }
@@ -309,9 +313,18 @@ impl Pool {
         if now.saturating_duration_since(since) < self.settings.idle_after {
             return IdleStep::Nothing;
         }
-        k2_core::log_debug!("[k8s/pool] {highest} idle for {:?}: draining it for a scale-down", self.settings.idle_after);
+        k2_core::log_debug!("[provisioner] {highest} idle for {:?}: draining it for a scale-down", self.settings.idle_after);
         st.draining = Some(highest.clone());
         IdleStep::Drain(highest)
+    }
+
+    fn on_hello(&self, host_id: &str) -> bool {
+        let mut st = self.st.lock();
+        if st.scaling.as_deref() == Some(host_id) {
+            st.scaling = None;
+            return true;
+        }
+        false
     }
 }
 

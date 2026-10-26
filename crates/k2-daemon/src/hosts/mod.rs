@@ -165,6 +165,14 @@ pub fn start() {
                 Ok(reg) => enroll::sync_enrolled(&reg, crate::agent_host::remote::global()),
                 Err(e) => k2_core::log_debug!("[hosts] enroll registry: {e}"),
             });
+            // The provisioner's idle tick (Kubernetes: scale the pool down).
+            tokio::spawn(async {
+                let mut tick = tokio::time::interval(IDLE_TICK);
+                loop {
+                    tick.tick().await;
+                    let _ = tokio::task::spawn_blocking(|| crate::agent_host::remote::global().idle_tick(std::time::Instant::now())).await;
+                }
+            });
         }
         crate::runtime_role::Role::All => {}
     }
@@ -187,6 +195,9 @@ fn host_ptyd_ring(session_id: &str, from: u64, max: usize) -> Result<byte_ring::
     let (start, end, bytes) = owner.read_ring(session_id, from, max).map_err(|e| e.to_string())?;
     Ok(byte_ring::RingRead { start, end, bytes })
 }
+
+/// How often a controller asks its provisioner whether to scale down.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The controller's `k2_core::transcript_probe`.
 fn controller_transcript_probe(provider: &str, session_id: &str, project_path: &str) -> Option<bool> {
