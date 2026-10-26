@@ -253,6 +253,8 @@ class ChaosKilled(unittest.TestCase):
                 self.assertEqual(g2.chaos_hit("host-1", 7, "2026-01-01T00:00:02Z"), [], "before the attempt")
                 self.assertEqual([e["kind"] for e in g2.chaos_hit("host-2", 5, "2026")], ["host"])
                 self.assertEqual(g2.chaos_hit("controller", None, "2026"), [], "a controller restart is S9's own test")
+                self.assertEqual([e["kind"] for e in g2.chaos_hit("controller", None, "2026", kinds=("controller",))],
+                                 ["controller"], "asked for explicitly: a spawn lost in flight")
 
 
 class Plan(unittest.TestCase):

@@ -149,16 +149,17 @@ def chaos_killed(host, pid):
     return None
 
 
-def chaos_hit(host, pid, since):
+def chaos_hit(host, pid, since, kinds=("cli", "host")):
     """chaos.log entries since `since` (ISO) in which --chaos itself
-    SIGKILLed the agent CLI `pid` on `host`, or `host` itself."""
+    SIGKILLed the agent CLI `pid` on `host`, or `host` itself (a host, or
+    with kinds=("controller",) the controller)."""
     path = os.environ.get("LAB_CHAOS_LOG")
     if not (os.environ.get("LAB_CHAOS") and path and host and os.path.isfile(path)):
         return []
     return [e for e in fleetlib.read_jsonl(path)
-            if (e.get("ts") or "") >= since and e.get("action") == "SIGKILL"
+            if (e.get("ts") or "") >= since and e.get("action") == "SIGKILL" and e.get("kind") in kinds
             and ((e.get("kind") == "cli" and e.get("host") == host and e.get("pid") == pid)
-                 or (e.get("kind") == "host" and e.get("target", e.get("host")) == host))]
+                 or (e.get("kind") != "cli" and e.get("target", e.get("host")) == host))]
 
 
 def send_waiting_for_daemon(make_req, log=None, method="POST", path=""):
@@ -1099,6 +1100,11 @@ def s9(c, sc):
             continue
         failed = [x["name"] for x in sc.checks[mark:] if not x["ok"]]
         hits = chaos_hit(sc.info.get("host"), sc.info.get("cli_pid"), since) if failed else []
+        if failed and len(sc.checks) == mark + 1 and "spawned" in failed[0]:
+            # The spawn itself was lost: --chaos killed the controller while
+            # it was in flight (a spawn is never sent twice), so S9 never got
+            # an agent to test.
+            hits = chaos_hit("controller", None, since, kinds=("controller",))
         if not hits or attempt == 3:
             return
         # --chaos killed this agent's CLI or its host: what failed after it
