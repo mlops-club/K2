@@ -20,7 +20,15 @@
 //!     manage a regular-file install.
 //!   - **Non-fatal.** A failed write (not root, read-only `/usr/local/bin`)
 //!     is logged by the caller, never crashes boot.
+//!   - **`K2_HOME` keeps everything inside it** (K2 Distributed Runtime: a
+//!     container's volume, a lab process, several daemons per user). With
+//!     `K2_HOME` set the CLI is staged at `$K2_HOME/bin/k2` only (beside
+//!     the `k2-open` shim), on every Unix, and nothing is written to
+//!     `/usr/local/bin` or `~/.local/bin`. Agents still find it: every
+//!     agent session gets `$K2_HOME/bin` first on its PATH
+//!     ([`agent_bin_dir`], `terminal::daemon_pty`).
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The CLI script, embedded verbatim from `cli/k2` at the repo root so
@@ -146,18 +154,48 @@ pub fn stage_cli_with_fallback(
         .map_err(|e| format!("{primary_err}; fallback {e}"))
 }
 
-/// Real boot entry — Linux ONLY (macOS keeps the app-managed symlink).
-/// No-op on other platforms. Stages into `/usr/local/bin/k2`, falling
-/// back to `~/.local/bin/k2` when the canonical path isn't writable by
-/// the daemon user.
-pub fn stage_cli() -> Result<Option<PathBuf>, String> {
-    if !cfg!(target_os = "linux") {
-        return Ok(None);
+/// `<k2_home>/bin/k2`: the CLI staged inside a K2 home.
+pub fn cli_path_at(k2_home: &Path) -> PathBuf {
+    crate::open_shim::bin_dir_at(k2_home).join("k2")
+}
+
+/// PURE — where [`stage_cli`] writes, as (target, fallback), or `None`
+/// for nowhere. `k2_home` is `$K2_HOME` (unset or empty: not set), `home`
+/// is `$HOME`.
+/// - `K2_HOME` set: `$K2_HOME/bin/k2` only, on any Unix;
+/// - else on Linux: `/usr/local/bin/k2`, then `~/.local/bin/k2`;
+/// - else nowhere (macOS keeps the app-managed symlink).
+pub fn stage_plan(k2_home: Option<&OsStr>, home: Option<&OsStr>, linux: bool) -> Option<(PathBuf, Option<PathBuf>)> {
+    if let Some(k2) = k2_home.filter(|v| !v.is_empty()) {
+        return Some((cli_path_at(Path::new(k2)), None));
     }
-    let fallback = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".local/bin/k2"));
-    stage_cli_with_fallback(Path::new(INSTALL_PATH), fallback.as_deref())
+    if !linux {
+        return None;
+    }
+    let fallback = home.filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".local/bin/k2"));
+    Some((PathBuf::from(INSTALL_PATH), fallback))
+}
+
+/// Real boot entry, by [`stage_plan`]: under `K2_HOME`, `$K2_HOME/bin/k2`;
+/// else Linux only, `/usr/local/bin/k2` falling back to `~/.local/bin/k2`
+/// when the canonical path isn't writable by the daemon user.
+pub fn stage_cli() -> Result<Option<PathBuf>, String> {
+    let k2_home = std::env::var_os(crate::paths::K2_HOME_ENV);
+    let home = std::env::var_os("HOME");
+    match stage_plan(k2_home.as_deref(), home.as_deref(), cfg!(target_os = "linux")) {
+        Some((target, fallback)) => stage_cli_with_fallback(&target, fallback.as_deref()),
+        None => Ok(None),
+    }
+}
+
+/// `<k2_home>/bin` when the daemon staged the `k2` CLI or the `k2-open`
+/// shim there: the directory every agent session gets first on its PATH,
+/// so `k2` (and `xdg-open`) resolve to what this daemon staged in every
+/// topology, containers included.
+pub fn agent_bin_dir() -> Option<PathBuf> {
+    let home = crate::paths::k2_home_opt()?;
+    let bin = crate::open_shim::bin_dir_at(&home);
+    (cli_path_at(&home).is_file() || crate::open_shim::shim_path_at(&home).is_file()).then_some(bin)
 }
 
 #[cfg(test)]
@@ -342,5 +380,38 @@ mod tests {
         assert_eq!(std::fs::read(&blocker).unwrap(), b"not a directory");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// K2_HOME keeps the CLI inside it, on every Unix: never
+    /// `/usr/local/bin`, never `~/.local/bin`.
+    #[test]
+    fn under_k2_home_the_cli_is_staged_only_inside_it() {
+        let k2 = OsStr::new("/var/lib/k2");
+        let home = OsStr::new("/home/u");
+        for linux in [true, false] {
+            assert_eq!(
+                stage_plan(Some(k2), Some(home), linux),
+                Some((PathBuf::from("/var/lib/k2/bin/k2"), None)),
+                "linux={linux}"
+            );
+        }
+        assert_eq!(
+            stage_plan(Some(OsStr::new("")), Some(home), true),
+            Some((PathBuf::from(INSTALL_PATH), Some(PathBuf::from("/home/u/.local/bin/k2")))),
+            "an empty K2_HOME is unset"
+        );
+        assert_eq!(stage_plan(None, Some(home), false), None, "macOS without K2_HOME: the app's symlink");
+        assert_eq!(stage_plan(None, None, true), Some((PathBuf::from(INSTALL_PATH), None)));
+    }
+
+    #[test]
+    fn a_staged_cli_under_a_k2_home_is_current_and_executable() {
+        let k2 = tmp_dir("k2-home");
+        let (target, fallback) = stage_plan(Some(k2.as_os_str()), None, cfg!(target_os = "linux")).unwrap();
+        assert_eq!(stage_cli_with_fallback(&target, fallback.as_deref()).unwrap(), Some(cli_path_at(&k2)));
+        assert_eq!(std::fs::read_to_string(cli_path_at(&k2)).unwrap(), CLI_CONTENT);
+        #[cfg(unix)]
+        assert_eq!(mode_of(&cli_path_at(&k2)) & 0o777, 0o755);
+        std::fs::remove_dir_all(&k2).unwrap();
     }
 }

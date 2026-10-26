@@ -61,7 +61,7 @@ if [ "$is_http" = 1 ] && command -v curl >/dev/null 2>&1; then
         fi
     fi
     # 2. Owner fallback: daemon loopback with the disk owner credentials.
-    _k2_home="${HOME}/.k2"
+    _k2_home="${K2_HOME:-${HOME}/.k2}"
     if [ -r "${_k2_home}/heartbeat.port" ] && [ -r "${_k2_home}/heartbeat.token" ]; then
         _port=$(cat "${_k2_home}/heartbeat.port" 2>/dev/null)
         _tok=$(cat "${_k2_home}/heartbeat.token" 2>/dev/null)

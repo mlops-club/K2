@@ -946,6 +946,13 @@ impl DaemonPtySession {
         if let Some(shim) = crate::open_shim::staged_shim_path() {
             apply_browser_shim_env(&mut child_env, &shim);
         }
+        // `k2` (k2 msg, …) in every topology: the K2 home's `bin`, where
+        // the daemon staged the CLI (`cli_stage`; under `K2_HOME` the only
+        // place it does), goes first on the PATH of every session, in
+        // process or on k2-ptyd, whatever the provider.
+        if let Some(bin) = crate::cli_stage::agent_bin_dir() {
+            prepend_bin_env(&mut child_env, &bin);
+        }
 
         // Capture spawn-failure diagnostics before `req` takes ownership
         // of `shell` / `child_env`. PATH entry count helps distinguish
@@ -2384,6 +2391,24 @@ fn drop_unsafe_path_entries(child_env: &mut HashMap<String, String>) -> usize {
     dropped
 }
 
+/// PURE — put `bin` first on a child env's PATH (idempotent: no duplicate
+/// segment on respawn). A missing PATH key gets just `bin`.
+fn prepend_bin_env(child_env: &mut HashMap<String, String>, bin: &std::path::Path) {
+    // Prefer the existing PATH/`Path` value (Windows uses `Path`);
+    // always write back under `PATH` so a single canonical key is set.
+    let current = login_path::env_path_entry(child_env)
+        .map(|(_, v)| v)
+        .unwrap_or("");
+    let merged = crate::open_shim::prepend_bin_dir(current, bin);
+    // Drop a Windows-style `Path` sibling so we don't hand the child
+    // two competing PATH values after enrichment.
+    #[cfg(windows)]
+    {
+        child_env.retain(|k, _| !k.eq_ignore_ascii_case("PATH"));
+    }
+    child_env.insert("PATH".to_string(), merged);
+}
+
 /// 0.40.34 — wire the staged browser-open shim into a child env map.
 /// PURE (no disk, no globals) so the injection rule is unit-testable:
 ///   - PATH: the shim's directory (`~/.k2/bin`) is PREPENDED via
@@ -2399,19 +2424,7 @@ fn apply_browser_shim_env(
     shim: &std::path::Path,
 ) {
     if let Some(bin) = shim.parent() {
-        // Prefer the existing PATH/`Path` value (Windows uses `Path`);
-        // always write back under `PATH` so a single canonical key is set.
-        let current = login_path::env_path_entry(child_env)
-            .map(|(_, v)| v)
-            .unwrap_or("");
-        let merged = crate::open_shim::prepend_bin_dir(current, bin);
-        // Drop a Windows-style `Path` sibling so we don't hand the child
-        // two competing PATH values after enrichment.
-        #[cfg(windows)]
-        {
-            child_env.retain(|k, _| !k.eq_ignore_ascii_case("PATH"));
-        }
-        child_env.insert("PATH".to_string(), merged);
+        prepend_bin_env(child_env, bin);
     }
     child_env
         .entry("BROWSER".to_string())
