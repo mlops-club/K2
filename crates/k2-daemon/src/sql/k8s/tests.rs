@@ -196,6 +196,8 @@ fn create_on_kubernetes_uses_the_operators_logins_and_keeps_k2s_shape() {
     assert!(all.contains(&format!("GRANT \"{agent}\" TO \"{mig}\"")), "{all}");
     assert!(all.contains(&format!("ALTER TABLE public._k2_migrations OWNER TO \"{mig}\"")), "{all}");
     assert!(all.contains(&format!("GRANT CONNECT ON DATABASE \"{name}\" TO \"{agent}\"")), "{all}");
+    // Only its own logins connect (PUBLIC's default CONNECT taken away).
+    assert!(all.contains(&format!("REVOKE CONNECT ON DATABASE \"{name}\" FROM PUBLIC;\nGRANT CONNECT ON DATABASE \"{name}\" TO \"{mig}\", \"{agent}\";")), "{all}");
 
     // The agent's DSN: the operator's password, the Service, TLS.
     assert_eq!(v["dsn"], json!(format!("postgres://{agent}:{agent}-pw@k2-pg:5432/{name}?sslmode=require")));

@@ -660,6 +660,23 @@ fn seal_k2_internal_tables(ops: &dyn SystemOps, cl: &Cluster, db_name: &str) -> 
 /// sealed on the cluster its record names (V50): after a move the same
 /// name also exists as the kept source in the old cluster
 /// (`ALLOW_CONNECTIONS false`), which this never touches.
+/// Only the database's own logins may connect: Postgres gives PUBLIC
+/// CONNECT on every new database, so any K2 login (another workspace's
+/// agent) could open it. Grantees get CONNECT from `k2 db grant`
+/// ([`grant_access`]); the superuser needs none. Idempotent.
+pub(crate) fn connect_lockdown_sql(db_name: &str) -> String {
+    format!(
+        "REVOKE CONNECT ON DATABASE {db} FROM PUBLIC;\n\
+         GRANT CONNECT ON DATABASE {db} TO {migrator}, {agent};",
+        db = pg_quote_ident(db_name),
+        migrator = pg_quote_ident(&migrator_role(db_name)),
+        agent = pg_quote_ident(&agent_role(db_name)),
+    )
+}
+
+/// Boot pass over K2's live databases: the k2 helpers and the guest seal
+/// ([`ensure_k2_helpers_db`]), then [`connect_lockdown_sql`] for databases
+/// made before it existed.
 pub fn seal_existing_databases(ops: &dyn SystemOps) -> Vec<String> {
     let names: Vec<String> = {
         let db = k2_core::db::shared();
@@ -676,9 +693,15 @@ pub fn seal_existing_databases(ops: &dyn SystemOps) -> Vec<String> {
     names
         .into_iter()
         .filter(|name| !super::pgmove::k2::moving(name))
-        .map(|name| match ensure_k2_helpers_db(ops, &name) {
-            Ok(()) => format!("{name}: sealed"),
-            Err(e) => format!("{name}: not sealed ({})", e.hint()),
+        .map(|name| {
+            let lock = connect_lockdown_sql(&name);
+            let locked = cluster_of(&name).and_then(|cl| {
+                su_psql(ops, &cl, "postgres", &["-v", "ON_ERROR_STOP=1"], Some(lock.as_bytes())).map(|_| ())
+            });
+            match (ensure_k2_helpers_db(ops, &name), locked) {
+                (Ok(()), Ok(())) => format!("{name}: sealed"),
+                (Err(e), _) | (_, Err(e)) => format!("{name}: not sealed ({})", e.hint()),
+            }
         })
         .collect()
 }
@@ -1265,7 +1288,8 @@ fn create_database_inner(
     };
 
     let grants = format!(
-        "GRANT CONNECT ON DATABASE {db} TO {agent};\n\
+        "{lockdown}\n\
+         GRANT CONNECT ON DATABASE {db} TO {agent};\n\
          GRANT USAGE ON SCHEMA public TO {agent};\n\
          GRANT CREATE ON SCHEMA public TO {migrator};\n\
          ALTER DEFAULT PRIVILEGES FOR ROLE {migrator} IN SCHEMA public \
@@ -1295,6 +1319,7 @@ fn create_database_inner(
         db = pg_quote_ident(&name),
         agent = pg_quote_ident(&agent),
         migrator = pg_quote_ident(&migrator),
+        lockdown = connect_lockdown_sql(&name),
         helpers = ensure_k2_helpers_sql(),
         fn_owner = k2_helper_owner_sql(&name),
         seal = seal_k2_internal_tables_sql(&name),

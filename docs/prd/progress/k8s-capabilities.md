@@ -137,7 +137,13 @@ sequenceDiagram
        - The agent writes but can't `CREATE TABLE` or alter K2's tables.
        - Another workspace's agent can't read the tables.
      - The controller image needs `psql`. `packaging/oci/Dockerfile` installs `postgresql-client`; kind adds it with `scripts/kind/caps/build-image.sh`.
-     - **Finding (same on a host, not changed):** K2 never revokes `PUBLIC`'s default `CONNECT` on a workspace database. Any K2 login can open another workspace's database, though not read its tables. Revoking it is a one-line hardening for host and Kubernetes alike, once decided.
+     - **Finding, closed (coordinator's decision):** K2 never revoked `PUBLIC`'s default `CONNECT` on a workspace database, so any K2 login could open another workspace's database (though not read its tables).
+       - Now, on host and Kubernetes alike (`ops::connect_lockdown_sql`), create revokes it and grants `CONNECT` to the database's migrator and agent only. `k2 db grant` and `k2 db revoke` already grant and revoke it per grantee.
+       - The boot seal pass applies the same to databases made before.
+       - Tests:
+         - unit tests (host and Kubernetes);
+         - `real_pg_connect_is_the_databases_own`, for a throwaway Postgres 16: B refused, A's logins in, grant then revoke, and an old database locked by the boot pass;
+         - `db-check.sh` on kind: B's agent is refused at connect, and `PUBLIC` still has no `CONNECT` after the operator's syncs.
 2. **App code:** the App's Deployment fetches its code archive (the Seed) from the controller with a per-App token. **This revises D6: no registry** (recorded in `p4-plan.md`).
 3. **Routing:** minimal edits in `apps/router.rs` and `tunnel_tls_listener.rs`: an optional upstream host, default unchanged, with tests proving `K2_ROLE=all` and local are byte for byte the same.
 4. **Mail, a security fix, first:** T3 now owns `deploy/kubernetes/core/mail.yaml`. A config Secret with a generated admin credential, never in git; no bootstrap or open admin; K2's mail code wired to `K2_STALWART_URL` and those credentials.

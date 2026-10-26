@@ -23,8 +23,8 @@
 #      pod to a client pod over stdin, never printed), over TLS to the
 #      Service: insert and read work, CREATE TABLE is refused, and K2's
 #      _k2_migrations can't be altered (it is the migrator's);
-#   6. B's agent cannot read A's tables (it can CONNECT, as on a host:
-#      noted);
+#   6. B's agent cannot connect to A's database (PUBLIC's default CONNECT
+#      is revoked at create, and the operator's syncs leave it so);
 #   7. POST /cli/db/drop for A: the entry leaves postgresql/k2-pg, the
 #      database is gone, and an operator sync does not bring it back.
 # No password is printed: the controller's token and the DSNs stay in pods.
@@ -275,12 +275,13 @@ out=$(as_agent dbcheck-a "" "ALTER TABLE _k2_migrations ADD COLUMN x int")
 printf '%s' "$out" | grep -q "must be owner" && ok "the agent cannot alter K2's _k2_migrations (the migrator's)" || bad "agent altering _k2_migrations: $out"
 
 echo "== 6. B's agent and A's database"
-out=$(as_agent dbcheck-b "$A" "SELECT count(*) FROM notes")
-printf '%s' "$out" | grep -q "permission denied for table notes" && ok "B's agent cannot read A's tables" || bad "B's agent reading $A: $out"
-# As on a host: K2 never revokes PUBLIC's default CONNECT, so any K2 login
-# can open the database; its tables are what is granted (sql/ops.rs).
+# Only a database's own logins connect (sql/ops.rs connect_lockdown_sql,
+# host and Kubernetes alike). B's create came after A's: the operator
+# synced every prepared database then, and PUBLIC's CONNECT stayed away.
 out=$(as_agent dbcheck-b "$A" "SELECT 1")
-[ "$out" = 1 ] && note "B's agent can CONNECT to $A (PUBLIC's default CONNECT; the same on a host)" || note "B's agent cannot CONNECT to $A: $out"
+printf '%s' "$out" | grep -q "permission denied for database" && ok "B's agent cannot connect to $A" || bad "B's agent connecting to $A: $out"
+acl=$(su_sql postgres "SELECT has_database_privilege('public', '$A', 'CONNECT')")
+[ "$acl" = f ] && ok "PUBLIC has no CONNECT on $A after the operator's syncs" || bad "PUBLIC CONNECT on $A: $acl"
 
 echo "== 7. drop A"
 r=$(ctl POST /cli/db/drop '{"project":"dbcheck-a","yes":true}')

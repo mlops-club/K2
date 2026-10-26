@@ -172,6 +172,32 @@ mod tests {
         }
     }
 
+    /// Only the database's own logins may CONNECT (PUBLIC's default is
+    /// revoked at create), and the boot seal pass does the same for
+    /// databases made before. Real Postgres: real_pg_connect_is_the_databases_own.
+    #[test]
+    fn create_and_the_boot_seal_take_connect_from_public() {
+        let _g = sql_server_test_lock();
+        k2_core::db::init_for_tests();
+        seed_running_sidecar();
+        let dir = std::env::temp_dir().join(format!("k2-sql-connect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = insert_project("sql-connect", &dir.to_string_lossy());
+        let ops = FakeSystemOps::baked();
+        let secrets = MemSecretStore::default();
+        let v = ops::create_database(&ops, &secrets, &pid, 1, None, None).expect("create");
+        let db = v["name"].as_str().unwrap().to_string();
+        let lockdown = format!(
+            "REVOKE CONNECT ON DATABASE \"{db}\" FROM PUBLIC;\nGRANT CONNECT ON DATABASE \"{db}\" TO \"{db}_migrator\", \"{db}_agent\";"
+        );
+        let sql = |ops: &FakeSystemOps| ops.pg.lock().unwrap().helper_psql.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>().join("\n");
+        assert!(sql(&ops).contains(&lockdown), "create: {}", sql(&ops));
+
+        let fresh = FakeSystemOps::baked();
+        let lines = ops::seal_existing_databases(&fresh);
+        assert!(sql(&fresh).contains(&lockdown), "boot seal: {lines:?} {}", sql(&fresh));
+    }
+
     #[test]
     fn create_catalog_row_json_has_no_superuser() {
         let _g = sql_server_test_lock();

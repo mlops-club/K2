@@ -875,3 +875,88 @@ fn real_pg_search_path_pin_holds() {
     let _ = std::fs::remove_dir_all(&dir_b);
     assert_eq!(failed, 0, "{failed} search_path-pin checks failed (see [realpg-sp] lines)");
 }
+
+/// CONNECT is the database's own (re-check of the k8s-capabilities
+/// finding): Postgres gives PUBLIC CONNECT on every new database, so any
+/// K2 login could open another workspace's. After `k2 db create`:
+/// - workspace B's agent is refused on A's database;
+/// - A's own agent and migrator connect;
+/// - `k2 db grant` lets B's agent in, `k2 db revoke` shuts it out again;
+/// - a database made before the lockdown (PUBLIC CONNECT given back here)
+///   is locked again by the boot seal pass.
+#[test]
+#[ignore = "needs a throwaway Postgres 16 cluster (REALPG_PORT/REALPG_SOCK/REALPG_BIN)"]
+fn real_pg_connect_is_the_databases_own() {
+    let cluster: &'static ClusterOps = Box::leak(Box::new(ClusterOps {
+        port: need_env("REALPG_PORT"),
+        sock: need_env("REALPG_SOCK"),
+        psql: format!("{}/psql", need_env("REALPG_BIN")),
+    }));
+    let _home = crate::test_support::TempHome::new();
+    let _g = sql_server_test_lock();
+    k2_core::db::init_for_tests();
+    seed_running_sidecar();
+    let secrets = crate::sql::secrets::FileSecretStore::default();
+    let mut ws = Vec::new();
+    for tag in ["a", "b"] {
+        let dir = std::env::temp_dir().join(format!("k2-realpg-conn-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = format!("cpg{tag}{}", &uuid::Uuid::new_v4().to_string()[..6]);
+        let pid = insert_project_handle(&format!("real-pg-conn-{tag}"), &dir.to_string_lossy(), &handle);
+        let created = ops::create_database(cluster, &secrets, &pid, 1, None, None).expect("create db");
+        ws.push((pid, created["name"].as_str().unwrap().to_string(), created["dsn"].as_str().unwrap().to_string()));
+    }
+    let (_pid_a, db_a, dsn_a) = ws[0].clone();
+    let (pid_b, _db_b, dsn_b) = ws[1].clone();
+    // A DSN pointed at the throwaway cluster and at database `db`.
+    let on = |dsn: &str, db: &str| -> String {
+        let (head, _) = dsn.rsplit_once('/').unwrap();
+        let (userinfo, _) = head.rsplit_once('@').unwrap();
+        format!("{userinfo}@127.0.0.1:{}/{db}", cluster.port)
+    };
+    let connect = |dsn: &str| -> Result<String, String> {
+        RealSystemOps
+            .run_cmd(&cluster.psql, &[dsn, "-tAX", "-c", "SELECT current_user"], &[("PSQLRC", "/dev/null")], None)
+            .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+    };
+    let refused = |r: &Result<String, String>| matches!(r, Err(e) if e.contains("permission denied for database"));
+
+    let mut results: Vec<(&str, Result<(), String>)> = Vec::new();
+    let r = connect(&on(&dsn_b, &db_a));
+    results.push(("B's agent is refused on A's database", want(refused(&r), format!("{r:?}"))));
+    let r = connect(&on(&dsn_a, &db_a));
+    results.push(("A's agent connects to A's database", want(r.as_deref() == Ok(ops::agent_role(&db_a).as_str()), format!("{r:?}"))));
+    let mig = cluster
+        .run_helper(&["psql", "-d", &db_a, "-tA"], Some(format!("SELECT has_database_privilege('{}', '{db_a}', 'CONNECT');", ops::migrator_role(&db_a)).as_bytes()))
+        .unwrap_or_default();
+    results.push(("A's migrator may connect", want(mig == "t", mig)));
+
+    ops::grant_access(cluster, &secrets, None, &db_a, &pid_b, "read", false, &[]).expect("grant");
+    let r = connect(&on(&dsn_b, &db_a));
+    results.push(("granted: B's agent connects to A's database", want(r.is_ok(), format!("{r:?}"))));
+    ops::revoke_access(cluster, None, &db_a, &pid_b).expect("revoke");
+    let r = connect(&on(&dsn_b, &db_a));
+    results.push(("revoked: B's agent is refused again", want(refused(&r), format!("{r:?}"))));
+
+    // A database from before the lockdown: PUBLIC CONNECT given back.
+    cluster
+        .run_helper(&["psql", "-d", "postgres", "-tA"], Some(format!("GRANT CONNECT ON DATABASE \"{db_a}\" TO PUBLIC;").as_bytes()))
+        .expect("give PUBLIC CONNECT back");
+    let r = connect(&on(&dsn_b, &db_a));
+    results.push(("(setup) with PUBLIC CONNECT, B's agent gets in", want(r.is_ok(), format!("{r:?}"))));
+    let lines = ops::seal_existing_databases(cluster);
+    let r = connect(&on(&dsn_b, &db_a));
+    results.push(("the boot seal pass locks it again", want(refused(&r), format!("{r:?}; {lines:?}"))));
+
+    let mut failed = 0;
+    for (name, r) in &results {
+        match r {
+            Ok(()) => println!("PASS {name}"),
+            Err(e) => {
+                failed += 1;
+                println!("FAIL {name}: {e}");
+            }
+        }
+    }
+    assert_eq!(failed, 0, "{failed} check(s) failed");
+}
