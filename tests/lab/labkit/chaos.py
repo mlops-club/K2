@@ -14,7 +14,10 @@ downtime with the same HOME and port. CLI picks are made among the live
 agent CLIs sorted by workspace, then pid.
 
 A scenario that restarts processes itself holds the fleet's control lock;
-chaos never waits for it: that step is logged as skipped. On SIGTERM chaos
+chaos never waits for it: that step is logged as skipped. A process a
+scenario took down itself and guards (fleet.set_guard: S10 under
+LAB_S10_CHAOS, which holds the lock only to kill and restart its host) is
+left out of the picks; chaos acts on the rest. On SIGTERM chaos
 finishes the step in progress (a downed daemon is started again) and exits.
 
     lab.py chaos --state F --seed N --out chaos.log
@@ -81,8 +84,12 @@ class Chaos:
             if not held:
                 self.log(step=n, kind=kind, action="skipped", why="a scenario holds the fleet")
                 return
+            # Processes a scenario took down itself and guards (S10 under
+            # LAB_S10_CHAOS): never killed or started here; the pick is made
+            # among the rest with the same draw.
+            guard = self.fleet.guarded()
             if kind == "cli":
-                clis = self.live_clis()
+                clis = [x for x in self.live_clis() if x[1] not in guard]
                 if not clis:
                     self.log(step=n, kind=kind, action="skipped", why="no live agent CLI")
                     return
@@ -94,10 +101,16 @@ class Chaos:
                     self.log(step=n, kind=kind, target=cwd, pid=pid, action="SIGKILL", result="failed: %s" % e)
                 return
             if kind == "host":
-                names = sorted(h["proc"] for h in self.fleet.hosts())
+                names = sorted(h["proc"] for h in self.fleet.hosts() if h["proc"] not in guard)
+                if not names:
+                    self.log(step=n, kind=kind, action="skipped", why="every host is guarded by a scenario")
+                    return
                 name = names[int(pick * len(names))]
             else:
                 name = self.fleet.st["controller"]
+                if name in guard:
+                    self.log(step=n, kind=kind, action="skipped", why="the controller is guarded by a scenario")
+                    return
             fleetlib.refresh(self.fleet.st)
             pid = self.fleet.proc(name)["pid"]
             gone = self.fleet.kill(name)

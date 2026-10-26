@@ -1,6 +1,7 @@
 """Gate G2's checkers against hand-written evidence: invariants I1 to I4,
 the chaos schedule, the fleet plan. Run: tests/lab/run_tests.sh"""
 
+import contextlib
 import json
 import os
 import sys
@@ -198,6 +199,128 @@ class Chaos(unittest.TestCase):
         self.assertEqual([chaos.kind_of("fleet", r) for r in (0.0, 0.49, 0.5, 0.79, 0.8, 0.99)],
                          ["cli", "cli", "host", "host", "controller", "controller"])
         self.assertEqual([chaos.kind_of("solo", r) for r in (0.69, 0.7)], ["cli", "controller"])
+
+
+class ChaosGuard(unittest.TestCase):
+    """S10 under LAB_S10_CHAOS: a host the scenario took down itself is
+    guarded; chaos acts on the rest."""
+
+    class StubFleet:
+        def __init__(self, guard):
+            self.guard, self.killed, self.started = set(guard), [], []
+            self.st = {"controller": "controller", "procs": {}}
+
+        @contextlib.contextmanager
+        def control(self, wait=True):
+            yield True
+
+        def guarded(self):
+            return self.guard
+
+        def hosts(self):
+            return [{"name": "host-1", "proc": "host-1"}, {"name": "host-2", "proc": "host-2"}]
+
+        def proc(self, name):
+            return {"pid": 100}
+
+        def kill(self, name):
+            self.killed.append(name)
+            return True
+
+        def start(self, name):
+            self.started.append(name)
+            return 101
+
+        def kill_cli(self, pid, host=None):
+            self.killed.append(("cli", host, pid))
+
+    def chaos(self, d, guard):
+        c = chaos.Chaos.__new__(chaos.Chaos)
+        c.fleet, c.seed, c.out_path, c.stop = self.StubFleet(guard), 1, os.path.join(d, "chaos.log"), False
+        c.live_clis = lambda: [("/w/a", "host-1", 11), ("/w/b", "host-2", 22)]
+        return c
+
+    def test_a_guarded_host_is_never_killed_or_started_and_the_pick_moves_to_the_rest(self):
+        with tempfile.TemporaryDirectory() as d, unittest.mock.patch.object(fleet, "refresh", lambda st: None):
+            c = self.chaos(d, {"host-1"})
+            for pick in (0.0, 0.99):
+                c.step(1, "host", pick, 0.01)
+            self.assertEqual(c.fleet.killed, ["host-2", "host-2"])
+            self.assertEqual(c.fleet.started, ["host-2", "host-2"])
+            c.step(2, "cli", 0.0, 0.01)
+            self.assertEqual(c.fleet.killed[-1], ("cli", "host-2", 22), "no CLI on the guarded host")
+            c.fleet.guard = {"host-1", "host-2", "controller"}
+            c.step(3, "host", 0.5, 0.01)
+            c.step(4, "controller", 0.5, 0.01)
+            log = fleet.read_jsonl(c.out_path)
+            self.assertEqual([e["action"] for e in log[-2:]], ["skipped", "skipped"])
+            self.assertEqual(len(c.fleet.killed), 3)
+
+    def test_the_guard_needs_a_live_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            st = {"lock": os.path.join(d, "control.lock")}
+            self.assertEqual(fleet.guarded(st), set())
+            fleet.set_guard(st, ["host-1"])
+            self.assertEqual(fleet.guarded(st), {"host-1"})
+            with open(st["lock"] + ".guard", "w") as fh:
+                json.dump({"pid": 2 ** 22 + 12345, "names": ["host-1"]}, fh)
+            self.assertEqual(fleet.guarded(st), set(), "a dead scenario's guard counts for nothing")
+            fleet.clear_guard(st)
+            fleet.clear_guard(st)
+            self.assertFalse(os.path.exists(st["lock"] + ".guard"))
+
+    def test_s10_lets_chaos_in_only_when_asked_and_under_chaos(self):
+        with unittest.mock.patch.dict(os.environ, {"LAB_S10_CHAOS": "1", "LAB_CHAOS": "seed=7"}):
+            self.assertTrue(g2.s10_chaos())
+        with unittest.mock.patch.dict(os.environ, {"LAB_S10_CHAOS": "1"}):
+            os.environ.pop("LAB_CHAOS", None)
+            self.assertFalse(g2.s10_chaos())
+        with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS": "seed=7"}):
+            os.environ.pop("LAB_S10_CHAOS", None)
+            self.assertFalse(g2.s10_chaos())
+
+    def test_chaos_inside_the_open_hold_excuses_no_red(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "chaos.log")
+            with open(log, "w") as fh:
+                fh.write(json.dumps({"ts": "2999-01-01T00:00:00Z", "kind": "host", "target": "host-1",
+                                     "action": "SIGKILL"}) + "\n")
+            sc = g2.Scenario("S10", d)
+            calls = []
+
+            def attempt(c, sc_, n):
+                calls.append(n)
+                sc_.info.update(host="host-1", no_redo_after="2000-01-01T00:00:00Z")
+                sc_.check("something", False, "red")
+
+            with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS": "seed=7", "LAB_CHAOS_LOG": log}):
+                g2.redo_on_chaos(None, sc, attempt, "S10")
+            self.assertEqual(calls, [1], "the red stands")
+            calls.clear()
+
+            def attempt_before(c, sc_, n):
+                calls.append(n)
+                sc_.info.update(host="host-1")
+                sc_.check("something", n > 1, "red")
+
+            sc = g2.Scenario("S10", d)
+            with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS": "seed=7", "LAB_CHAOS_LOG": log}):
+                g2.redo_on_chaos(None, sc, attempt_before, "S10")
+            self.assertEqual(calls, [1, 2], "a hit outside the hold still redoes")
+
+    def test_s10_hits_are_the_hosts_its_clis_and_the_controller(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "chaos.log")
+            with open(log, "w") as fh:
+                for e in ({"ts": "2026-01-01T00:00:01Z", "kind": "cli", "host": "host-2", "pid": 7, "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:02Z", "kind": "cli", "host": "host-1", "pid": 8, "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:03Z", "kind": "controller", "target": "controller", "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:04Z", "kind": "host", "target": "host-2", "action": "started"}):
+                    fh.write(json.dumps(e) + "\n")
+            with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS_LOG": log}):
+                self.assertEqual([e["kind"] for e in g2.s10_hits("host-2", "2026")], ["cli", "controller"])
+                self.assertEqual(len(g2.s10_hits(None, "2026")), 3)
+                self.assertEqual(g2.s10_hits("host-2", "2026-01-01T00:00:03Z")[0]["kind"], "controller")
 
 
 class WaitingForTheDaemon(unittest.TestCase):

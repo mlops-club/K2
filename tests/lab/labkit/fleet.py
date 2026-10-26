@@ -546,6 +546,29 @@ def control(st, wait=True):
             os.rmdir(lock)
 
 
+def set_guard(st, names):
+    """A scenario that took processes down itself and lets chaos act
+    around them (LAB_S10_CHAOS) guards them: chaos neither kills nor starts
+    a guarded process. Set and cleared under the control lock."""
+    with open(st["lock"] + ".guard", "w") as fh:
+        json.dump({"pid": os.getpid(), "names": sorted(names)}, fh)
+
+
+def clear_guard(st):
+    with contextlib.suppress(OSError):
+        os.remove(st["lock"] + ".guard")
+
+
+def guarded(st):
+    """The guarded process names (empty when the guard's owner is gone)."""
+    try:
+        with open(st["lock"] + ".guard") as fh:
+            g = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    return set(g.get("names") or []) if pid_alive(int(g.get("pid") or 0)) else set()
+
+
 # ── Monitor ─────────────────────────────────────────────────────────────
 
 def monitor(state_path, out_path, stop=None):
@@ -650,6 +673,15 @@ class Fleet:
 
     def control(self, wait=True):
         return control(self.st, wait)
+
+    def set_guard(self, names):
+        set_guard(self.st, names)
+
+    def clear_guard(self):
+        clear_guard(self.st)
+
+    def guarded(self):
+        return guarded(self.st)
 
 
 def read_jsonl(path):
