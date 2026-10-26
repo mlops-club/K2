@@ -63,6 +63,12 @@
 # only: nothing is read out or printed. A host that has a login keeps it;
 # POD itself is skipped. The volumes are ReadWriteOnce, which works because
 # every host sits on the controller's node (above).
+# --p4 deploys the P4 test variant (TEST ONLY; implies --dist --fake;
+# deploy/kind/p4, namespace k2-kind-p4, port 7444): dist-fake's lab
+# hosts, but each with its own workspaces volume (no shared k2-work, P3
+# D9), on different worker nodes, never on a node labelled
+# k2.dev/p4-drained (scripts/kind/drain-demo.sh). scripts/kind/p4-up.sh
+# runs it with the pool and home sync.
 # --render-only=PATH builds nothing and applies nothing: it writes the
 # manifests a --dist run would apply, at its final host count, to PATH
 # (for `kubectl diff`), and exits.
@@ -76,11 +82,12 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
-provisioner=static render_to= max_hosts= work_root= login_from=
+provisioner=static render_to= max_hosts= work_root= login_from= p4=0
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
         --dist) dist=1 ;;
+        --p4) p4=1 dist=1 fake=1 ;;
         --rebuild-daemon) rebuild_daemon=1 ;;
         --reset-password) reset_password=1 ;;
         --port-forward) door=port-forward ;;
@@ -93,7 +100,7 @@ for a in "$@"; do
         --max-hosts=*) max_hosts=${a#--max-hosts=} ;;
         --work-root=*) work_root=${a#--work-root=} ;;
         --login-from=*) login_from=${a#--login-from=} ;;
-        -h|--help) sed -n '2,72p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,79p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -127,7 +134,7 @@ case "$login_from" in ''|k2-host-[0-9]*) ;; *) echo "up.sh: --login-from takes a
 if { [ -n "$work_root" ] || [ -n "$login_from" ]; } && [ "$dist" = 0 ]; then
     echo "up.sh: --work-root and --login-from need --dist" >&2; exit 2
 fi
-kind_variant_from_flags "$fake" "$dist"
+if [ "$p4" = 1 ]; then kind_variant p4; else kind_variant_from_flags "$fake" "$dist"; fi
 ptyd=${ptyd:-${K2_KIND_PTYD:-$KIND_PTYD_DEFAULT}}
 case "$ptyd" in 0|1) ;; *) echo "up.sh: K2_PTYD must be 0 or 1 (got $ptyd)" >&2; exit 2 ;; esac
 user=${K2_KIND_USER:-owner}

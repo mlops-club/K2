@@ -1,0 +1,102 @@
+# TEST ONLY (P4 T4, docs/prd/progress/kind-p4.md): the kind overlay for the
+# host pool and the drain demo, namespace k2-kind-p4, port 7444.
+# scripts/kind/p4-up.sh deploys it (up.sh --p4 with the pool, enroll,
+# K2_PTYD=1 and K2_WORK_ROOT); scripts/kind/drain-demo.sh drains a host.
+#
+# Over deploy/kind/dist-fake (the lab's fake agent, traces, supervise.sh),
+# and different from it in what P4 is about:
+#   - no shared k2-work (P3 D9): each host has its own workspaces volume
+#     (claim template "work"), the controller its own (k2-work-controller).
+#     An agent's workspace reaches another host only through home sync;
+#   - the hosts are on different worker nodes (required anti-affinity), not
+#     on the controller's node, and never on a node labelled
+#     k2.dev/p4-drained: the drain demo's namespace-scoped "cordon". A real
+#     cordon or `kubectl drain` would move other namespaces' pods (the
+#     owner's k2-kind-dist among them) and is never used on k2lab;
+#   - small volumes (local-path doesn't enforce size; the Docker VM's disk
+#     is shared).
+# Its own images (k2-daemon:p4, k2-agents:p4), never the owner's.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k2-kind-p4
+resources:
+  - ../dist-fake
+  - work-controller-pvc.yaml
+  - pdb.yaml                      # the end state's, which deploy/kind/dist drops
+images:
+  - name: k2-daemon
+    newTag: p4                    # p4-up.sh tags it from the daemon image it is given
+  - name: k2-agents
+    newTag: p4                    # deploy/kind/Dockerfile.fake FROM k2-daemon:p4
+patches:
+  - target: {kind: PersistentVolumeClaim, name: k2-work}
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: k2-work
+  - target: {kind: Service, name: k2-controller-nodeport}
+    patch: |-
+      - {op: replace, path: /spec/ports/0/nodePort, value: 30744}
+  - target: {kind: StatefulSet, name: k2-controller}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-controller
+      spec:
+        template:
+          spec:
+            volumes:
+              - name: work
+                persistentVolumeClaim: {claimName: k2-work-controller}
+        volumeClaimTemplates:
+          - metadata: {name: data}
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources: {requests: {storage: 1Gi}}
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            # A drain waits for the turn in progress, then saves and releases
+            # (K2_HOST_DRAIN_SECS); the pod's grace must outlast it.
+            terminationGracePeriodSeconds: 120
+            containers:
+              - name: k2-host
+                env:
+                  - {name: K2_HOST_DRAIN_SECS, value: "90"}
+            affinity:
+              podAffinity: null
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels: {app.kubernetes.io/name: k2-host}
+                    topologyKey: kubernetes.io/hostname
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - {key: k2.dev/p4-drained, operator: DoesNotExist}
+            volumes:
+              - name: work
+                $patch: delete
+        volumeClaimTemplates:
+          - metadata: {name: data}
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources: {requests: {storage: 1Gi}}
+          - metadata: {name: work}
+            spec:
+              accessModes: [ReadWriteOnce]
+              resources: {requests: {storage: 1Gi}}
+labels:
+  - pairs:
+      k2.dev/deploy: kind-p4
+    includeSelectors: false

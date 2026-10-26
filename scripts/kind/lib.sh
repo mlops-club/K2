@@ -29,6 +29,7 @@ kind_variant() {
         agents|fake) KIND_BASE_IMAGE=k2-daemon:dev ;;
         dist) KIND_BASE_IMAGE=k2-daemon:dist ;;
         dist-fake) KIND_BASE_IMAGE=k2-daemon:dist-fake ;;   # its own tag: a test build never reaches the owner's pods
+        p4) KIND_BASE_IMAGE=k2-daemon:p4 ;;                 # P4 T4: the pool and home sync (wave3 rc1 or later)
         *) echo "unknown variant $1" >&2; return 2 ;;
     esac
     case "$1" in
@@ -36,18 +37,20 @@ kind_variant() {
         fake) KIND_IMAGE=k2-agents:fake ;;
         dist) KIND_IMAGE=k2-agents:dist ;;
         dist-fake) KIND_IMAGE=k2-agents:dist-fake ;;
+        p4) KIND_IMAGE=k2-agents:p4 ;;
     esac
     case "$1" in
         agents|dist) KIND_DOCKERFILE=deploy/kind/Dockerfile.agents KIND_CONTEXT=deploy/kind ;;
         # K2_KIND_FAKE_SRC: a tree whose tests/fakes/k2-fake-agent to build
         # (e.g. an export of the lab's branch); default this one.
-        fake|dist-fake) KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=${K2_KIND_FAKE_SRC:-.} ;;
+        fake|dist-fake|p4) KIND_DOCKERFILE=deploy/kind/Dockerfile.fake KIND_CONTEXT=${K2_KIND_FAKE_SRC:-.} ;;
     esac
     case "$1" in
         agents) KIND_NS=k2-kind KIND_OVERLAY=deploy/kind/agents KIND_PORT=${K2_KIND_PORT:-7440} KIND_NODEPORT=30740 KIND_FLAGS="" ;;
         fake) KIND_NS=k2-kind-fake KIND_OVERLAY=deploy/kind/fake KIND_PORT=${K2_KIND_PORT:-7441} KIND_NODEPORT=30741 KIND_FLAGS=" --fake" ;;
         dist) KIND_NS=k2-kind-dist KIND_OVERLAY=deploy/kind/dist KIND_PORT=${K2_KIND_PORT:-7443} KIND_NODEPORT=30743 KIND_FLAGS=" --dist" ;;
         dist-fake) KIND_NS=k2-kind-dist-fake KIND_OVERLAY=deploy/kind/dist-fake KIND_PORT=${K2_KIND_PORT:-7442} KIND_NODEPORT=30742 KIND_FLAGS=" --dist --fake" ;;
+        p4) KIND_NS=k2-kind-p4 KIND_OVERLAY=deploy/kind/p4 KIND_PORT=${K2_KIND_PORT:-7444} KIND_NODEPORT=30744 KIND_FLAGS=" --p4" ;;
     esac
     # The Mac's door: a socat container (deploy/kind/proxy) on Docker's kind
     # network, 127.0.0.1:KIND_PORT → <any node>:KIND_NODEPORT. The overlays
@@ -60,7 +63,7 @@ kind_variant() {
             KIND_AGENT_POD=k2-solo-0 KIND_AGENT_CONTAINER=k2-daemon KIND_AGENT_HOME=/var/lib/k2
             KIND_ROLLOUT="k2-solo=$KIND_IMAGE" KIND_LOAD="$KIND_IMAGE"
             KIND_WORK=/var/lib/k2/work ;;
-        dist|dist-fake)
+        dist|dist-fake|p4)
             KIND_DIST=1 KIND_SVC=k2-controller KIND_POD=k2-controller-0
             KIND_AGENT_POD=k2-host-0 KIND_AGENT_CONTAINER=k2-host KIND_AGENT_HOME=/var/lib/k2-host
             KIND_WORK=/var/lib/k2/work      # the shared k2-work volume, same path in both pods
