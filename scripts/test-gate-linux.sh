@@ -178,7 +178,25 @@ BATCH=${K2_GATE_BATCH:-0}
 for pkg in k2-core k2-daemon k2-ptyd; do
   if [ "$BATCH" -gt 0 ] 2>/dev/null; then
     echo "gate: cargo test -p $pkg --no-fail-fast, in steps of $BATCH integration tests (K2_GATE_BATCH)"
-    clean_cargo "$LOGS/$pkg.log" test -p "$pkg" --lib --bins --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
+    # lib + the bins that have tests: `--bins` would also run a bin marked
+    # `test = false` (k2-ptyd-test-agent, a fake agent that refuses the
+    # harness's --test-threads). Bins with required-features are left out,
+    # as --bins leaves them out (an explicit --bin would be an error).
+    UNIT=(--lib)
+    if bins=$(cd "$SRC" && cargo metadata --no-deps --format-version 1 --offline 2>/dev/null | python3 -c '
+import json, sys
+pkg = sys.argv[1]
+for p in json.load(sys.stdin)["packages"]:
+    if p["name"] == pkg:
+        for t in p["targets"]:
+            if "bin" in t["kind"] and t.get("test", True) and not t.get("required-features"):
+                print(t["name"])' "$pkg" 2>/dev/null); then
+      for b in $bins; do UNIT+=(--bin "$b"); done
+    else
+      echo "gate: $pkg: cargo metadata unreadable, testing --bins"
+      UNIT+=(--bins)
+    fi
+    clean_cargo "$LOGS/$pkg.log" test -p "$pkg" "${UNIT[@]}" --no-fail-fast "${THREAD_ARGS[@]}" || STATUS=1
     drop_linked
     # Integration test targets, as cargo discovers them: tests/*.rs and
     # tests/<dir>/main.rs.
