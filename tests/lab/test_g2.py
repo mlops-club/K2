@@ -203,7 +203,8 @@ class WaitingForTheDaemon(unittest.TestCase):
     def test_only_a_daemon_that_is_not_there_is_waited_for(self):
         self.assertTrue(g2.daemon_down(0, "request failed: [Errno 61] Connection refused"))
         self.assertTrue(g2.daemon_down(503, '{"state":"migrating","error":"daemon is completing first-boot migrations"}'))
-        self.assertFalse(g2.daemon_down(503, '{"error":"no agent host is connected"}'))
+        self.assertTrue(g2.daemon_down(503, '{"error":"no agent host is connected to this controller"}'))
+        self.assertFalse(g2.daemon_down(503, '{"error":"something else"}'))
         self.assertFalse(g2.daemon_down(500, "boom"))
 
     def test_a_dropped_request_is_sent_again_only_when_that_is_safe(self):

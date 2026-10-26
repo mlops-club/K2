@@ -112,6 +112,10 @@ def daemon_down(status, text, method="POST", path=""):
     idempotent route only, a connection the daemon dropped while dying."""
     if (status == 0 and "refused" in text) or (status == 503 and '"migrating"' in text):
         return True
+    # A controller with no host linked refuses a spawn explicitly; nothing
+    # was placed, so asking again once a host is back is safe (--chaos).
+    if status == 503 and "no agent host is connected" in text:
+        return True
     dropped = status == 0 and ("closed connection" in text or "reset" in text or "Broken pipe" in text)
     return dropped and (method == "GET" or path in IDEMPOTENT)
 
