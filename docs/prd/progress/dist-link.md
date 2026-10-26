@@ -379,7 +379,7 @@ W3 results:
 | `K2_ROLE=all` regression after W3: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 161 test binaries: **5204 passed, 0 failed**, 6 ignored |
 | `cargo test -p k2-core -- --test-threads=3` (W3 adds `db::shared_path`), throwaway HOME | 17 test binaries: **3866 passed, 0 failed**, 1 ignored (fork_tab_repair green since `d543108d5`) |
 
-## W3b: byte streams through the controller (in progress)
+## W3b: byte streams through the controller
 
 `/cli/sessions/bytes?session&from` on a controller is relayed to the
 session's host (it was a 501). Same client protocol as under
@@ -400,14 +400,20 @@ from `hosts::byte_ring`, a process-wide ring source: 32 KiB per
 `bytes.data`, a 50 ms look for new output once caught up, and on a ring
 overrun the stream ends with the dropped range rather than skipping it.
 
-Open (blocked on a decision outside my files): v2 sessions have no byte
-ring to install as the source. k2-ptyd keeps one per session, but its only
-read is `Attach`, and ptyd allows one data stream per session, which the
-daemon's own IO loop holds. Options: A2 a read-only `ReadRing{sid, from,
-max}` in k2-ptyd plus `Owner::read_ring` in k2-core (recommended); A3 a
-tee in k2-core's ptyd IO loop into a `BytesRing`; B K2's own reader on
-the alacritty path. Either A needs `K2_PTYD=1` and the k2-ptyd binary on
-hosts.
+The ring (coordinator decision A2): k2-ptyd's own per-session ring (4 MiB
+by default; it outlives the host daemon too). A new owner request
+`read_ring {sid, from, max}` → `ring {start, end, hex}` copies up to
+256 KiB from `from` (clamped to the ring's start) without taking the
+session's data stream or moving its cursor: ptyd allows one data stream per
+session and the daemon's IO loop holds it, so `attach` could not be used.
+`k2-core` wraps it as `Owner::read_ring`. A `K2_ROLE=host` installs
+`hosts::host_ptyd_ring` as the `byte_ring` source: k2-ptyd's ring for a
+ptyd-backed session on that host, and for any other session (no
+`K2_PTYD=1`, or an in-process terminal) "no byte ring", so the client falls
+back to the grid snapshot; ptyd is never started for such a session.
+`K2_ROLE=all` and `controller` install no source. Host pods need
+`K2_PTYD=1` (kind-app); the OCI image already installs `/usr/bin/k2-ptyd`
+and embeds it in `k2-daemon` (`packaging/oci/Dockerfile`).
 
 | Check | Result |
 |---|---|
@@ -415,6 +421,10 @@ hosts.
 | `hosts::tests::a_reconnecting_byte_client_gets_exactly_the_bytes_it_missed` | real host link, test ring: read, the link drops while the agent prints, relink, reconnect with `from`: exactly the session's bytes, once each, in order |
 | `hosts::tests::a_ring_overrun_ends_the_byte_stream_instead_of_skipping` | the ring drops unsent bytes: the stream ends naming `[10, 20)`; a reconnect's ack shows the gap |
 | `cargo test -p k2-daemon --lib -- hosts:: agent_host::` | 42 passed, 3 runs |
+| `cargo test -p k2-ptyd` | 17 unit (with `hex_round_trips_every_byte_and_rejects_junk`) + 6 fuzz + 19 integration passed, including `read_ring_copies_the_ring_without_taking_the_data_stream`: the ring copy equals what the attached stream delivered, `max` and `from` are honoured, and the attached stream still carries input and output after the reads |
+| two-process with the host on k2-ptyd (run `20261026T010426Z`) | **12/12 PASS**. S9 14/14 with the byte checks: a client reads the session's bytes up to the banner (84 bytes) and keeps its offset; the controller is TERMed mid-turn and restarted; the client reconnects with `from=84`: ack `fromOffset 84, currentFrontOffset 84` (no gap), the 58 missed bytes hold the prompt echo and the reply, and 84 + 58 equals a fresh read from 0 byte for byte. Agents are children of the host's ptyd (pid unchanged across the restart). S8 10/10 unchanged. No ptyd left running after the run |
+| `K2_ROLE=all` regression: `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3`, throwaway HOME | 162 binaries: 5219 passed, **1 failed**: `routes::frame_walk::every_raw_http_response_carries_the_frame_headers` caught the relay's raw 400 without the frame headers; fixed (`CONNECT_HEADER_LINES`), then `frame_walk` + `hosts::` + `agent_host::` 45/45 |
+| `cargo test -p k2-core --no-fail-fast -- --test-threads=3`, throwaway HOME | 17 binaries: **3887 passed, 0 failed**, 1 ignored |
 
 ## Env contract
 

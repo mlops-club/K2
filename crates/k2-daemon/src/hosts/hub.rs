@@ -275,8 +275,9 @@ where
             use tokio::io::AsyncWriteExt;
             let body = serde_json::json!({ "error": e }).to_string();
             let resp = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
                 body.len(),
+                k2_core::frame_policy::CONNECT_HEADER_LINES,
                 body
             );
             let _ = stream.write_all(resp.as_bytes()).await;
