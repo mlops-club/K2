@@ -30,7 +30,8 @@
 //! delivery. The store is `k2_core::delivery`; the protocol and state
 //! machine are in `docs/prd/progress/outbox.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -54,6 +55,23 @@ pub const OUTBOX_PATH: &str = "/cli/hosts/outbox";
 /// The drains look again at least this often (a recipient may have been
 /// placed since the last pass).
 const TICK: Duration = Duration::from_millis(500);
+/// Controller: how long a message waits for an agent whose session ended
+/// (its CLI exited or was killed, it was closed) to be placed again before
+/// it goes through the direct path, or fails `recipient_gone`.
+pub const GONE_GRACE_VAR: &str = "K2_DELIVERY_GONE_GRACE_SECS";
+pub const DEFAULT_GONE_GRACE: Duration = Duration::from_secs(120);
+
+/// [`GONE_GRACE_VAR`] through `get`; a bad value is the default, logged.
+pub fn gone_grace(get: impl Fn(&str) -> Option<String>) -> Duration {
+    match get(GONE_GRACE_VAR).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        None => DEFAULT_GONE_GRACE,
+        Some(v) => v.parse::<u64>().map(Duration::from_secs).unwrap_or_else(|_| {
+            log_debug!("[delivery] {GONE_GRACE_VAR}={v:?} is not a number of seconds; using {}", DEFAULT_GONE_GRACE.as_secs());
+            DEFAULT_GONE_GRACE
+        }),
+    }
+}
+
 /// How long `k2 msg` on a host waits for the controller to accept the
 /// message before answering "queued on this host".
 const ACCEPT_WAIT: Duration = Duration::from_secs(5);
@@ -68,6 +86,9 @@ pub mod events {
     pub const HOST_MSG_ACK: &str = "host.msg_ack";
     /// A message ended `failed` (attrs: hop, reason). I2: the loud end.
     pub const MSG_FAILED: &str = "delivery.failed";
+    /// A queued message whose recipient's session ended went through the
+    /// direct path (attrs: ok, reason).
+    pub const CTL_MSG_GONE_DIRECT: &str = "ctl.msg_gone_direct";
 }
 
 fn ready(db: Db) -> Db {
@@ -149,6 +170,10 @@ pub struct Controller {
     policy: Policy,
     nudge: Notify,
     direct: Direct,
+    /// [`GONE_GRACE_VAR`], in ms.
+    gone_grace_ms: AtomicI64,
+    /// Rows handed to the direct path and not finished yet.
+    handing: parking_lot::Mutex<HashSet<String>>,
 }
 
 /// `k2 msg` recipients the controller resolves itself instead of queueing
@@ -216,7 +241,15 @@ pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy, dir
     if let Some(c) = all.iter().find(|c| std::ptr::eq(c.remote, remote)) {
         return Arc::clone(c);
     }
-    let c = Arc::new(Controller { remote, db: ready(db), policy, nudge: Notify::new(), direct });
+    let c = Arc::new(Controller {
+        remote,
+        db: ready(db),
+        policy,
+        nudge: Notify::new(),
+        direct,
+        gone_grace_ms: AtomicI64::new(DEFAULT_GONE_GRACE.as_millis() as i64),
+        handing: Default::default(),
+    });
     all.push(Arc::clone(&c));
     tokio::spawn(Arc::clone(&c).run());
     log_debug!("[delivery] controller drain started");
@@ -227,7 +260,9 @@ pub fn start_controller(remote: &'static RemoteHost, db: Db, policy: Policy, dir
 /// `RemoteHost`), started on first use. The gate calls it when a host
 /// links, so a restarted controller drains what it had queued.
 pub fn ensure_controller_drain() -> Arc<Controller> {
-    start_controller(crate::agent_host::remote::global(), k2_core::db::shared(), Policy::PRODUCTION, Direct::production())
+    let c = start_controller(crate::agent_host::remote::global(), k2_core::db::shared(), Policy::PRODUCTION, Direct::production());
+    c.set_gone_grace(gone_grace(|k| std::env::var(k).ok()));
+    c
 }
 
 /// `RemoteHost::on_frame`'s hook for `deliver` and `deliver.ack` from a host.
@@ -407,9 +442,94 @@ impl Controller {
         self.nudge.notify_one();
     }
 
+    pub fn set_gone_grace(&self, d: Duration) {
+        self.gone_grace_ms.store(d.as_millis() as i64, Ordering::SeqCst);
+    }
+
+    /// When `recipient`'s session ended (itself or through an alias), if
+    /// it did and nothing placed it again: the latest such end.
+    fn ended_at(&self, recipient: &str) -> Option<i64> {
+        let mut ids = vec![recipient.to_string()];
+        ids.extend((self.direct.aliases)(recipient));
+        ids.iter().filter_map(|a| self.remote.session_ended_at(a)).max()
+    }
+
+    /// A due row with no placement. Its recipient's host being lost keeps
+    /// it waiting (S6), as does a drain (S8). If its recipient's session
+    /// ended and nothing placed it again within the grace: a `kind=msg`
+    /// row whose address resolves on this controller goes through the
+    /// direct path (returned, to run off this task; today's wake rules
+    /// apply), anything else fails `recipient_gone` (I2: final, loud).
+    fn after_gone(&self, conn: &Connection, r: &Row, now: i64) -> Option<Row> {
+        if self.awaiting_resume(&r.recipient) {
+            return None;
+        }
+        let ended = self.ended_at(&r.recipient)?;
+        let grace = self.gone_grace_ms.load(Ordering::SeqCst);
+        if now - ended < grace {
+            return None;
+        }
+        let body: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
+        let is_msg = matches!(body.get("kind").and_then(Value::as_str), Some("msg") | None);
+        if is_msg && (self.direct.resolves)(&r.recipient) {
+            return self.handing.lock().insert(r.msg_id.clone()).then(|| r.clone());
+        }
+        let why = format!(
+            "recipient_gone: {}'s session ended and nothing placed it again within {} s",
+            r.recipient,
+            grace / 1000
+        );
+        match outbox::mark_failed(conn, Hop::Down, &r.msg_id, &why, now) {
+            Ok(true) => {
+                if let Ok(Some(row)) = outbox::get(conn, Hop::Down, &r.msg_id) {
+                    report_failed(Hop::Down, &[row]);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => log_debug!("[delivery] ERROR: fail {}: {e}", r.msg_id),
+        }
+        None
+    }
+
+    /// Deliver a row [`Self::after_gone`] handed over through
+    /// [`Direct::deliver`] (blocking: it may wake the agent).
+    pub fn deliver_gone(&self, r: &Row) {
+        let body: Value = serde_json::from_str(&r.body).unwrap_or(Value::Null);
+        let res = (self.direct.deliver)(&r.recipient, &r.sender, &body);
+        let now = delivery::now_ms();
+        let conn = self.db.lock();
+        match &res {
+            Ok(()) => {
+                let _ = outbox::mark_delivered(&conn, Hop::Down, &r.msg_id, now);
+                log_debug!("[delivery] {} to {} delivered directly: its session had ended", r.msg_id, r.recipient);
+            }
+            Err(why) => {
+                let reason = format!("{why}: {}'s session ended; the direct path didn't deliver it", r.recipient);
+                if outbox::mark_failed(&conn, Hop::Down, &r.msg_id, &reason, now).unwrap_or(false) {
+                    if let Ok(Some(row)) = outbox::get(&conn, Hop::Down, &r.msg_id) {
+                        report_failed(Hop::Down, &[row]);
+                    }
+                }
+            }
+        }
+        drop(conn);
+        k2_core::trace::emit(|| {
+            let e = k2_core::trace::Event::new(events::CTL_MSG_GONE_DIRECT)
+                .msg(r.msg_id.as_str())
+                .agent(r.recipient.as_str())
+                .attr("ok", res.is_ok());
+            match &res {
+                Err(why) => e.attr("reason", why.as_str()),
+                Ok(()) => e,
+            }
+        });
+        self.handing.lock().remove(&r.msg_id);
+    }
+
     /// One drain pass at `now`: dead letters first, then send every due
-    /// row whose recipient is placed on a linked host.
-    pub fn pass(&self, now: i64) {
+    /// row whose recipient is placed on a linked host. Returns the rows
+    /// for [`Self::deliver_gone`].
+    pub fn pass(&self, now: i64) -> Vec<Row> {
         let conn = self.db.lock();
         match outbox::sweep(&conn, Hop::Down, now, &self.policy) {
             Ok(failed) => report_failed(Hop::Down, &failed),
@@ -419,13 +539,21 @@ impl Controller {
             Ok(d) => d,
             Err(e) => {
                 log_debug!("[delivery] ERROR: due: {e}");
-                return;
+                return Vec::new();
             }
         };
+        let mut gone = Vec::new();
         for r in due {
-            // Not placed: wait (no attempt spent) until it is, or the TTL.
-            // The address stays the row's; the host gets the placement id.
-            let Some(p) = self.placed(&r.recipient) else { continue };
+            if self.handing.lock().contains(&r.msg_id) {
+                continue;
+            }
+            // Not placed: wait (no attempt spent) until it is, the TTL, or
+            // (its session ended) the gone rule. The address stays the
+            // row's; the host gets the placement id.
+            let Some(p) = self.placed(&r.recipient) else {
+                gone.extend(self.after_gone(&conn, &r, now));
+                continue;
+            };
             let attempt = r.attempts + 1;
             let mut frame = deliver_frame(&r, Some(p.epoch.0), attempt);
             if let Frame::Deliver { agent_id, .. } = &mut frame {
@@ -454,6 +582,7 @@ impl Controller {
                 Err(e) => log_debug!("[delivery] {} waits: {e}", r.msg_id),
             }
         }
+        gone
     }
 
     /// The row for `msg_id` (tests and the status route).
@@ -464,7 +593,10 @@ impl Controller {
     async fn run(self: Arc<Self>) {
         loop {
             let now = delivery::now_ms();
-            self.pass(now);
+            for r in self.pass(now) {
+                let c = Arc::clone(&self);
+                tokio::task::spawn_blocking(move || c.deliver_gone(&r));
+            }
             let next = outbox::next_wakeup_ms(&self.db.lock(), Hop::Down).ok().flatten();
             let wait = next.map(|t| Duration::from_millis((t - now).clamp(0, TICK.as_millis() as i64) as u64)).unwrap_or(TICK);
             tokio::select! {

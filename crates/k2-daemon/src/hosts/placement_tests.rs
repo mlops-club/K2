@@ -281,3 +281,141 @@ async fn a_drained_agent_is_resumed_when_its_host_is_back_and_its_messages_wait_
     assert!(!remote.awaiting_resume("bob"));
     assert_eq!(remote.placement("bob").unwrap().host_id, "host-a");
 }
+
+// ── the gone rule: a recipient whose session ended (I2 under chaos) ────
+
+async fn wait_final(outbox: &crate::delivery_drain::Controller, msg_id: &str) -> k2_core::delivery::outbox::Row {
+    within("the message's final state", async {
+        loop {
+            if let Some(r) = outbox.get(msg_id).filter(|r| {
+                matches!(r.state, k2_core::delivery::State::Delivered | k2_core::delivery::State::Failed)
+            }) {
+                return r;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_for_an_agent_whose_session_ended_goes_direct_or_fails_after_the_grace() {
+    use crate::delivery_drain::{start_controller, Direct};
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let direct_calls: Arc<parking_lot::Mutex<Vec<(String, bool)>>> = Arc::default();
+    let calls = Arc::clone(&direct_calls);
+    // `ws-*` resolve on the controller (a workspace); `bare-*` don't.
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|r| r.starts_with("ws-")),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(move |to: &str, _from: &str, body: &Value| {
+                let wake = body["wake"].as_bool() == Some(true);
+                calls.lock().push((to.to_string(), wake));
+                if wake { Ok(()) } else { Err("dormant_no_wake".into()) }
+            }),
+        },
+    );
+    let mut a = fake_host(&url, "host-a").await;
+    for (agent, n) in [("bare-1", 1), ("ws-1", 2), ("ws-2", 3)] {
+        spawn_on(remote, &mut a, agent, "/w", &sid(n)).await;
+        gone(&mut a, remote, agent).await; // the CLI was killed
+        assert!(remote.session_ended_at(agent).is_some(), "{agent}");
+    }
+    let msg = |wake: bool| json!({"kind": "msg", "text": "hi", "wake": wake});
+    let bare = outbox.send("agent:alice", "bare-1", msg(false)).unwrap();
+    let ws_sleep = outbox.send("agent:alice", "ws-1", msg(false)).unwrap();
+    let ws_wake = outbox.send("agent:alice", "ws-2", msg(true)).unwrap();
+
+    // Within the grace (default 120 s): they wait.
+    assert!(outbox.pass(k2_core::delivery::now_ms()).is_empty());
+    for id in [&bare, &ws_sleep, &ws_wake] {
+        assert_eq!(outbox.get(id).unwrap().state, State::Queued, "{id}");
+    }
+
+    // Past it: a bare name fails recipient_gone; a workspace takes today's
+    // direct path, which wakes it with --wake and refuses without.
+    outbox.set_gone_grace(Duration::ZERO);
+    let r = wait_final(&outbox, &bare).await;
+    assert_eq!(r.state, State::Failed);
+    assert!(r.reason.as_deref().unwrap_or("").starts_with("recipient_gone: bare-1's session ended"), "{:?}", r.reason);
+    let r = wait_final(&outbox, &ws_sleep).await;
+    assert_eq!(r.state, State::Failed);
+    assert!(r.reason.as_deref().unwrap_or("").starts_with("dormant_no_wake"), "{:?}", r.reason);
+    assert_eq!(wait_final(&outbox, &ws_wake).await.state, State::Delivered);
+    let mut seen = direct_calls.lock().clone();
+    seen.sort();
+    assert_eq!(seen, [("ws-1".to_string(), false), ("ws-2".to_string(), true)], "once each");
+
+    // Placed again: no longer ended, so nothing about it is "gone".
+    spawn_on(remote, &mut a, "bare-1", "/w", &sid(4)).await;
+    assert_eq!(remote.session_ended_at("bare-1"), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_for_an_agent_on_a_lost_host_keeps_waiting_and_lands_when_it_is_back() {
+    use crate::delivery_drain::{start_controller, Direct};
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| panic!("a lost host's agent never takes the direct path")),
+        },
+    );
+    // The rule would act at once if it applied.
+    outbox.set_gone_grace(Duration::ZERO);
+    let mut b = fake_host(&url, "host-b").await;
+    spawn_on(remote, &mut b, "dave", "/w/dave", &sid(1)).await;
+    drop(b); // the host is lost; dave may still run there
+    within("host-b to be lost", async {
+        while remote.status_json()["lost"] != json!(["host-b"]) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(remote.session_ended_at("dave"), None);
+    let id = outbox.send("agent:alice", "dave", json!({"kind": "msg", "text": "hold on"})).unwrap();
+    for _ in 0..3 {
+        assert!(outbox.pass(k2_core::delivery::now_ms()).is_empty());
+    }
+    assert_eq!(outbox.get(&id).unwrap().state, State::Queued, "held while the host is lost (S6)");
+
+    // host-b is back, still running dave (hello.resume, W3): adopted, and
+    // the message lands. (Back *without* dave would mean his session ended:
+    // the other test's case.)
+    let epoch = remote.placement("dave").unwrap().epoch.0;
+    let (mut b, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("dial");
+    let resume = super::proto::ResumePlacement {
+        agent_id: "dave".into(),
+        session_id: sid(1),
+        epoch,
+        ring: None,
+        child_alive: true,
+        cwd: Some("/w/dave".into()),
+        program: Some("claude".into()),
+        args: vec![],
+        label: None,
+    };
+    send(&mut b, &Frame::Hello { protocol: PROTOCOL, host_name: "host-b".into(), token: TOKEN.into(), labels: vec![], resume: vec![resume] })
+        .await;
+    assert!(matches!(recv(&mut b).await, Frame::Welcome { .. }));
+    match recv(&mut b).await {
+        Frame::Deliver { msg_id, agent_id, .. } => {
+            assert_eq!((msg_id.as_str(), agent_id.as_str()), (id.as_str(), "dave"));
+            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the held message, got {other:?}"),
+    }
+    assert_eq!(wait_final(&outbox, &id).await.state, State::Delivered);
+}

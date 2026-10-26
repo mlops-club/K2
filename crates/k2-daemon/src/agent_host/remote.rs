@@ -165,6 +165,13 @@ struct Inner {
     /// their host links again, or placed by the next need
     /// (`hosts::drain`). In the store as `host_resume`.
     resume: HashMap<String, StoredPlacement>,
+    /// When each agent's session ended (its CLI exited or was killed, it
+    /// was closed or unplaced, or its host came back without it), in Unix
+    /// ms, until it is placed again. Not set while only its host is lost,
+    /// nor for a drained agent awaiting resume. The outbox gives such an
+    /// agent's messages a grace period, then the direct path or a loud
+    /// failure. In the store as `host_ended`.
+    ended: HashMap<String, i64>,
 }
 
 /// Where a new placement goes and why ([`RemoteHost::pick_host_for`]).
@@ -241,6 +248,10 @@ impl PlacementStore {
                     label TEXT NOT NULL DEFAULT '',
                     label_source TEXT NOT NULL DEFAULT 'pty',
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE TABLE IF NOT EXISTS host_ended (
+                    agent_id TEXT PRIMARY KEY,
+                    ended_ms INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS host_affinity (
                     agent_id TEXT PRIMARY KEY,
@@ -365,6 +376,27 @@ impl PlacementStore {
         )
         .map(drop)
         .map_err(|e| format!("remember the host of {agent_id}: {e}"))
+    }
+
+    /// `agent_id`'s session ended at `ended_ms` (`None`: it is placed again).
+    pub fn set_ended(&self, agent_id: &str, ended_ms: Option<i64>) -> Result<(), String> {
+        let c = self.db.lock();
+        let r = match ended_ms {
+            Some(ms) => c.execute(
+                "INSERT INTO host_ended (agent_id, ended_ms) VALUES (?1, ?2)
+                 ON CONFLICT(agent_id) DO UPDATE SET ended_ms = ?2",
+                rusqlite::params![agent_id, ms],
+            ),
+            None => c.execute("DELETE FROM host_ended WHERE agent_id = ?1", [agent_id]),
+        };
+        r.map(drop).map_err(|e| format!("record the end of {agent_id}'s session: {e}"))
+    }
+
+    pub fn load_ended(&self) -> Result<Vec<(String, i64)>, String> {
+        let c = self.db.lock();
+        let mut st = c.prepare("SELECT agent_id, ended_ms FROM host_ended").map_err(|e| e.to_string())?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
     /// Every remembered (agent, host, cwd), oldest first.
@@ -584,6 +616,10 @@ impl RemoteHost {
                 }
             }
             Err(e) => log_debug!("[hosts] host affinity unreadable: {e}"),
+        }
+        match store.load_ended() {
+            Ok(ended) => self.inner.lock().ended.extend(ended),
+            Err(e) => log_debug!("[hosts] ended sessions unreadable: {e}"),
         }
         match store.load_resume() {
             Ok(waiting) => {
@@ -814,6 +850,7 @@ impl RemoteHost {
                 if !stale {
                     if let Some(p) = inner.placements.remove(&agent_id) {
                         self.forget(&agent_id, p.epoch);
+                        self.note_ended(&mut inner, &agent_id);
                     }
                     if let Some(s) = inner.sessions.remove(&agent_id) {
                         s.exited(exit_code);
@@ -1085,6 +1122,7 @@ impl RemoteHost {
                     if inner.placements.get(&agent_id).is_some_and(|p| p.epoch == epoch) {
                         inner.placements.remove(&agent_id);
                         self.forget(&agent_id, epoch);
+                        self.note_ended(&mut inner, &agent_id);
                         if let Some(s) = inner.sessions.remove(&agent_id) {
                             s.mark_exited();
                         }
@@ -1116,6 +1154,13 @@ impl RemoteHost {
             inner.last_host_for_cwd.insert(cwd.clone(), host_id.to_string());
         }
         inner.last_host_for_agent.insert(agent_id.to_string(), host_id.to_string());
+        if inner.ended.remove(agent_id).is_some() {
+            if let Some(store) = &self.store {
+                if let Err(e) = store.set_ended(agent_id, None) {
+                    log_debug!("[hosts] {e}");
+                }
+            }
+        }
         if inner.resume.remove(agent_id).is_some() {
             if let Some(store) = &self.store {
                 if let Err(e) = store.remove_resume(agent_id) {
@@ -1435,11 +1480,45 @@ impl RemoteHost {
             }
         }
         inner.resume.insert(agent_id.to_string(), row);
+        if inner.ended.remove(agent_id).is_some() {
+            if let Some(store) = &self.store {
+                if let Err(e) = store.set_ended(agent_id, None) {
+                    log_debug!("[hosts] {e}");
+                }
+            }
+        }
         s.exited(None);
         log_debug!("[hosts] host {host_id} drained agent {agent_id}: resumed when the host is back or on the next need");
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new(crate::hosts::drain::events::CTL_DRAIN_RELEASE).agent(agent_id).attr("host", host_id)
         });
+    }
+
+    /// `agent_id`'s session ended now: its CLI is gone and nothing holds a
+    /// placement for it (not a lost host, not a drain).
+    fn note_ended(&self, inner: &mut Inner, agent_id: &str) {
+        if inner.resume.contains_key(agent_id) {
+            return;
+        }
+        let now = now_ms() as i64;
+        inner.ended.insert(agent_id.to_string(), now);
+        if let Some(store) = &self.store {
+            if let Err(e) = store.set_ended(agent_id, Some(now)) {
+                log_debug!("[hosts] {e}");
+            }
+        }
+    }
+
+    /// When `agent_id`'s session ended (Unix ms), while it is not placed
+    /// again ([`Inner::ended`]).
+    pub fn session_ended_at(&self, agent_id: &str) -> Option<i64> {
+        self.inner.lock().ended.get(agent_id).copied()
+    }
+
+    /// Tests: pretend `agent_id`'s session ended at `ms`.
+    #[cfg(test)]
+    pub fn set_session_ended_for_test(&self, agent_id: &str, ms: i64) {
+        self.inner.lock().ended.insert(agent_id.to_string(), ms);
     }
 
     /// True while `agent_id` was drained and is not placed again yet: its
@@ -1519,6 +1598,7 @@ impl RemoteHost {
             for (agent, epoch) in gone {
                 inner.placements.remove(&agent);
                 self.forget(&agent, epoch);
+                self.note_ended(&mut inner, &agent);
                 if let Some(s) = inner.sessions.remove(&agent) {
                     s.exited(None);
                 }
@@ -1860,7 +1940,11 @@ impl AgentHost for RemoteHost {
     fn unplace(&self, agent_id: &str) -> Option<AgentSession> {
         let (placement, session) = {
             let mut inner = self.inner.lock();
-            (inner.placements.remove(agent_id), inner.sessions.remove(agent_id))
+            let placed = (inner.placements.remove(agent_id), inner.sessions.remove(agent_id));
+            if placed.0.is_some() {
+                self.note_ended(&mut inner, agent_id);
+            }
+            placed
         };
         let placement = placement?;
         self.forget(agent_id, placement.epoch);
