@@ -165,6 +165,14 @@ write_overlay() {  # write_overlay <k2-host replicas>
         cat <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
+# Everything in the variant's namespace, with its deploy label: the
+# overlay's own objects already are; pool-rbac.yaml has neither, and
+# \`kubectl apply -f\` would put an object without a namespace in the
+# kubeconfig's default one.
+namespace: $KIND_NS
+labels:
+  - pairs: {k2.dev/deploy: kind-$KIND_VARIANT}
+    includeSelectors: false
 resources:
   - $(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/$KIND_OVERLAY" "$overlay")
 $([ "$provisioner" = kubernetes ] && printf '  - %s\n' "$(python3 -I -c 'import os,sys; r = os.path.realpath; print(os.path.relpath(r(sys.argv[1]), r(sys.argv[2])))' "$KIND_REPO/deploy/kind/dist/pool-rbac.yaml" "$overlay")")

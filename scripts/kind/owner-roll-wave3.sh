@@ -141,6 +141,9 @@ env = {e["name"]: e.get("value") for c in ctl["spec"]["template"]["spec"]["conta
 floor = env.get("K2_PROVISIONER") == "kubernetes" and env.get("K2_PROVISIONER_MIN_HOSTS") == "1" and env.get("K2_PROVISIONER_MAX_HOSTS") == "1"
 print(("ok  " if floor else "FAIL") + " (b) K2_PROVISIONER=%s, MIN_HOSTS=%s, MAX_HOSTS=%s; k2-host replicas %s" % (
     env.get("K2_PROVISIONER"), env.get("K2_PROVISIONER_MIN_HOSTS"), env.get("K2_PROVISIONER_MAX_HOSTS"), host["spec"]["replicas"]))
+stray = ["%s/%s" % (d["kind"], d["metadata"]["name"]) for d in docs if d["kind"] != "Namespace" and d["metadata"].get("namespace") != ns]
+print(("ok  " if not stray else "FAIL") + " every object is in %s (an object without one lands in the kubeconfig's default namespace)%s" % (
+    ns, "" if not stray else ": " + ", ".join(stray)))
 np = find("Service", "k2-controller-nodeport")
 ports = [p.get("nodePort") for p in np["spec"]["ports"]]
 claims_ctl = claims(ctl)
