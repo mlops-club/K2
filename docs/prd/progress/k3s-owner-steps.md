@@ -56,7 +56,7 @@ Check these on the cluster:
 | What | How | Why |
 |---|---|---|
 | Node architecture | `kubectl --kubeconfig "$K" get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.nodeInfo.architecture}{"\n"}{end}'` | The images must match it (section 1). A Mac builds arm64 |
-| Storage class | `kubectl --kubeconfig "$K" get storageclass` | k3s ships `local-path`, which pins a volume to one node. The kind runs used `local-path` too |
+| Storage class | `kubectl --kubeconfig "$K" get storageclass` | k3s ships `local-path`, which pins a volume to one node (ReadWriteOnce only). The kind runs used `local-path` too. For hosts on several nodes you need a class with **ReadWriteMany** (NFS, Longhorn RWX) for `k2-work`: section 2 |
 | Pod CIDR | `kubectl --kubeconfig "$K" get nodes -o jsonpath='{.items[*].spec.podCIDR}'` (k3s default cluster CIDR `10.42.0.0/16`) | Level B mail: `K2_STALWART_ALLOWED_IPS` (section 4) |
 | Free memory per node | `kubectl --kubeconfig "$K" describe nodes` | About 400 MB per awake Claude CLI (measured). kind ran hosts at 512Mi requested and 3Gi limit |
 | Traefik, Gateway API CRDs | `kubectl --kubeconfig "$K" get gatewayclass` | Only for section 6 option (c) and level B |
@@ -183,13 +183,41 @@ What this shape is, from `deploy/kind/dist`:
 - **Hosts** (StatefulSet `k2-host`; each has `data-k2-host-N` at
   `/var/lib/k2-host`, which holds the Claude login and the agents' homes).
 - **The workspaces volume `k2-work`**, shared by the controller and every
-  host. It is ReadWriteOnce, so **every K2 pod runs on the controller's
-  node** (podAffinity). That fits a single-node k3s, or a node you set
-  aside for K2.
-- **Across nodes**: the shape with no shared `k2-work`, each host its own
-  work volume and hosts on different nodes, is `deploy/kind/p4`. It ran the
-  drain demo on kind, but a drained agent's move needs drain-move. Use it
-  after the hold ends.
+  host at `/var/lib/k2/work`. **It is required**: the controller serves the
+  app's file browser (`/cli/fs/*`), git panel (`/cli/git/*`), project
+  create/add and App deploy-from-folder from its own disk, and nothing
+  relays those to the agent's host yet. Without the shared volume the app
+  shows the controller's copy while agents work on theirs, and a workspace
+  made through the app never reaches a host (seen on kind with
+  `home-move-check.sh`, `kind-p4.md`). Relaying them is a dist-link task
+  after rc1 (coordinator, 2026-10-26).
+  - **Single node, or no ReadWriteMany class (what ran on kind):** `k2-work`
+    is ReadWriteOnce, so **every K2 pod runs on the controller's node**
+    (the hosts' podAffinity). That fits a single-node k3s, or one node set
+    aside for K2. Home sync still saves and restores each agent's home.
+  - **Hosts on several nodes:** make `k2-work` **ReadWriteMany** (an NFS
+    provisioner, or Longhorn with RWX) and drop the hosts' podAffinity to
+    the controller. Add to the overlay's `patches` **(untested: kind has no
+    RWX class)**:
+
+    ```yaml
+      - target: {kind: PersistentVolumeClaim, name: k2-work}
+        patch: |-
+          - {op: replace, path: /spec/accessModes, value: [ReadWriteMany]}
+          - {op: add, path: /spec/storageClassName, value: <your RWX class, e.g. longhorn or nfs-client>}
+      - target: {kind: StatefulSet, name: k2-host}
+        patch: |-
+          - {op: remove, path: /spec/template/spec/affinity/podAffinity}
+    ```
+
+    Then hosts spread across nodes, but each host's own `data` volume
+    (local-path) still pins that host to its node: a host whose node is
+    drained waits Pending, and its agents move by home sync (after
+    drain-move). Longhorn for `data` too would let the host pod itself
+    move.
+  - `deploy/kind/p4` (no `k2-work` at all, each host its own work volume)
+    ran the drain demo and the home move on kind. It isn't a deployment
+    shape until the fs/git relay exists.
 - `components/no-k2dev` turns off the tunnel lease, federation and relays,
   which talk to k2.dev. Leave it in unless you mean to use those.
 - Resources are kind-sized: the controller requests 512Mi and is limited to
@@ -382,4 +410,4 @@ The pattern `owner-roll-wave3.sh` and `owner-roll-rc1.sh` follow:
 | Level B not in rc1; Sew has no image or TCP management API | Postgres/Apps/mail stay off; no Sew | k8s-capabilities merge; Sew (decision pending) |
 | Claude login copy and token rotation unverified | Prefer `/login` per host | – |
 | Resources sized for kind | Raise host limits and volume sizes | owner |
-| Shared `k2-work` keeps all K2 pods on one node | Multi-node needs the `deploy/kind/p4` shape, after drain-move | kind-p4 |
+| `k2-work` is required (the controller's fs/git/project/App-folder routes read its own disk); ReadWriteOnce keeps all K2 pods on one node | Single node without an RWX class; RWX (NFS/Longhorn) for several nodes, untested | dist-link: relay fs/git to the agent's host (after rc1) |

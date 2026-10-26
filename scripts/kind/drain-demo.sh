@@ -102,6 +102,14 @@ events() { # pod file event: matching lines
     trace "$1" "$2" | grep -F "\"event\":\"$3\""
 }
 count() { events "$@" | wc -l | tr -d ' '; }
+# The last cli.exec of this agent's workspace on a host (other agents may
+# run there too: a lost host's agents all move).
+exec_of() { events "$1" fake.jsonl cli.exec | python3 -I -c '
+import json,sys
+last=""
+for l in sys.stdin:
+    if ((json.loads(l).get("attrs") or {}).get("cwd") or "").startswith(sys.argv[1]): last=l.strip()
+print(last)' "$WS"; }
 memory() { # pod: MEMORY.md's path in the agent's Claude projects dir
     kn exec "$1" -c k2-host -- sh -c 'ls /var/lib/k2-host/.claude/projects/*-demo/memory/MEMORY.md 2>/dev/null | head -1'
 }
@@ -148,7 +156,7 @@ wait_for 120 has_placement || true
 SRC=$(placed_on)
 case "$SRC" in k2-host-0) DST=k2-host-1 ;; k2-host-1) DST=k2-host-0 ;; *) DST= ;; esac
 wait_for 120 mem_has "$SRC" "$FACT" || true
-SESSION=$(events "$SRC" fake.jsonl cli.exec | tail -1 | field session_id)
+SESSION=$(exec_of "$SRC" | field session_id)
 EPOCH1=$(placed_epoch)
 check "demo is placed on a host and its first turn remembers a fact in MEMORY.md" \
     "$([ -n "$DST" ] && mem_has "$SRC" "$FACT" && [ -n "$SESSION" ] && echo 1)" \
@@ -198,7 +206,7 @@ wait_for 120 mem_has "$DST" "after the drain" || true
 EPOCH2=$(placed_epoch)
 restored=$(events "$DST" daemon.jsonl host.home_restored | tail -1)
 fetched=$(printf '%s' "$restored" | field attrs.fetched)
-EX=$(events "$DST" fake.jsonl cli.exec | tail -1)
+EX=$(exec_of "$DST")
 resumed=$(printf '%s' "$EX" | python3 -I -c '
 import json,sys
 e=json.loads(sys.stdin.read() or "{}"); a=e.get("attrs") or {}
@@ -226,7 +234,8 @@ drain_start=$(count "$SRC" daemon.jsonl host.drain_start)
 drain_done=$(count "$SRC" daemon.jsonl host.drain_done)
 release_saves=$(events "$SRC" daemon.jsonl host.home_saved | grep -c '"trigger":"release"')
 sleep 10
-live_src=$(kn exec "$SRC" -c k2-host -- sh -c 'pgrep -f k2-fake-agent | wc -l' 2>/dev/null | tr -d ' ')
+# The image has no ps/pgrep: count the fake agent's processes in /proc.
+live_src=$(kn exec "$SRC" -c k2-host -- sh -c 'n=0; for p in /proc/[0-9]*; do [ "${p#/proc/}" = $$ ] && continue; case "$(tr "\0" " " < $p/cmdline 2>/dev/null)" in /opt/k2-fake/shim/*|*/k2-fake-agent\ *) n=$((n+1));; esac; done; echo $n' 2>/dev/null)
 check "$SRC was Pending for the affinity while cordoned; uncordoned it relinks by its key; its trace has the drain; demo stays on $DST, no CLI on $SRC (I1)" \
     "$([ "$pending_ok" = 1 ] && linked "$SRC" && [ "$enrolled_after" = "$enrolled_before" ] && [ "$drain_start" -ge 1 ] && [ "$drain_done" -ge 1 ] && [ "$release_saves" -ge 1 ] && [ "$(placed_on)" = "$DST" ] && [ "${live_src:-1}" = 0 ] && echo 1)" \
     "Pending: $(printf '%s' "$reason" | cut -c1-120); enrollments $enrolled_before -> $enrolled_after; drain_start $drain_start drain_done $drain_done release saves $release_saves; on $(placed_on); fake CLIs on $SRC: $live_src"

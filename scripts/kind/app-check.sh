@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check K2 on kind the way the desktop app uses it, with no agent CLI:
 #
-#   scripts/kind/app-check.sh [--dist] [--fake] --password-file=PATH
+#   scripts/kind/app-check.sh [--dist] [--fake] [--p4] --password-file=PATH
 #
 # 1. POST /cli/auth/login as the app login (K2_KIND_USER, default "owner";
 #    the password read from PATH) → a session token, as the app gets one
@@ -17,23 +17,25 @@
 # 5. POST /cli/sessions/v2/close
 #
 # Passes when the line arrives through the door and the shell runs in the
-# agents pod (k2-host-0 with --dist) and, with --dist, not in the
-# controller. Prints no password and no token.
+# agents pod (k2-host-0 with --dist; with --p4, k2-kind-p4, whichever host
+# the controller chose) and, with --dist, not in the controller. Prints no
+# password and no token.
 set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
-fake=0 dist=0 password_file=""
+fake=0 dist=0 p4=0 password_file=""
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
         --dist) dist=1 ;;
+        --p4) p4=1 ;;
         --password-file=*) password_file=${a#--password-file=} ;;
-        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "app-check.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
 [ -r "$password_file" ] || { echo "app-check.sh: --password-file=PATH (readable) is required" >&2; exit 2; }
-kind_variant_from_flags "$fake" "$dist"
+if [ "$p4" = 1 ]; then kind_variant p4; fake=1; else kind_variant_from_flags "$fake" "$dist"; fi
 kind_kubeconfig
 cd "$KIND_REPO"
 marker=$(python3 -I -c 'import uuid; print(uuid.uuid4())')   # also the fake agent's --session-id
@@ -120,8 +122,16 @@ py=$!
 msg=""
 read -r -t 120 msg <&3 || true
 if [ "$msg" = scan ]; then
-    agents=$(proc_scan "$KIND_AGENT_POD" "$KIND_AGENT_CONTAINER")
-    echo "     /proc in $KIND_AGENT_POD: ${agents:-(none)}"
+    if [ "$p4" = 1 ]; then
+        # Any host: the controller places it (no shared volume ties it to one).
+        for h in $(kc -n "$KIND_NS" get pods -l app.kubernetes.io/name=k2-host -o jsonpath='{.items[*].metadata.name}'); do
+            agents=$(proc_scan "$h" "$KIND_AGENT_CONTAINER")
+            [ -n "$agents" ] && { KIND_AGENT_POD=$h; break; }
+        done
+    else
+        agents=$(proc_scan "$KIND_AGENT_POD" "$KIND_AGENT_CONTAINER")
+    fi
+    echo "     /proc in $KIND_AGENT_POD ($(kc -n "$KIND_NS" get pod "$KIND_AGENT_POD" -o jsonpath='{.spec.nodeName}')): ${agents:-(none)}"
     ctl=""
     if [ "$KIND_AGENT_POD" != "$KIND_POD" ]; then
         ctl=$(proc_scan "$KIND_POD" k2-daemon)
