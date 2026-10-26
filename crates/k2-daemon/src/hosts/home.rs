@@ -50,6 +50,9 @@ use crate::routes::http;
 
 /// Host: homes are synced only for agents whose cwd is under this dir.
 pub const WORK_ROOT_VAR: &str = "K2_WORK_ROOT";
+/// The `hello` label of a host that syncs homes (`K2_WORK_ROOT` set): an
+/// agent placed there gets its home restored before it starts.
+pub const LABEL_HOME_SYNC: &str = "k2.home_sync";
 
 pub const SESSION_PATH: &str = "/cli/hosts/home/session";
 pub const HAVE_PATH: &str = "/cli/hosts/home/have";
@@ -334,6 +337,30 @@ pub async fn serve(stream: &mut TcpStream, buf: &mut [u8], s: &'static Server, p
         .await
         .unwrap_or_else(|e| error("500 Internal Server Error", format!("home: {e}")));
     write_reply(stream, r).await;
+}
+
+/// The `placementNote` when `agent` is placed on `placed` by load, away
+/// from `own`, the host that last ran it (`why`: which is not linked, full,
+/// draining…). It says what the agent finds on `placed`: its home from the
+/// store's `snapshot` when that host syncs homes, else nothing of it.
+pub fn placement_note(agent: &str, own: &str, why: &str, placed: &str, syncs: bool, snapshot: Option<&Latest>) -> String {
+    match (snapshot, syncs) {
+        (Some(s), true) => format!(
+            "agent {agent} last ran on host {own}, {why}; placed on {placed} by load, which restores its home \
+             (snapshot {}, saved on {}) before it starts, so its conversation and memory come with it",
+            s.seq, s.host
+        ),
+        (Some(s), false) => format!(
+            "agent {agent}'s home is on host {own}, {why}; placed on {placed} by load, which doesn't sync homes \
+             ({WORK_ROOT_VAR} is not set there), so its conversation and memory are not there \
+             (the store holds snapshot {})",
+            s.seq
+        ),
+        (None, _) => format!(
+            "agent {agent}'s home is on host {own}, {why}; placed on {placed} by load, where its conversation \
+             and memory are not (no snapshot of its home is in the store)"
+        ),
+    }
 }
 
 // ── host ───────────────────────────────────────────────────────────────

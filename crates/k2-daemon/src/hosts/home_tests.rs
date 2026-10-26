@@ -281,3 +281,18 @@ fn a_spawn_resumes_a_conversation_the_restored_home_holds() {
     assert_eq!(resume_held(&mut resumed, &|_| true), None, "already a resume");
     assert_eq!(resume_held(&mut [json!("--session-id")], &|_| true), None, "no id");
 }
+
+#[test]
+fn the_placement_note_says_what_the_agent_finds_on_its_new_host() {
+    let snap = Latest { seq: 7, epoch: 3, host: "host-a".into(), manifest_sha: "0".repeat(64), created_ms: 0, files: 1, bytes: 1 };
+    let restored = placement_note("notes", "host-a", "which is not linked", "host-b", true, Some(&snap));
+    assert!(restored.contains("placed on host-b by load, which restores its home (snapshot 7, saved on host-a)"), "{restored}");
+    assert!(!restored.contains("are not"), "nothing missing on a syncing host with a snapshot: {restored}");
+    let unsynced = placement_note("notes", "host-a", "which is draining", "host-b", false, Some(&snap));
+    assert!(unsynced.contains("which doesn't sync homes (K2_WORK_ROOT is not set there)") && unsynced.contains("are not there"), "{unsynced}");
+    let none = placement_note("notes", "host-a", "which is full", "host-b", true, None);
+    assert!(
+        none.contains("home is on host host-a, which is full; placed on host-b by load, where its conversation and memory are not (no snapshot"),
+        "{none}"
+    );
+}

@@ -149,6 +149,38 @@ async fn when_the_home_host_is_away_the_agent_is_placed_by_load_and_the_answer_s
     assert!(note.contains("home is on host host-a, which is not linked") && note.contains("placed on host-b"), "{answer}");
 }
 
+/// The away home host's agent placed by load on a host that syncs homes,
+/// with a snapshot in the store: the note says its home comes with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_host_that_syncs_homes_the_note_says_the_home_is_restored() {
+    let snap = k2_core::agent_home::Latest {
+        seq: 5,
+        epoch: 1,
+        host: "host-a".into(),
+        manifest_sha: "0".repeat(64),
+        created_ms: 0,
+        files: 1,
+        bytes: 1,
+    };
+    let remote: &'static RemoteHost =
+        Box::leak(Box::new(RemoteHost::new().with_home_latest(move |a| (a == "s7").then(|| snap.clone()))));
+    let url = serve(remote).await;
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "s7", "/w/s7", &sid(1)).await;
+    gone(&mut a, remote, "s7").await;
+    drop(a);
+    let (mut b, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("dial");
+    let labels = vec![super::home::LABEL_HOME_SYNC.to_string()];
+    send(&mut b, &Frame::Hello { protocol: PROTOCOL, host_name: "host-b".into(), token: TOKEN.into(), labels, resume: vec![] }).await;
+    assert!(matches!(recv(&mut b).await, Frame::Welcome { .. }));
+    wait_hosts(remote, 1).await;
+
+    let answer = spawn_on(remote, &mut b, "s7", "/w/s7", &sid(2)).await;
+    let note = answer["placementNote"].as_str().unwrap_or_default();
+    assert!(note.contains("last ran on host host-a, which is not linked; placed on host-b by load, which restores its home (snapshot 5"), "{answer}");
+    assert!(!note.contains("are not"), "{note}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_home_host_is_remembered_across_a_controller_restart() {
     let path = k2_core::test_env::unique_temp_path("affinity.db");
