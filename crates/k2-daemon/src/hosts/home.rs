@@ -19,6 +19,8 @@
 //! spawn that would start a conversation this host now holds (the
 //! controller decided before the restore: `--session-id <id>`) resumes it
 //! instead (`--resume <id>`).
+//! - every turn's end saves the home too (T2, `hosts::turn_save`), so a
+//!   host that dies without a drain loses at most the turn in progress;
 //! - every release saves the home first: a `close` from the controller
 //!   (sleep, a pool's scale-down, the v2 close) is answered after the push
 //!   ([`before_close`], [`with_home`]); the SIGTERM drain pushes before its
@@ -29,11 +31,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use k2_core::agent_home::restore::{self, Outcome, Target};
-use k2_core::agent_home::snapshot::{self, Options, Pushed};
+use k2_core::agent_home::snapshot::{self, HashCache, Options, Pushed};
 use k2_core::agent_home::store::{CommitError, Fence, Store};
 use k2_core::agent_home::{Committed, Latest, Remote, MAX_BYTES_VAR, MAX_OBJECT_BYTES};
 use k2_core::log_debug;
@@ -76,6 +78,14 @@ pub mod events {
 
 /// The I4 fence over `remote`'s placements (T1-c).
 pub fn fence(remote: &RemoteHost, f: &Fence) -> Result<(), String> {
+    // Never under a newer writer's snapshot (T2: a host that comes back
+    // with an old placement still adopted must not write over a move).
+    if let Some(n) = f.newest.filter(|n| f.epoch < n.epoch) {
+        return Err(format!(
+            "epoch {} is older than agent {}'s newest snapshot (seq {} at epoch {} from {})",
+            f.epoch, f.agent, n.seq, n.epoch, n.host
+        ));
+    }
     if let Some(p) = remote.placement(f.agent) {
         if p.host_id == f.host && p.epoch.0 == f.epoch {
             return Ok(());
@@ -86,21 +96,13 @@ pub fn fence(remote: &RemoteHost, f: &Fence) -> Result<(), String> {
         ));
     }
     match remote.last_host_of(f.agent) {
-        Some(last) if last == f.host => {}
-        last => {
-            return Err(format!(
-                "{} is not the host that last ran agent {} ({})",
-                f.host,
-                f.agent,
-                last.as_deref().unwrap_or("none known")
-            ))
-        }
-    }
-    match f.newest {
-        Some(n) if f.epoch < n.epoch => {
-            Err(format!("epoch {} is older than agent {}'s newest snapshot (seq {} at epoch {})", f.epoch, f.agent, n.seq, n.epoch))
-        }
-        _ => Ok(()),
+        Some(last) if last == f.host => Ok(()),
+        last => Err(format!(
+            "{} is not the host that last ran agent {} ({})",
+            f.host,
+            f.agent,
+            last.as_deref().unwrap_or("none known")
+        )),
     }
 }
 
@@ -536,10 +538,40 @@ fn this_host() -> String {
     super::host_config(env).map(|c| c.host_name).unwrap_or_default()
 }
 
+/// Why a home is saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The agent is released: a close, a pool's scale-down, a drain.
+    Release,
+    /// Its turn ended (T2).
+    Turn,
+}
+
+impl Trigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Trigger::Release => "release",
+            Trigger::Turn => "turn",
+        }
+    }
+}
+
+/// The hashes of this host's files, kept between snapshots (T2: a turn's
+/// save reads only what changed).
+fn hash_cache() -> Arc<HashCache> {
+    static C: OnceLock<Arc<HashCache>> = OnceLock::new();
+    Arc::clone(C.get_or_init(Arc::default))
+}
+
 /// Save `agent`'s home as a snapshot at placement `epoch`, before it is
 /// released. `Ok(None)`: home sync is off here, or the agent isn't in a
 /// workspace under `K2_WORK_ROOT`.
 pub async fn save(agent: &str, epoch: u64) -> Result<Option<Pushed>, String> {
+    save_as(agent, epoch, Trigger::Release).await
+}
+
+/// [`save`], saying why.
+pub async fn save_as(agent: &str, epoch: u64, trigger: Trigger) -> Result<Option<Pushed>, String> {
     let Some(root) = work_root(env) else { return Ok(None) };
     let Some(cwd) = crate::agent_host::host().find_agent(agent).and_then(|s| s.cwd_path().map(|p| p.to_path_buf())) else {
         log_debug!("[hosts/home] {agent}: no session here, nothing to save");
@@ -561,6 +593,7 @@ pub async fn save(agent: &str, epoch: u64) -> Result<Option<Pushed>, String> {
             let mut opts = Options::new(&t.home);
             opts.max_bytes = max_bytes(env);
             opts.work_root = t.work_root.clone();
+            opts.cache = Some(hash_cache());
             let p = snapshot::push(&remote, &agent, epoch, &host, &cwd.to_string_lossy(), parent, &opts)?;
             restore::mark(&t.state, &agent, p.seq, &p.manifest_sha, &p.manifest.encode())?;
             Ok::<_, String>(p)
@@ -572,28 +605,36 @@ pub async fn save(agent: &str, epoch: u64) -> Result<Option<Pushed>, String> {
     match &result {
         Ok(p) => {
             log_debug!(
-                "[hosts/home] {agent}: saved snapshot {} at epoch {epoch} ({} files, {} bytes; sent {} objects, {} bytes)",
+                "[hosts/home] {agent}: saved snapshot {} at epoch {epoch} on {} ({} files, {} bytes; {} read; sent {} objects, {} bytes)",
                 p.seq,
+                trigger.as_str(),
                 p.files,
                 p.bytes,
+                p.hashed,
                 p.sent_objects,
                 p.sent_bytes
             );
             k2_core::trace::emit(|| {
                 k2_core::trace::Event::new(events::HOST_HOME_SAVED)
                     .agent(agent)
+                    .attr("trigger", trigger.as_str())
                     .attr("epoch", epoch)
                     .attr("seq", p.seq)
                     .attr("files", p.files)
                     .attr("bytes", p.bytes)
                     .attr("sent_objects", p.sent_objects)
                     .attr("sent_bytes", p.sent_bytes)
+                    .attr("hashed", p.hashed)
             });
         }
         Err(e) => {
-            log_debug!("[hosts/home] {agent}: saving its home failed: {e}");
+            log_debug!("[hosts/home] {agent}: saving its home on {} failed: {e}", trigger.as_str());
             k2_core::trace::emit(|| {
-                k2_core::trace::Event::new(events::HOST_HOME_SAVE_FAILED).agent(agent).attr("epoch", epoch).attr("error", e.as_str())
+                k2_core::trace::Event::new(events::HOST_HOME_SAVE_FAILED)
+                    .agent(agent)
+                    .attr("trigger", trigger.as_str())
+                    .attr("epoch", epoch)
+                    .attr("error", e.as_str())
             });
         }
     }

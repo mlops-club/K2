@@ -1,7 +1,12 @@
 //! Take a snapshot on a host and push it: [`push`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
 
 use super::{file_mode, now_ms, sha256_hex, Class, Entry, Manifest, Remote, MAX_OBJECT_BYTES, STAGED_PREFIX};
 use crate::clone::{inventory, CloneOptions};
@@ -18,11 +23,96 @@ pub struct Options {
     /// The host's work root: the manifest records the workspace's path
     /// relative to it, so another host can put it under its own.
     pub work_root: Option<PathBuf>,
+    /// The hashes of files already read, so a snapshot taken again (every
+    /// turn, T2) reads only the files that changed.
+    pub cache: Option<Arc<HashCache>>,
 }
 
 impl Options {
     pub fn new(home: &Path) -> Options {
-        Options { home: home.to_path_buf(), max_bytes: super::DEFAULT_MAX_BYTES, max_object: MAX_OBJECT_BYTES, work_root: None }
+        Options {
+            home: home.to_path_buf(),
+            max_bytes: super::DEFAULT_MAX_BYTES,
+            max_object: MAX_OBJECT_BYTES,
+            work_root: None,
+            cache: None,
+        }
+    }
+}
+
+/// A file as it was when it was hashed. Any write moves `ctime`, which
+/// nothing can set back, so an equal stamp means the same bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+    ino: u64,
+    dev: u64,
+}
+
+impl Stamp {
+    fn of(m: &std::fs::Metadata) -> Stamp {
+        let ns = |s: i64, n: i64| s as i128 * 1_000_000_000 + n as i128;
+        Stamp {
+            size: m.len(),
+            mtime_ns: ns(m.mtime(), m.mtime_nsec()),
+            ctime_ns: ns(m.ctime(), m.ctime_nsec()),
+            ino: m.ino(),
+            dev: m.dev(),
+        }
+    }
+}
+
+/// A file written this close to its hashing may be written again within
+/// the same clock tick: it is not cached (git's "racy" files).
+pub const RACY: Duration = Duration::from_secs(2);
+
+/// sha256 by path and [`Stamp`], one per host process.
+pub struct HashCache {
+    entries: Mutex<HashMap<PathBuf, (Stamp, String)>>,
+    racy: Duration,
+}
+
+impl std::fmt::Debug for HashCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HashCache").field("files", &self.len()).field("racy", &self.racy).finish()
+    }
+}
+
+impl Default for HashCache {
+    fn default() -> Self {
+        HashCache::with_racy(RACY)
+    }
+}
+
+impl HashCache {
+    /// A cache that trusts files last written more than `racy` before
+    /// they were hashed.
+    pub fn with_racy(racy: Duration) -> Self {
+        HashCache { entries: Mutex::default(), racy }
+    }
+
+    fn get(&self, path: &Path, stamp: &Stamp) -> Option<String> {
+        self.entries.lock().get(path).filter(|(s, _)| s == stamp).map(|(_, sha)| sha.clone())
+    }
+
+    fn put(&self, path: &Path, stamp: Stamp, sha: &str, hashed_at: SystemTime) {
+        let at = hashed_at.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0);
+        let racy = self.racy.as_nanos() as i128;
+        if stamp.mtime_ns + racy < at && stamp.ctime_ns + racy < at {
+            self.entries.lock().insert(path.to_path_buf(), (stamp, sha.to_string()));
+        } else {
+            self.entries.lock().remove(path);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -38,6 +128,8 @@ pub struct Pushed {
     /// time, only the changed files after.
     pub sent_objects: usize,
     pub sent_bytes: u64,
+    /// Files read to hash them (the rest came from [`Options::cache`]).
+    pub hashed: usize,
 }
 
 /// Does a workspace file travel? Not git's hooks (code another host would
@@ -119,12 +211,31 @@ pub fn push(
     opts: &Options,
 ) -> Result<Pushed, String> {
     let (project, slug, mut files, scrubbed) = collect(project_path, opts)?;
-    // Hash every file; one source path per distinct content.
+    // Hash every file whose stamp changed; one source path per distinct
+    // content.
     let mut by_sha: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut hashed = 0usize;
     for (entry, abs) in files.iter_mut() {
-        let bytes = std::fs::read(&*abs).map_err(|e| format!("read {}: {e}", abs.display()))?;
-        entry.sha256 = sha256_hex(&bytes);
-        entry.size = bytes.len() as u64;
+        let stamp = std::fs::metadata(&*abs).map(|m| Stamp::of(&m)).ok();
+        let cached = opts.cache.as_ref().zip(stamp.as_ref()).and_then(|(c, s)| c.get(abs, s));
+        match cached {
+            Some(sha) => {
+                entry.sha256 = sha;
+                entry.size = stamp.as_ref().map_or(entry.size, |s| s.size);
+            }
+            None => {
+                let at = SystemTime::now();
+                let bytes = std::fs::read(&*abs).map_err(|e| format!("read {}: {e}", abs.display()))?;
+                entry.sha256 = sha256_hex(&bytes);
+                entry.size = bytes.len() as u64;
+                hashed += 1;
+                if let (Some(c), Some(s)) = (&opts.cache, stamp) {
+                    if s.size == entry.size {
+                        c.put(abs, s, &entry.sha256, at);
+                    }
+                }
+            }
+        }
         by_sha.entry(entry.sha256.clone()).or_insert_with(|| abs.clone());
     }
     let shas: Vec<String> = by_sha.keys().cloned().collect();
@@ -168,6 +279,7 @@ pub fn push(
         manifest,
         sent_objects: missing.len(),
         sent_bytes,
+        hashed,
     })
 }
 

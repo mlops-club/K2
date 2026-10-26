@@ -211,6 +211,44 @@ fn a_second_snapshot_sends_only_what_changed() {
     assert_eq!((third.seq, third.sent_objects, third.sent_bytes), (3, 0, 0), "nothing changed, nothing sent");
 }
 
+/// T2: a snapshot taken again reads only the files whose stamp changed,
+/// and a file written just before it was hashed is read again next time.
+#[test]
+fn a_hash_cache_reads_only_the_files_that_changed() {
+    let l = lab();
+    seed(&l, &l.a);
+    let snap = |cache: &std::sync::Arc<snapshot::HashCache>| {
+        let mut opts = Options::new(&l.a.home);
+        opts.cache = Some(std::sync::Arc::clone(cache));
+        let parent = restore::held(&l.a.state, "notes").map(|h| h.seq);
+        let p = snapshot::push(&remote(&l, "host-a"), "notes", 1, "host-a", &l.project.to_string_lossy(), parent, &opts)
+            .unwrap_or_else(|e| panic!("push: {e}"));
+        restore::mark(&l.a.state, "notes", p.seq, &p.manifest_sha, &p.manifest.encode()).unwrap();
+        p
+    };
+    let trusting = std::sync::Arc::new(snapshot::HashCache::with_racy(std::time::Duration::ZERO));
+    let first = snap(&trusting);
+    assert_eq!(first.hashed, first.files, "a cold cache reads every file");
+    assert_eq!(trusting.len(), first.files);
+    let again = snap(&trusting);
+    assert_eq!((again.hashed, again.sent_objects), (0, 0), "nothing changed: no file read, nothing sent");
+    assert_eq!(again.manifest.entries, first.manifest.entries, "the cached hashes are the files' hashes");
+    // The same size, new bytes: the stamp (ctime) still changes.
+    let memory = slug_dir(&l, &l.a).join("memory/MEMORY.md");
+    write(&memory, "- remember z\n");
+    let changed = snap(&trusting);
+    assert_eq!((changed.hashed, changed.sent_objects), (1, 1), "only MEMORY.md is read again and sent");
+    let mem = changed.manifest.entries.iter().find(|e| e.path.ends_with("MEMORY.md")).expect("MEMORY.md in the manifest");
+    assert_eq!(mem.sha256, sha256_hex(b"- remember z\n"));
+
+    // Files written within the racy window of their hashing are never
+    // trusted: every one is read again.
+    let wary = std::sync::Arc::new(snapshot::HashCache::with_racy(std::time::Duration::from_secs(3600)));
+    let a = snap(&wary);
+    let b = snap(&wary);
+    assert_eq!((a.hashed, b.hashed, wary.len()), (a.files, b.files, 0));
+}
+
 #[test]
 fn the_store_takes_a_commit_only_from_the_writer_its_fence_admits() {
     let l = lab();
