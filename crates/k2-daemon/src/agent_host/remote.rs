@@ -616,7 +616,23 @@ pub struct RemoteHost {
     host_wait: Duration,
     /// How long a need waits for a known host to link (`K2_HOST_LINK_GRACE`).
     link_grace: Duration,
+    /// Homes a scale-down's releases are saving, by agent: the pool holds
+    /// the host until each is in the store.
+    saves: Mutex<HashMap<String, PendingSave>>,
+    /// The store's newest snapshot of an agent (`hosts::home::latest`).
+    home_latest: Box<dyn Fn(&str) -> Option<k2_core::agent_home::Latest> + Send + Sync>,
 }
+
+/// A scale-down release whose home save hasn't been seen in the store.
+#[derive(Debug, Clone)]
+struct PendingSave {
+    host: String,
+    epoch: u64,
+    since: Instant,
+}
+
+/// How long a pool holds a drained host for its agents' home saves.
+pub const HOME_SAVE_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// Default for `K2_HOST_AWAY_FORGET`.
 pub const AWAY_FORGET: Duration = Duration::from_secs(24 * 60 * 60);
@@ -665,7 +681,14 @@ impl RemoteHost {
             hello_waiters: Default::default(),
             host_wait: HOST_WAIT,
             link_grace: LINK_GRACE,
+            saves: Mutex::default(),
+            home_latest: Box::new(crate::hosts::home::latest),
         }
+    }
+
+    /// Where the pool's home check reads an agent's newest snapshot.
+    pub fn with_home_latest(self, f: impl Fn(&str) -> Option<k2_core::agent_home::Latest> + Send + Sync + 'static) -> Self {
+        Self { home_latest: Box::new(f), ..self }
     }
 
     /// How long a need waits for a known host to link before "no host".
@@ -1100,6 +1123,7 @@ impl RemoteHost {
                 // S8: a host that said it is draining takes nothing new.
                 v.draining = inner.draining.contains(&id);
                 v.awake = inner.placements.values().filter(|p| p.host_id == id).count() as u32;
+                v.saving = self.saves.lock().values().filter(|s| s.host == id).count() as u32;
                 v
             })
             .collect()
@@ -1446,17 +1470,81 @@ impl RemoteHost {
     /// drains has its agents released (they sleep; their next wake goes
     /// elsewhere). Blocking: run it on a blocking thread.
     pub fn idle_tick(&self, now: Instant) -> IdleStep {
+        self.settle_saves(now);
         let views = self.host_views(&self.inner.lock());
         let step = self.provisioner.idle(now, &views);
         if let IdleStep::Drain(host) = &step {
-            let agents: Vec<String> =
-                self.inner.lock().placements.values().filter(|p| &p.host_id == host).map(|p| p.agent_id.clone()).collect();
+            let agents: Vec<(String, u64)> = self
+                .inner
+                .lock()
+                .placements
+                .values()
+                .filter(|p| &p.host_id == host)
+                .map(|p| (p.agent_id.clone(), p.epoch.0))
+                .collect();
             log_debug!("[hosts] draining {host} for a scale-down: releasing {} agent(s)", agents.len());
-            for a in agents {
+            for (a, epoch) in agents {
+                // Its close saves its home; the pool holds the host until
+                // the save is in the store (or the close said there is none).
+                self.saves.lock().insert(a.clone(), PendingSave { host: host.clone(), epoch, since: now });
                 let _ = super::AgentHost::unplace(self, &a);
             }
         }
         step
+    }
+
+    /// A scale-down's pending home saves, checked against the store: one
+    /// at the released epoch or later is in. Past [`HOME_SAVE_WAIT`] the
+    /// host is let go, loudly.
+    fn settle_saves(&self, now: Instant) {
+        let pending: Vec<(String, PendingSave)> = self.saves.lock().iter().map(|(a, s)| (a.clone(), s.clone())).collect();
+        for (agent, s) in pending {
+            let latest = (self.home_latest)(&agent);
+            if let Some(l) = latest.filter(|l| l.epoch >= s.epoch) {
+                log_debug!("[hosts] agent {agent}: home snapshot {} (epoch {}) is in the store; host {} may go", l.seq, l.epoch, s.host);
+                if let Err(e) = self.policy.record_home_seq(&agent, l.seq) {
+                    log_debug!("[hosts] agent {agent}: home_seq not written: {e}");
+                }
+                self.saves.lock().remove(&agent);
+            } else if now.saturating_duration_since(s.since) >= HOME_SAVE_WAIT {
+                log_debug!(
+                    "[hosts] ERROR: agent {agent}: no home snapshot at epoch {} from host {} after {HOME_SAVE_WAIT:?}; letting the host go",
+                    s.epoch,
+                    s.host
+                );
+                k2_core::trace::emit(|| {
+                    k2_core::trace::Event::new("ctl.home_save_lost").agent(agent.as_str()).attr("host", s.host.as_str()).attr("epoch", s.epoch)
+                });
+                self.saves.lock().remove(&agent);
+            }
+        }
+    }
+
+    /// A close's reply for a placement this controller released: the
+    /// `home` the host saved first (`hosts::home::before_close`). A seq is
+    /// recorded as the agent's `home_seq`; no `home` means it has none to
+    /// save (its cwd isn't under the host's work root). An error, or no
+    /// reply, leaves a pending scale-down save to the store check.
+    fn on_close_reply(&self, agent_id: &str, reply: &Result<Frame, String>) {
+        let Ok(Frame::Reply { status, body, .. }) = reply else { return };
+        if !status.starts_with('2') {
+            return;
+        }
+        let home = serde_json::from_str::<Value>(body).ok().and_then(|b| b.get("home").cloned());
+        match home {
+            None | Some(Value::Null) => {
+                self.saves.lock().remove(agent_id);
+            }
+            Some(h) => match h.get("seq").and_then(Value::as_u64) {
+                Some(seq) => {
+                    if let Err(e) = self.policy.record_home_seq(agent_id, seq) {
+                        log_debug!("[hosts] agent {agent_id}: home_seq not written: {e}");
+                    }
+                    self.saves.lock().remove(agent_id);
+                }
+                None => log_debug!("[hosts] ERROR: agent {agent_id}: its host didn't save its home on close: {h}"),
+            },
+        }
     }
 
     /// `ctl.place_affinity`: why a new placement went where it did.
@@ -2356,9 +2444,10 @@ impl AgentHost for RemoteHost {
             |req| Frame::Close { req, agent_id: agent_id.to_string(), epoch: placement.epoch.0, body },
             REPLY_DEADLINE,
         );
-        if let Err(e) = r {
+        if let Err(e) = &r {
             log_debug!("[hosts] unplace {agent_id}: close on host {} failed: {e}", placement.host_id);
         }
+        self.on_close_reply(agent_id, &r);
         session.map(|s| {
             s.mark_exited();
             AgentSession::remote(s)

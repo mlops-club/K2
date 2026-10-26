@@ -78,6 +78,9 @@ pub struct HostView {
     pub draining: bool,
     /// Agents placed on it now.
     pub awake: u32,
+    /// Agents released from it whose home hasn't reached the controller's
+    /// store yet: a pool doesn't scale it down before they have.
+    pub saving: u32,
     /// `k2.max_awake`; `None` = no limit.
     pub max_awake: Option<u32>,
     pub kind: HostKind,
@@ -90,7 +93,7 @@ impl HostView {
         let labels = parse_labels(labels);
         let max_awake = labels.get(LABEL_MAX_AWAKE).and_then(|v| v.parse().ok());
         let kind = if labels.get(LABEL_KIND).map(String::as_str) == Some("laptop") { HostKind::Laptop } else { HostKind::Server };
-        HostView { host_id: host_id.to_string(), linked: false, away: false, draining: false, awake: 0, max_awake, kind, labels }
+        HostView { host_id: host_id.to_string(), linked: false, away: false, draining: false, awake: 0, saving: 0, max_awake, kind, labels }
     }
 
     /// Takes a new agent now: linked, not draining.

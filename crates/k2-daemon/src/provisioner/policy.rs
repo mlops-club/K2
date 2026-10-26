@@ -106,6 +106,19 @@ impl PolicyStore {
         self.record_placement(agent, host, kind).map(|_| ())
     }
 
+    /// The newest home snapshot a host saved for `agent` (its close reply).
+    pub fn record_home_seq(&self, agent: &str, seq: u64) -> Result<(), String> {
+        self.db
+            .lock()
+            .execute(
+                "INSERT INTO agent_placement (agent, mode, home_seq, updated_ms) VALUES (?1, 'portable', ?2, ?3)
+                 ON CONFLICT(agent) DO UPDATE SET home_seq = MAX(COALESCE(home_seq, 0), ?2), updated_ms = ?3",
+                params![agent, seq as i64, now_ms()],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("agent_placement: {e}"))
+    }
+
     pub fn set_mode(&self, agent: &str, mode: &Mode) -> Result<(), String> {
         let (m, pinned) = match mode {
             Mode::Pinned { host } => ("pinned", Some(host.as_str())),
