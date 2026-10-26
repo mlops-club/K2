@@ -191,7 +191,7 @@ topo_down() {
     done
     TP_HOST_PID="" TP_CTL_PID=""
     if [ -n "$TP_ROOT" ] && [ -d "$TP_ROOT" ]; then
-        pkill -9 -f "$TP_ROOT/" 2>/dev/null || true
+        [ -n "${TP_ROOT:-}" ] && pkill -9 -f "$TP_ROOT/" 2>/dev/null || true
         rm -rf "$TP_ROOT"
         TP_ROOT=""
     fi

@@ -202,6 +202,7 @@ class Client:
         self.out = out
         self.sc = None  # the running Scenario (for logging)
         self.tag = uuid.uuid4().hex[:6]
+        self.projects = {}  # cwd -> project id (register_enabled)
 
     # ── plumbing ────────────────────────────────────────────────────────
     def log(self, msg):
@@ -266,7 +267,20 @@ class Client:
         st, text, _ = self.http("POST", "/cli/projects/update", body={"id": pid, "agentEnabled": 1})
         if st != 200:
             return None, "update HTTP %s %s" % (st, text[:200])
+        self.projects[cwd] = pid
         return pid, "project %s" % pid
+
+    def activate(self, cwd):
+        """What the app does when it opens or focuses a workspace: POST
+        /cli/projects/activate {projectId} stamps its need clock, so the
+        active reaper leaves its chat alone for the interaction window
+        (without it a chat counts as aged out and is closed ~30-60 s on,
+        even mid-turn). Logged, never fatal (an older daemon: 404)."""
+        pid = self.projects.get(cwd)
+        if pid:
+            st, text, _ = self.http("POST", "/cli/projects/activate", body={"projectId": pid})
+            if st != 200:
+                self.log("activate %s: HTTP %s %s" % (pid, st, text[:120]))
 
     def msg(self, workspace, text, wake=True, sender="lab-g2", port=None, token=None):
         form = {"workspace": workspace, "text": text, "from": sender, "wake": "true" if wake else "false"}
@@ -790,7 +804,9 @@ def s6(c, sc):
 
 def open_chat(c, sc, cwd, what):
     """The app opening a workspace's agent: POST /cli/workspace/ensure-pinned-chat
-    {project}. Returns (daemon session, claude session, reused, sock, grid) or None."""
+    {project}, after activating it as the app does (Client.activate).
+    Returns (daemon session, claude session, reused, sock, grid) or None."""
+    c.activate(cwd)
     st, raw, resp = c.http("POST", "/cli/workspace/ensure-pinned-chat", body={"project": cwd})
     sid, csid = resp.get("sessionId"), resp.get("claudeSessionId")
     if not sc.check(what, st == 200 and sid and csid,
@@ -1408,7 +1424,7 @@ def s10_attempt(c, sc, attempt):
                  "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
         # And it goes on there.
         n4 = "s10 after %s" % uuid.uuid4().hex[:6]
-        st, raw, resp = c.msg(cwd, n4, wake=True)
+        st, raw, resp = c.msg(cwd, n4, wake=False)  # it is live there: queued, with a msg id (I2)
         wait_until(lambda: c.replied(cwd, n4), DEADLINE_S)
         sc.check("a message after the move lands on %s and is answered" % h2,
                  c.replied(cwd, n4) and [p[0] for p in c.prompts_with(cwd, n4)] == [h2],

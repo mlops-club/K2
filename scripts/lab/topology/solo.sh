@@ -102,7 +102,7 @@ topo_down() {
     fi
     if [ -n "$SOLO_ROOT" ] && [ -d "$SOLO_ROOT" ]; then
         # Agents, or an frpc, the daemon left behind under this sandbox.
-        pkill -9 -f "$SOLO_ROOT/" 2>/dev/null || true
+        [ -n "${SOLO_ROOT:-}" ] && pkill -9 -f "$SOLO_ROOT/" 2>/dev/null || true
         rm -rf "$SOLO_ROOT"
         SOLO_ROOT=""
     fi

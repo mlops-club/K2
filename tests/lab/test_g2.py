@@ -334,6 +334,19 @@ class Plan(unittest.TestCase):
             self.assertEqual(st["procs"]["controller"]["env"]["K2_HOST_MOVE_AFTER"], want, env)
             self.assertNotIn("K2_HOST_MOVE_AFTER", st["procs"]["host-1"]["env"])
 
+    def test_open_chat_activates_a_registered_workspace_first_as_the_app_does(self):
+        c = g2.Client.__new__(g2.Client)
+        c.projects, calls = {"/w/a": "p1"}, []
+        c.http = lambda method, path, body=None, **kw: calls.append((path, body)) or (500, "x", {})
+        c.log = lambda msg: None
+        sc = unittest.mock.Mock(check=lambda name, ok, detail="": ok)
+        self.assertIsNone(g2.open_chat(c, sc, "/w/a", "opens"))
+        self.assertEqual(calls[0], ("/cli/projects/activate", {"projectId": "p1"}))
+        self.assertEqual(calls[1][0], "/cli/workspace/ensure-pinned-chat")
+        calls.clear()
+        g2.open_chat(c, sc, "/w/unregistered", "opens")
+        self.assertEqual([p for p, _ in calls], ["/cli/workspace/ensure-pinned-chat"])
+
     def test_s10_is_fleet_only_and_opt_in(self):
         self.assertIn("S10", g2.FLEET_ONLY)
         self.assertIn("S10", g2.SCENARIOS)
