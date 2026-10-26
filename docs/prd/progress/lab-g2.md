@@ -361,6 +361,65 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### G2 + S10 on wave3 0c6d3c9f7 (P3 T2 turn-end snapshots)
+
+S10 (`LAB_S10=1`, fleet only, opt-in) is the first independent check of
+outbox's T2: a host SIGKILLed with its CLI mid-turn, no drain. The agent
+must not move before `K2_HOST_MOVE_AFTER` (the lab sets 20 s on the
+controller when S10 runs); then `ctl.move_decision`, a resume on the other
+host (same session, `--resume`, new epoch) after it restores the last
+turn's snapshot (`host.home_restored`); the moved CLI starts with turn
+two's MEMORY.md (sha256); turns one and two are in its transcript there;
+turn three's message, never acked, is delivered again there once and
+answered; I1 when the dead host returns (one live CLI over 15 s, on the
+new host); a later message lands there. The fleet's hosts share one work
+dir, so the workspace half is outbox's `turn-snapshots.sh`; S10 checks
+what each host keeps apart (its HOME).
+
+Throwaway branches `k2-dist/lab-g2-wave3d-run` (ff933ef19) and
+`k2-dist/lab-g2-wave3e-run` (0c6d3c9f7 + lab-g2), deleted. Procs,
+`LAB_S8_RESUME_ELSEWHERE=1`.
+
+| Run | Tree | Chaos | Result |
+|---|---|---|---|
+| `2026-10-26T12-02-37Z` | ff933ef19 | 4117, 4 rounds | S1–S9 PASS, I1–I4 pass |
+| `2026-10-26T12-07-13Z` | ff933ef19 | 7, 2 rounds | S4 r2, S9 r2 FAIL: chaos exhausted the lab's retry budget (fixed below) |
+| `2026-10-26T12-17-31Z` | 0c6d3c9f7 | none | S1–S9 PASS; S10 FAIL (active reaper, below) |
+| `2026-10-26T12-30-20Z` | 0c6d3c9f7 | 4117, 2 rounds | S1–S9 PASS; S10 FAIL (same) |
+| `2026-10-26T12-40-08Z` | 0c6d3c9f7 | 7 | cut off: the session exited (SIGTERM) mid-run |
+| `2026-10-26T12-50-20Z` | 0c6d3c9f7 | none | **S1–S10 PASS, I1–I4 pass** (after 93e599ef2) |
+| `2026-10-26T12-53-39Z`, `13-07-59Z` | 0c6d3c9f7 | 7, 4117 | S1–S9 PASS; S10 FAIL (lab timing, below) |
+| `2026-10-26T13-14-36Z` | 0c6d3c9f7 | 7, 2 rounds | **S1–S10 PASS, I1–I4 pass**, S10 never redone |
+| `2026-10-26T13-19-19Z` | 0c6d3c9f7 | 4117, 2 rounds | **S1–S10 PASS, I1–I4 pass**, S10 never redone |
+
+Caveat: S10 holds the fleet for most of a round, so in the last two runs
+chaos mostly skipped (seed 7: 4 kills, 26 skipped; 4117: 5 kills, 23
+skipped). S1–S9 under fuller chaos on 0c6d3c9f7 is `12-30-20Z` (4117).
+
+Lab fixes on the way (all class c):
+- 7bbf819fe: chaos budgets: S4's wake retries up to 3 times (chaos killed
+  the retry's CLI 200 ms after it took the prompt); `redo_on_chaos` up to 5
+  attempts (S9: chaos hit all three). A redo still needs chaos.log to show
+  the scenario's own agent or host was hit.
+- 93e599ef2: `open_chat` activates the workspace first (`POST
+  /cli/projects/activate`), as the app does. Without it the controller's
+  active reaper counts a lab chat as aged out and closes it 30-60 s on,
+  even mid-turn (its doc: "the need clock wins even if the agent is
+  Working"); S10's long turn was the first to cross that. Also: S10's last
+  message is queued (a msg id for I2), and `pkill -f "$ROOT/"` is skipped
+  when the root var is empty (`/` would match every process).
+- 426411217: S10 under chaos: turn three lasts 30 s and the reply wait
+  outlasts its redelivered copy (the chaos gone wait is 60 s); the I1
+  sampling and the last message stay under the fleet hold.
+
+For outbox and dist-link (open, K2-d candidate): a queued outbox delivery
+doesn't seem to count as a need on the controller. In `12-17-31Z`, turn
+three was delivered to the moved agent at 12:27:21 and 12:27:25, and the
+reaper armed at 12:27:27 and closed it mid-turn at 12:27:57 (host-1:
+release save, CLI reaped, no turn end); the message stays delivered,
+unanswered. An agent driven only by messages, with no app attached, can
+be closed mid-turn this way.
+
 ### G2 on wave3 587c665c8 with home sync (resume elsewhere)
 
 Base: wave3 587c665c8 (21eb64ca9's P3 home sync + dist-link's chaos-fixes2
