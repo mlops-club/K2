@@ -235,7 +235,7 @@ pub(crate) fn now_secs() -> i64 {
 /// Upsert the singleton row into `installing` at enable start; clears
 /// stale last_error. Keeps any prior progress JSON (that's the resume
 /// state).
-fn ensure_installing_row(hostname: &str, port_plan: &str) -> Result<(), String> {
+pub(super) fn ensure_installing_row(hostname: &str, port_plan: &str) -> Result<(), String> {
     let db = k2_core::db::shared();
     let conn = db.lock();
     conn.execute(
@@ -581,6 +581,10 @@ pub(crate) fn mgmt_client_from_row() -> Result<StalwartClient, String> {
 }
 
 pub fn is_already_enabled() -> bool {
+    // P4 T3: a delegated Stalwart has no unit here.
+    if let Some(url) = super::k8s_enable::external_url() {
+        return super::k8s_enable::is_enabled(&url);
+    }
     let unit = stalwart_unit_state();
     if unit.trim() != "active" {
         return false;
@@ -1065,21 +1069,21 @@ pub(crate) fn with_test_unit_state(state: &str) -> TestUnitStateGuard {
     TestUnitStateGuard
 }
 
-fn progress_load() -> serde_json::Value {
+pub(super) fn progress_load() -> serde_json::Value {
     row_field("enable_progress_json")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({ "steps": {} }))
 }
 
-fn progress_save(v: &serde_json::Value) {
+pub(super) fn progress_save(v: &serde_json::Value) {
     set_row_field("enable_progress_json", &v.to_string());
 }
 
-fn step_is_done(step: &str) -> bool {
+pub(super) fn step_is_done(step: &str) -> bool {
     progress_load()["steps"].get(step).is_some()
 }
 
-fn mark_step(step: &str) {
+pub(super) fn mark_step(step: &str) {
     let mut p = progress_load();
     p["steps"][step] = serde_json::json!({ "at": now_secs() });
     p["current"] = serde_json::Value::Null;
@@ -1087,7 +1091,7 @@ fn mark_step(step: &str) {
 }
 
 /// Drop resume marks so a later enable re-runs those steps.
-fn unmark_steps(steps: &[&str]) {
+pub(super) fn unmark_steps(steps: &[&str]) {
     let mut p = progress_load();
     if let Some(obj) = p.get_mut("steps").and_then(|v| v.as_object_mut()) {
         for step in steps {
@@ -1097,19 +1101,19 @@ fn unmark_steps(steps: &[&str]) {
     progress_save(&p);
 }
 
-fn set_current(step: &str) {
+pub(super) fn set_current(step: &str) {
     let mut p = progress_load();
     p["current"] = serde_json::json!(step);
     progress_save(&p);
 }
 
-fn progress_extra_set(key: &str, value: &str) {
+pub(super) fn progress_extra_set(key: &str, value: &str) {
     let mut p = progress_load();
     p[key] = serde_json::json!(value);
     progress_save(&p);
 }
 
-fn progress_extra(key: &str) -> Option<String> {
+pub(super) fn progress_extra(key: &str) -> Option<String> {
     progress_load()[key].as_str().map(str::to_string)
 }
 
@@ -1793,7 +1797,7 @@ pub fn rotate_leftover_admins_live() -> Result<RotateAdminReport, String> {
 /// restart finds the mgmt API there instead.
 /// HTTP 401 is a credential reject. Retrying it looks like a brute
 /// force and will not make a wrong password right.
-fn is_auth_rejected(err: &str) -> bool {
+pub(super) fn is_auth_rejected(err: &str) -> bool {
     err.contains("401")
 }
 
@@ -1967,7 +1971,10 @@ pub fn refresh_health() -> serde_json::Value {
             .ok_or("api key missing from the mail secret store")?;
         StalwartClient::new(api_url, key).ping()
     };
-    let health = health_check_with(&RealSystemOps, &ping);
+    let health = match super::k8s_enable::external_url() {
+        Some(_) => super::k8s_enable::health(&ping), // P4 T3: no unit, the ping only
+        None => health_check_with(&RealSystemOps, &ping),
+    };
     persist_health(&health);
     serde_json::json!({
         "state": health.as_status_str(),

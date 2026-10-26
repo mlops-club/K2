@@ -378,6 +378,11 @@ pub(crate) fn handle_server_enable_at(body: &[u8], daemon_port: Option<u16>) -> 
         }
         return CliResponse::ok_json(body.to_string());
     }
+    // P4 T3: Stalwart in its own pod (K2_CAP_MAIL=external): nothing to
+    // install here; the controller sets the pod up over K2_STALWART_URL.
+    if let Some(url) = super::k8s_enable::external_url() {
+        return super::k8s_enable::handle_enable(hostname, url);
+    }
     if !mail_supported() {
         return unsupported();
     }

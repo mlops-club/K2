@@ -154,6 +154,7 @@ pub mod identity;
 pub mod imap_listeners;
 pub mod import;
 pub mod jmap;
+pub mod k8s_enable;
 pub mod lists;
 pub mod messages;
 pub mod oauth;
