@@ -944,6 +944,8 @@ async fn async_main() {
                             }
                             _ = sigterm.recv() => {
                                 log_debug!("[daemon] SIGTERM received, shutting down");
+                                // K2_ROLE=host: drain first (S8); nothing otherwise.
+                                crate::hosts::drain::on_sigterm().await;
                             }
                         }
                         let _ = shutdown_tx_for_signal.send(());

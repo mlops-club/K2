@@ -14,12 +14,15 @@
 //! frames are in `docs/prd/progress/dist-link.md`.
 
 pub mod byte_ring;
+pub mod drain;
 pub mod enroll;
 pub mod gate;
 pub mod health;
 pub mod hub;
 pub mod link;
 pub mod proto;
+#[cfg(test)]
+mod placement_tests;
 #[cfg(test)]
 mod tests;
 

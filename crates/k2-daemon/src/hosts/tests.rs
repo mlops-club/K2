@@ -150,7 +150,8 @@ async fn fake_host(c: &Controller, name: &str) -> Ws {
 /// Place `agent` on the fake host, answering its spawn with `session`.
 /// Returns the epoch the controller assigned.
 async fn place(c: &Controller, host: &mut Ws, agent: &str, session: &str) -> u64 {
-    let body = json!({"agent_name": agent, "cwd": "/tmp", "command": "claude"}).to_string();
+    // Each agent its own cwd: a shared one would be a placement preference (S7).
+    let body = json!({"agent_name": agent, "cwd": format!("/w/{agent}"), "command": "claude"}).to_string();
     let remote = c.remote;
     let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
     let (req, epoch) = match recv(host).await {
@@ -164,7 +165,10 @@ async fn place(c: &Controller, host: &mut Ws, agent: &str, session: &str) -> u64
     let reply = json!({"sessionId": session, "reused": false}).to_string();
     send(host, &Frame::Reply { req, status: "200 OK".into(), body: reply.clone() }).await;
     let (status, out) = within("the spawn answer", spawn).await.unwrap();
-    assert_eq!((status.as_str(), out.as_str()), ("200 OK", reply.as_str()));
+    // The host's reply, verbatim; a placementNote (S7) may be added.
+    let mut out: Value = serde_json::from_str(&out).unwrap();
+    out.as_object_mut().unwrap().remove("placementNote");
+    assert_eq!((status.as_str(), out), ("200 OK", serde_json::from_str::<Value>(&reply).unwrap()));
     epoch
 }
 
