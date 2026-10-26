@@ -1,0 +1,11 @@
+# k2-daemon:caps for kind: the kind runtime image (kind-app's
+# deploy/kind/Dockerfile.daemon-prebuilt) plus postgresql-client, as
+# packaging/oci/Dockerfile's runtime stage now has it. Built by
+# scripts/kind/caps/build-image.sh.
+ARG BASE=k2-daemon:caps-base
+FROM ${BASE}
+USER 0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-client \
+ && rm -rf /var/lib/apt/lists/*
+USER 10000:0

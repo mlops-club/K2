@@ -3,11 +3,11 @@
 #
 # Only the kind cluster k2lab, only through an explicit kubeconfig written by
 # `kind get kubeconfig`; never the current kube context (`default` is the
-# owner's real k3s cluster). Only namespace k2-p4-caps: never k2-kind,
+# owner's real k3s cluster). Only T3's namespaces (k2-p4-caps, k2-p4-db): never k2-kind,
 # k2-kind-dist or their proxies, never agent-sandbox-system.
 
 CAPS_CLUSTER=k2lab
-CAPS_NS=k2-p4-caps
+CAPS_NS=${CAPS_NS:-k2-p4-caps}   # db-check.sh uses its own (k2-p4-db)
 CAPS_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 CAPS_STATE="${TMPDIR:-/tmp}/k2-kind/caps"
 CAPS_KUBECONFIG="$CAPS_STATE/kubeconfig"

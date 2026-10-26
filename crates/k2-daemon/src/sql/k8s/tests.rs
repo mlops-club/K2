@@ -19,6 +19,9 @@ struct FakeOperator {
     secrets: Mutex<HashMap<String, (String, String)>>,
     /// Reads of a Secret before it appears (the operator is still syncing).
     pending_reads: Mutex<u32>,
+    /// The Postgres the operator creates the logins in (as it does after
+    /// writing their Secrets): the fake superuser psql.
+    pg: Mutex<Option<&'static FakeSystemOps>>,
 }
 
 impl FakeOperator {
@@ -29,6 +32,12 @@ impl FakeOperator {
     }
     fn put(&self, user_for_name: &str, user: &str, pw: &str) {
         self.secrets.lock().unwrap().insert(credentials_secret("k2-pg", user_for_name), (user.into(), pw.into()));
+    }
+    /// A fake Postgres the operator creates its logins in.
+    fn with_pg(&self) -> &'static FakeSystemOps {
+        let ops: &'static FakeSystemOps = Box::leak(Box::new(FakeSystemOps::baked()));
+        *self.pg.lock().unwrap() = Some(ops);
+        ops
     }
     fn patches(&self) -> Vec<Value> {
         self.patches.lock().unwrap().clone()
@@ -45,6 +54,9 @@ impl Operator for FakeOperator {
                     for u in [format!("{db}_owner_user"), format!("{db}_writer_user")] {
                         let pw = format!("{u}-pw");
                         self.secrets.lock().unwrap().entry(credentials_secret("k2-pg", &u)).or_insert((u.clone(), pw));
+                        if let Some(ops) = *self.pg.lock().unwrap() {
+                            ops.pg.lock().unwrap().roles.push(u);
+                        }
                     }
                 }
             }
@@ -165,9 +177,9 @@ fn create_on_kubernetes_uses_the_operators_logins_and_keeps_k2s_shape() {
     let op = FakeOperator::leaked();
     let _m = kubernetes_mode(op);
     let pid = project("create");
-    let ops = FakeSystemOps::baked();
+    let ops = op.with_pg();
     let secrets = MemSecretStore::default();
-    let v = ops::create_database(&ops, &secrets, &pid, 1, None, None).expect("create");
+    let v = ops::create_database(ops, &secrets, &pid, 1, None, None).expect("create");
     let name = v["name"].as_str().unwrap().to_string();
     let (mig, agent) = (format!("{name}_owner_user"), format!("{name}_writer_user"));
     assert_eq!(ops::migrator_role(&name), mig);
@@ -175,7 +187,7 @@ fn create_on_kubernetes_uses_the_operators_logins_and_keeps_k2s_shape() {
 
     // The operator declared it; K2 created neither the database nor a role.
     assert_eq!(op.patches()[0].pointer(&format!("/spec/preparedDatabases/{name}/defaultUsers")), Some(&json!(true)));
-    let all: String = helper_sql(&ops).iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+    let all: String = helper_sql(ops).iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
     assert!(!all.contains("CREATE DATABASE") && !all.contains("CREATE ROLE"), "{all}");
     // K2's shape on the operator's logins, as superuser.
     assert!(all.contains(&format!("ALTER ROLE \"{mig}\" NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT")), "{all}");
@@ -190,7 +202,7 @@ fn create_on_kubernetes_uses_the_operators_logins_and_keeps_k2s_shape() {
     let s = v.to_string();
     assert!(!s.contains("su-pw") && !s.contains("postgres://postgres"), "{s}");
     // Asked again: the same database, nothing new declared.
-    let again = ops::create_database(&ops, &secrets, &pid, 1, None, None).expect("again");
+    let again = ops::create_database(ops, &secrets, &pid, 1, None, None).expect("again");
     assert_eq!(again["existing"], json!(true));
     assert_eq!(op.patches().len(), 1);
 }
@@ -201,12 +213,12 @@ fn drop_on_kubernetes_forgets_the_entry_then_drops() {
     let op = FakeOperator::leaked();
     let _m = kubernetes_mode(op);
     let pid = project("drop");
-    let ops = FakeSystemOps::baked();
+    let ops = op.with_pg();
     let secrets = MemSecretStore::default();
-    let name = ops::create_database(&ops, &secrets, &pid, 1, None, None).unwrap()["name"].as_str().unwrap().to_string();
-    ops::drop_database(&ops, &pid).expect("drop");
+    let name = ops::create_database(ops, &secrets, &pid, 1, None, None).unwrap()["name"].as_str().unwrap().to_string();
+    ops::drop_database(ops, &pid).expect("drop");
     assert_eq!(op.patches().last(), Some(&json!({"spec": {"preparedDatabases": {name.clone(): null}}})));
-    let all: String = helper_sql(&ops).iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+    let all: String = helper_sql(ops).iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
     assert!(all.contains(&format!("DROP DATABASE IF EXISTS \"{name}\"")), "{all}");
 }
 
@@ -216,9 +228,9 @@ fn a_major_other_than_the_operators_is_refused() {
     let op = FakeOperator::leaked();
     let _m = kubernetes_mode(op);
     let pid = project("major");
-    let ops = FakeSystemOps::baked();
+    let ops = op.with_pg();
     let secrets = MemSecretStore::default();
-    match ops::create_database_on(&ops, &secrets, &pid, 1, None, None, Some(17)) {
+    match ops::create_database_on(ops, &secrets, &pid, 1, None, None, Some(17)) {
         Err(OpsError::Refused(code, hint)) => {
             assert_eq!(code, "major_is_the_operators");
             assert!(hint.contains("postgresql/k2-pg"), "{hint}");
@@ -226,7 +238,7 @@ fn a_major_other_than_the_operators_is_refused() {
         other => panic!("expected a refusal, got {other:?}"),
     }
     assert!(op.patches().is_empty(), "nothing declared");
-    ops::create_database_on(&ops, &secrets, &pid, 1, None, None, Some(16)).expect("its own major is fine");
+    ops::create_database_on(ops, &secrets, &pid, 1, None, None, Some(16)).expect("its own major is fine");
 }
 
 #[test]
@@ -259,4 +271,21 @@ fn host_mode_is_unchanged() {
     assert_eq!(ops::migrator_role("ws_a"), "ws_a_migrator");
     assert_eq!(ops::agent_role("ws_a"), "ws_a_agent");
     assert!(!kubernetes());
+}
+
+#[test]
+fn create_waits_for_the_operators_roles_and_never_alters_a_missing_one() {
+    // Seen live: the Secrets come first, the roles and the database after.
+    let _g = sql_server_test_lock();
+    let op = FakeOperator::leaked();
+    let _m = kubernetes_mode(op);
+    let pid = project("late");
+    let ops: &'static FakeSystemOps = Box::leak(Box::new(FakeSystemOps::baked())); // the operator never creates them here
+    let secrets = MemSecretStore::default();
+    match ops::create_database(ops, &secrets, &pid, 1, None, None) {
+        Err(OpsError::Engine(e)) => assert!(e.contains("has not created") && e.contains("_owner_user"), "{e}"),
+        other => panic!("expected the wait to give up, got {other:?}"),
+    }
+    let all: String = helper_sql(ops).iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(!all.contains("ALTER ROLE") && !all.contains("ALTER DATABASE"), "nothing altered: {all}");
 }

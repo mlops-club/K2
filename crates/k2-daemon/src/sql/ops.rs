@@ -1377,6 +1377,33 @@ fn create_on_operator(
     agent: &str,
 ) -> Result<(String, String, Option<String>), OpsError> {
     let (m, a) = super::k8s::prepare_database(super::k8s::operator(), name, migrator, agent).map_err(OpsError::Engine)?;
+    // The operator writes its Secrets before it creates the roles and the
+    // database (seen live): wait for all three in Postgres itself.
+    let ready = format!(
+        "SELECT rolname FROM pg_roles WHERE rolname = {m} \
+         AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {a}) \
+         AND EXISTS (SELECT 1 FROM pg_database WHERE datname = {db});",
+        m = pg_quote_literal(migrator),
+        a = pg_quote_literal(agent),
+        db = pg_quote_literal(name),
+    );
+    let tries = 180;
+    let mut created = false;
+    for i in 0..tries {
+        if su_psql(ops, cl, "postgres", &["-tA"], Some(ready.as_bytes()))?.trim() == migrator {
+            created = true;
+            break;
+        }
+        if i + 1 < tries {
+            ops.sleep_ms(1000);
+        }
+    }
+    if !created {
+        return Err(OpsError::Engine(format!(
+            "postgresql/{} has not created {migrator}, {agent} and database {name} within {tries}s",
+            super::k8s::cluster_name()
+        )));
+    }
     let shape = format!(
         "ALTER ROLE {m} NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT;\n\
          ALTER ROLE {a} NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT;\n\

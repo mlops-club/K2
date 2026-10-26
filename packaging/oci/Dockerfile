@@ -51,8 +51,10 @@ RUN --mount=type=cache,id=k2-oci-cargo-registry,target=/usr/local/cargo/registry
 # ── runtime ───────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}
 # curl: the Compose healthcheck. git: workspaces. ca-certificates: TLS out.
+# postgresql-client: K2's psql against the operator's Postgres when the
+# controller runs on Kubernetes (K2_CAP_POSTGRES=kubernetes, sql/k8s.rs).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git libssl3 tini \
+ && apt-get install -y --no-install-recommends ca-certificates curl git libssl3 postgresql-client tini \
  && rm -rf /var/lib/apt/lists/*
 # UID 10000 as deploy/kubernetes/core/controller.yaml. State is group 0 and
 # group-writable, so any UID with GID 0 (OpenShift style, `--user 54321:0`)
