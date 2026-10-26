@@ -193,4 +193,9 @@ both:
     snapshot and a syncing host. In a turn-snapshots.sh run
     (`20261026T155821Z`), the controller logged exactly that note for the
     moved agent.
+  - **Regression:** `cargo test -p k2-daemon --no-fail-fast` (throwaway
+    HOME): 5342 passed, 1 failed, 6 ignored, across 162 binaries. The one
+    failure, `auth_routes_integration::catchall_accepts_member_session_for_fs_read_dir`,
+    ran across a 3.7 h hibernation of the Mac; the binary then passed 43/43
+    three times on its own. It doesn't touch placement.
 - Hermes's `state.db` merge isn't restored (T1-h).
