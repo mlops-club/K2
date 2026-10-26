@@ -90,8 +90,8 @@ sequenceDiagram
 | 2 | S12 parity: an App gives a Deployment, Service and NetworkPolicy; its database user is made through `postgresql/k2-pg` and logs in; the policy lets the controller and its database in and keeps a neighbour out; `/cli/db` lists it; deleting the App removes all four | **Needs decisions 1–3** (below). Infra checked: `pg-smoke.sh` PASS (8ab1ee4f3) |
 | 3 | Mail and Sew answer on their management APIs | **Mail: answers, but unconfigured** (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
 | 4 | Front door through a Gateway (D7 (a): Envoy Gateway in its own namespace) | **PASS** (`scripts/kind/caps/gateway-check.sh`): `gateway.yaml`'s listener and route with TLS passthrough; the client sees the backend's own certificate, a line round-trips, an unknown SNI gets no route. The backend is a stand-in for the controller's front door until item 5 runs a controller here |
-| 5 | `/boot-status` capabilities read `delegated` for each | the report already does this for any non-`host`, non-`off` override. To do: show it on a controller in `k2-p4-caps` with the drivers running |
-| – | k8s client (D1) | written (`crates/k2-daemon/src/k8s/`), with tests against a fake API server |
+| 5 | `/boot-status` capabilities read `delegated` for each | **PASS** (`scripts/kind/caps/controller-check.sh`, image `k2-daemon:caps` at 7720600b8). A controller shaped like `controller.yaml`, with the RBAC of `rbac.yaml`, reads `delegated` for postgres, mail, sew, apps and front. Its drivers report: postgres ok (`postgresql/k2-pg` Running, `k2` credentials readable), apps ok (may list Deployments), mail ok (`/healthz/ready` 200; still unconfigured, see decision 4), front ok. Sew is not ok, as expected with no Sew image |
+| – | k8s client (D1) and capability drivers | `crates/k2-daemon/src/k8s/` and `capabilities/kubernetes/`: every delegated feature gets a driver that checks its backend every 30 s, and `/boot-status` shows `capabilities.<f>.driver`. `cargo test -p k2-daemon --lib -- k8s:: capabilities:: boot_status`: 61 passed, twice |
 
 ### What the infra checks showed
 
@@ -147,5 +147,8 @@ Found by reading the code (`apps/`, `sql/`, `capabilities.rs`) against the plan.
 ## Status
 
 - MILESTONE 1/6: NetworkPolicy enforced on kindnet (ad28865c1).
-- Done: the Postgres operator path checked on k2lab (8ab1ee4f3); the k8s client written, its tests running.
-- Waiting for decisions 1–4 before the Apps, database and mail drivers. Next without them: the Stalwart management check, the Gateway (D7 (a)), and the capability-driver hook with `/boot-status` on a controller in `k2-p4-caps`.
+- MILESTONE 4/6: front door through Gateway API, TLS passthrough (5d39026a9).
+- MILESTONE 5/6: a controller on Kubernetes reads every capability `delegated`, and its drivers reach what they are delegated to.
+- Done: the Postgres operator path checked on k2lab (8ab1ee4f3); the k8s client and the drivers (7720600b8).
+- Left on k2lab, in `k2-p4-caps` only: `postgresql k2-pg` (for item 2), the namespace itself, and Envoy Gateway in `envoy-gateway-system` with GatewayClass `k2-p4-eg` (`gateway-check.sh --uninstall` removes them). The test Stalwart was deleted.
+- Waiting for decisions 1–4 before item 2 (Apps and their databases) and before the mail driver acts. Item 3 (mail and Sew) stays open until then: mail is unconfigured as declared, and Sew has no image.
