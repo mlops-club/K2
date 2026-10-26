@@ -5,7 +5,7 @@
 #   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]
 #                             [--provisioner=static|kubernetes [--max-hosts=N]]
 #                             [--work-root=PATH] [--login-from=POD] [--max-awake=N]
-#                             [--host-work=shared|own] [--move-after=S]] [--fake] [--rebuild-daemon]
+#                             [--host-work=shared|own] [--move-after=S] [--idle-after=S]] [--fake] [--rebuild-daemon]
 #                      [--reset-password] [--port-forward] [--password-file=PATH] [--render-only=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
@@ -65,6 +65,9 @@
 # deleted first (its PVCs stay). shared (the default) is as before.
 # --move-after=S sets the controller's K2_HOST_MOVE_AFTER (seconds before a
 # lost host's portable agents move; the daemon's default is 300).
+# --idle-after=S sets the controller's K2_PROVISIONER_IDLE_AFTER (seconds a
+# host above the pool's minimum stays idle before it is drained and scaled
+# away; the daemon's default is 900).
 # --max-awake=N sets K2_HOST_MAX_AWAKE on the hosts (the end state's 100):
 # how many awake agents a host takes before the pool adds one.
 # --login-from=POD (e.g. k2-host-0) gives every host an init container that
@@ -93,7 +96,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
-provisioner=static render_to= max_hosts= work_root= login_from= p4=0 max_awake= host_work=shared move_after=
+provisioner=static render_to= max_hosts= work_root= login_from= p4=0 max_awake= host_work=shared move_after= idle_after=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
@@ -114,7 +117,8 @@ for a in "$@"; do
         --max-awake=*) max_awake=${a#--max-awake=} ;;
         --host-work=shared|--host-work=own) host_work=${a#--host-work=} ;;
         --move-after=*) move_after=${a#--move-after=} ;;
-        -h|--help) sed -n '2,88p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --idle-after=*) idle_after=${a#--idle-after=} ;;
+        -h|--help) sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -147,6 +151,8 @@ case "$work_root" in ''|/*) ;; *) echo "up.sh: --work-root takes an absolute pat
 case "$max_awake" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) echo "up.sh: --max-awake takes a number from 1" >&2; exit 2 ;; esac
 [ -z "$max_awake" ] || [ "$dist" = 1 ] || { echo "up.sh: --max-awake needs --dist" >&2; exit 2; }
 case "$move_after" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) echo "up.sh: --move-after takes seconds from 1" >&2; exit 2 ;; esac
+case "$idle_after" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]) ;; *) echo "up.sh: --idle-after takes seconds from 1" >&2; exit 2 ;; esac
+[ -z "$idle_after" ] || [ "$provisioner" = kubernetes ] || { echo "up.sh: --idle-after needs --provisioner=kubernetes" >&2; exit 2; }
 { [ "$host_work" = shared ] && [ -z "$move_after" ]; } || [ "$dist" = 1 ] || { echo "up.sh: --host-work and --move-after need --dist" >&2; exit 2; }
 [ "$host_work" = shared ] || [ "$p4" = 0 ] || { echo "up.sh: --p4 hosts already have their own work volumes" >&2; exit 2; }
 case "$login_from" in ''|k2-host-[0-9]*) ;; *) echo "up.sh: --login-from takes a host pod (k2-host-N)" >&2; exit 2 ;; esac
@@ -242,7 +248,7 @@ replicas:
   - {name: k2-host, count: $1}
 EOF
         if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ] || [ -n "$max_awake" ] \
-            || [ "$host_work" = own ] || [ -n "$move_after" ]; then echo "patches:"; fi
+            || [ "$host_work" = own ] || [ -n "$move_after" ] || [ -n "$idle_after" ]; then echo "patches:"; fi
         if [ "$host_work" = own ]; then
             # The host's own workspaces volume; data's template is repeated
             # because a list of claim templates is replaced, not merged.
@@ -270,7 +276,7 @@ EOF
               resources: {requests: {storage: 2Gi}}
 EOF
         fi
-        if [ -n "$move_after" ]; then
+        if [ -n "$move_after" ] || [ -n "$idle_after" ]; then
             cat <<EOF
   - target: {kind: StatefulSet, name: k2-controller}
     patch: |-
@@ -284,8 +290,10 @@ EOF
             containers:
               - name: k2-daemon
                 env:
-                  - {name: K2_HOST_MOVE_AFTER, value: "$move_after"}
 EOF
+            [ -n "$move_after" ] && echo "                  - {name: K2_HOST_MOVE_AFTER, value: \"$move_after\"}"
+            [ -n "$idle_after" ] && echo "                  - {name: K2_PROVISIONER_IDLE_AFTER, value: \"$idle_after\"}"
+            true
         fi
         if [ "$ptyd" = 1 ] || [ -n "$work_root" ] || [ -n "$max_awake" ]; then
             cat <<EOF
