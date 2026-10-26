@@ -41,8 +41,8 @@
 # carry it: its secret scrub leaves credentials out on purpose.
 #
 # --go (only when the coordinator says so) also
-#   6. tags the running images (by id) k2-daemon:dist-wave3 and
-#      k2-agents:dist-wave3, the rollback;
+#   6. tags the running images (by id) k2-daemon:dist-$PREV and
+#      k2-agents:dist-$PREV (dist-wave3 or dist-rc1), the rollback;
 #   7. rehearses on k2-kind-dist-fake: k2-daemon:rc1 as :dist-fake, up.sh
 #      with the same flags; a dummy login (not a credential) on its
 #      k2-host-0 when it has none; the second host (below) gets it; then
@@ -68,6 +68,10 @@
 # data-k2-host-1 deleted when this roll made it (it holds a copy of the
 # login); 7443 and app-check again.
 #
+# Roll #3 (onto rc2, from rc1): RC_DAEMON=k2-daemon:rc2 RC_COMMIT=<sha>
+# PREV=rc1 POOL_MAX=2; the rollback images are then :dist-rc1 and the
+# rollback goes back to rc1's flags.
+#
 # Only k2lab, through an explicit kubeconfig; never the current context. No
 # credential is read out of a pod or printed: files are checked in place.
 set -euo pipefail
@@ -90,10 +94,19 @@ POOL_MAX=${POOL_MAX:-1}
 case "$POOL_MAX" in 1|2) ;; *) echo "owner-roll-rc1.sh: POOL_MAX is 1 or 2" >&2; exit 2 ;; esac
 ROLL_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts="$POOL_MAX"
     --work-root=/var/lib/k2/work --login-from=k2-host-0)
-PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes)   # wave3's roll
+# What runs now, for the rollback: PREV=wave3 (roll #2, the default) or
+# PREV=rc1 (roll #3 onto rc2: rc1's shape, MIN = MAX = 1 with home sync).
+PREV=${PREV:-wave3}
+case "$PREV" in
+    wave3) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes) ;;
+    rc1) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=1
+                     --work-root=/var/lib/k2/work --login-from=k2-host-0) ;;
+    *) echo "owner-roll-rc1.sh: PREV is wave3 or rc1" >&2; exit 2 ;;
+esac
+ROLLBACK_TAG=dist-$PREV                                           # k2-daemon:dist-<PREV>, k2-agents:dist-<PREV>
 RC_COMMIT=${RC_COMMIT:-c59acf7e02af4b2237e175546f6b1f7c76073068}   # k2-dist/wave3, the release candidate
 RC_DAEMON=${RC_DAEMON:-k2-daemon:rc1}                             # dist-link's verified build
-OUT="$KIND_STATE/owner-roll-rc1"
+OUT="$KIND_STATE/owner-roll-${RC_DAEMON#*:}"
 mkdir -p "$OUT" && chmod 700 "$OUT"
 kd() { kubectl --kubeconfig "$KIND_KUBECONFIG" -n "$NS" "$@"; }
 fails=0
@@ -263,8 +276,8 @@ for pair in k2-controller=k2-daemon k2-host=k2-agents; do
     id=$(sed -n '/^# images/,$p' "$OUT/before.txt" | awk -v n="${pair%%=*}" '$1 == n {print $2}')   # that section only
     case "$id" in sha256:*) ;; *) echo "owner-roll-rc1.sh: no image id for ${pair%%=*}" >&2; exit 1 ;; esac
     docker image inspect "$id" >/dev/null 2>&1 || { echo "owner-roll-rc1.sh: ${pair%%=*}'s image $id is not on this Mac" >&2; exit 1; }
-    docker tag "$id" "${pair#*=}:dist-wave3"
-    ok "${pair#*=}:dist-wave3 = ${id:7:12} (what ${pair%%=*} runs)"
+    docker tag "$id" "${pair#*=}:$ROLLBACK_TAG"
+    ok "${pair#*=}:$ROLLBACK_TAG = ${id:7:12} (what ${pair%%=*} runs)"
 done
 
 if [ "$rehearse" = 1 ]; then
@@ -301,7 +314,7 @@ fi
 echo "== 8. back up the controller's volume (inside the cluster)"
 docker tag "$RC_DAEMON" k2-daemon:dist
 backup=$("$KIND_REPO/scripts/kind/backup-controller.sh" --leave-down) || {
-    docker tag k2-daemon:dist-wave3 k2-daemon:dist
+    docker tag "k2-daemon:$ROLLBACK_TAG" k2-daemon:dist
     echo "STOPPED: the backup failed; k2-kind-dist was not rolled" >&2; exit 1; }
 echo "$backup" > "$OUT/backup-pvc"
 ok "backup PVC $backup"
@@ -311,8 +324,8 @@ kd get pvc data-k2-host-1 >/dev/null 2>&1 && had_host1=1
 rollback() {
     echo "== ROLLBACK"
     kd scale statefulset k2-host --replicas=1 >&2 || true
-    docker tag k2-daemon:dist-wave3 k2-daemon:dist
-    docker tag k2-agents:dist-wave3 k2-agents:dist
+    docker tag "k2-daemon:$ROLLBACK_TAG" k2-daemon:dist
+    docker tag "k2-agents:$ROLLBACK_TAG" k2-agents:dist
     "$KIND_REPO/scripts/kind/backup-controller.sh" --restore="$backup" >&2 || echo "FAIL the restore" >&2
     "$KIND_REPO/scripts/kind/up.sh" "${PREV_FLAGS[@]}" >&2 || echo "FAIL up.sh ${PREV_FLAGS[*]}" >&2
     if [ "$had_host1" = 0 ] && kd get pvc data-k2-host-1 >/dev/null 2>&1; then
@@ -359,7 +372,7 @@ c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/
 [ "$c" = 200 ] && ok "127.0.0.1:$PORT answers" || bad "127.0.0.1:$PORT -> ${c:-no answer}"
 echo
 if [ "$fails" = 0 ]; then
-    echo "ROLLED: k2-kind-dist on rc1 ${RC_COMMIT:0:9} (backup PVC $backup kept; rollback images :dist-wave3)"
+    echo "ROLLED: k2-kind-dist on $RC_DAEMON ${RC_COMMIT:0:9} (backup PVC $backup kept; rollback images :$ROLLBACK_TAG)"
 else
     echo "ROLL: $fails check(s) failed; rolling back"; rollback; exit 1
 fi
