@@ -921,7 +921,7 @@ def s8(c, sc):
     for S8: SIGTERM drains (the turn's Stop before exit) and the replacement
     resumes the agents that were awake, delivering what waited."""
     s8_crash(c, sc)
-    s8_drain(c, sc)
+    redo_on_chaos(c, sc, s8_drain, "S8 drain")
 
 
 def s8_crash(c, sc):
@@ -977,8 +977,8 @@ def s8_crash(c, sc):
         c.close(name)
 
 
-def s8_drain(c, sc):
-    cwd = c.fleet.workspace("s8-%s" % c.tag)
+def s8_drain(c, sc, attempt=1):
+    cwd = c.fleet.workspace("s8-%s%s" % (c.tag, "" if attempt == 1 else "-%d" % attempt))
     pid, why = c.register_enabled(cwd)
     if not sc.check("drain: workspace registered", pid, why):
         return
@@ -1073,14 +1073,15 @@ def s8_drain(c, sc):
         # message landed, the gone rule failing it loudly is the right end.
         killed = [e for x in c.fake("cli.exec", csid) if (x.get("ts") or "") >= t_restart
                   for e in chaos_hit(x.get("host"), x.get("pid"), t_restart) if e.get("kind") == "cli"]
-        lost_to_chaos = bool(killed) and state == "failed" and not seen3
-        if lost_to_chaos:
-            sc.info["s8_msg_lost_to_chaos"] = [(e["ts"], e.get("host"), e.get("pid")) for e in killed]
+        # Before it landed (not in the transcript), or mid-turn (in it once,
+        # unanswered: the turn in progress is lost with the CLI).
+        lost_to_chaos = bool(killed) and state == "failed" and len(seen3) <= 1 and not c.replied(cwd, n3)
+        sc.info["s8_msg_chaos_kills"] = [(e["ts"], e.get("host"), e.get("pid")) for e in killed]
         sc.check("drain: the message sent while it was down was delivered exactly once"
                  " (or failed with a reason after --chaos killed the resumed CLI)",
                  (len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered")) or lost_to_chaos,
                  "in transcripts %d time(s); outbox state %s; chaos kills of the resumed CLI %s"
-                 % (len(seen3), state, sc.info.get("s8_msg_lost_to_chaos", [])))
+                 % (len(seen3), state, sc.info["s8_msg_chaos_kills"]))
     finally:
         if sock:
             sock.close()
@@ -1094,9 +1095,21 @@ def s9(c, sc):
     agent's CLI surviving, so when --chaos itself SIGKILLed the CLI
     (chaos.log) the attempt shows nothing: it is redone with a fresh agent
     (at most 3 attempts, each one counted in info)."""
+    redo_on_chaos(c, sc, s9_attempt, "S9")
+
+
+def redo_on_chaos(c, sc, attempt_fn, what):
+    """Run attempt_fn(c, sc, attempt) up to 3 times. An attempt is redone
+    when it failed a check and chaos.log shows --chaos itself killed the
+    attempt's agent CLI or its host (sc.info host / cli_pid), or, when the
+    attempt failed its first check (a spawn), the controller: then what
+    failed says nothing about the property under test. The dropped checks
+    stay in the log and in info["redone_after_chaos"]."""
     for attempt in (1, 2, 3):
         mark, since = len(sc.checks), now_iso()
-        if s9_attempt(c, sc, attempt) == "redo":
+        sc.info.pop("cli_pid", None)
+        sc.info.pop("host", None)  # set again by the attempt (S8: the crash half set them)
+        if attempt_fn(c, sc, attempt) == "redo":
             continue
         failed = [x["name"] for x in sc.checks[mark:] if not x["ok"]]
         hits = chaos_hit(sc.info.get("host"), sc.info.get("cli_pid"), since) if failed else []
@@ -1111,8 +1124,8 @@ def s9(c, sc):
         # says nothing about the controller restart. Kept in log and info.
         sc.info.setdefault("redone_after_chaos", []).append(
             {"attempt": attempt, "failed": failed, "chaos": [(e["ts"], e.get("kind"), e.get("pid")) for e in hits]})
-        sc.log("--chaos killed S9's agent (%s) during attempt %d; its failed checks %s are dropped; redoing S9"
-               % ([(e["ts"], e.get("kind")) for e in hits], attempt, failed))
+        sc.log("--chaos killed %s's agent (%s) during attempt %d; its failed checks %s are dropped; redoing %s"
+               % (what, [(e["ts"], e.get("kind")) for e in hits], attempt, failed, what))
         del sc.checks[mark:]
 
 
