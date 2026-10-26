@@ -148,6 +148,10 @@ def _base_env(root, name, home):
         "K2_RUNTIME_DIR": "",
         "USER": os.environ.get("USER") or subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip(),
         "LANG": "en_US.UTF-8",
+        # The outbox's gone rule (a message for an agent whose host is gone
+        # is failed after this grace); empty = the daemon's default (120 s).
+        # prove.sh sets LAB_GONE_GRACE_S=30 under --chaos.
+        "K2_DELIVERY_GONE_GRACE_SECS": os.environ.get("LAB_GONE_GRACE_S", ""),
     }
 
 
@@ -205,6 +209,11 @@ def plan(layout, root, run_dir, daemon_bin, fake_bin):
         extra.update({"K2_HOME": os.path.join(root, h, "home", ".k2"), "K2_ROLE": "host",
                       "K2_CONTROLLER_URL": "ws://127.0.0.1:%d" % ctl_port,
                       "K2_HOST_ENROLL_TOKEN_FILE": token_file, "K2_HOST_NAME": h})
+        if os.environ.get("LAB_HOST_PTYD") == "1":
+            # Agents under k2-ptyd (built by prove.sh), which is designed to
+            # outlive its daemon; down() kills what is left of it by pid.
+            extra.update({"K2_PTYD": "1", "K2_PTYD_BIN": os.environ["LAB_PTYD_BIN"]})
+            st["host_ptyd"] = True
         proc(h, "host", extra)
         st["hosts"].append({"name": h, "proc": h, "home": st["procs"][h]["home"],
                             "fake_trace": extra["K2_FAKE_AGENT_TRACE"]})
@@ -348,6 +357,24 @@ def agent_cli_pids(st):
     return sorted(pids)
 
 
+def ptyd_pids(st):
+    """Live k2-ptyd processes of this run (procs): a daemon runs its copy
+    from <home>/bin/ptyd/<version>/k2-ptyd, and every home is under the
+    run's root, so a path under the root is ours and nothing else is."""
+    if st.get("backend") == "compose":
+        return []
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    prefix = st["root"].rstrip("/") + "/"
+    pids = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            exe = parts[1].split(" ")[0]
+            if exe.startswith(prefix) and os.path.basename(exe) == "k2-ptyd":
+                pids.append(int(parts[0]))
+    return sorted(pids)
+
+
 def cli_key(st, host, pid):
     """How agent_cli_pids names a CLI."""
     return "%s:%s" % (host, pid) if st.get("backend") == "compose" else pid
@@ -392,6 +419,15 @@ def down(st):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(p["pid"], signal.SIGKILL)
     for pid in agent_cli_pids(st):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    # k2-ptyd outlives its daemon by design: whatever is left after the
+    # daemons stopped is recorded (evidence) and killed, pid by pid.
+    left = ptyd_pids(st)
+    if st.get("host_ptyd") or left:
+        with open(os.path.join(st["run_dir"], "ptyd-leftovers.txt"), "a") as fh:
+            fh.write("k2-ptyd still running after the daemons stopped: %s\n" % (left or "none"))
+    for pid in left:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
 

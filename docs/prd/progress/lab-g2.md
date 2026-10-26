@@ -187,9 +187,53 @@ tests/lab/run_tests.sh                                            # the lab's ow
 - Linux gate on wave2-preview 3912ab2ff: k2-core 3867/0, k2-daemon 5250/1
   (the one failure and five ignored tests are class (b), pre-existing; see
   below). Both wave-1 gate failures are fixed.
-- Next: G2 with chaos on wave2-preview 18a13dbda merged with lab-g2
-  (`K2_DELIVERY_GONE_GRACE_SECS=30` under chaos), then the hosts on
-  `K2_PTYD=1` (no chaos, seed 4117).
+- G2 on wave3 (below): no chaos green on procs and compose; chaos on
+  636391108 green but for one new K2 red (K2-c, a duplicate after an
+  interrupted delivery); hosts on `K2_PTYD=1`: unplace stops the agent, a need
+  while its host is drained places it fresh on the other host (K2 gap, not
+  ptyd-specific).
+
+### G2 on k2-dist/wave3
+
+Throwaway run branches (never wave3 itself): `k2-dist/lab-g2-wave3-run`
+(853157fee + lab-g2) and `k2-dist/lab-g2-wave3b-run` (636391108, the K2-a and
+K2-b fixes, + lab-g2). Under `--chaos`, every daemon gets
+`K2_DELIVERY_GONE_GRACE_SECS=30` and S8 waits grace + 30 s (ecc9d1edd).
+
+| Run | Base | Result |
+|---|---|---|
+| procs, no chaos `07-27-32Z` | 853157fee | S1-S9 PASS, I1-I4 pass |
+| compose, no chaos `07-46-33Z` | 853157fee | S1-S9 PASS, I1-I4 pass |
+| procs, seeds 4117 / 7 / 2026 `07-33-19Z` `07-37-38Z` `07-40-55Z` | 853157fee | I1-I4 pass; reds: K2-a, K2-b, allowed, lab (fixed) |
+| procs, seeds 4117 / 7 / 2026 `08-24-52Z` `08-30-21Z` `08-34-48Z` | 853157fee + lab fixes | 4117 green; 7 and 2026: K2-a only (+ one lab red, fixed) |
+| procs, seeds 4117 / 7 / 2026 `08-59-21Z` `09-03-17Z` `09-07-34Z` | 636391108 + lab-g2 aefdb4bfa | 4117 and 7 green; 2026: S3 round 5 red (K2-c); I1-I4 pass |
+| hosts on `K2_PTYD=1`, no chaos `08-01-41Z` and seed 4117 `08-03-30Z` | 853157fee | all PASS but S8's resume elsewhere (below) |
+| `LAB_S8_RESUME_ELSEWHERE=1` without ptyd `08-08-09Z` (control) | 853157fee | the same S8 red: not ptyd |
+
+K2 reds found on wave3 (for the owners):
+
+| | What | Evidence | Status |
+|---|---|---|---|
+| K2-a | Right after a controller restart, before any host linked back, ensure-pinned-chat answered 400 `spawn failed: no agent host is connected` (spawn answers 503, which the app waits on); `k2 msg --wake` failed `spawn_failed`; heartbeat fire `error` | seed 7 and 2026 round 2 (`07-37-38Z`, `07-40-55Z`) | fixed in 636391108 (gone in every round since) |
+| K2-b | A message injected just before chaos SIGKILLed its host was recorded `failed` (`dormant_no_wake`) though the agent had it | seed 4117 S8 round 5 (`07-33-19Z`) | fixed in 636391108 |
+| K2-c | A message injected into a CLI that chaos killed mid-turn (host answers `retry`) is delivered again by the gone rule's direct path, which spawns `--resume <session> "<msg>"`: the same prompt twice in one conversation (the host's `duplicate` check is bypassed) | seed 2026 S3 round 5 (`09-07-34Z`): `ctl.deliver` 09:10:11.899, turn 1 09:10:12.055, chaos kill 09:10:12.325, `host.deliver retry` 09:10:12.433, `ctl.msg_gone_direct ok` 09:10:42.371 | open |
+| resume elsewhere | A need (the app) for an agent its drained host released for resume, while that host is down, places it on the other host with `--session-id <same id>` (`resumed: false`): a fresh conversation under the old id; the history stays on the drained host | S8 `08-01-41Z`, `08-03-30Z` (3 rounds), `08-08-09Z` (in-process) | open (design: wait for the host, or carry the conversation) |
+
+`K2_PTYD=1` (all 18 / 49 agent sessions `backend: ptyd`): the drain's turn ends
+before exit, unplacing stops the agent's CLI though both hosts' k2-ptyd keep
+running (as designed; the lab records them in `ptyd-leftovers.txt` and kills
+them by pid), the queued message is delivered once, and the drained host's
+return never places the agent twice.
+
+Allowed reds (PRD failure table) the lab now tells apart, from `chaos.log`
+only: chaos killed the scenario's own agent CLI or host (S8 drain, S9: the
+attempt is redone, at most 3, dropped checks kept in `info.redone_after_chaos`),
+killed the controller under a spawn in flight (S9), or killed the resumed CLI
+before or during the queued message (S8: failing it with a reason is right).
+Lab fixes: reattach when a controller restart closes the grid stream (S7, S9),
+S3 sends from the other host when chaos left both agents on one, idempotent
+routes wait on 502 `is not connected` (b0d0b81ae, fca655129, 2feba07f0,
+aefdb4bfa).
 
 ### G2 matrix on wave2-preview 13e5a5939 (merged as 319e17dbb)
 

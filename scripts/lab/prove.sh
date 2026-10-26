@@ -61,6 +61,16 @@ case "$LAB_LINUX_GATE" in hold|run) ;; *) echo "prove.sh: --linux-gate is hold o
 export LAB_LINUX_GATE
 export LAB_TEST_THREADS=${LAB_TEST_THREADS:-3}
 case "$CHAOS" in ""|seed=[0-9]*) ;; *) echo "prove.sh: --chaos takes seed=N" >&2; exit 2 ;; esac
+# Under chaos a host is gone often; the outbox's gone grace (default 120 s)
+# would outlast the scenario waits, so chaos runs set it to 30 s on every
+# daemon (K2_DELIVERY_GONE_GRACE_SECS) and S8 waits grace + 30 s.
+[ -n "$CHAOS" ] && export LAB_GONE_GRACE_S=${LAB_GONE_GRACE_S:-30}
+# Scenarios tell chaos's own kills (chaos.log) from the daemons'.
+if [ -n "$CHAOS" ]; then export LAB_CHAOS=$CHAOS; else unset LAB_CHAOS; fi
+# LAB_HOST_PTYD=1: the hosts run their agents under k2-ptyd (K2_PTYD=1).
+if [ "${LAB_HOST_PTYD:-0}" = 1 ] && [ "${LAB_FLEET_BACKEND:-procs}" = compose ]; then
+    echo "prove.sh: LAB_HOST_PTYD=1 is for the procs backend (the fleet image has no k2-ptyd)" >&2; exit 2
+fi
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 case "$GATE/$TOPOLOGY" in
     G0/solo|G2/solo|G2/fleet) ;;
@@ -113,6 +123,7 @@ run_set gate "$GATE" topology "$TOPOLOGY" sha "$LAB_SHA" branch "$(git rev-parse
 if [ -n "$(git status --porcelain --untracked-files=no -- . ':!lab-runs')" ]; then
     NOTES+=("The working tree has uncommitted changes. Solo and the local suites ran on the working tree; the Linux gate ran on the committed sha $LAB_SHA.")
 fi
+[ -n "$CHAOS" ] && NOTES+=("--chaos: K2_DELIVERY_GONE_GRACE_SECS=$LAB_GONE_GRACE_S on every daemon (the outbox gone rule; default 120 s).")
 if [ -n "$CHAOS" ] && [ "$GATE" = G0 ]; then
     NOTES+=("--chaos $CHAOS recorded; G0 has no chaos scenarios (chaos applies to S3 to S10).")
 fi
@@ -165,6 +176,7 @@ g2_scenarios() {
         python3 -I tests/lab/lab.py chaos --state "$LAB_FLEET_STATE" --seed "${CHAOS#seed=}" --out "$RUN/chaos.log" \
             >>"$RUN/prove.log" 2>&1 &
         CHAOS_PID=$!
+        export LAB_CHAOS_LOG="$RUN/chaos.log"
     fi
     say "scenarios S3 to S9"
     # Under chaos the set repeats in rounds for at least LAB_CHAOS_MIN_S (180 s),
@@ -209,7 +221,8 @@ say "building k2-daemon, k2-fake-agent, and k2-node + k2-provider-fakes (tests/c
 # Two commands: `--bin k2-daemon` would limit EVERY selected package to a
 # bin of that name, leaving the others unbuilt.
 if ! { lab_cargo build -p k2-daemon --bin k2-daemon >>"$RUN/build.log" 2>&1 \
-        && lab_cargo build -p k2-fake-agent -p k2-node -p k2-provider-fakes --bins >>"$RUN/build.log" 2>&1; }; then
+        && lab_cargo build -p k2-fake-agent -p k2-node -p k2-provider-fakes --bins >>"$RUN/build.log" 2>&1 \
+        && { [ "${LAB_HOST_PTYD:-0}" != 1 ] || lab_cargo build -p k2-ptyd --bin k2-ptyd >>"$RUN/build.log" 2>&1; }; }; then
     say "build failed (see build.log)"
     NOTES+=("Build failed (build.log). Nothing ran.")
     finish
@@ -222,6 +235,11 @@ for b in k2-node k2-provider-fakes; do
     [ -x "target/debug/$b" ] || { say "target/debug/$b was not built (see build.log)"; NOTES+=("target/debug/$b was not built; tests/cli scripts that need it will fail."); }
 done
 LAB_DAEMON_BIN="$LAB_TMP/bin/k2-daemon"
+if [ "${LAB_HOST_PTYD:-0}" = 1 ]; then
+    cp target/debug/k2-ptyd "$LAB_TMP/bin/" || { say "k2-ptyd missing"; finish; }
+    export LAB_PTYD_BIN="$LAB_TMP/bin/k2-ptyd" LAB_HOST_PTYD=1
+    NOTES+=("LAB_HOST_PTYD=1: hosts run agents under k2-ptyd (K2_PTYD=1, K2_PTYD_BIN); k2-ptyd left after the run: ptyd-leftovers.txt.")
+fi
 LAB_FAKE_AGENT_BIN="$LAB_TMP/bin/k2-fake-agent"
 "$LAB_FAKE_AGENT_BIN" --install-shims "$LAB_TMP/shim"
 LAB_SHIM_DIR="$LAB_TMP/shim"

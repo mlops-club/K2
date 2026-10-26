@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -214,6 +215,47 @@ class WaitingForTheDaemon(unittest.TestCase):
         self.assertFalse(g2.daemon_down(0, dropped, "POST", "/cli/workspace/msg"), "k2 msg could be sent twice")
         self.assertFalse(g2.daemon_down(0, dropped, "POST", "/cli/inbox/compose"))
 
+    def test_a_host_not_linked_back_yet_is_waited_for_on_idempotent_routes_only(self):
+        lost = '{"error":"agent host host-1 is not connected (lost: its agents keep their placement there until it links again)"}'
+        self.assertTrue(g2.daemon_down(502, lost, "POST", "/cli/sessions/v2/close"))
+        self.assertFalse(g2.daemon_down(502, lost, "POST", "/cli/sessions/v2/spawn"), "S8 crash expects this 502")
+        self.assertFalse(g2.daemon_down(400, '{"error":"spawn failed: no agent host is connected"}', "POST",
+                                        "/cli/workspace/ensure-pinned-chat"), "a 400 is the daemon's answer, not a wait")
+
+
+class ChaosKilled(unittest.TestCase):
+    def test_only_a_cli_chaos_itself_killed_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "chaos.log")
+            with open(log, "w") as fh:
+                fh.write(json.dumps({"ts": "t1", "kind": "cli", "host": "host-2", "pid": 3302, "action": "SIGKILL"}) + "\n")
+                fh.write(json.dumps({"ts": "t2", "kind": "host", "action": "skipped"}) + "\n")
+            env = {"LAB_CHAOS": "seed=7", "LAB_CHAOS_LOG": log}
+            with unittest.mock.patch.dict(os.environ, env):
+                self.assertEqual(g2.chaos_killed("host-2", 3302)["ts"], "t1")
+                self.assertIsNone(g2.chaos_killed("host-1", 3302), "same pid on another host")
+                self.assertIsNone(g2.chaos_killed("host-2", 9999))
+            with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS_LOG": log}):
+                os.environ.pop("LAB_CHAOS", None)
+                self.assertIsNone(g2.chaos_killed("host-2", 3302), "no chaos in this run")
+
+    def test_chaos_hit_counts_the_agents_cli_or_its_host_since_a_time(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "chaos.log")
+            with open(log, "w") as fh:
+                for e in ({"ts": "2026-01-01T00:00:01Z", "kind": "cli", "host": "host-1", "pid": 7, "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:02Z", "kind": "host", "target": "host-2", "pid": 9, "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:03Z", "kind": "controller", "target": "controller", "action": "SIGKILL"},
+                          {"ts": "2026-01-01T00:00:04Z", "kind": "host", "target": "host-2", "action": "started"}):
+                    fh.write(json.dumps(e) + "\n")
+            with unittest.mock.patch.dict(os.environ, {"LAB_CHAOS": "seed=1", "LAB_CHAOS_LOG": log}):
+                self.assertEqual(len(g2.chaos_hit("host-1", 7, "2026-01-01T00:00:00Z")), 1)
+                self.assertEqual(g2.chaos_hit("host-1", 7, "2026-01-01T00:00:02Z"), [], "before the attempt")
+                self.assertEqual([e["kind"] for e in g2.chaos_hit("host-2", 5, "2026")], ["host"])
+                self.assertEqual(g2.chaos_hit("controller", None, "2026"), [], "a controller restart is S9's own test")
+                self.assertEqual([e["kind"] for e in g2.chaos_hit("controller", None, "2026", kinds=("controller",))],
+                                 ["controller"], "asked for explicitly: a spawn lost in flight")
+
 
 class Plan(unittest.TestCase):
     def test_fleet_plan_follows_the_env_contract(self):
@@ -229,6 +271,26 @@ class Plan(unittest.TestCase):
         self.assertEqual(h2["K2_TRACE_FILE"], "/run/traces/host-2.daemon.jsonl")
         self.assertEqual(len({p["port"] for p in st["procs"].values()}), 3)
         self.assertEqual(len({p["home"] for p in st["procs"].values()}), 3)
+
+    def test_ptyd_hosts_get_k2_ptyd_and_its_binary_the_controller_does_not(self):
+        with unittest.mock.patch.dict(os.environ, {"LAB_HOST_PTYD": "1", "LAB_PTYD_BIN": "/b/k2-ptyd"}):
+            st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
+        h1, ctl = st["procs"]["host-1"]["env"], st["procs"]["controller"]["env"]
+        self.assertEqual((h1["K2_PTYD"], h1["K2_PTYD_BIN"]), ("1", "/b/k2-ptyd"))
+        self.assertNotIn("K2_PTYD", ctl)
+        self.assertTrue(st["host_ptyd"])
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LAB_HOST_PTYD", None)
+            self.assertNotIn("K2_PTYD", fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")["procs"]["host-1"]["env"])
+
+    def test_gone_grace_reaches_every_daemon_only_when_the_lab_sets_it(self):
+        with unittest.mock.patch.dict(os.environ, {"LAB_GONE_GRACE_S": "30"}):
+            st = fleet.plan("fleet", "/r", "/run", "/bin/d", "/bin/f")
+            self.assertEqual({p["env"]["K2_DELIVERY_GONE_GRACE_SECS"] for p in st["procs"].values()}, {"30"})
+            self.assertEqual(g2.gone_wait_s(), 60)
+        with unittest.mock.patch.dict(os.environ, {}):
+            os.environ.pop("LAB_GONE_GRACE_S", None)
+            self.assertEqual(g2.gone_wait_s(), 150)
 
     def test_one_process_never_writes_back_anothers_stale_pids(self):
         with tempfile.TemporaryDirectory() as d:

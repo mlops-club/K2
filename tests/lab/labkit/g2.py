@@ -16,6 +16,7 @@ Each scenario writes DIR/<S>.json ({"scenario", "title", "status", "checks":
 appended to DIR/messages.jsonl (the I2 ledger).
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -34,6 +35,17 @@ from . import s1
 from . import ws as wslib
 
 DEADLINE_S = 90
+
+
+def gone_wait_s():
+    """A wait that outlasts the outbox's gone grace (LAB_GONE_GRACE_S, else
+    the daemon's 120 s) by 30 s, so a message the gone rule settles is seen
+    settled, not still queued."""
+    try:
+        grace = int(os.environ.get("LAB_GONE_GRACE_S") or 120)
+    except ValueError:
+        grace = 120
+    return max(60, grace + 30)
 HTTP_TIMEOUT_S = 120
 REPLY_MARKER = s1.REPLY_MARKER
 BANNER = "k2-fake-agent (as claude)"
@@ -116,8 +128,38 @@ def daemon_down(status, text, method="POST", path=""):
     # was placed, so asking again once a host is back is safe (--chaos).
     if status == 503 and "no agent host is connected" in text:
         return True
+    # A host the controller still counts as lost (it has not linked back
+    # yet, e.g. right after a controller restart): an idempotent request
+    # converges once it links, so wait for it as for a booting daemon.
+    if status == 502 and "is not connected" in text and path in IDEMPOTENT:
+        return True
     dropped = status == 0 and ("closed connection" in text or "reset" in text or "Broken pipe" in text)
     return dropped and (method == "GET" or path in IDEMPOTENT)
+
+
+def chaos_killed(host, pid):
+    """The chaos.log entry in which --chaos itself SIGKILLed the agent CLI
+    `pid` on `host`, or None (no chaos, or not chaos's doing)."""
+    path = os.environ.get("LAB_CHAOS_LOG")
+    if not (os.environ.get("LAB_CHAOS") and path and pid and os.path.isfile(path)):
+        return None
+    for e in fleetlib.read_jsonl(path):
+        if e.get("kind") == "cli" and e.get("action") == "SIGKILL" and e.get("pid") == pid and e.get("host") == host:
+            return e
+    return None
+
+
+def chaos_hit(host, pid, since, kinds=("cli", "host")):
+    """chaos.log entries since `since` (ISO) in which --chaos itself
+    SIGKILLed the agent CLI `pid` on `host`, or `host` itself (a host, or
+    with kinds=("controller",) the controller)."""
+    path = os.environ.get("LAB_CHAOS_LOG")
+    if not (os.environ.get("LAB_CHAOS") and path and host and os.path.isfile(path)):
+        return []
+    return [e for e in fleetlib.read_jsonl(path)
+            if (e.get("ts") or "") >= since and e.get("action") == "SIGKILL" and e.get("kind") in kinds
+            and ((e.get("kind") == "cli" and e.get("host") == host and e.get("pid") == pid)
+                 or (e.get("kind") != "cli" and e.get("target", e.get("host")) == host))]
 
 
 def send_waiting_for_daemon(make_req, log=None, method="POST", path=""):
@@ -315,6 +357,22 @@ class Client:
                           deadline, 0.3) or self.final_state(msg_id)
 
     # ── grid ────────────────────────────────────────────────────────────
+    def reattach(self, sc, sid, sock):
+        """The grid stream through the controller closed under us (a
+        restart): wait until the controller answers and attach again, as the
+        app does. Counted in the scenario's info. Returns (sock, grid) or
+        (None, None)."""
+        sc.info["reattached_after_stream_close"] = sc.info.get("reattached_after_stream_close", 0) + 1
+        sc.log("the grid stream closed; reattaching once the controller answers")
+        with contextlib.suppress(OSError):
+            sock.close()
+        wait_until(lambda: fleetlib.http_json(self.fleet.port, "/cli/hosts/status"), DAEMON_BACK_S, 0.5)
+        try:
+            return self.attach(sid)
+        except (OSError, wslib.WsError) as e:
+            self.log("reattach failed: %s" % e)
+            return None, None
+
     def attach(self, session):
         end = time.monotonic() + DAEMON_BACK_S
         while True:
@@ -523,6 +581,13 @@ def s3(c, sc):
         ha, hb = agents[alice][3], agents[bob][3]
         sc.info["hosts"] = {alice: ha, bob: hb}
         if c.fleet.layout == "fleet":
+            if ha and ha == hb and os.environ.get("LAB_CHAOS"):
+                # --chaos had the other host down at placement, so both went
+                # to one host (correct placement). S3 needs the message to
+                # cross hosts: alice's k2 msg runs on the other host instead.
+                ha = next((h["name"] for h in c.fleet.hosts() if h["name"] != hb), None)
+                sc.log("alice and bob both on %s (chaos): sending from %s instead" % (hb, ha))
+                sc.info["sent_from"] = ha
             sc.check("alice and bob run on different hosts", ha and hb and ha != hb, "alice %s, bob %s" % (ha, hb))
         nonce = uuid.uuid4().hex[:8]
         text = "S3 hello bob from alice %s" % nonce
@@ -734,7 +799,15 @@ def ask_chat(c, sc, cwd, a, text, n=None, tries=3):
             if n or wait_until(lambda: c.replied(cwd, text)):
                 return True, a
         if c.fleet.cli_alive((c.exec_of(csid) or {}).get("host"), (c.exec_of(csid) or {}).get("pid")):
-            return False, a  # the CLI lives: a real failure, no retry
+            if c.stream_end(sock, 1) is None:
+                return False, a  # the CLI lives and the stream is open: a real failure, no retry
+            sock, grid = c.reattach(sc, sid, sock)
+            if not sock:
+                return False, a
+            a = (sid, csid, reused, sock, grid)
+            if not wait_until(lambda: c.prompts_with(cwd, text), 5):
+                c.type(sock, text)  # the prompt never reached the agent
+            return bool(wait_until(lambda: c.replied(cwd, text), DEADLINE_S)), a
         sc.info["retries_after_cli_death"] = sc.info.get("retries_after_cli_death", 0) + 1
         sc.log("the CLI died before answering %r (attempt %d): the next need reopens it" % (text, attempt))
         sock.close()
@@ -848,7 +921,7 @@ def s8(c, sc):
     for S8: SIGTERM drains (the turn's Stop before exit) and the replacement
     resumes the agents that were awake, delivering what waited."""
     s8_crash(c, sc)
-    s8_drain(c, sc)
+    redo_on_chaos(c, sc, s8_drain, "S8 drain")
 
 
 def s8_crash(c, sc):
@@ -904,8 +977,8 @@ def s8_crash(c, sc):
         c.close(name)
 
 
-def s8_drain(c, sc):
-    cwd = c.fleet.workspace("s8-%s" % c.tag)
+def s8_drain(c, sc, attempt=1):
+    cwd = c.fleet.workspace("s8-%s%s" % (c.tag, "" if attempt == 1 else "-%d" % attempt))
     pid, why = c.register_enabled(cwd)
     if not sc.check("drain: workspace registered", pid, why):
         return
@@ -943,23 +1016,72 @@ def s8_drain(c, sc):
             sc.check("drain: the turn in progress finished before the host exited (turn end and Stop hook)",
                      bool(ends) and bool(stops) and ends[0]["ts"] <= t_exit and stops[0]["ts"] <= t_exit,
                      "turn.end %s, Stop %s, host gone %s" % ([e["ts"] for e in ends][:1], [e["ts"] for e in stops][:1], t_exit))
+            # Unplacing stops the agent: its CLI must not outlive the drain,
+            # even when it runs under k2-ptyd (LAB_HOST_PTYD=1), which is
+            # designed to outlive its daemon.
+            cli_pid = (ex or {}).get("pid")
+            gone = wait_until(lambda: not c.fleet.cli_alive(host, cli_pid), 10)
+            ptyd_left = fleetlib.ptyd_pids(c.fleet.st) if c.fleet.st.get("host_ptyd") else "n/a (in-process)"
+            sc.info["ptyd_after_drain"] = ptyd_left
+            sc.check("drain: unplacing stopped the agent's CLI on %s (gone once the host exited)" % host, gone,
+                     "pid %s on %s gone=%s; k2-ptyd processes of this run: %s" % (cli_pid, host, bool(gone), ptyd_left))
             n3 = "s8-while-down-%s" % uuid.uuid4().hex[:6]
             st, raw, resp = c.msg(cwd, n3, wake=False)
             msg_id = resp.get("msgId")
             sc.check("drain: a message sent while the host is down is accepted (or fails with a reason), not lost silently",
                      st == 200 and (resp.get("success") is True or resp.get("reason")), "HTTP %s %s" % (st, raw[:300]))
-            t_restart = now_iso()
-            c.fleet.start(host)
-        resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
-                                      if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], 60)
-        sc.check("drain: the replacement host resumed the agent that was awake (same session, no re-spawn by the lab)",
-                 bool(resumed), "resumed cli.exec of %s after %s: %d" % (csid, t_restart, len(resumed or [])))
-        wait_until(lambda: c.replied(cwd, n3), 60)
+            # LAB_S8_RESUME_ELSEWHERE=1 (default under LAB_HOST_PTYD=1): a
+            # need comes first, while the host is still down, and places the
+            # agent the usual way, on the other host.
+            elsewhere = os.environ.get("LAB_S8_RESUME_ELSEWHERE", os.environ.get("LAB_HOST_PTYD", "0")) == "1"
+            if not elsewhere:
+                t_restart = now_iso()
+                c.fleet.start(host)
+        if elsewhere:
+            t_need = now_iso()
+            b = open_chat(c, sc, cwd, "drain: a need (the app) opens the agent while %s is down" % host)
+            if b:
+                b[3].close()
+                ex2 = c.exec_of(csid)
+                sc.info["resumed_on"] = (ex2 or {}).get("host")
+                sc.check("drain: the need resumed the agent on the other host while %s was down (same session)" % host,
+                         b[1] == csid and bool(ex2) and ex2.get("host") not in (None, host)
+                         and bool((ex2.get("attrs") or {}).get("resumed")) and (ex2.get("ts") or "") >= t_need,
+                         "session %s -> %s; last cli.exec %s" % (csid, b[1], json.dumps(ex2)[:250]))
+            with c.fleet.control():
+                t_restart = now_iso()
+                c.fleet.start(host)  # waits for its link
+            # The controller's resume loop runs when the drained host links
+            # back: it must not place the agent a second time.
+            most, live = 0, []
+            end = time.monotonic() + 15
+            while time.monotonic() < end:
+                live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
+                most = max(most, len(live))
+                time.sleep(0.5)
+            sc.check("drain: once %s is back, one live CLI for the agent (not placed twice)" % host, most == 1,
+                     "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
+        else:
+            resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
+                                          if (e.get("attrs") or {}).get("resumed") and (e.get("ts") or "") >= t_restart], gone_wait_s())
+            sc.check("drain: the replacement host resumed the agent that was awake (same session, no re-spawn by the lab)",
+                     bool(resumed), "resumed cli.exec of %s after %s: %d" % (csid, t_restart, len(resumed or [])))
+        wait_until(lambda: c.replied(cwd, n3), gone_wait_s())
         seen3 = c.prompts_with(cwd, n3)
-        state = c.wait_final(msg_id, 60) if msg_id else None
-        sc.check("drain: the message sent while it was down was delivered exactly once",
-                 len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered"),
-                 "in transcripts %d time(s); outbox state %s" % (len(seen3), state))
+        state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
+        # PRD failure table: when --chaos killed the resumed CLI before the
+        # message landed, the gone rule failing it loudly is the right end.
+        killed = [e for x in c.fake("cli.exec", csid) if (x.get("ts") or "") >= t_restart
+                  for e in chaos_hit(x.get("host"), x.get("pid"), t_restart) if e.get("kind") == "cli"]
+        # Before it landed (not in the transcript), or mid-turn (in it once,
+        # unanswered: the turn in progress is lost with the CLI).
+        lost_to_chaos = bool(killed) and state == "failed" and len(seen3) <= 1 and not c.replied(cwd, n3)
+        sc.info["s8_msg_chaos_kills"] = [(e["ts"], e.get("host"), e.get("pid")) for e in killed]
+        sc.check("drain: the message sent while it was down was delivered exactly once"
+                 " (or failed with a reason after --chaos killed the resumed CLI)",
+                 (len(seen3) == 1 and c.replied(cwd, n3) and state in (None, "delivered")) or lost_to_chaos,
+                 "in transcripts %d time(s); outbox state %s; chaos kills of the resumed CLI %s"
+                 % (len(seen3), state, sc.info["s8_msg_chaos_kills"]))
     finally:
         if sock:
             sock.close()
@@ -969,7 +1091,46 @@ def s8_drain(c, sc):
 # ── S9 ──────────────────────────────────────────────────────────────────
 
 def s9(c, sc):
-    name = "s9-%s" % c.tag
+    """The controller restarts under a running agent. S9 is about that
+    agent's CLI surviving, so when --chaos itself SIGKILLed the CLI
+    (chaos.log) the attempt shows nothing: it is redone with a fresh agent
+    (at most 3 attempts, each one counted in info)."""
+    redo_on_chaos(c, sc, s9_attempt, "S9")
+
+
+def redo_on_chaos(c, sc, attempt_fn, what):
+    """Run attempt_fn(c, sc, attempt) up to 3 times. An attempt is redone
+    when it failed a check and chaos.log shows --chaos itself killed the
+    attempt's agent CLI or its host (sc.info host / cli_pid), or, when the
+    attempt failed its first check (a spawn), the controller: then what
+    failed says nothing about the property under test. The dropped checks
+    stay in the log and in info["redone_after_chaos"]."""
+    for attempt in (1, 2, 3):
+        mark, since = len(sc.checks), now_iso()
+        sc.info.pop("cli_pid", None)
+        sc.info.pop("host", None)  # set again by the attempt (S8: the crash half set them)
+        if attempt_fn(c, sc, attempt) == "redo":
+            continue
+        failed = [x["name"] for x in sc.checks[mark:] if not x["ok"]]
+        hits = chaos_hit(sc.info.get("host"), sc.info.get("cli_pid"), since) if failed else []
+        if failed and len(sc.checks) == mark + 1 and "spawned" in failed[0]:
+            # The spawn itself was lost: --chaos killed the controller while
+            # it was in flight (a spawn is never sent twice), so S9 never got
+            # an agent to test.
+            hits = chaos_hit("controller", None, since, kinds=("controller",))
+        if not hits or attempt == 3:
+            return
+        # --chaos killed this agent's CLI or its host: what failed after it
+        # says nothing about the controller restart. Kept in log and info.
+        sc.info.setdefault("redone_after_chaos", []).append(
+            {"attempt": attempt, "failed": failed, "chaos": [(e["ts"], e.get("kind"), e.get("pid")) for e in hits]})
+        sc.log("--chaos killed %s's agent (%s) during attempt %d; its failed checks %s are dropped; redoing %s"
+               % (what, [(e["ts"], e.get("kind")) for e in hits], attempt, failed, what))
+        del sc.checks[mark:]
+
+
+def s9_attempt(c, sc, attempt):
+    name = "s9-%s%s" % (c.tag, "" if attempt == 1 else "-%d" % attempt)
     cwd = c.fleet.workspace(name)
     a = c.start_agent(sc, name, cwd)
     if not a:
@@ -982,6 +1143,11 @@ def s9(c, sc):
         n1 = "s9 long %s [[turn-ms=6000]]" % uuid.uuid4().hex[:6]
         c.type(sock, n1)
         started = wait_until(lambda: c.turn_events(csid, "cli.turn.start"), 30)
+        if not started and c.fleet.cli_alive(host, cli_pid) and c.stream_end(sock, 1) is not None:
+            sock, grid = c.reattach(sc, sid, sock)
+            if sock:
+                c.type(sock, n1)
+                started = wait_until(lambda: c.turn_events(csid, "cli.turn.start"), 30)
         if not sc.check("a long turn started", started, ""):
             return
         sock.close()
@@ -995,6 +1161,14 @@ def s9(c, sc):
             c.fleet.start("controller")
             t_up = now_iso()
         sc.info.update(controller_down=t_down, controller_restarting=t_up_start, controller_up=t_up)
+        if attempt < 3 and not c.fleet.cli_alive(host, cli_pid):
+            killed = chaos_killed(host, cli_pid)
+            if killed:
+                sc.info.setdefault("redone_after_chaos_cli_kill", []).append(
+                    {"attempt": attempt, "pid": cli_pid, "host": host, "chaos": killed.get("ts")})
+                sc.log("--chaos SIGKILLed this agent's CLI (pid %s on %s, %s): attempt %d shows nothing; redoing S9"
+                       % (cli_pid, host, killed.get("ts"), attempt))
+                return "redo"
         sc.check("the agent finished its turn while the controller was down",
                  bool(ended) and t_down <= ended[0]["ts"] <= t_up_start,
                  "turn.end %s; controller down %s, restarted %s" % (ended[0]["ts"] if ended else None, t_down, t_up_start))
@@ -1022,8 +1196,25 @@ def s9(c, sc):
         if sock:
             n2 = "s9 after %s" % uuid.uuid4().hex[:6]
             typed = c.type(sock, n2)
-            sc.check("typing reaches the same agent and is answered",
-                     typed and c.grid_wait(sock, grid, "%s2: %s" % (REPLY_MARKER, n2), 30), n2 if typed else "the grid stream was closed")
+            answered = typed and c.grid_wait(sock, grid, "%s2: %s" % (REPLY_MARKER, n2), 30)
+            if not answered and c.stream_end(sock, 1) is not None:
+                # The stream through the controller closed under us (--chaos
+                # restarted it): reattach once it is back, as the app does,
+                # and type again only if the prompt never reached the agent.
+                sc.info["reattached_after_stream_close"] = sc.info.get("reattached_after_stream_close", 0) + 1
+                sc.log("the grid stream closed while typing; reattaching once the controller answers")
+                sock.close()
+                sock = None
+                wait_until(lambda: fleetlib.http_json(c.fleet.port, "/cli/hosts/status"), DAEMON_BACK_S, 0.5)
+                try:
+                    sock, grid = c.attach(sid)
+                    if not wait_until(lambda: c.prompts_with(cwd, n2), 5):
+                        typed = c.type(sock, n2)
+                    answered = typed and bool(wait_until(lambda: c.replied(cwd, n2), 30))
+                except (OSError, wslib.WsError) as e:
+                    c.log("reattach failed: %s" % e)
+            sc.check("typing reaches the same agent and is answered", answered,
+                     n2 if typed else "the grid stream was closed")
         n3 = "s9-msg-%s" % uuid.uuid4().hex[:6]
         st, raw, resp = c.msg(name, n3, wake=False)
         wait_until(lambda: c.replied(cwd, n3), 60)
