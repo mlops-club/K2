@@ -1404,6 +1404,9 @@ impl RemoteHost {
             if need.last_host.is_none() {
                 need.last_host = home.0.clone().or(home.1);
             }
+            // Off `inner`: a home commit holds the store while its fence
+            // reads the placements.
+            let snapshot = home.0.as_ref().and_then(|_| (self.home_latest)(agent_id));
             match self.provisioner.ensure_host(&need, &views) {
                 Ensure::Ready(host_id) => {
                     let mut inner = self.inner.lock();
@@ -1434,10 +1437,11 @@ impl RemoteHost {
                                 Some(v) if v.usable() => "which can't take it now",
                                 _ => "which is not linked",
                             };
-                            let note = format!(
-                                "agent {agent_id}'s home is on host {own}, {why}; placed on {host_id} by load, \
-                                 where its conversation and memory are not"
-                            );
+                            let syncs = views
+                                .iter()
+                                .find(|v| v.host_id == host_id)
+                                .is_some_and(|v| v.labels.contains_key(crate::hosts::home::LABEL_HOME_SYNC));
+                            let note = crate::hosts::home::placement_note(agent_id, own, why, &host_id, syncs, snapshot.as_ref());
                             log_debug!("[hosts] {note}");
                             ("fallback", Some(note))
                         }

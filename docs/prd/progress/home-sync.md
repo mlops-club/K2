@@ -178,7 +178,19 @@ both:
   each release and spawn (in enroll mode that is an enroll call, a
   challenge and a session call). Caching the token for its lifetime is a
   small follow-up.
-- **S7's `placementNote`** still says the agent's "conversation and memory
-  are not" on the fallback host. With home sync on, they are restored, so
-  the note should say so.
+- **S7's `placementNote`**: done on `k2-dist/placement-note`.
+  - **What the note says now:** the new host's situation.
+    - The store holds a snapshot and the host syncs homes: "…placed on
+      host-2 by load, which restores its home (snapshot N, saved on host-1)
+      before it starts, so its conversation and memory come with it".
+    - No snapshot, or a host without `K2_WORK_ROOT`: the warning, with why.
+  - **How the controller knows:** a host with `K2_WORK_ROOT` set adds the
+    `k2.home_sync` label to its hello; the labels are free-form, so the
+    protocol doesn't change.
+  - **The function:** `hosts::home::placement_note`. `reserve_for` looks up
+    the snapshot before it takes the placement lock.
+  - **Evidence:** the S7 test still passes. There is a new test with a
+    snapshot and a syncing host. In a turn-snapshots.sh run
+    (`20261026T155821Z`), the controller logged exactly that note for the
+    moved agent.
 - Hermes's `state.db` merge isn't restored (T1-h).

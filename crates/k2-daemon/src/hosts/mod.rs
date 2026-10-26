@@ -110,6 +110,10 @@ pub fn host_config(get: impl Fn(&str) -> Option<String>) -> Result<HostConfig, S
             labels.push(format!("{label}={n}"));
         }
     }
+    // P3: a host that syncs homes says so (the controller's placementNote).
+    if get(home::WORK_ROOT_VAR).is_some_and(|v| !v.trim().is_empty()) && !labels.iter().any(|l| l.trim() == home::LABEL_HOME_SYNC) {
+        labels.push(home::LABEL_HOME_SYNC.to_string());
+    }
     Ok(HostConfig { attach_url, token, host_name, labels })
 }
 
@@ -290,6 +294,20 @@ mod config_tests {
         assert_eq!(with("2", "k2.kind=laptop").unwrap().labels, vec!["k2.kind=laptop", "k2.max_awake=2"]);
         assert_eq!(with("2", "k2.max_awake=5").unwrap().labels, vec!["k2.max_awake=5"], "an explicit label wins");
         assert_eq!(with("lots", "").unwrap_err(), "K2_HOST_MAX_AWAKE=\"lots\" is not a whole number");
+        // A host that syncs homes (K2_WORK_ROOT) says so in its labels.
+        let syncing = |root: &str, labels: &str| {
+            host_config(getter(&[
+                (CONTROLLER_URL_VAR, "ws://ctl:7420".into()),
+                (ENROLL_TOKEN_FILE_VAR, tok.clone()),
+                (HOST_LABELS_VAR, labels.into()),
+                (home::WORK_ROOT_VAR, root.into()),
+            ]))
+            .unwrap()
+            .labels
+        };
+        assert_eq!(syncing("/var/lib/k2/work", "gpu"), vec!["gpu", home::LABEL_HOME_SYNC]);
+        assert_eq!(syncing("/var/lib/k2/work", home::LABEL_HOME_SYNC), vec![home::LABEL_HOME_SYNC], "once");
+        assert_eq!(syncing(" ", "gpu"), vec!["gpu"], "an empty K2_WORK_ROOT is unset");
         assert_eq!(
             host_config(getter(&[(CONTROLLER_URL_VAR, "http://ctl".into()), (ENROLL_TOKEN_FILE_VAR, tok)])),
             Err("K2_CONTROLLER_URL=\"http://ctl\" must start with ws:// or wss://".into())
