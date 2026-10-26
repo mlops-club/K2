@@ -42,7 +42,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
-use crate::agent_host::remote::RemoteHost;
+use crate::agent_host::remote::{RemoteHost, RemotePlacement};
 use crate::hosts::proto::{trace_events, DeliverStatus, Frame};
 
 pub type Db = Arc<ReentrantMutex<Connection>>;
@@ -157,6 +157,11 @@ pub struct Controller {
 pub struct Direct {
     /// Does this controller know `recipient` as a workspace, sidecar or session?
     pub resolves: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// The ids `recipient` may be placed under, as `K2_ROLE=all` resolves
+    /// it: a workspace name or path gives its project id, its spawn name
+    /// and its saved session ids; a session id gives itself. Each is
+    /// matched against placement ids and placements' session ids.
+    pub aliases: Box<dyn Fn(&str) -> Vec<String> + Send + Sync>,
     /// Deliver a `kind=msg` body to `recipient` now (blocking: it may wake
     /// the agent). `Err` is the reason it wasn't delivered.
     pub deliver: Box<dyn Fn(&str, &str, &Value) -> Result<(), String> + Send + Sync>,
@@ -165,13 +170,18 @@ pub struct Direct {
 impl Direct {
     /// Every recipient goes through the outbox.
     pub fn none() -> Self {
-        Direct { resolves: Box::new(|_| false), deliver: Box::new(|_, _, _| Err("no direct delivery".into())) }
+        Direct {
+            resolves: Box::new(|_| false),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(|_, _, _| Err("no direct delivery".into())),
+        }
     }
 
     /// The daemon's own resolver and cascade (`workspace_msg`).
     pub fn production() -> Self {
         Direct {
             resolves: Box::new(|r| crate::workspace_msg::resolve_msg_target(r).is_some()),
+            aliases: Box::new(crate::workspace_msg::placement_aliases),
             deliver: Box::new(crate::workspace_msg::deliver_for_controller),
         }
     }
@@ -288,8 +298,23 @@ impl Controller {
     /// with no placement that this controller resolves itself.
     pub fn is_direct(&self, recipient: &str, body: &Value) -> bool {
         matches!(body.get("kind").and_then(Value::as_str), Some("msg") | None)
-            && self.remote.placement(recipient).is_none()
+            && self.placed(recipient).is_none()
             && (self.direct.resolves)(recipient)
+    }
+
+    /// Where `recipient` runs: its own placement, else one of its
+    /// [`Direct::aliases`] (a placement id, or a placement's session id).
+    pub fn placed(&self, recipient: &str) -> Option<RemotePlacement> {
+        if let Some(p) = self.remote.placement(recipient) {
+            return Some(p);
+        }
+        let aliases = (self.direct.aliases)(recipient);
+        if aliases.is_empty() {
+            return None;
+        }
+        aliases.iter().find_map(|a| self.remote.placement(a)).or_else(|| {
+            self.remote.placements().into_iter().find(|p| p.session_id.as_ref().is_some_and(|s| aliases.contains(s)))
+        })
     }
 
     /// A `deliver` from a host: answered from `delivery_seen` when this
@@ -392,14 +417,25 @@ impl Controller {
         };
         for r in due {
             // Not placed: wait (no attempt spent) until it is, or the TTL.
-            let Some(p) = self.remote.placement(&r.recipient) else { continue };
+            // The address stays the row's; the host gets the placement id.
+            let Some(p) = self.placed(&r.recipient) else { continue };
             let attempt = r.attempts + 1;
-            match self.remote.send_frame(&p.host_id, deliver_frame(&r, Some(p.epoch.0), attempt)) {
+            let mut frame = deliver_frame(&r, Some(p.epoch.0), attempt);
+            if let Frame::Deliver { agent_id, .. } = &mut frame {
+                agent_id.clone_from(&p.agent_id);
+            }
+            match self.remote.send_frame(&p.host_id, frame) {
                 Ok(()) => {
                     if let Err(e) = outbox::mark_sent(&conn, Hop::Down, &r.msg_id, now, &self.policy) {
                         log_debug!("[delivery] ERROR: mark sent {}: {e}", r.msg_id);
                     }
-                    log_debug!("[delivery] deliver {} to {} on host {} (attempt {attempt})", r.msg_id, r.recipient, p.host_id);
+                    log_debug!(
+                        "[delivery] deliver {} to {} ({}) on host {} (attempt {attempt})",
+                        r.msg_id,
+                        r.recipient,
+                        p.agent_id,
+                        p.host_id
+                    );
                     k2_core::trace::emit(|| {
                         k2_core::trace::Event::new(trace_events::CTL_DELIVER)
                             .msg(r.msg_id.as_str())
