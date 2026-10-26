@@ -17,23 +17,52 @@ fn hardened() -> bool {
     NO_HOOKS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// The `git` command K2 runs (hardened on an agent host, [`set_no_hooks`]).
-pub fn git_command() -> Command {
-    git_cli()
+/// The `git` command K2 runs in `dir` (hardened on an agent host,
+/// [`set_no_hooks`]; refused there when the repository's config names a
+/// hook, [`no_config_hooks`]).
+pub fn git_command_in(dir: &Path) -> Result<Command, String> {
+    git_in(dir)
 }
 
-/// `git worktree add` with `rest`: on an agent host, without checking out
-/// (a checkout runs the repository's filter drivers), then checked out by
-/// libgit2, which runs none.
-fn worktree_add(project_path: &str, rest: &[&str], worktree_path: &str) -> Result<std::process::Output, String> {
-    let mut args = vec!["worktree", "add"];
-    if hardened() {
-        args.push("--no-checkout");
+fn git_in(dir: &Path) -> Result<Command, String> {
+    no_config_hooks(dir)?;
+    let mut c = git_cli();
+    c.current_dir(dir);
+    Ok(c)
+}
+
+/// fs-relay (R6): on an agent host, git run in `dir` must not see any
+/// `hook.*` key in its config. Config-defined hooks (`hook.<name>.command`)
+/// run whatever `core.hooksPath` says, and no `-c` can switch off names it
+/// doesn't know; git 2.39 (the host image) has none, a newer git might.
+/// git's own parser reads the config (includes, `includeIf`) the way the
+/// command would; a config it can't read is refused too.
+fn no_config_hooks(dir: &Path) -> Result<(), String> {
+    if !hardened() {
+        return Ok(());
     }
-    args.extend_from_slice(rest);
-    let output = git_cli()
+    let out = git_cli()
+        .args(["config", "--list", "--name-only"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("read the git config in {}: {e}", dir.display()))?;
+    if !out.status.success() {
+        return Err(format!("read the git config in {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let names = String::from_utf8_lossy(&out.stdout);
+    if let Some(k) = names.lines().find(|k| k.trim().to_ascii_lowercase().starts_with("hook.")) {
+        return Err(format!("the git config in {} names a hook ({k}); K2 doesn't run git there", dir.display()));
+    }
+    Ok(())
+}
+
+/// `git worktree add [-b <new_branch>] -- <worktree_path> <commitish>`: on
+/// an agent host, without checking out (a checkout runs the repository's
+/// filter drivers), then checked out by libgit2, which runs none.
+fn worktree_add(project_path: &str, new_branch: Option<&str>, worktree_path: &str, commitish: &str) -> Result<std::process::Output, String> {
+    let args = worktree_add_args(hardened(), new_branch, worktree_path, commitish);
+    let output = git_in(Path::new(project_path))?
         .args(&args)
-        .current_dir(project_path)
         .output()
         .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
     if output.status.success() && hardened() {
@@ -43,6 +72,20 @@ fn worktree_add(project_path: &str, rest: &[&str], worktree_path: &str) -> Resul
         repo.checkout_head(Some(&mut co)).map_err(|e| format!("check out the new worktree: {e}"))?;
     }
     Ok(output)
+}
+
+/// `worktree add`'s arguments: options, then `--`, then the path and the
+/// commit (never read as options, whatever they start with).
+fn worktree_add_args<'a>(no_checkout: bool, new_branch: Option<&'a str>, worktree_path: &'a str, commitish: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["worktree", "add"];
+    if no_checkout {
+        args.push("--no-checkout");
+    }
+    if let Some(b) = new_branch {
+        args.extend_from_slice(&["-b", b]);
+    }
+    args.extend_from_slice(&["--", worktree_path, commitish]);
+    args
 }
 
 /// fs-relay (N7): the repository K2's git code opens for `path` (as
@@ -290,11 +333,8 @@ pub fn list_branches(path: &str) -> BranchList {
 
 pub fn list_worktrees(path: &str) -> Vec<WorktreeInfo> {
     // Use git CLI for worktree list since git2 worktree support is limited
-    let output = match git_cli()
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(path)
-        .output()
-    {
+    let Ok(mut git) = git_in(Path::new(path)) else { return Vec::new() };
+    let output = match git.args(["worktree", "list", "--porcelain"]).output() {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -352,11 +392,38 @@ pub fn list_worktrees(path: &str) -> Vec<WorktreeInfo> {
 
 // ── Create Worktree ───────────────────────────────────────────────────────
 
+/// Where a worktree for `branch_name` goes: `<project>/.worktrees` and the
+/// branch's folder in it (`/` as `-`). The branch is a valid branch name
+/// and its folder one plain name. On an agent host (fs-relay R6) neither
+/// `.worktrees`, the branch's folder nor `.gitignore` may be a symlink: K2
+/// creates, appends to and checks out into them.
+pub fn worktree_place(project_path: &str, branch_name: &str) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    if !git2::Branch::name_is_valid(branch_name).unwrap_or(false) {
+        return Err(format!("Invalid branch name: {branch_name}"));
+    }
+    let safe_branch = branch_name.replace('/', "-");
+    let mut parts = Path::new(&safe_branch).components();
+    if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
+        return Err(format!("Invalid branch name: {branch_name}"));
+    }
+    let project = Path::new(project_path);
+    let worktrees_dir = project.join(".worktrees");
+    let worktree_path = worktrees_dir.join(&safe_branch);
+    if hardened() {
+        for p in [&worktrees_dir, &worktree_path, &project.join(".gitignore")] {
+            if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Err(format!("{} is a symlink; K2 doesn't follow it here", p.display()));
+            }
+        }
+    }
+    Ok((worktrees_dir, worktree_path))
+}
+
 pub fn create_worktree(
     project_path: &str,
     branch_name: &str,
 ) -> Result<WorktreeCreateResult, String> {
-    let worktrees_dir = Path::new(project_path).join(".worktrees");
+    let (worktrees_dir, worktree_path) = worktree_place(project_path, branch_name)?;
 
     // Create worktrees directory if needed
     if !worktrees_dir.exists() {
@@ -377,9 +444,15 @@ pub fn create_worktree(
 
     if needs_gitignore_update {
         use std::fs::OpenOptions;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        if hardened() {
+            // R6: never through a link swapped in since `worktree_place`.
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts
             .open(&gitignore_path)
             .map_err(|e| format!("Failed to update .gitignore: {}", e))?;
         // Add newline before entry if file doesn't end with one
@@ -395,12 +468,10 @@ pub fn create_worktree(
             .map_err(|e| format!("Failed to write .gitignore: {}", e))?;
     }
 
-    let safe_branch = branch_name.replace('/', "-");
-    let worktree_path = worktrees_dir.join(&safe_branch);
     let wt_path_str = worktree_path.to_string_lossy().to_string();
 
     // Always create a new branch from HEAD
-    let output = worktree_add(project_path, &["-b", branch_name, &wt_path_str, "HEAD"], &wt_path_str)?;
+    let output = worktree_add(project_path, Some(branch_name), &wt_path_str, "HEAD")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -425,7 +496,7 @@ pub fn checkout_worktree(
     project_path: &str,
     branch_name: &str,
 ) -> Result<WorktreeCreateResult, String> {
-    let worktrees_dir = Path::new(project_path).join(".worktrees");
+    let (worktrees_dir, worktree_path) = worktree_place(project_path, branch_name)?;
 
     // Create worktrees directory if needed
     if !worktrees_dir.exists() {
@@ -446,9 +517,15 @@ pub fn checkout_worktree(
 
     if needs_gitignore_update {
         use std::fs::OpenOptions;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        if hardened() {
+            // R6: never through a link swapped in since `worktree_place`.
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts
             .open(&gitignore_path)
             .map_err(|e| format!("Failed to update .gitignore: {}", e))?;
         if gitignore_path.exists() {
@@ -463,12 +540,10 @@ pub fn checkout_worktree(
             .map_err(|e| format!("Failed to write .gitignore: {}", e))?;
     }
 
-    let safe_branch = branch_name.replace('/', "-");
-    let worktree_path = worktrees_dir.join(&safe_branch);
     let wt_path_str = worktree_path.to_string_lossy().to_string();
 
     // Checkout existing branch (no -b flag)
-    let output = worktree_add(project_path, &[&wt_path_str, branch_name], &wt_path_str)?;
+    let output = worktree_add(project_path, None, &wt_path_str, branch_name)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -503,10 +578,9 @@ pub fn remove_worktree(
 
         if std::fs::rename(wt, &temp_path).is_ok() {
             // Prune git metadata (detach the worktree ref)
-            let _ = git_cli()
-                .args(["worktree", "prune"])
-                .current_dir(project_path)
-                .output();
+            if let Ok(mut git) = git_in(Path::new(project_path)) {
+                let _ = git.args(["worktree", "prune"]).output();
+            }
 
             // Move to Trash in background thread (recoverable).
             // 0.37.6: route through the centralized safe_delete
@@ -540,10 +614,9 @@ pub fn remove_worktree(
     // we surface the error and STOP — better to leave the worktree
     // in place and let the user investigate than to permanently
     // destroy their work.
-    let _ = git_cli()
-        .args(["worktree", "prune"])
-        .current_dir(project_path)
-        .output();
+    if let Ok(mut git) = git_in(Path::new(project_path)) {
+        let _ = git.args(["worktree", "prune"]).output();
+    }
     if Path::new(worktree_path).exists() {
         crate::safe_delete::trash(worktree_path).map_err(|e| {
             format!(
@@ -1275,9 +1348,9 @@ pub fn gather_git_context(project_path: &str) -> serde_json::Value {
     use std::io::Read;
 
     let run = |args: &[&str]| -> String {
-        let mut child = match git_cli()
+        let Ok(mut git) = git_in(Path::new(project_path)) else { return String::new() };
+        let mut child = match git
             .args(args)
-            .current_dir(project_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1322,4 +1395,29 @@ pub fn gather_git_context(project_path: &str) -> serde_json::Value {
         "stagedStat": run(&["diff", "--cached", "--stat"]),
         "recentLog": run(&["log", "--oneline", "-5"]),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fs-relay R6: `--` before the path and the commit, after every option.
+    #[test]
+    fn worktree_add_puts_dash_dash_before_its_paths() {
+        assert_eq!(
+            worktree_add_args(true, Some("b"), "/w/.worktrees/b", "HEAD"),
+            ["worktree", "add", "--no-checkout", "-b", "b", "--", "/w/.worktrees/b", "HEAD"]
+        );
+        assert_eq!(worktree_add_args(false, None, "-p", "-x"), ["worktree", "add", "--", "-p", "-x"]);
+    }
+
+    /// A branch's folder is one plain name under `.worktrees`.
+    #[test]
+    fn a_worktree_branch_is_a_valid_name_and_one_folder() {
+        let (dir, wt) = worktree_place("/w", "feature/x").unwrap();
+        assert_eq!((dir, wt), (Path::new("/w/.worktrees").to_path_buf(), Path::new("/w/.worktrees/feature-x").to_path_buf()));
+        for bad in ["..", "-b", "a..b", "", "a b", "x/../..", "HEAD"] {
+            assert!(worktree_place("/w", bad).is_err(), "{bad}");
+        }
+    }
 }

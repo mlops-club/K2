@@ -706,6 +706,9 @@ pub struct RemoteHost {
     saves: Mutex<HashMap<String, PendingSave>>,
     /// The store's newest snapshot of an agent (`hosts::home::latest`).
     home_latest: Box<dyn Fn(&str) -> Option<k2_core::agent_home::Latest> + Send + Sync>,
+    /// fs-relay is on (`K2_FS_RELAY=1` on the controller; R6: off by
+    /// default, and off is the controller as it was without it).
+    fs_relay: bool,
     /// fs-relay: this controller's work root (`K2_WORK_ROOT`), as given and
     /// canonical: the only paths it relays are under it.
     work_roots: Vec<PathBuf>,
@@ -780,6 +783,7 @@ impl RemoteHost {
             link_grace: LINK_GRACE,
             saves: Mutex::default(),
             home_latest: Box::new(crate::hosts::home::latest),
+            fs_relay: std::env::var(crate::hosts::fs_relay::FS_RELAY_VAR).is_ok_and(|v| v.trim() == "1"),
             work_roots: crate::hosts::fs_relay::controller_roots(),
             host_roots: HostRoots::from_env(|k| std::env::var(k).ok()),
             relay_spaces: Mutex::default(),
@@ -801,6 +805,11 @@ impl RemoteHost {
     /// production reads `K2_WORK_ROOT` and `K2_HOST_WORK_ROOT(S)`).
     pub fn with_relay_roots(self, work_roots: Vec<PathBuf>, host_roots: HostRoots) -> Self {
         Self { work_roots, host_roots, ..self }
+    }
+
+    /// fs-relay on or off, whatever `K2_FS_RELAY` says (tests).
+    pub fn with_fs_relay(self, fs_relay: bool) -> Self {
+        Self { fs_relay, ..self }
     }
 
     /// fs-relay: how long a workspace stays bound without a spawn (tests).
@@ -1873,6 +1882,9 @@ impl RemoteHost {
     /// host: `cwd` as this controller asked for it (strictly under its work
     /// root), on a host on its own disk. Called at each spawn.
     fn note_relay_space(&self, host_id: &str, agent_id: &str, cwd: &Path) {
+        if !self.fs_relay {
+            return;
+        }
         let own_disk = self.inner.lock().host_labels.get(host_id).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some());
         if !own_disk {
             return;
@@ -1922,6 +1934,11 @@ impl RemoteHost {
                 }
             }
         }
+    }
+
+    /// fs-relay: is it on (`K2_FS_RELAY=1`)?
+    pub fn fs_relay_on(&self) -> bool {
+        self.fs_relay
     }
 
     /// fs-relay: is any host that linked on its own disk (`k2.work_root`)?

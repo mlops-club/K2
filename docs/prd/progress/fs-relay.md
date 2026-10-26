@@ -219,6 +219,88 @@ attack refused). N7 was partial:
 | R5-1 relative paths (high) | **Coordinator's decision.** The host refuses any relative value under a path key, except a route's repo-relative keys that its handler joins to an absolute base (`file_path`, `old_path`, `files` against `path` on the git routes; resolve-links' `paths` against `workspace`), which are confined as `base.join(v)`; a name (`new_name`, `filename`) is one plain component. The controller refuses to relay a request with any other relative path-key value (400 `relative_path`): only absolute paths go to a host. With no relative repository path left, `git_precheck` checks the exact repositories the handler opens | `r5_a_relative_path_beside_an_absolute_key_is_refused_read_and_write` (controller and host, read and write; a repo-relative stage passes), `r5_a_relative_nested_repo_is_refused` |
 | R5-2 the repository's own commands in create-worktree | One hardened `git` on an agent host (`k2_core::git::git_command`, every K2 git CLI call): every inherited `GIT_*` removed, `GIT_CONFIG_NOSYSTEM=1`, `-c core.hooksPath=/dev/null -c core.fsmonitor=false`; `worktree add --no-checkout`, then a libgit2 checkout (libgit2 runs no external filter drivers); prune-worktrees through it too | `r5_create_worktree_runs_no_smudge_filter_or_fsmonitor` (with a control: unhardened, git does run the filter) |
 
+## Round 6 review of 48fbab1ab: the structural fix
+
+Round 6 found R6-1 (medium): create-worktree's `.worktrees/<branch>` and
+`.gitignore` are paths the handler derives, and the host never confined
+them. The coordinator decided on a structural fix instead of another
+patch:
+
+- **One schema per relayed route** (`hosts/fs_relay_schema.rs`, `SCHEMAS`).
+  It lists every key the route's handler reads and what each key is: an
+  absolute path, a path relative to a base key, a file name, resolve-links'
+  candidates, or not a path. It also lists the paths the handler derives:
+  the repository each git path opens, the worktree's folders and
+  `.gitignore`, `<path>/.git`, an upload's collision-free file and a chunk's
+  `.part`, and a copy's target plus every file under its sources (a link
+  inside a copied folder would copy what it points at).
+  - The host refuses any key the schema doesn't declare, and any key given
+    twice (403 `undeclared_key`).
+  - It confines every path and derived path to the work root (403
+    `outside_work_root`).
+  - It rebuilds the request its daemon gets from the confined values alone.
+    A folder link is resolved, in the request's own spelling of the root,
+    so the controller still maps answers back. The last name is kept as
+    given, so a delete removes a link, not its target.
+  - The controller refuses an undeclared key before relaying (400
+    `undeclared_key`).
+- **Repo-relative paths join the repository's work tree.** That is the base
+  `git::stage_file` and `diff_file` join them to, not the request's `path`,
+  which may be a sub-folder of the repository.
+- **The handler scan.** A test reads each relayed handler's source: its
+  `params.get`, `str_param`/`flag_param`, the struct it parses its body into
+  (serde renames applied), and any helper it hands `params` to. It fails if
+  a handler reads a key its schema doesn't declare, or uses `params` or
+  `body` in a way the scan can't read. It also checks that each handler is
+  the one the dispatch runs for its route.
+- **Off by default.** fs-relay runs only when the controller has
+  `K2_FS_RELAY=1`. Off, the gate and the POST arms hand every request back
+  untouched, and no workspace is bound to a host: the controller behaves
+  as it did without fs-relay.
+  - A host keeps its git hardening and its `k2.work_root` label either way.
+    The hardening only narrows what K2's own git does on a host, and the
+    label is inert while the controller is off.
+- **Named items:**
+  - `.worktrees`, the branch's folder and `.gitignore` must not be symlinks
+    on a host: the schema checks this, and so does `git::worktree_place`.
+    `.gitignore` is opened with `O_NOFOLLOW` there.
+  - The branch must be a valid branch name, and its folder one plain name.
+  - Every git CLI call that takes a path puts `--` before it. That is
+    `worktree add`; `worktree list`, `worktree prune` and `config` run in
+    the folder and take no path.
+  - Config-defined hooks: the host image's git is 2.39.5 (Debian bookworm),
+    which has none. git 2.50 (macOS) doesn't run them either, by test.
+    `core.hooksPath=/dev/null` covers the hooks directory. A newer git's
+    `hook.<name>.command` runs whatever `hooksPath` says, and no `-c` can
+    switch off hook names it doesn't know. So on a host, K2's git first
+    reads the config with git's own parser (`git config --list
+    --name-only`, includes and `includeIf` resolved as the command would
+    see them), and refuses any `hook.*` key or a config it can't read
+    (`git::git_command_in`).
+- **Not closed:** confinement is a check before the handler runs. A link an
+  agent swaps in between that check and the handler's open is still
+  possible (a race), except at `.gitignore`. Later Linux hardening: open
+  through `openat2` with `RESOLVE_BENEATH` (or `RESOLVE_IN_ROOT`) from the
+  work root, so the kernel enforces the confinement at the open itself.
+- **Test changes:**
+  - `h1_…` now expects `undeclared_key` (still a 403) for a path under an
+    unknown key.
+  - `r5_…` stages with `filePath`, the key the stage handler reads. The
+    old request's `file_path` was never read: the schema caught it.
+
+| Item | Test |
+|---|---|
+| Off by default; off, nothing bound, gate and arms hand back | `r6_off_by_default_the_controller_serves_every_route_itself` |
+| One schema per route; its paths are the mapped keys; relative keys join a path of the same route | `r6_every_relayed_route_has_one_schema` |
+| A handler reads only declared keys (source scan, non-vacuous; a mutation removing `show_hidden` fails it) | `r6_a_relayed_handler_reads_only_its_schemas_keys` |
+| Undeclared or repeated keys refused (host and controller) | `r6_an_undeclared_or_repeated_key_is_refused` |
+| The daemon gets confined values | `r6_the_daemon_gets_the_confined_values` |
+| R6-1: `.worktrees`, branch folder, `.gitignore` links refused; invalid branches | `r6_create_worktree_refuses_a_symlinked_worktrees_dir_branch_folder_or_gitignore` (with a control) |
+| Config hooks | `r6_k2s_git_refuses_a_repository_whose_config_names_a_hook` (with a control) |
+| `--` before paths | `git::tests::worktree_add_puts_dash_dash_before_its_paths`, `a_worktree_branch_is_a_valid_name_and_one_folder` |
+| `file_path` joins the repository's work tree | `r6_a_repo_relative_path_joins_the_work_tree_the_handler_joins` |
+| An upload's files, a copy's tree | `r6_an_uploads_files_and_a_copys_tree_are_confined` (with controls) |
+
 ## Checks
 
 | Check | Result |
@@ -226,12 +308,12 @@ attack refused). N7 was partial:
 | Unit: route set, path mapping by whole components, query/JSON/form paths, the label | `hosts::fs_relay::tests` 2 tests, `hosts::config_tests` (the label) |
 | Unit: which host (placed, the controller's or the host's name, siblings, no path, two hosts → split, host gone → away, shared-volume host → local) | `a_path_goes_to_the_host_its_agents_workspace_is_on` |
 | In process: the controller's relay → a fake host link → a real host daemon: read-dir, read-file (paths mapped back), a bad token refused before relaying, a path no host holds stays local, write-file, git changes, stage-all, commit, diff-file | `the_file_browser_and_git_panel_through_the_controller_see_the_hosts_disk` |
-| Two processes, separate work roots (`scripts/lab/topology/fs-relay.sh`) | **7/7 PASS** (`lab-runs/fs-relay/20261026T143509Z`) |
+| Two processes, separate work roots (`scripts/lab/topology/fs-relay.sh`) | **7/7 PASS** (`lab-runs/fs-relay/20261026T143509Z`); round 6, with `K2_FS_RELAY=1`: **PASS** (`lab-runs/fs-relay/20261026T233729Z`) |
 
 ## How to try it
 
 ```sh
-scripts/lab/topology/fs-relay.sh            # builds k2-daemon and the fake agent, then 7 checks
+scripts/lab/topology/fs-relay.sh            # builds k2-daemon and the fake agent, then 7 checks (sets K2_FS_RELAY=1)
 cargo test -p k2-daemon --lib fs_relay      # the unit and in-process tests
 ```
 

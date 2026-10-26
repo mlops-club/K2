@@ -131,7 +131,7 @@ async fn controller_at(ctl: &[&str], per_host: &[(&str, &Path)]) -> (&'static Re
         default: pb(crate::agent_host::remote::DEFAULT_HOST_WORK_ROOT),
         per_host: per_host.iter().map(|(h, r)| (h.to_string(), r.to_path_buf())).collect(),
     };
-    let remote = RemoteHost::new().with_relay_roots(ctl.iter().map(|c| pb(c)).collect(), roots);
+    let remote = RemoteHost::new().with_fs_relay(true).with_relay_roots(ctl.iter().map(|c| pb(c)).collect(), roots);
     serve_controller(Box::leak(Box::new(remote))).await
 }
 
@@ -408,8 +408,10 @@ async fn h1_the_host_confines_every_path_traversal_a_second_path_and_a_symlink_e
     // A second path (a copy's destination), and a path under a key the relay doesn't know.
     let copy = json!({"sources": [d.ws.join("a")], "destination": outside.join("x")});
     assert!(refused(served("POST", "/cli/fs/copy", "", Some(copy)).await));
+    // R6: a key the route's schema doesn't declare is refused as such.
     let odd_key = json!({"path": d.ws.join("a"), "target_dir": outside});
-    assert!(refused(served("POST", "/cli/fs/create", "", Some(odd_key)).await));
+    let (st, v) = served("POST", "/cli/fs/create", "", Some(odd_key)).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("undeclared_key")));
     // A name inside a path.
     let q = format!("{}&file_path={}", e(&d.ws), encode("../../secret/id_ed25519"));
     assert!(refused(served("GET", "/cli/git/diff-file", &q, None).await));
@@ -676,7 +678,7 @@ async fn n1_dot_dot_after_a_symlink_is_the_links_parent_read_and_write_refused()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n3_a_binding_lives_while_its_agent_is_placed() {
     let roots = crate::agent_host::remote::HostRoots { default: pb("/h/work"), per_host: Default::default() };
-    let remote = RemoteHost::new().with_relay_roots(vec![pb("/ctl/work")], roots).with_relay_ttl(Duration::ZERO);
+    let remote = RemoteHost::new().with_fs_relay(true).with_relay_roots(vec![pb("/ctl/work")], roots).with_relay_ttl(Duration::ZERO);
     let (remote, url) = serve_controller(Box::leak(Box::new(remote))).await;
     let mut h = host(&url, "h", &["k2.work_root=/h/work"]).await;
     place(remote, &mut h, "notes", "/ctl/work/notes").await;
@@ -899,8 +901,9 @@ async fn r5_a_relative_path_beside_an_absolute_key_is_refused_read_and_write() {
     assert!(refused(served("GET", "/cli/fs/read-file", &q, None).await), "read");
     let w = json!({"path": ".k2/evil", "dir": d.ws, "content": "x"});
     assert!(refused(served("POST", "/cli/fs/write-file", "", Some(w)).await), "write");
-    // A repo-relative name on a git route is fine, against its absolute path.
-    let ok = json!({"path": d.ws, "file_path": "a.md"});
+    // A repo-relative name on a git route is fine, against its absolute path
+    // (R6: stage's key is `filePath`, as its handler reads it).
+    let ok = json!({"path": d.ws, "filePath": "a.md"});
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     set_local_daemon(closed, "unused");
     k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
@@ -960,4 +963,480 @@ fn r5_create_worktree_runs_no_smudge_filter_or_fsmonitor() {
     assert!(smudged.exists(), "unhardened, git runs the repository's filter");
     drop(_serial);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── round 6 ────────────────────────────────────────────────────────────
+
+/// R6: fs-relay is off unless the controller has `K2_FS_RELAY=1`. Off, a
+/// host on its own disk binds nothing and every route is the controller's
+/// own: the gate and the POST arms hand the request back untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_off_by_default_the_controller_serves_every_route_itself() {
+    {
+        let _unset = k2_core::test_env::EnvVar::remove(FS_RELAY_VAR);
+        assert!(!RemoteHost::new().fs_relay_on(), "unset: off");
+    }
+    for (v, on) in [("1", true), ("0", false), ("true", false), ("", false)] {
+        let _set = k2_core::test_env::EnvVar::set(FS_RELAY_VAR, v);
+        assert_eq!(RemoteHost::new().fs_relay_on(), on, "K2_FS_RELAY={v}");
+    }
+    let roots = crate::agent_host::remote::HostRoots { default: pb("/h1/work"), per_host: Default::default() };
+    let remote = RemoteHost::new().with_fs_relay(false).with_relay_roots(vec![pb("/ctl/work")], roots);
+    let (remote, url) = serve_controller(Box::leak(Box::new(remote))).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    place(remote, &mut h1, "notes", "/ctl/work/notes").await;
+    assert_eq!(remote.workspace_route(&strs(&["/ctl/work/notes/a.md"])), WorkspaceRoute::Local, "nothing bound");
+    let body = json!({"path": "/ctl/work/notes/a.md", "content": "x"}).to_string();
+    assert_eq!(relay_post_on(remote, "/cli/fs/write-file", "token=ctl-owner", "ctl-owner", body.as_bytes()).await, None);
+    let refused = json!({"path": "/ctl/work/notes/../../x", "content": "x"}).to_string();
+    assert_eq!(relay_post_on(remote, "/cli/fs/write-file", "token=ctl-owner", "ctl-owner", refused.as_bytes()).await, None, "not even refused");
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (mut s, _client) = tokio::join!(async { l.accept().await.unwrap().0 }, TcpStream::connect(addr));
+    let mut buf = vec![0u8; 1024];
+    let q = format!("token=ctl-owner&path={}", encode("/ctl/work/notes/a.md"));
+    assert!(!route_on(remote, &mut s, &mut buf, "GET", "/cli/fs/read-file", &q, "ctl-owner").await, "the gate hands it back");
+    drop(h1);
+}
+
+/// R6: every relayed route has exactly one schema; its path keys are the
+/// ones the controller maps and routes, and every relative key joins a path
+/// key of the same route.
+#[test]
+fn r6_every_relayed_route_has_one_schema() {
+    use schema::Kind;
+    for (i, s) in schema::SCHEMAS.iter().enumerate() {
+        assert!(
+            !schema::SCHEMAS[..i].iter().any(|t| t.route == s.route),
+            "{} has one schema (and one method)",
+            s.route
+        );
+        assert!(relayed(s.method, s.route));
+        for (k, kind) in s.keys {
+            match kind {
+                Kind::Abs | Kind::Candidates => assert!(PATH_KEYS.contains(k), "{} {k}: a path key the controller maps", s.route),
+                Kind::RepoRel(base) | Kind::NameIn(base) | Kind::NameBeside(base) => {
+                    assert_eq!(s.kind(base), Some(Kind::Abs), "{} {k} joins {base}, one of its paths", s.route)
+                }
+                Kind::Plain => assert!(!PATH_KEYS.contains(k) || *k == "base", "{} {k}: not a path key", s.route),
+            }
+        }
+    }
+}
+
+/// The body of `fn name(` in `src`: from its first `{` to the matching `}`.
+fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let at = [format!("pub fn {name}("), format!("fn {name}(")]
+        .iter()
+        .find_map(|sig| src.find(sig.as_str()))
+        .unwrap_or_else(|| panic!("no fn {name}"));
+    let open = at + src[at..].find('{').unwrap();
+    let mut depth = 0;
+    for (i, c) in src[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[at..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced fn {name}")
+}
+
+/// Every `"…"` right after `pat` in `body`.
+fn quoted_after(body: &str, pat: &str) -> Vec<String> {
+    body.match_indices(pat).filter_map(|(i, _)| body[i + pat.len()..].split('"').next().map(str::to_string)).collect()
+}
+
+fn camel(s: &str) -> String {
+    let mut out = String::new();
+    let mut up = false;
+    for c in s.chars() {
+        if c == '_' {
+            up = true;
+        } else if up {
+            out.extend(c.to_uppercase());
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The JSON keys `struct name` deserializes (its serde renames applied).
+fn struct_keys(src: &str, name: &str) -> Vec<String> {
+    let at = src.find(&format!("struct {name} {{")).unwrap_or_else(|| panic!("no struct {name}"));
+    let attrs = &src[src[..at].rfind("\n\n").unwrap_or(0)..at];
+    let camel_case = attrs.contains("rename_all = \"camelCase\"");
+    let body = &src[at..at + src[at..].find("\n}").unwrap()];
+    let mut keys = Vec::new();
+    let mut rename = None;
+    for line in body.lines().skip(1) {
+        let l = line.trim();
+        if l.starts_with("#[serde(") && l.contains("rename = \"") {
+            rename = quoted_after(l, "rename = \"").into_iter().next();
+        } else if let Some((f, _)) = l.strip_prefix("pub ").unwrap_or(l).split_once(':').filter(|_| !l.starts_with("//") && !l.starts_with('#')) {
+            let f = f.trim();
+            keys.push(rename.take().unwrap_or_else(|| if camel_case { camel(f) } else { f.to_string() }));
+        }
+    }
+    keys
+}
+
+/// The request keys `handler` (in `src`) reads: through `params.get`,
+/// `str_param`/`flag_param`, the struct it parses its body into, and any
+/// fn of the same file it hands `params` to. A use of `params` or `body`
+/// the scan can't read fails it.
+fn handler_keys(src: &str, handler: &str) -> Vec<String> {
+    let body = fn_body(src, handler);
+    let inner = &body[body.find('{').unwrap()..];
+    let mut keys = Vec::new();
+    for pat in ["params.get(\"", "str_param(params, \"", "flag_param(params, \""] {
+        keys.extend(quoted_after(inner, pat));
+    }
+    let mut understood = 0;
+    for pat in ["params.get(\"", "str_param(params, \"", "flag_param(params, \""] {
+        understood += inner.matches(pat).count();
+    }
+    // `params` handed whole to another fn of this file.
+    for (i, _) in inner.match_indices("params)") {
+        let call = &inner[..i];
+        let name_end = call.rfind('(').unwrap();
+        let name = call[..name_end].rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap();
+        if name.starts_with("handle_") {
+            keys.extend(handler_keys(src, name));
+            understood += 1;
+        }
+    }
+    let used = inner.match_indices("params").filter(|(i, _)| !inner[i + 6..].starts_with(':')).count();
+    assert_eq!(used, understood, "{handler}: every use of params is one the scan reads");
+    // The body: parsed into a struct, never read any other way.
+    for (i, _) in inner.match_indices(" = match ") {
+        let line_start = inner[..i].rfind('\n').unwrap_or(0);
+        let decl = &inner[line_start..i];
+        if let Some((_, ty)) = decl.split_once(": ") {
+            let rest = &inner[i..i + 60.min(inner.len() - i)];
+            if rest.contains("from_slice(body)") || rest.contains("parse_body(body)") {
+                keys.extend(struct_keys(src, ty.trim()));
+            }
+        }
+    }
+    let body_uses = inner
+        .match_indices("body")
+        .filter(|(i, _)| {
+            let before = inner[..*i].chars().last().unwrap_or(' ');
+            let after = &inner[i + 4..];
+            !(before.is_alphanumeric() || before == '_' || after.starts_with(|c: char| c.is_alphanumeric() || c == '_') || after.starts_with(':'))
+        })
+        .count();
+    let parsed = inner.matches("from_slice(body)").count() + inner.matches("parse_body(body)").count();
+    assert_eq!(body_uses, parsed, "{handler}: the body is only parsed into its struct");
+    keys
+}
+
+/// The match arm the text at `at` is in: its line and the lines under it
+/// (indented deeper, or a `||`/`&&` of its pattern).
+fn match_arm(src: &str, at: usize) -> String {
+    let start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let mut lines = src[start..].lines();
+    let first = lines.next().unwrap_or("");
+    let base = indent(first);
+    let mut arm = vec![first];
+    for l in lines {
+        let t = l.trim_start();
+        if !t.is_empty() && indent(l) <= base && !t.starts_with("||") && !t.starts_with("&&") {
+            break;
+        }
+        arm.push(l);
+    }
+    arm.join("\n")
+}
+
+/// R6: the handler each relayed route runs on a host reads only the keys
+/// its schema declares (a source scan: a new key a handler reads fails
+/// here until the schema declares and confines it). Each handler is the
+/// one the daemon's dispatch runs for its route.
+#[test]
+fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
+    let fs = include_str!("../fs_routes.rs");
+    let git = include_str!("../git_routes.rs");
+    let dispatch = [include_str!("../routes/dispatcher.rs"), include_str!("../misc_routes.rs"), git];
+    let handlers: &[(&str, &str, &str)] = &[
+        ("/cli/fs/info", "fs", "handle_info"),
+        ("/cli/fs/read-dir", "fs", "handle_read_dir"),
+        ("/cli/fs/read-file", "fs", "handle_read_file"),
+        ("/cli/fs/read-binary", "fs", "handle_read_binary"),
+        ("/cli/fs/read-range", "fs", "handle_read_range"),
+        ("/cli/fs/stat", "fs", "handle_stat"),
+        ("/cli/fs/zip-list", "fs", "handle_zip_list"),
+        ("/cli/fs/create", "fs", "handle_create"),
+        ("/cli/fs/delete", "fs", "handle_delete"),
+        ("/cli/fs/move", "fs", "handle_move"),
+        ("/cli/fs/rename", "fs", "handle_rename"),
+        ("/cli/fs/copy", "fs", "handle_copy"),
+        ("/cli/fs/duplicate", "fs", "handle_duplicate"),
+        ("/cli/fs/write-file", "fs", "handle_write_file"),
+        ("/cli/fs/upload-binary", "fs", "handle_upload_binary"),
+        ("/cli/fs/upload-chunk", "fs", "handle_upload_chunk"),
+        ("/cli/fs/search-tree", "fs", "handle_search_tree"),
+        ("/cli/fs/resolve-links", "fs", "handle_resolve_links"),
+        ("/cli/git/branches", "git", "handle_git_branches"),
+        ("/cli/git/changes", "git", "handle_git_changes"),
+        ("/cli/git/diff-between", "git", "handle_git_diff_between_branches"),
+        ("/cli/git/diff-file", "git", "handle_git_diff_file"),
+        ("/cli/git/diff-summary", "git", "handle_git_diff_summary"),
+        ("/cli/git/file-at-ref", "git", "handle_git_file_at_ref"),
+        ("/cli/git/info", "git", "handle_git_info"),
+        ("/cli/git/merge-status", "git", "handle_git_merge_status"),
+        ("/cli/git/snapshot", "git", "handle_git_snapshot"),
+        ("/cli/git/worktrees", "git", "handle_git_worktrees"),
+        ("/cli/git/abort-merge", "git", "handle_git_abort_merge"),
+        ("/cli/git/commit", "git", "handle_git_commit"),
+        ("/cli/git/create-worktree", "git", "handle_git_create_worktree"),
+        ("/cli/git/delete-branch", "git", "handle_git_delete_branch"),
+        ("/cli/git/discard", "git", "handle_git_discard"),
+        ("/cli/git/init", "git", "handle_git_init"),
+        ("/cli/git/merge-branch", "git", "handle_git_merge_branch"),
+        ("/cli/git/prune-worktrees", "git", "handle_git_prune_worktrees"),
+        ("/cli/git/remove-worktree", "git", "handle_git_remove_worktree"),
+        ("/cli/git/reopen-worktree", "git", "handle_git_reopen_worktree"),
+        ("/cli/git/resolve", "git", "handle_git_resolve_conflict"),
+        ("/cli/git/stage", "git", "handle_git_stage"),
+        ("/cli/git/stage-all", "git", "handle_git_stage_all"),
+        ("/cli/git/unstage", "git", "handle_git_unstage"),
+    ];
+    for s in schema::SCHEMAS {
+        assert!(handlers.iter().any(|(r, _, _)| *r == s.route), "{}: its handler is scanned", s.route);
+    }
+    // The scan reads what the handlers read (it isn't vacuous): query keys,
+    // a helper's, a struct's (camelCase), a defaulted field.
+    let has = |src: &str, h: &str, keys: &[&str]| {
+        let got = handler_keys(src, h);
+        assert!(keys.iter().all(|k| got.iter().any(|g| g == k)), "{h}: {got:?} has {keys:?}");
+    };
+    has(fs, "handle_read_range", &["path", "offset", "len"]);
+    has(git, "handle_git_diff_file", &["path", "file_path", "sides", "mode", "staged", "base", "old_path"]);
+    has(git, "handle_git_create_worktree", &["projectPath", "branch", "projectId", "existingBranch"]);
+    has(git, "handle_git_discard", &["path", "files", "includeStaged"]);
+    has(fs, "handle_upload_chunk", &["upload_id", "dir", "filename", "offset", "base64", "is_last", "total_bytes"]);
+    for (route, file, handler) in handlers {
+        let s = schema::SCHEMAS.iter().find(|s| s.route == *route).unwrap_or_else(|| panic!("{route} has a schema"));
+        let src = if *file == "fs" { fs } else { git };
+        // The daemon dispatches the route to this handler (or to its
+        // `_gated` form, whose owner branch is this handler).
+        let gated = format!("{handler}_gated(");
+        let dispatched = dispatch.iter().any(|d| {
+            d.match_indices(&format!("\"{route}\"")).any(|(i, _)| {
+                let arm = match_arm(d, i);
+                arm.contains(&format!("{handler}(")) || arm.contains(&gated)
+            })
+        });
+        assert!(dispatched, "{route} is dispatched to {handler}");
+        if dispatch.iter().any(|d| d.contains(&gated)) {
+            assert!(fn_body(src, &format!("{handler}_gated")).contains(&format!("None => {handler}(")), "{handler}_gated runs {handler} for the owner");
+        }
+        for k in handler_keys(src, handler) {
+            assert!(s.kind(&k).is_some(), "{route}: {handler} reads {k}, which its schema doesn't declare");
+        }
+    }
+}
+
+/// R6: the host refuses a key the route's schema doesn't declare, or one
+/// given twice; so does the controller, before relaying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_an_undeclared_or_repeated_key_is_refused() {
+    let d = host_disk();
+    std::fs::write(d.ws.join("a.md"), "a").unwrap();
+    let undeclared = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "undeclared_key";
+    let p = encode(&d.ws.join("a.md").to_string_lossy());
+    assert!(undeclared(served("GET", "/cli/fs/read-file", &format!("path={p}&dir={}", encode(&d.ws.to_string_lossy())), None).await));
+    assert!(undeclared(served("GET", "/cli/fs/read-file", &format!("path={p}&path={p}"), None).await), "twice");
+    let w = json!({"path": d.ws.join("a.md"), "content": "x", "mode": "0777"});
+    assert!(undeclared(served("POST", "/cli/fs/write-file", "", Some(w)).await));
+    assert!(undeclared(served("POST", "/cli/git/stage", "", Some(json!(["not", "an", "object"]))).await));
+    let (remote, url) = controller_at(&["/ctl/work"], &[("h1", &h("/h1/work"))]).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    place(remote, &mut h1, "notes", "/ctl/work/notes").await;
+    let code = |d: Decision| match d {
+        Decision::Refuse(a) => serde_json::from_str::<Value>(&a.body).unwrap()["code"].clone(),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(code(decide(remote, "/cli/fs/read-file", "path=%2Fctl%2Fwork%2Fnotes%2Fa.md&encoding=latin1", b"")), json!("undeclared_key"));
+    let w = json!({"path": "/ctl/work/notes/a.md", "content": "x", "mode": "0777"}).to_string();
+    assert_eq!(code(decide(remote, "/cli/fs/write-file", "", w.as_bytes())), json!("undeclared_key"));
+    let ok = json!({"path": "/ctl/work/notes/a.md", "content": "x"}).to_string();
+    assert!(matches!(decide(remote, "/cli/fs/write-file", "", ok.as_bytes()), Decision::Relay { .. }));
+    drop(h1);
+}
+
+fn link(target: &Path, at: &Path) {
+    std::os::unix::fs::symlink(target, at).unwrap();
+}
+
+fn route_schema(method: &str, route: &str) -> &'static schema::Schema {
+    schema::schema(method, route).unwrap()
+}
+
+/// R6: the daemon gets the confined values: a folder link resolved (in the
+/// request's own spelling of the work root), the last name as given (a
+/// delete removes the link, not its target), nothing undeclared.
+#[test]
+fn r6_the_daemon_gets_the_confined_values() {
+    let d = host_disk();
+    std::fs::create_dir_all(d.ws.join("real")).unwrap();
+    std::fs::write(d.ws.join("real/a.md"), "a").unwrap();
+    link(&d.ws.join("real"), &d.ws.join("alias"));
+    link(&d.ws.join("real/a.md"), &d.ws.join("a-link"));
+    let spelled = d.root.parent().unwrap().join("root-alias");
+    link(&d.root, &spelled);
+    let q = |v: &Path| vec![("path".to_string(), v.to_string_lossy().into_owned())];
+    let read = route_schema("GET", "/cli/fs/read-file");
+    let c = schema::confine(&d.root, read, &q(&d.ws.join("alias/a.md")), &Value::Null).unwrap();
+    assert_eq!(c.query, q(&d.ws.join("real/a.md")));
+    let c = schema::confine(&d.root, read, &q(&spelled.join("notes/alias/a.md")), &Value::Null).unwrap();
+    assert_eq!(c.query, q(&spelled.join("notes/real/a.md")), "the request's spelling of the root");
+    let del = route_schema("POST", "/cli/fs/delete");
+    let body = json!({"paths": [d.ws.join("a-link"), d.ws.join("alias/a.md")], "permanent": false});
+    let c = schema::confine(&d.root, del, &[], &body).unwrap();
+    assert_eq!(c.body, json!({"paths": [d.ws.join("a-link"), d.ws.join("real/a.md")], "permanent": false}));
+    assert!(c.query.is_empty());
+}
+
+/// R6 (R6-1): create-worktree's derived paths: a symlinked `.worktrees`,
+/// branch folder or `.gitignore` is refused on the host (the schema) and by
+/// K2's git on a host; nothing is written through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_create_worktree_refuses_a_symlinked_worktrees_dir_branch_folder_or_gitignore() {
+    let d = host_disk();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::write(d.ws.join("a.md"), "a").unwrap();
+    host_git(&d.ws, &["add", "-A"]);
+    host_git(&d.ws, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-wt");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("bashrc"), "mine\n").unwrap();
+    let wt = route_schema("POST", "/cli/git/create-worktree");
+    let body = |b: &str| json!({"projectPath": d.ws, "branch": b, "projectId": "p"});
+    let refused = |b: &str| matches!(schema::confine(&d.root, wt, &[], &body(b)), Err(schema::Refusal::Outside(_)));
+    let made = |b: &str| {
+        let _hardened = Hardened::on();
+        k2_core::git::create_worktree(&d.ws.to_string_lossy(), b)
+    };
+    // `.worktrees` a link out.
+    link(&outside, &d.ws.join(".worktrees"));
+    assert!(refused("wt-a"));
+    assert!(made("wt-a").is_err());
+    assert!(!outside.join("wt-a").exists(), "no worktree out there");
+    std::fs::remove_file(d.ws.join(".worktrees")).unwrap();
+    // The branch's folder a link out (to an empty folder git would fill).
+    std::fs::create_dir_all(d.ws.join(".worktrees")).unwrap();
+    let empty = outside.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    link(&empty, &d.ws.join(".worktrees/wt-b"));
+    assert!(refused("wt-b"));
+    assert!(made("wt-b").is_err());
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "nothing checked out there");
+    // `.gitignore` a link out.
+    link(&outside.join("bashrc"), &d.ws.join(".gitignore"));
+    assert!(refused("wt-c"));
+    assert!(made("wt-c").is_err());
+    assert_eq!(std::fs::read_to_string(outside.join("bashrc")).unwrap(), "mine\n", "not appended to");
+    std::fs::remove_file(d.ws.join(".gitignore")).unwrap();
+    // A branch whose folder isn't one name.
+    for b in ["..", "-x", "a/../.."] {
+        assert!(schema::confine(&d.root, wt, &[], &body(b)).is_err(), "{b}");
+    }
+    // The control: plain, it goes through and creates the worktree.
+    assert!(schema::confine(&d.root, wt, &[], &body("wt-d")).is_ok());
+    assert!(made("wt-d").is_ok());
+}
+
+/// R6: K2's git on a host refuses a repository whose config names a hook
+/// (`hook.<name>.*`, config-defined hooks a newer git runs whatever
+/// `core.hooksPath` says); unhardened (a local daemon) it carries on.
+#[test]
+fn r6_k2s_git_refuses_a_repository_whose_config_names_a_hook() {
+    let dir = k2_core::test_env::unique_temp_path("relay-cfg-hook");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = dir.to_string_lossy().into_owned();
+    k2_core::git::init_repo(&repo).unwrap();
+    std::fs::write(dir.join("a.md"), "a").unwrap();
+    host_git(&dir, &["add", "-A"]);
+    host_git(&dir, &["commit", "-qm", "first"]);
+    host_git(&dir, &["config", "hook.evil.command", "touch /nonexistent/never"]);
+    host_git(&dir, &["config", "hook.evil.event", "post-checkout"]);
+    {
+        let _hardened = Hardened::on();
+        let made = k2_core::git::create_worktree(&repo, "cfg-hook");
+        assert!(made.as_ref().is_err_and(|e| e.contains("hook.evil")), "{made:?}");
+        assert!(k2_core::git::list_worktrees(&repo).is_empty());
+        assert!(k2_core::git::git_command_in(&dir).is_err());
+    }
+    let _serial = Hardened::on();
+    k2_core::git::set_no_hooks(false);
+    assert!(k2_core::git::create_worktree(&repo, "cfg-hook").is_ok(), "unhardened, as before");
+    drop(_serial);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R6: a repo-relative `file_path` joins the repository's work tree, as
+/// `git::stage_file` and `diff_file` join it, not the request's `path` (a
+/// sub-folder of the repository).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_a_repo_relative_path_joins_the_work_tree_the_handler_joins() {
+    let d = host_disk();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(d.ws.join("sub")).unwrap();
+    let outside = d.root.parent().unwrap().join("outside-rel");
+    std::fs::create_dir_all(&outside).unwrap();
+    link(&outside, &d.ws.join("escape"));
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let sub = d.ws.join("sub");
+    let stage = json!({"path": sub, "filePath": "escape/id_ed25519"});
+    assert!(refused(served("POST", "/cli/git/stage", "", Some(stage)).await), "ws/escape, not ws/sub/escape");
+    let q = format!("path={}&file_path=escape%2Fid_ed25519&sides=1", encode(&sub.to_string_lossy()));
+    assert!(refused(served("GET", "/cli/git/diff-file", &q, None).await));
+    // The same name under the folder that is in the repository passes.
+    let ok = json!({"path": sub, "filePath": "sub/a.md"});
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/stage"), &[], &ok).is_ok());
+}
+
+/// R6: an upload's derived files (its collision-free name, a chunk's
+/// `.part`) and a copy's tree (a link inside a copied folder) are confined.
+#[test]
+fn r6_an_uploads_files_and_a_copys_tree_are_confined() {
+    let d = host_disk();
+    let outside = d.root.parent().unwrap().join("outside-up");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret"), "s").unwrap();
+    let outside_file = |r: Result<schema::Confined, schema::Refusal>| matches!(r, Err(schema::Refusal::Outside(_)));
+    // `a.txt` taken, `a (1).txt` a dangling link out: the upload would land there.
+    std::fs::write(d.ws.join("a.txt"), "a").unwrap();
+    link(&outside.join("new"), &d.ws.join("a (1).txt"));
+    let up = json!({"dir": d.ws, "filename": "a.txt", "base64": ""});
+    assert!(outside_file(schema::confine(&d.root, route_schema("POST", "/cli/fs/upload-binary"), &[], &up)));
+    let fresh = json!({"dir": d.ws, "filename": "b.txt", "base64": ""});
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/upload-binary"), &[], &fresh).is_ok());
+    // A chunk's `.part` a link out.
+    link(&outside.join("part"), &d.ws.join(".k2-upload-x1.part"));
+    let chunk = json!({"upload_id": "x1", "dir": d.ws, "filename": "c.bin", "offset": 0, "base64": "", "is_last": false});
+    assert!(outside_file(schema::confine(&d.root, route_schema("POST", "/cli/fs/upload-chunk"), &[], &chunk)));
+    // A filename that isn't one name.
+    let bad = json!({"dir": d.ws, "filename": "../x", "base64": ""});
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/upload-binary"), &[], &bad).is_err());
+    // A folder holding a link out: copying or duplicating it copies the secret.
+    std::fs::create_dir_all(d.ws.join("folder/deep")).unwrap();
+    link(&outside.join("secret"), &d.ws.join("folder/deep/s"));
+    std::fs::create_dir_all(d.ws.join("dest")).unwrap();
+    let copy = json!({"sources": [d.ws.join("folder")], "destination": d.ws.join("dest")});
+    assert!(outside_file(schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy)));
+    assert!(outside_file(schema::confine(&d.root, route_schema("POST", "/cli/fs/duplicate"), &[], &json!({"path": d.ws.join("folder")}))));
+    std::fs::remove_file(d.ws.join("folder/deep/s")).unwrap();
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy).is_ok(), "the control");
 }

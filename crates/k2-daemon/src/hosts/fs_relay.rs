@@ -2,7 +2,8 @@
 //! the agent's host's disk (design, decisions and the security review's
 //! fixes in `docs/prd/progress/fs-relay.md`).
 //!
-//! Under `K2_ROLE=controller` the `/cli/fs/*` and `/cli/git/*` routes act on
+//! Off unless the controller has `K2_FS_RELAY=1` ([`FS_RELAY_VAR`]); off,
+//! nothing here runs. Under `K2_ROLE=controller` the `/cli/fs/*` and `/cli/git/*` routes act on
 //! the controller's own disk. A host on its own disk (`K2_WORK_ROOT`, home
 //! sync) says so with the `k2.work_root` label; a request whose paths are in
 //! a workspace an agent runs (or last ran) on such a host goes over the host
@@ -14,10 +15,14 @@
 //!   caller's token; POSTs by the dispatcher's arms once they have read the
 //!   whole body ([`relay_post`]). A local one runs today's handler, as is;
 //!   one for a host workspace is never served from the controller's copy.
-//! - The controller maps only known path keys, refuses `..` and any path
-//!   outside the workspace it relays to. The host serves only the exact
-//!   route list, confines every path to its work root (symlinks resolved),
-//!   sends its own token in a header, and caps its answer.
+//! - Each relayed route has one schema ([`schema`]): every key its handler
+//!   reads, which are paths and what relative ones join to, and the paths
+//!   it derives. The controller maps only path keys, refuses `..`, any path
+//!   outside the workspace it relays to and any undeclared key. The host
+//!   serves only the routes with a schema, refuses undeclared keys,
+//!   confines every path and derived path to its work root (symlinks
+//!   resolved), hands its daemon the confined values only, sends its own
+//!   token in a header, and caps its answer.
 //!
 //! Everything else stays local, byte for byte: `K2_ROLE=all`, hosts on the
 //! shared volume (no label), paths no host holds, and the routes that are
@@ -33,8 +38,17 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 
 use super::proto::Frame;
+
+#[path = "fs_relay_schema.rs"]
+pub mod schema;
 use crate::agent_host::remote::{RemoteHost, WorkspaceRoute};
 use crate::routes::http;
+
+/// The controller's switch (R6): `K2_FS_RELAY=1` turns fs-relay on. Off
+/// (the default) the controller is as it was without it: every file and
+/// git route is served from its own disk, and no workspace is bound to a
+/// host.
+pub const FS_RELAY_VAR: &str = "K2_FS_RELAY";
 
 /// A host's label: the work root its workspaces are under (its own disk).
 pub const LABEL_WORK_ROOT: &str = "k2.work_root";
@@ -47,58 +61,6 @@ const RELAY_DEADLINE: Duration = Duration::from_secs(120);
 /// smaller upload chunks, or read a file by ranges.
 pub const MAX_RELAY_BODY: usize = 8 << 20;
 
-/// The GETs the relay carries, exactly.
-const GET_ROUTES: &[&str] = &[
-    "/cli/fs/info",
-    "/cli/fs/read-dir",
-    "/cli/fs/read-file",
-    "/cli/fs/read-binary",
-    "/cli/fs/read-range",
-    "/cli/fs/stat",
-    "/cli/fs/zip-list",
-    "/cli/git/branches",
-    "/cli/git/changes",
-    "/cli/git/diff-between",
-    "/cli/git/diff-file",
-    "/cli/git/diff-summary",
-    "/cli/git/file-at-ref",
-    "/cli/git/info",
-    "/cli/git/merge-status",
-    "/cli/git/snapshot",
-    "/cli/git/worktrees",
-];
-
-/// The POSTs the relay carries, exactly. Not the git notes (they live in
-/// the controller's database and are checked by author), not
-/// `open-changes` (an event on the controller's bus).
-const POST_ROUTES: &[&str] = &[
-    "/cli/fs/create",
-    "/cli/fs/delete",
-    "/cli/fs/move",
-    "/cli/fs/rename",
-    "/cli/fs/copy",
-    "/cli/fs/duplicate",
-    "/cli/fs/write-file",
-    "/cli/fs/upload-binary",
-    "/cli/fs/upload-chunk",
-    "/cli/fs/search-tree",
-    "/cli/fs/resolve-links",
-    "/cli/git/abort-merge",
-    "/cli/git/commit",
-    "/cli/git/create-worktree",
-    "/cli/git/delete-branch",
-    "/cli/git/discard",
-    "/cli/git/init",
-    "/cli/git/merge-branch",
-    "/cli/git/prune-worktrees",
-    "/cli/git/remove-worktree",
-    "/cli/git/reopen-worktree",
-    "/cli/git/resolve",
-    "/cli/git/stage",
-    "/cli/git/stage-all",
-    "/cli/git/unstage",
-];
-
 /// POSTs the relay doesn't carry yet that act on a workspace's files: for a
 /// workspace on a host they are refused (501), never run on the
 /// controller's copy (re-review H6). Their cancels and status polls name a
@@ -109,15 +71,10 @@ const NOT_RELAYED_POST: &[&str] = &["/cli/fs/compress", "/cli/fs/extract"];
 /// capped at 16 MiB; JSON escaping can grow a body several times).
 pub const MAX_RELAY_FRAME: usize = 15 << 20;
 
-/// Is `method path` one the relay carries? Exact routes only.
+/// Is `method path` one the relay carries? Exact routes only: those with
+/// a schema ([`schema::SCHEMAS`]).
 pub fn relayed(method: &str, path: &str) -> bool {
-    if method.eq_ignore_ascii_case("GET") {
-        GET_ROUTES.contains(&path)
-    } else if method.eq_ignore_ascii_case("POST") {
-        POST_ROUTES.contains(&path)
-    } else {
-        false
-    }
+    schema::schema(method, path).is_some()
 }
 
 /// The keys whose values are paths (or path lists), in requests and in
@@ -143,12 +100,6 @@ const PATH_KEYS: &[&str] = &[
     "workspace",
     "prefixes",
 ];
-
-/// Keys whose values are relative names inside a path: never `..`.
-const NAME_KEYS: &[&str] = &["file_path", "filePath", "new_name", "newName", "filename"];
-
-/// Keys that hold text, not paths (a host doesn't confine their values).
-const TEXT_KEYS: &[&str] = &["content", "base64", "message", "query", "text", "body"];
 
 /// The work root a host's labels name, if it is on its own disk.
 pub fn work_root_label(labels: &[String]) -> Option<PathBuf> {
@@ -299,7 +250,7 @@ fn map_body(body: &[u8], maps: &[(PathBuf, PathBuf)]) -> Vec<u8> {
     }
 }
 
-fn has_dot_dot(p: &str) -> bool {
+pub(crate) fn has_dot_dot(p: &str) -> bool {
     Path::new(p).components().any(|c| matches!(c, Component::ParentDir))
 }
 
@@ -364,6 +315,10 @@ pub fn decide(remote: &RemoteHost, route: &str, query: &str, body: &[u8]) -> Dec
                     "400 Bad Request",
                     json!({"error": format!("{k}={v} is relative; give the absolute path"), "code": "relative_path"}),
                 ));
+            }
+            // R6: only the keys the route's schema declares go to a host.
+            if let Some(e) = undeclared(route, query, body) {
+                return Decision::Refuse(Answer::json("400 Bad Request", json!({"error": e, "code": "undeclared_key"})));
             }
             if let Some(out) = paths.iter().find(|p| !maps.iter().any(|(from, _)| map_path(p, from, from).is_some())) {
                 return Decision::Refuse(Answer::json(
@@ -489,7 +444,7 @@ pub async fn route_on(
     query: &str,
     owner_token: &str,
 ) -> bool {
-    if !method.eq_ignore_ascii_case("GET") || !relayed(method, path) || !remote.any_host_on_own_disk() {
+    if !remote.fs_relay_on() || !method.eq_ignore_ascii_case("GET") || !relayed(method, path) || !remote.any_host_on_own_disk() {
         return false;
     }
     let answer = if app_pass(query) {
@@ -531,7 +486,7 @@ pub async fn relay_post(path: &str, query: &str, owner_token: &str, body: &[u8])
 /// [`relay_post`] over `remote`.
 pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str, owner_token: &str, body: &[u8]) -> Option<Answer> {
     let not_relayed = NOT_RELAYED_POST.contains(&path);
-    if !(relayed("POST", path) || not_relayed) || !remote.any_host_on_own_disk() {
+    if !remote.fs_relay_on() || !(relayed("POST", path) || not_relayed) || !remote.any_host_on_own_disk() {
         return None;
     }
     if app_pass(query) {
@@ -665,7 +620,7 @@ fn plain_route(method: &str, path: &str) -> bool {
 /// (the parent of where a link really points, never of its name), a
 /// dangling link followed too (a write through it would land there).
 /// `None` past 40 links (a loop).
-fn resolve(p: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve(p: &Path) -> Option<PathBuf> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
     fn parts(p: &Path) -> Vec<OsString> {
@@ -706,89 +661,32 @@ fn resolve(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// R5-1: the keys whose relative values a route's handler joins to an
-/// absolute base it opens (and which key holds that base). Anywhere else a
-/// relative value under a path key is refused: a handler would take it
-/// against the daemon's own working directory.
-fn relative_keys(route: &str) -> Option<(&'static str, &'static [&'static str])> {
-    if route.starts_with("/cli/git/") {
-        Some(("path", &["file_path", "filePath", "old_path", "oldPath", "files"]))
-    } else if route == "/cli/fs/resolve-links" {
-        Some(("workspace", &["paths"]))
-    } else {
-        None
-    }
-}
-
-/// A relative value under a path key that `route` doesn't join to a base.
+/// A relative value under a path key that `route`'s schema doesn't take
+/// relative (a repo-relative path, resolve-links' candidates): a handler
+/// would take it against the daemon's own working directory (R5-1).
 fn stray_relative(route: &str, key: &str, v: &str) -> bool {
-    !v.is_empty()
-        && !v.starts_with('/')
-        && PATH_KEYS.contains(&key)
-        && !relative_keys(route).is_some_and(|(_, keys)| keys.contains(&key))
+    let relative_ok = schema::SCHEMAS
+        .iter()
+        .find(|s| s.route == route)
+        .and_then(|s| s.kind(key))
+        .is_some_and(|k| matches!(k, schema::Kind::RepoRel(_) | schema::Kind::Candidates));
+    !v.is_empty() && !v.starts_with('/') && PATH_KEYS.contains(&key) && !relative_ok
 }
 
-/// Every path a relayed request names is under this host's work root
-/// (strictly: a workspace, never the root itself), after every symlink.
-/// Values under path keys are absolute (R5-1), but for a route's
-/// repo-relative keys, confined as `base.join(v)` against the absolute
-/// base its handler joins them to; a name (`new_name`, `filename`) is one
-/// plain component. Absolute strings under any key but the text keys count
-/// as paths.
-fn confine(root: &Path, route: &str, query: &[(String, String)], body: &Value) -> Result<(), String> {
-    let rel = relative_keys(route);
-    let base = rel.and_then(|(bk, _)| {
-        query
-            .iter()
-            .find(|(k, v)| k == bk && v.starts_with('/'))
-            .map(|(_, v)| v.clone())
-            .or_else(|| body.get(bk).and_then(Value::as_str).filter(|v| v.starts_with('/')).map(str::to_string))
-    });
-    let inside = |v: &str, p: &Path| -> Result<(), String> {
-        let r = resolve(p).ok_or_else(|| format!("{v} can't be resolved"))?;
-        if r == root || !r.starts_with(root) {
-            return Err(format!("{v} is not in a workspace under this host's work root"));
-        }
-        Ok(())
-    };
-    let check = |key: &str, v: &str| -> Result<(), String> {
-        if TEXT_KEYS.contains(&key) || v.is_empty() {
-            return Ok(());
-        }
-        if NAME_KEYS.contains(&key) && !PATH_KEYS.contains(&key) && !rel.is_some_and(|(_, keys)| keys.contains(&key)) {
-            let plain = Path::new(v).components().count() == 1 && matches!(Path::new(v).components().next(), Some(Component::Normal(_)));
-            if !plain {
-                return Err(format!("{key} is not one plain name"));
-            }
-            return Ok(());
-        }
-        if (PATH_KEYS.contains(&key) || NAME_KEYS.contains(&key) || v.starts_with('/')) && has_dot_dot(v) {
-            return Err(format!("{key} has '..'"));
-        }
-        if v.starts_with('/') {
-            return inside(v, Path::new(v));
-        }
-        if stray_relative(route, key, v) {
-            return Err(format!("{key} is relative; a relayed request names absolute paths"));
-        }
-        if rel.is_some_and(|(_, keys)| keys.contains(&key)) {
-            let b = base.as_ref().ok_or_else(|| format!("{key} is relative and the request has no absolute base"))?;
-            return inside(v, &Path::new(b).join(v));
-        }
-        Ok(())
-    };
-    for (k, v) in query {
-        check(k, v)?;
+/// R6: a key `route`'s schema doesn't declare (a relayed route only), or a
+/// body that isn't one JSON object.
+fn undeclared(route: &str, query: &str, body: &[u8]) -> Option<String> {
+    let s = schema::SCHEMAS.iter().find(|s| s.route == route)?;
+    if let Some((k, _)) = pairs(query).into_iter().find(|(k, _)| s.kind(k).is_none()) {
+        return Some(format!("{route} doesn't take {k}"));
     }
-    fn walk(key: &str, v: &Value, check: &dyn Fn(&str, &str) -> Result<(), String>) -> Result<(), String> {
-        match v {
-            Value::String(s) => check(key, s),
-            Value::Array(a) => a.iter().try_for_each(|x| walk(key, x, check)),
-            Value::Object(o) => o.iter().try_for_each(|(k, x)| if TEXT_KEYS.contains(&k.as_str()) { Ok(()) } else { walk(k, x, check) }),
-            _ => Ok(()),
-        }
+    if body.is_empty() {
+        return None;
     }
-    walk("", body, &check)
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(o)) => o.keys().find(|k| s.kind(k).is_none()).map(|k| format!("{route} doesn't take {k}")),
+        _ => Some("a relayed request's body is one JSON object".into()),
+    }
 }
 
 /// N6: resolve-links' candidates, one by one: a link outside the work root
@@ -839,30 +737,24 @@ fn merge_links(answer: &str, refused: &[(usize, String)]) -> Option<String> {
 }
 
 /// N7: a relayed git request works on repositories inside the work root.
-/// For every git path it names (`path`, `projectPath`, `worktreePath`, …),
+/// For every git path it names (its schema's paths: `path`,
+/// `projectPath`, `worktreePath`),
 /// the repository K2's git code (and the git CLI, from that directory)
 /// would open is opened the same way, and its git dir, common dir and work
 /// tree must resolve under the work root: a nested repository, a gitfile,
 /// `core.worktree` in any config syntax, or a repository above the
 /// workspace all fail. K2's own git commands run without hooks here
 /// (`set_no_hooks`).
-fn git_precheck(root: &Path, query: &[(String, String)], body: &Value) -> Result<(), String> {
-    const GIT_PATH_KEYS: &[&str] = &["path", "projectPath", "project_path", "worktreePath", "worktree_path", "repo_root", "repoRoot"];
-    let mut paths: Vec<String> =
-        query.iter().filter(|(k, v)| GIT_PATH_KEYS.contains(&k.as_str()) && v.starts_with('/')).map(|(_, v)| v.clone()).collect();
-    for k in GIT_PATH_KEYS {
-        if let Some(v) = body.get(*k).and_then(Value::as_str).filter(|v| v.starts_with('/')) {
-            paths.push(v.to_string());
-        }
-    }
+pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String> {
     if paths.is_empty() {
         return Err("a git request names its repository's path".into());
     }
     let inside = |p: &Path| resolve(p).is_some_and(|r| r.starts_with(root) && r != root);
     for p in paths {
+        let p = p.display();
         // A path that doesn't exist yet (a worktree to create) opens its
         // nearest existing folder, as git would from there.
-        let mut open_at = PathBuf::from(&p);
+        let mut open_at = PathBuf::from(p.to_string());
         while !open_at.exists() {
             if !open_at.pop() {
                 break;
@@ -905,27 +797,28 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
         Ok(_) => return reply("413 Payload Too Large", json!({"error": "relay body too large"})),
         Err(e) => return reply("400 Bad Request", json!({"error": format!("relay body: {e}")})),
     };
-    let query_pairs = pairs(query);
+    let Some(route) = schema::schema(method, path) else {
+        return reply("403 Forbidden", json!({"error": format!("{method} {path} is not relayed to hosts")}));
+    };
     let body_json = if body.is_empty() { Value::Null } else { serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null) };
     if !body.is_empty() && body_json.is_null() {
         return reply("400 Bad Request", json!({"error": "a relayed body is JSON"}));
     }
     let mut refused_links = Vec::new();
-    let (body, body_json) = if path == "/cli/fs/resolve-links" {
+    let body_json = if path == "/cli/fs/resolve-links" {
         let (b, refused) = split_links(&root, &body_json);
         refused_links = refused;
-        (b.to_string().into_bytes(), b)
+        b
     } else {
-        (body, body_json)
+        body_json
     };
-    if let Err(e) = confine(&root, path, &query_pairs, &body_json) {
-        return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"}));
-    }
-    if path.starts_with("/cli/git/") && path != "/cli/git/init" {
-        if let Err(e) = git_precheck(&root, &query_pairs, &body_json) {
-            return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"}));
-        }
-    }
+    // R6: the route's schema: undeclared keys refused, every path and
+    // derived path confined, and the daemon gets the confined values only.
+    let (query_pairs, body) = match schema::confine(&root, route, &pairs(query), &body_json) {
+        Ok(c) => (c.query, if c.body.is_null() { Vec::new() } else { c.body.to_string().into_bytes() }),
+        Err(schema::Refusal::Outside(e)) => return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"})),
+        Err(schema::Refusal::Undeclared(e)) => return reply("403 Forbidden", json!({"error": e, "code": "undeclared_key"})),
+    };
     let Some((port, token)) = LOCAL.lock().clone() else {
         return reply("503 Service Unavailable", json!({"error": "this host's daemon address is not known yet"}));
     };
