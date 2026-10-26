@@ -89,7 +89,7 @@ sequenceDiagram
 | 1 | NetworkPolicy is enforced on kindnet (deny probe, then allow) | **PASS** (ad28865c1, `scripts/kind/caps/netpol-check.sh`): same node and across nodes; deny, allow, and removal |
 | 2 | S12 parity: an App gives a Deployment, Service and NetworkPolicy; its database user is made through `postgresql/k2-pg` and logs in; the policy lets the controller and its database in and keeps a neighbour out; `/cli/db` lists it; deleting the App removes all four | **Needs decisions 1–3** (below). Infra checked: `pg-smoke.sh` PASS (8ab1ee4f3) |
 | 3 | Mail and Sew answer on their management APIs | **Mail: answers, but unconfigured** (`scripts/kind/caps/mail-check.sh`). The declared `mail.yaml` boots Stalwart 0.16 in *bootstrap mode*: a temporary admin in its log, a recovery listener on 8080, and `/jmap/session` answering 200 without credentials. See decision 4. **Sew: no image exists** (`deploy/kubernetes/kustomization.yaml`), so it is deferred until one does |
-| 4 | Front door through a Gateway (D7 (a): Envoy Gateway in its own namespace) | to do |
+| 4 | Front door through a Gateway (D7 (a): Envoy Gateway in its own namespace) | **PASS** (`scripts/kind/caps/gateway-check.sh`): `gateway.yaml`'s listener and route with TLS passthrough; the client sees the backend's own certificate, a line round-trips, an unknown SNI gets no route. The backend is a stand-in for the controller's front door until item 5 runs a controller here |
 | 5 | `/boot-status` capabilities read `delegated` for each | the report already does this for any non-`host`, non-`off` override. To do: show it on a controller in `k2-p4-caps` with the drivers running |
 | – | k8s client (D1) | written (`crates/k2-daemon/src/k8s/`), with tests against a fake API server |
 
@@ -112,6 +112,14 @@ sequenceDiagram
   - Its 8080 listener is `http-recovery`, and `GET /jmap/session` answers 200 without credentials.
   - K2's mail code drives Stalwart over JMAP (`crates/k2-daemon/src/mail/`), and today the root helper writes Stalwart's config. On Kubernetes nothing does, and **no code reads `K2_STALWART_URL`**.
   - The test Stalwart was deleted with its volume, so its log with the temporary login is gone; nothing of it was printed.
+- **Gateway** (`lab-runs/caps/gateway-check.log`), Envoy Gateway 1.9.2:
+  - The controller went in by Helm, into `envoy-gateway-system`.
+  - Only Envoy's 8 CRDs went in, rendered and applied server-side: Helm can't store that chart's release, which would exceed 1 MiB.
+  - The rendered set is checked to hold no `gateway.networking.k8s.io` object, and the Gateway API CRDs' resourceVersion is unchanged before and after (v1.6.3).
+  - GatewayClass `k2-p4-eg` uses an `EnvoyProxy` with a ClusterIP Service, because kind has no LoadBalancer; k3s would keep ServiceLB.
+  - The Gateway is Programmed and the TLSRoute Accepted.
+  - SNI `front.k2.test` reaches the backend, which shows its own certificate (CN=front.k2.test): the gateway did not terminate TLS.
+  - `gateway-check.sh --uninstall` removes Envoy Gateway, its CRDs and the class.
 - **Pod Security**: `k2-p4-caps` enforces `baseline` and warns on `restricted`, exactly like namespace `k2` in `deploy/kubernetes/namespaces.yaml`. Spilo and Stalwart need more than `restricted`.
 
 ## Decisions asked of the coordinator (2026-10-26)
