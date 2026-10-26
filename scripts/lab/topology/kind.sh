@@ -31,9 +31,15 @@
 #   3. kind checks as scenarios K1 to K6: enroll-check (relink, revoke,
 #      restore), app-check (the app's path), the home move between two
 #      nodes and the drain demo (k2-kind-p4: hosts on different nodes, no
-#      shared volume), and rows PENDING on work not merged yet: a drained
-#      agent's move (k2-dist/drain-move) and the controller's workspace
-#      routes on the agent's host (fs/git relay).
+#      shared volume), the pool's scale-down, and a row PENDING on work
+#      not merged yet: the controller's workspace routes on the agent's
+#      host (fs/git relay).
+#
+# LAB_KIND_DRAIN_MOVE=1 says the daemon image has k2-dist/drain-move (rc2
+# and later): K4's checks 5-7 then count (without it they show PENDING),
+# and K6 runs kind-pool-accept.sh from LAB_KIND_DAEMON_SRC (the daemon
+# image's source tree) in its own namespace (LAB_KIND_POOL_NS) with the
+# fake agents image LAB_KIND_FAKE_AGENTS.
 
 LAB_KIND_REPO=${LAB_KIND_REPO:-$(cd "$LAB_REPO/.." && pwd)/kind-p4}
 LAB_KIND_DAEMON_IMAGE=${LAB_KIND_DAEMON_IMAGE:-k2-daemon:rc1}
@@ -41,6 +47,10 @@ LAB_KIND_WORK=${LAB_KIND_WORK:-shared}
 LAB_KIND_POOL=${LAB_KIND_POOL:-1:3}
 LAB_HOST_MOVE_AFTER=${LAB_HOST_MOVE_AFTER:-20}
 LAB_KIND_START_HOSTS=${LAB_KIND_START_HOSTS:-2}
+LAB_KIND_DRAIN_MOVE=${LAB_KIND_DRAIN_MOVE:-0}
+LAB_KIND_DAEMON_SRC=${LAB_KIND_DAEMON_SRC:-}
+LAB_KIND_FAKE_AGENTS=${LAB_KIND_FAKE_AGENTS:-}
+LAB_KIND_POOL_NS=${LAB_KIND_POOL_NS:-k2-p4-pool-g4}
 KIND_NS_FLEET=k2-kind-dist-fake
 KIND_NS_P4=k2-kind-p4
 LAB_KIND_KUBECONFIG=""
@@ -58,6 +68,12 @@ kind_preflight() {
     LAB_KIND_KUBECONFIG="$LAB_TMP/kubeconfig"
     kind get kubeconfig --name k2lab >"$LAB_KIND_KUBECONFIG" && chmod 600 "$LAB_KIND_KUBECONFIG"
     docker image inspect "$LAB_KIND_DAEMON_IMAGE" >/dev/null 2>&1 || { echo "kind: no image $LAB_KIND_DAEMON_IMAGE" >&2; return 1; }
+    if [ "$LAB_KIND_DRAIN_MOVE" = 1 ]; then
+        [ -x "$LAB_KIND_DAEMON_SRC/scripts/lab/topology/kind-pool-accept.sh" ] \
+            || { echo "kind: LAB_KIND_DRAIN_MOVE=1 needs LAB_KIND_DAEMON_SRC with scripts/lab/topology/kind-pool-accept.sh" >&2; return 1; }
+        docker image inspect "$LAB_KIND_FAKE_AGENTS" >/dev/null 2>&1 || { echo "kind: no image LAB_KIND_FAKE_AGENTS=$LAB_KIND_FAKE_AGENTS" >&2; return 1; }
+        case "$LAB_KIND_POOL_NS" in k2-kind*|k2-p4-pool) echo "kind: LAB_KIND_POOL_NS can't be $LAB_KIND_POOL_NS" >&2; return 1 ;; esac
+    fi
 }
 
 # kind_result <id> <title> <status pass|fail|not_run> <reason> [log]: a
@@ -217,8 +233,13 @@ PY
         "$LAB_KIND_REPO/scripts/kind/drain-demo.sh" >"$RUN/topology/K4-drain-demo.log" 2>&1
         w=$(grep -c '^FAIL' "$RUN/topology/K4-drain-demo.log" || true)
         first4=$(grep -E '^(PASS|FAIL) ' "$RUN/topology/K4-drain-demo.log" | head -4 | grep -c '^PASS' || true)
-        if [ "$w" = 0 ]; then
-            kind_result K4 "Drain a node mid-conversation: the agent continues on another host" pass "" "$RUN/topology/K4-drain-demo.log"
+        if [ "$w" = 0 ] || [ "$LAB_KIND_DRAIN_MOVE" = 1 ]; then
+            if [ "$w" = 0 ]; then
+                kind_result K4 "Drain a node mid-conversation: the agent continues on another host" pass "" "$RUN/topology/K4-drain-demo.log"
+            else
+                kind_result K4 "Drain a node mid-conversation: the agent continues on another host" fail \
+                    "$w check(s) fail (K4-drain-demo.log)" "$RUN/topology/K4-drain-demo.log"
+            fi
         elif [ "$first4" != 4 ]; then
             kind_result K4 "Drain a node mid-conversation: the agent continues on another host" fail \
                 "the drain itself failed (checks 1-4: $first4 of 4 pass)" "$RUN/topology/K4-drain-demo.log"
@@ -235,6 +256,12 @@ PY
     fi
     kind_result K5 "A workspace made through the app is on the agent's host; the app shows the agent's files" not_run \
         "PENDING the fs/git relay (dist-link, after rc1): /cli/fs, /cli/git, project create/add and App deploy-from-folder use the controller's own disk; home-move-check.sh shows the gap (docs/prd/progress/kind-p4.md on k2-dist/kind-p4)"
-    kind_result K6 "The pool scales a host down and its agents continue on the others" not_run \
-        "PENDING k2-dist/drain-move: a scale-down releases its host's agents like a drain"
+    if [ "$LAB_KIND_DRAIN_MOVE" = 1 ]; then
+        kind_check K6 "The pool scales a host down and its agents continue on the others" "$RUN/topology/K6-pool-accept.log" \
+            env K2_P4_NS="$LAB_KIND_POOL_NS" KUBECONFIG=/dev/null "$LAB_KIND_DAEMON_SRC/scripts/lab/topology/kind-pool-accept.sh" \
+            "$LAB_KIND_DAEMON_IMAGE" "$LAB_KIND_FAKE_AGENTS"
+    else
+        kind_result K6 "The pool scales a host down and its agents continue on the others" not_run \
+            "PENDING k2-dist/drain-move: a scale-down releases its host's agents like a drain"
+    fi
 }
