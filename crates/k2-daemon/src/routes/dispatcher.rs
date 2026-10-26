@@ -1566,7 +1566,8 @@ async fn handle_one_request(
                     Ok(mut f) => {
                         let len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
                         let head = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\nContent-Length: {len}\r\nCache-Control: no-store\r\n{frame}Connection: close\r\n\r\n",
+                            frame = k2_core::frame_policy::CONNECT_HEADER_LINES,
                         );
                         if stream.write_all(head.as_bytes()).await.is_ok() {
                             let _ = tokio::io::copy(&mut f, &mut *stream).await;
