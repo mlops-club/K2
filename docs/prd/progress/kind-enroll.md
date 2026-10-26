@@ -149,7 +149,7 @@ The owner decided on 2026-10-26: switch, but only in the next owner roll, after 
 - Decided: `k2-kind-dist` switches to enroll mode in the next owner roll (steps above).
 - Later: the `k2` CLI verbs for mint, list and revoke (W5 has none yet).
 
-## The owner's end-state roll onto wave3 (prepared 2026-10-26, not applied)
+## The owner's end-state roll onto wave3 (prepared 2026-10-26, applied the same day)
 
 `scripts/kind/owner-roll-wave3.sh` folds the enroll switch above into the roll onto `k2-dist/wave3`: the host pool (`K2_PROVISIONER=kubernetes`), enroll, `K2_PTYD=1` and the real agents image. `--dry-run` (the default) changes nothing. `--go` waits for the coordinator.
 
@@ -169,3 +169,42 @@ The owner decided on 2026-10-26: switch, but only in the next owner roll, after 
 - **Risks to watch in `--go`:**
   - Rollback to the older daemon after wave3 migrated the controller's database is untested.
   - At boot the pool may raise `k2-host` before `enroll.py` has created `k2-host-enroll`. The host then waits for its optional token file. The rehearsal on `k2-kind-dist-fake` runs exactly this path first.
+
+### Applied, 2026-10-26: `k2-kind-dist` runs wave3 853157fee
+
+- **Rehearsal on `k2-kind-dist-fake` (2 hosts, the roll's exact images).** enroll-check, app-check and reconnect-check all PASS. On the way it caught three bugs, fixed before the owner was touched:
+  - the pool's RBAC landed in k2lab's `default` namespace (5bf0944d5);
+  - a stale test password;
+  - a race in `app-check.sh` (907486e6f).
+- **The roll:**
+  - an in-cluster backup of the controller's volume (PVC `k2-backup-controller-20261026-083333`);
+  - `up.sh --dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes`;
+  - the after-checks all passed except one false positive (the roll's own backup PVC in the PVC list).
+- **The false positive started a rollback.** The coordinator stopped it before any image changed. Its restore had already put the pre-roll database back, with the root-dir `tar` error. The coordinator re-minted `k2-host-0`'s token and restarted it.
+- **Checks on the end state (the pre-roll database, re-migrated by wave3):**
+  - `k2-host-0` is enrolled and linked, with a 0600 key.
+  - `reconnect-check --restart-live` PASS, and the host relinked by key: same key, `k2-host-enroll` unchanged, no new token.
+  - `app-check --dist` PASS.
+  - **owner-proof PASS through 7443 with the owner's app login.** A Claude Code agent on `k2-host-0` answered one short prompt (in its transcript), was slept, and was woken into the same session.
+  - The PVCs keep their uids. `.credentials.json` is unchanged; `.claude.json` changed only because Claude ran.
+- **Fixed afterwards (33c5059f2), verified with a backup and restore on `k2-kind-dist-fake`:**
+  - the backup Job uses `nodeAffinity`, not `nodeName`;
+  - restore extracts through a directory it owns;
+  - Jobs are polled for success or failure;
+  - after a restore in enroll mode, hosts get fresh tokens and restart;
+  - the PVC check ignores the roll's backup.
+- **For dist-link (daemon):** a host reads its enroll token file only at boot. A re-minted token is not picked up until the pod restarts.
+
+### Restoring the owner's controller volume (by hand)
+
+1. `docker tag k2-daemon:dist-prev k2-daemon:dist && docker tag k2-agents:dist-prev k2-agents:dist`. Do this only to go back to the images the backup was made with: `-prev` is 43efc6471.
+2. `scripts/kind/backup-controller.sh --restore=k2-backup-controller-20261026-083333`:
+   - the controller goes to 0;
+   - the archive's sha256 is checked;
+   - the volume is emptied and re-filled;
+   - the controller goes back to 1;
+   - in enroll mode, hosts get fresh tokens and restart.
+3. To go back to the previous deployment: `scripts/kind/up.sh --dist` (pool off, token auth). It loads the images tagged in step 1.
+4. Check 7443 (`/boot-status` 200) and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
+
+The backup PVC is kept in `k2-kind-dist`. Nothing of it left the cluster.
