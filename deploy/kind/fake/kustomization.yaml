@@ -1,0 +1,20 @@
+# TEST ONLY: K2 on kind k2lab with the lab's k2-fake-agent as every agent CLI
+# (deploy/kind/Dockerfile.fake), for scenario S1 through the port-forward
+# (scripts/kind/s1.sh). Its own namespace, so a test run never touches the
+# owner's k2-kind volume.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k2-kind-fake
+resources:
+  - ../../../packaging/oci/kind/solo.yaml
+  - nodeport.yaml                 # the Mac's door (deploy/kind/proxy)
+components:
+  - ../components/no-k2dev        # nothing from k2.dev (see that file)
+images:
+  - name: k2-daemon
+    newName: k2-agents
+    newTag: fake
+labels:
+  - pairs:
+      k2.dev/deploy: kind-app-fake
+    includeSelectors: false

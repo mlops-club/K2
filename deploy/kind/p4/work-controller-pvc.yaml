@@ -1,0 +1,10 @@
+# The controller's own workspaces volume (the app browses it). The hosts
+# each have their own (k2-host's claim template "work"): nothing is shared.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: k2-work-controller
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}

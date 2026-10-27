@@ -1,0 +1,29 @@
+# k2-daemon:<tag> from binaries scripts/kind/build-daemon.sh already
+# compiled: the runtime stage of packaging/oci/Dockerfile, unchanged, with
+# the compile moved out to a capped `docker run`. Keep the two in step.
+#
+# Build context: the build-daemon.sh output dir, which holds
+#   usr/bin/k2-daemon, usr/bin/k2-ptyd   (compiled from the source tree)
+#   k2-entrypoint                        (the tree's packaging/oci/entrypoint.sh)
+ARG RUNTIME_IMAGE=debian:bookworm-slim
+FROM ${RUNTIME_IMAGE}
+# curl: the Compose healthcheck. git: workspaces. ca-certificates: TLS out.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git libssl3 tini \
+ && rm -rf /var/lib/apt/lists/*
+# UID 10000 as deploy/kubernetes/core/controller.yaml. State is group 0 and
+# group-writable, so any UID with GID 0 can boot too.
+RUN useradd --uid 10000 --gid 0 --home-dir /var/lib/k2 --no-create-home --shell /usr/sbin/nologin k2 \
+ && install -d -m 0770 -o 10000 -g 0 /var/lib/k2
+COPY usr/ /usr/
+COPY k2-entrypoint /usr/bin/k2-entrypoint
+ENV HOME=/var/lib/k2 \
+    K2_ROLE=all \
+    K2_LISTEN=lan \
+    K2_DAEMON_PORT=7420
+VOLUME ["/var/lib/k2"]
+WORKDIR /var/lib/k2
+USER 10000:0
+EXPOSE 7420
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/bin/k2-entrypoint"]
+CMD ["/usr/bin/k2-daemon"]

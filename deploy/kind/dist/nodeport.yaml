@@ -1,0 +1,13 @@
+# The Mac's door: scripts/kind/up.sh --dist runs k2-kind-dist-proxy
+# (deploy/kind/proxy), 127.0.0.1:7443 → any node:30743 → this Service → the
+# controller. Hosts are never exposed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: k2-controller-nodeport
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: k2-controller
+  ports:
+    - {port: 7420, targetPort: 7420, nodePort: 30743}

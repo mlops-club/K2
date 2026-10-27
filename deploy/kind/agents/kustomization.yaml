@@ -1,0 +1,27 @@
+# K2 on kind k2lab with the Claude Code CLI (deploy/kind/README.md).
+#
+# An overlay over the image task's packaging/oci/kind/solo.yaml, which this
+# never edits: its own namespace (so it never collides with that file's
+# k2-solo namespace on the same cluster) and the k2-agents:dev image. No
+# Secret: the owner signs in with /login in a claude session, and the login
+# lands in HOME=/var/lib/k2 on the StatefulSet's volume.
+#
+# solo.yaml lives outside this directory, so render with
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind/agents
+# (scripts/kind/up.sh does).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: k2-kind
+resources:
+  - ../../../packaging/oci/kind/solo.yaml
+  - nodeport.yaml                 # the Mac's door (deploy/kind/proxy)
+components:
+  - ../components/no-k2dev        # nothing from k2.dev (see that file)
+images:
+  - name: k2-daemon
+    newName: k2-agents
+    newTag: dev
+labels:
+  - pairs:
+      k2.dev/deploy: kind-app
+    includeSelectors: false

@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1.7
+# k2-agents:fake — TEST ONLY. k2-daemon:dev with the lab's k2-fake-agent
+# (tests/fakes/k2-fake-agent) under every agent CLI name, so scenario S1
+# runs against the pod with no real agent and no key.
+#
+#   scripts/kind/up.sh --fake          # builds and deploys this
+#   scripts/kind/s1.sh                 # runs S1 through the port-forward
+#
+# Build context: the repo root, cut down by Dockerfile.fake.dockerignore to
+# Cargo.lock and the fake agent's crate.
+
+ARG BASE_IMAGE=k2-daemon:dev
+ARG RUST_IMAGE=rust:1.99.1-bookworm
+
+# ── build: the fake agent on its own (its only dependency is serde_json,
+#    resolved from the workspace's Cargo.lock) ─────────────────────────────
+FROM ${RUST_IMAGE} AS build
+# The Docker VM is shared with kind (8 GB): BuildKit can't cap a build's
+# memory, so cap cargo's parallelism instead.
+ARG CARGO_BUILD_JOBS=3
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+WORKDIR /src
+COPY tests/fakes/k2-fake-agent/ ./
+COPY Cargo.lock ./Cargo.lock
+RUN --mount=type=cache,id=k2-kind-fake-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=k2-kind-fake-target,target=/src/target \
+    set -eux; \
+    cargo build --release --bin k2-fake-agent; \
+    install -D -m 0755 target/release/k2-fake-agent /out/opt/k2-fake/bin/k2-fake-agent
+
+# ── runtime ───────────────────────────────────────────────────────────────
+FROM ${BASE_IMAGE}
+COPY --from=build /out/ /
+USER 0
+# Shims: one symlink per agent CLI name. /work/lab-agent is the git
+# workspace S1 starts its agent in (a path with no symlinks on the Mac
+# either, so both sides compute the same Claude project slug). It is
+# group-0 writable and a git safe.directory, so the distributed host's UID
+# (10001, deploy/kind/dist) can use it as well as the solo pod's (10000).
+RUN set -eux; \
+    /opt/k2-fake/bin/k2-fake-agent --install-shims /opt/k2-fake/shim; \
+    install -d -m 0770 -o 10000 -g 0 /work /work/lab-agent; \
+    git -C /work/lab-agent init -q; \
+    chown -R 10000:0 /work/lab-agent; \
+    chmod -R g+rwX /work; \
+    git config --system --add safe.directory '*'   # test image; git 2.39 has no path/* form
+# A test daemon (K2_TEST_AGENT_SHIM_DIR set) refuses to run with HOME at
+# its user's real home (k2_core::zen::sync::guard_real_home, which reads
+# the passwd entry). The lab's solo topology uses a temp HOME for that;
+# here the k2 user's passwd home moves, and HOME stays /var/lib/k2 on the
+# volume.
+RUN usermod -d /home/k2-fake k2
+USER 10000:0
+# The daemon's spawn guard resolves agent CLIs only inside this dir.
+ENV K2_TEST_AGENT_SHIM_DIR=/opt/k2-fake/shim \
+    PATH=/opt/k2-fake/shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    K2_FAKE_AGENT_TRACE=/work/fake-agent.trace.jsonl \
+    K2_FAKE_AGENT_TURN_MS=300 \
+    K2_FAKE_AGENT_SEED=0

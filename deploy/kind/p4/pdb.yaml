@@ -1,0 +1,12 @@
+# The end state's budget (deploy/kubernetes/core/hosts.yaml), which the
+# dist overlay drops (one host there): one host at a time. The drain demo's
+# eviction goes through it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: k2-host
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k2-host

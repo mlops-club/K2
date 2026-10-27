@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.7
+# k2-agents:dev — k2-daemon:dev plus the Claude Code CLI, for K2 on the kind
+# cluster k2lab driven from the desktop app (deploy/kind/README.md).
+#
+#   scripts/kind/up.sh                 # builds this after packaging/oci/build.sh
+#
+# The CLI is Claude Code's own native linux binary, pinned to one version
+# and copied to /usr/local/bin, a directory the daemon always puts on an
+# agent's PATH (k2_client::login_path::known_fallback_dirs). Nothing here
+# reads or embeds a credential: the owner signs in with /login in a claude
+# session, and the login lands in $HOME/.claude on the pod's volume.
+#
+# Build context: deploy/kind (nothing from it is copied).
+
+ARG BASE_IMAGE=k2-daemon:dev
+ARG NODE_IMAGE=node:22.20.0-bookworm-slim
+
+# ── fetch: the platform package from npm, checked against its registry
+#    integrity hash by npm itself ──────────────────────────────────────────
+FROM ${NODE_IMAGE} AS fetch
+ARG CLAUDE_CODE_VERSION=2.1.308
+ARG TARGETARCH
+WORKDIR /fetch
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      arm64) pkg=@anthropic-ai/claude-code-linux-arm64 ;; \
+      amd64) pkg=@anthropic-ai/claude-code-linux-x64 ;; \
+      *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    npm pack --silent "$pkg@$CLAUDE_CODE_VERSION"; \
+    tar xzf ./*.tgz; \
+    test "$(node -p 'require("./package/package.json").version')" = "$CLAUDE_CODE_VERSION"; \
+    install -D -m 0755 package/claude /out/usr/local/bin/claude
+
+# ── runtime ───────────────────────────────────────────────────────────────
+FROM ${BASE_IMAGE}
+ARG CLAUDE_CODE_VERSION=2.1.308
+COPY --from=fetch /out/ /
+# The image tag is the version: Claude Code never updates itself into
+# ~/.local/bin on the volume (which is also on the daemon's agent PATH).
+ENV DISABLE_AUTOUPDATER=1
+LABEL dev.k2.claude-code.version=${CLAUDE_CODE_VERSION}

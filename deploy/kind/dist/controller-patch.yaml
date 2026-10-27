@@ -1,0 +1,49 @@
+# Controller, kind-sized: no Postgres, mail, Sew, Apps or front door; the
+# static provisioner (hosts enroll themselves, so no Kubernetes API access).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: k2-controller
+spec:
+  template:
+    spec:
+      serviceAccountName: default
+      automountServiceAccountToken: false  # K2_PROVISIONER=static never talks to the API server
+      securityContext:
+        runAsGroup: 0                      # image state is group 0 and group-writable (packaging/oci)
+      containers:
+        - name: k2-daemon
+          imagePullPolicy: Never           # loaded with `kind load docker-image`
+          ports:
+            - {containerPort: 443, $patch: delete}
+          startupProbe:
+            httpGet: {path: /boot-status, port: api}     # first boot runs migrations
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          # The 1 s default timeout fails a busy daemon on a loaded laptop.
+          readinessProbe:
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            timeoutSeconds: 5
+          resources:                       # the Docker VM is 8 GB, shared with the owner's pod
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {memory: 2Gi}
+          securityContext:
+            capabilities:
+              add: null                    # no :443 front door here
+          volumeMounts:
+            - {mountPath: /run/secrets/pg, $patch: delete}
+            - {name: work, mountPath: /var/lib/k2/work}     # shared with k2-host (work-pvc.yaml)
+      volumes:
+        - {name: pg-app, $patch: delete}
+        - name: work
+          persistentVolumeClaim: {claimName: k2-work}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 5Gi}

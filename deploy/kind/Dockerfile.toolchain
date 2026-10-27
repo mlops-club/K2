@@ -1,0 +1,10 @@
+# k2-kind-toolchain:1.99.1 — the daemon's build toolchain, the same as the
+# `toolchain` stage of packaging/oci/Dockerfile (rust 1.99.1 on bookworm
+# plus what the daemon's C/C++ deps need). scripts/kind/build-daemon.sh runs
+# cargo in it with `docker run`, so the compile gets a real memory and CPU
+# cap (BuildKit can't cap a build step). No build context is used.
+ARG RUST_IMAGE=rust:1.99.1-bookworm
+FROM ${RUST_IMAGE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential cmake clang pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
