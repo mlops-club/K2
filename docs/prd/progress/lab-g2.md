@@ -368,6 +368,55 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### S10 heavy chaos on wave3 6ffcbb9da (K2-f.2): 9/10
+
+The setup was the same, on throwaway branch `k2-dist/lab-g2-k2f2-run`
+(deleted after). The tree carries the `ask_chat` retry (e58dd6781).
+
+| Seed | `lab-runs/G2/` | Chaos SIGKILLs (host / controller / CLI) | Inside holds | S10 rounds | I1–I4 |
+|---|---|---|---|---|---|
+| 4117 | `2026-10-27T07-34-14Z` | 45 / 29 / 4 | 47 | 5/5 | pass |
+| 7 | `2026-10-27T08-02-54Z` | 58 / 59 / 8 | 49 | 4/5 | pass |
+
+How every turn-three message ended:
+
+| Seed / round | Outcome |
+|---|---|
+| 4117 r1, r2, r4, r5 | `interrupted: … crashed mid-turn`, 1–2 ms after chaos killed the CLI. r4 had a controller restart in between, so the K2-f.1 persistence held |
+| 4117 r3 | `outcome unknown: host lost mid-turn` (host-2 SIGKILLed 1 s into the turn) |
+| 7 r1 | delivered and answered: the turn ended at +30 s, before the kill |
+| 7 r2, r5 | `outcome unknown: host lost mid-turn`. r5 had two controller restarts in between |
+| 7 r4 | `interrupted`, with a controller restart in between |
+| 7 r3 | **red**: `delivered`, unanswered (below) |
+
+False positives: none.
+
+- The live transcript check (the lab's assertion) passed for all 5
+  `interrupted` failures.
+- From the traces, the CLI that took the message in each of the 8 loud
+  failures logged no `cli.turn.end` before its CLI or host was killed.
+- None of these deliveries arrived while a turn was already running, so
+  this run doesn't exercise the fold-into-the-running-turn case the review
+  raised.
+
+(c) seed 7 round 3, K2-f.2 follow-up: a cut that comes before the
+delivery's ack is a no-op, and the late ack then makes the row
+`delivered`.
+
+1. Attempt 2 was injected on host-2 at 08:18:30.990, and the turn started
+   (`UserPromptSubmit` at 31.162).
+2. Chaos SIGKILLed host-2 at 31.29, before its `host.deliver` ack.
+3. On relink at 36.249, `ctl.adopt` said `gone` and the turn was cut.
+   The row was still `sent`, and `mark_interrupted` only updates `WHERE
+   state = 'delivered'` (`k2-core/src/delivery/outbox.rs:251` at
+   c504e6819).
+4. Seven ms later (36.256), host-2 re-acked from its seen table, and the
+   row became `delivered`.
+
+Suggested fix: the cut also fails a noted `sent` row, or an ack for a
+message whose turn was already cut ends it `interrupted` or `outcome
+unknown`.
+
 ### S10 heavy chaos on k2-dist/k2-f1-wave3 f76dce00d (K2-f.1): a regression
 
 These runs used the same setup as below, on throwaway branch
