@@ -171,7 +171,7 @@ async fn recv(ws: &mut Ws) -> Frame {
 async fn host(url: &str, name: &str, labels: &[&str]) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
     let labels = labels.iter().map(|l| l.to_string()).collect();
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![] }).await;
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![], ended: vec![] }).await;
     assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
     ws
 }

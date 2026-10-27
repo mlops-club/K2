@@ -368,7 +368,7 @@ pub fn on_host_frame(remote: &RemoteHost, host_id: &str, frame: Frame) {
                         .attr("attempt", attempt)
                         .attr("status", format!("{status:?}").to_lowercase())
                 });
-                if let Err(e) = c.remote.send_frame(host_id, Frame::DeliverAck { msg_id, status, reason }) {
+                if let Err(e) = c.remote.send_frame(host_id, Frame::DeliverAck { msg_id, status, reason, prompt: None }) {
                     log_debug!("[delivery] ack to host {host_id}: {e} (the host resends)");
                 }
             };
@@ -384,8 +384,8 @@ pub fn on_host_frame(remote: &RemoteHost, host_id: &str, frame: Frame) {
                 }
             }
         }
-        Frame::DeliverAck { msg_id, status, reason } => {
-            c.on_ack(host_id, &msg_id, status, reason.as_deref(), delivery::now_ms());
+        Frame::DeliverAck { msg_id, status, reason, prompt } => {
+            c.on_ack_prompt(host_id, &msg_id, status, reason.as_deref(), prompt, delivery::now_ms());
         }
         other => log_debug!("[delivery] unexpected {} from host {host_id}", other.kind()),
     }
@@ -491,7 +491,7 @@ impl Controller {
     /// ([`RemoteHost::note_delivered`]).
     fn delivered_to(&self, recipient: &str, msg_id: &str, mark: &TurnMark) {
         match self.placed(recipient) {
-            Some(p) => self.remote.note_delivered(&p.agent_id, msg_id, Some(mark)),
+            Some(p) => self.remote.note_delivered(&p.agent_id, msg_id, Some(mark), false),
             None => log_debug!("[delivery] {msg_id} delivered directly to {recipient}, which is not placed: its turn isn't followed"),
         }
     }
@@ -549,6 +549,11 @@ impl Controller {
     }
 
     pub fn on_ack(&self, host_id: &str, msg_id: &str, status: DeliverStatus, reason: Option<&str>, now: i64) {
+        self.on_ack_prompt(host_id, msg_id, status, reason, None, now)
+    }
+
+    /// [`Self::on_ack`] with the prompt the host typed it for (K2-f).
+    pub fn on_ack_prompt(&self, host_id: &str, msg_id: &str, status: DeliverStatus, reason: Option<&str>, prompt: Option<u64>, now: i64) {
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new(trace_events::CTL_DELIVER_ACK)
                 .msg(msg_id)
@@ -581,16 +586,22 @@ impl Controller {
         }
         drop(conn);
         // K2-d: delivered into the agent's session: activity for the idle
-        // reaper. (Its turn was noted before it was sent, K2-f; a refusal
-        // takes that back.)
+        // reaper. K2-f: its turn was noted when it was sent; the host says
+        // which prompt it typed it for, a refusal takes the note back, and a
+        // duplicate takes back a resend's (it was typed before).
         if let Some(p) = recipient.and_then(|r| self.placed(&r)).filter(|p| p.host_id == host_id) {
             match status {
-                DeliverStatus::Delivered if now_delivered => {
-                    let activity = Arc::clone(&self.activity.read());
-                    activity(&p.agent_id);
+                DeliverStatus::Delivered => {
+                    if let Some(k) = prompt {
+                        self.remote.set_note_prompt(&p.agent_id, msg_id, k);
+                    }
+                    if now_delivered {
+                        let activity = Arc::clone(&self.activity.read());
+                        activity(&p.agent_id);
+                    }
                 }
+                DeliverStatus::Duplicate => self.remote.unnote_resend(&p.agent_id, msg_id),
                 DeliverStatus::Rejected => self.remote.unnote_delivered(&p.agent_id, msg_id),
-                _ => {}
             }
         }
         self.nudge.notify_one();
@@ -765,12 +776,12 @@ impl Controller {
                 continue;
             }
             let attempt = r.attempts + 1;
-            // K2-f: noted before it can reach the agent, so the turn that
-            // submits it is the one that answers it (a note after its ack
-            // could come after that turn's Stop). The first send only: a
-            // resend may be one the host already delivered and answered.
-            if attempt == 1 && is_prompt(&r.body) {
-                self.remote.note_delivered(&p.agent_id, &r.msg_id, None);
+            // K2-f: noted before it can reach the agent (a note after its
+            // ack could come after its turn's Stop), on every send: a resend
+            // may reach another host. A resend the host answers `duplicate`
+            // was typed before: that note is taken back.
+            if is_prompt(&r.body) {
+                self.remote.note_delivered(&p.agent_id, &r.msg_id, None, attempt > 1);
             }
             let mut frame = deliver_frame(&r, Some(p.epoch.0), attempt);
             if let Frame::Deliver { agent_id, .. } = &mut frame {
@@ -1115,7 +1126,7 @@ impl HostSide {
             return None;
         }
         let _one = self.receiving.lock();
-        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason });
+        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason, prompt: None });
         let before = seen::status(&self.db.lock(), &m.msg_id);
         let out = match before {
             Ok(Some(s)) if s == "rejected" => ack(DeliverStatus::Rejected, Some("rejected before".into())),
@@ -1155,7 +1166,7 @@ impl HostSide {
     /// row `delivering`, and where the agent's transcript stands), inject,
     /// then the answer.
     fn deliver_fresh(&self, m: &Incoming, now: i64) -> Option<Frame> {
-        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason });
+        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason, prompt: None });
         let mark = self.transcripts.mark(&m.agent_id);
         let w = seen::WriteAhead {
             msg_id: m.msg_id.clone(),
@@ -1173,10 +1184,15 @@ impl HostSide {
         // From here a kill leaves the id on record, settled from the
         // transcript on the next receive or link.
         self.record_seen(&m.msg_id, DELIVERING, now);
+        // K2-f: the prompt that will submit it, counted before it is typed
+        // (its UserPromptSubmit can follow at once): the turn that answers it.
+        let prompt = crate::agent_host::host()
+            .find_agent(&m.agent_id)
+            .map(|s| crate::hosts::drain::turn_counts(&s.session_id().to_string()).map(|c| c.prompts).unwrap_or(0) + 1);
         let out = match (self.deliver)(m) {
             LocalDelivery::Delivered => {
                 self.record_seen(&m.msg_id, "delivered", now);
-                ack(DeliverStatus::Delivered, None)
+                Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status: DeliverStatus::Delivered, reason: None, prompt })
             }
             LocalDelivery::Rejected(why) => {
                 self.record_seen(&m.msg_id, "rejected", now);
@@ -1426,7 +1442,7 @@ impl HostSide {
             } else {
                 (DeliverStatus::Delivered, Some(REPORTED.to_string()))
             };
-            let _ = tx.send(Frame::DeliverAck { msg_id, status, reason });
+            let _ = tx.send(Frame::DeliverAck { msg_id, status, reason, prompt: None });
         }
     }
 
@@ -1524,7 +1540,7 @@ pub fn on_controller_frame(f: Frame, tx: &mpsc::UnboundedSender<Frame>) {
                 }
             });
         }
-        Frame::DeliverAck { msg_id, status, reason } => {
+        Frame::DeliverAck { msg_id, status, reason, .. } => {
             host_side().on_ack(&msg_id, status, reason.as_deref(), delivery::now_ms());
         }
         other => log_debug!("[delivery] unexpected {} from the controller", other.kind()),

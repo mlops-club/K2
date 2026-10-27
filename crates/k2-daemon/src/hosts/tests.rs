@@ -144,7 +144,7 @@ async fn recv(ws: &mut Ws) -> Frame {
 /// A fake host that completed the handshake as `name`.
 async fn fake_host(c: &Controller, name: &str) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.expect("dial");
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume: vec![] }).await;
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume: vec![], ended: vec![] }).await;
     match recv(&mut ws).await {
         Frame::Welcome { host_id, protocol, .. } => {
             assert_eq!(host_id, name);
@@ -248,6 +248,7 @@ async fn fake_host_s1_spawn_attach_type_hook_open_url_close() {
         at_ms: 1,
         epoch,
         subagent: false,
+        turn: None,
     };
     send(&mut host, &hook("not-placed", "Stop", None)).await;
     send(&mut host, &hook("sess-s1", "Stop", Some(epoch + 1000))).await;
@@ -327,9 +328,9 @@ async fn placement_spreads_and_session_gone_drops_it() {
 async fn bad_token_and_wrong_protocol_are_refused() {
     let c = Controller::start().await;
     for (hello, code) in [
-        (Frame::Hello { protocol: PROTOCOL, host_name: "x".into(), token: "wrong".into(), labels: vec![], resume: vec![] }, "bad_token"),
-        (Frame::Hello { protocol: PROTOCOL + 1, host_name: "x".into(), token: TOKEN.into(), labels: vec![], resume: vec![] }, "protocol"),
-        (Frame::Hello { protocol: 0, host_name: "x".into(), token: TOKEN.into(), labels: vec![], resume: vec![] }, "protocol"),
+        (Frame::Hello { protocol: PROTOCOL, host_name: "x".into(), token: "wrong".into(), labels: vec![], resume: vec![], ended: vec![] }, "bad_token"),
+        (Frame::Hello { protocol: PROTOCOL + 1, host_name: "x".into(), token: TOKEN.into(), labels: vec![], resume: vec![], ended: vec![] }, "protocol"),
+        (Frame::Hello { protocol: 0, host_name: "x".into(), token: TOKEN.into(), labels: vec![], resume: vec![], ended: vec![] }, "protocol"),
         (Frame::OpenUrl { url: "https://x".into(), source: "shim".into() }, "protocol"),
     ] {
         let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
@@ -752,7 +753,7 @@ async fn protocol_1_hosts_are_still_accepted_and_resume_is_handed_to_adopt() {
     let resume: Vec<super::proto::ResumePlacement> =
         resume.into_iter().map(|r| super::proto::ResumePlacement { session_id: uuid::Uuid::new_v4().to_string(), ..r }).collect();
     let (mut v2, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.unwrap();
-    send(&mut v2, &Frame::Hello { protocol: 2, host_name: "new-1".into(), token: TOKEN.into(), labels: vec![], resume: resume.clone() }).await;
+    send(&mut v2, &Frame::Hello { protocol: 2, host_name: "new-1".into(), token: TOKEN.into(), labels: vec![], resume: resume.clone(), ended: vec![] }).await;
     match recv(&mut v2).await {
         Frame::Welcome { protocol, .. } => assert_eq!(protocol, 2),
         other => panic!("expected welcome, got {other:?}"),
@@ -989,7 +990,7 @@ async fn place_on(c: &Controller, host: &mut Ws, agent: &str) -> (String, u64) {
 
 async fn hello_with(c: &Controller, name: &str, resume: Vec<super::proto::ResumePlacement>) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.expect("dial");
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume }).await;
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec![], resume, ended: vec![] }).await;
     assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
     ws
 }
@@ -1425,7 +1426,7 @@ async fn a_ring_overrun_ends_the_byte_stream_instead_of_skipping() {
 async fn fake_host_labeled(c: &Controller, name: &str, labels: &[&str]) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(c.attach_url.as_str()).await.expect("dial");
     let labels = labels.iter().map(|l| l.to_string()).collect();
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![] }).await;
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![], ended: vec![] }).await;
     assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
     ws
 }
@@ -1567,7 +1568,7 @@ async fn adopted_agents_from_before_the_table_are_portable_on_servers_pinned_on_
         let url = c.attach_url.clone();
         async move {
             let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("dial");
-            send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume }).await;
+            send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume, ended: vec![] }).await;
             assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
             ws
         }

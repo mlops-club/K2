@@ -212,3 +212,54 @@ row couldn't be written. Test:
 | `turn-snapshots.sh` `20261027T034339Z` | **7/7 PASS**. The cut on the move is now `HostLost`. In this run, turn three's message was still `sent` (its ack died with host-1), so nothing was failed. The outbox redelivered it to host-2 (attempt 2), which answered it: memory has turn three once |
 | `drain-move.sh` `20261027T034617Z`, `three-process-msg.sh` `20261027T034747Z` | **4/4, 4/4 PASS** |
 | `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3` (throwaway HOME) | **5358 passed, 0 failed**, 6 ignored, 162 binaries |
+
+## K2-f.2: the second review's fixes
+
+The review of 73fe2eb01 found #6 fixed, #5 fixed for placements made after
+the upgrade, and an old host with a new controller fine. It needed eight
+more fixes. K2-f.2 is on the wave3 integration branch `k2-dist/k2-f1-wave3`
+(wave3 9b4d7e0cf + K2-f.1, merge f76dce00d).
+
+**How a turn is followed now**
+
+- **Counts:** the controller takes each agent's prompts, turn ends and
+  running state from the host's absolute counts. Every forwarded hook
+  carries them, and so do `resume`, `ended` and `session_gone`. Older counts
+  never overwrite newer ones; a host without counts is still counted hook by
+  hook.
+- **Notes:** each delivered message is a note with its prompt index, the
+  `UserPromptSubmit` that submits it. A note is answered when a later
+  prompt started, or when its own prompt's turn has ended.
+- **Cuts:** when the session ends, every unanswered note is cut: one whose
+  prompt was never submitted, or whose turn was running.
+
+| # | Item | As built | Test |
+|---|---|---|---|
+| 1 (high) | The controller's counts drifted from the host's: a lagging hook forwarder dropped hooks, a turn was only created on a hook, an adopted agent had none | `Hook.turn` carries the host's counts after each hook, and the controller sets its own from them. `adopt` creates (or updates) the turn from `resume.turn`, in `adopt_unknown` too | `absolute_counts_survive_hooks_the_forwarder_dropped` (two hooks lost; the host lost: A answered, B unknown; a CLI's `session_gone` with counts: the same split); `an_adopted_agent_gets_its_turn_from_the_resume` |
+| 2 | A nested CLI's hooks (`from_descendant`, a `claude -p` in a Bash tool) moved the lead's turn | `drain::is_subagent`: `agent_id` set or `from_descendant`, on the host's count and on the forwarded `Hook.subagent` | `a_nested_clis_hooks_are_not_the_leads` (the envelope rule, and a nested Stop that doesn't end the controller's turn) |
+| 3 | Dead agents in `resume` with `child_alive: false` would be adopted by an older controller | A separate optional `Hello.ended: [{agent_id, session_id, epoch, turn}]`; `resume` lists live agents only, as before K2-f.1. An older controller ignores `ended` and finds the agent gone | the outage test uses `ended` (lou answered, mo `crashed`) |
+| 4 | With no host counts and no turn running, a submitted message was left delivered | The cut fails every unanswered note, with or without a running turn: unknown outcome on a lost host, `crashed`/`closed` otherwise. An agent with no hooks at all (a provider without them) isn't cut on a crash or close, since nothing could ever mark its messages answered; on a lost host its outcome is unknown | `a_lost_host_leaves_a_submitted_message_unknown_not_delivered` |
+| 5 | Pending messages: queued input merged into a turn, or several pending submitted as separate prompts | The host counts the pane's prompts before it types a message and acks with `prompt`: the one that submits it (`DeliverAck.prompt`). The note takes that index; the controller's estimate at send time stands for an older host. Each message is answered by its own prompt's turn | `each_message_is_answered_by_its_own_prompts_turn` (prompts 2 and 3; a crash in 3 fails only its message) |
+| 6 | A resend was not noted (a redelivery to another host went unfollowed). Lab's S10 heavy chaos on f76dce00d went 1/10 green for this: turn three's attempt 1 went to host-1, killed before its ack, so attempt 2 on host-2 was the first real delivery | Every send notes the message (once per message and session; a move starts a new session). A resend's own note is dropped on a `duplicate` ack (typed before; its first note, or that turn's end, already counted). A note cut with a lost host fails nothing that was only `sent` | `a_resend_is_followed_and_a_duplicate_one_is_not`; `attempt_one_lost_unacked_attempt_two_delivered_then_a_crash_fails_it` (S10's shape: host-1 killed before the ack, moved, attempt 2 on host-2 acked with no prompt, the CLI killed mid-turn → `interrupted`) |
+| 7 | The HTTP close route and a drain's release left the turn (and its row) behind | Both cut the turn like `unplace` (`… was closed mid-turn …`) and forget it | `the_close_route_and_a_drain_release_cut_a_running_turn` |
+| 8 | Eviction of the host's pane counts was in HashMap order; a pane handed over before `OwnerReleased` lingered | `Turns` keeps 4096 panes, evicting the least recently heard, exited ones before live ones | `drain::tests::panes_are_evicted_oldest_first_exited_ones_before_live_ones` |
+
+**The store:** `host_turns` gains `notes_json` (added to a table made by
+K2-f.1; its pending/current columns are no longer read).
+
+**What stays:**
+- A message typed while a turn runs and merged by the CLI into that turn
+  without its own `UserPromptSubmit` is still counted for the next prompt
+  (the review's "unconfirmed" half of #5).
+- The duplicate acks on relink.
+- `deliver_live`/`with_via` with no row.
+
+### Results (K2-f.2)
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host:: delivery_drain:: active_reaper:: workspace_msg:: hook_ingest::` | **286 passed**, 0 failed (with the wave3 merge's fs-relay tests) |
+| Mutations | hook counts ignored → #1 fails; the ack's prompt ignored → #5 fails; `from_descendant` ignored → #2 fails; no cut with unknown counts and no turn running → #4 fails; only attempt 1 noted (K2-f.1's rule) → the S10 test fails |
+| `hosts:: agent_host:: delivery_drain:: active_reaper:: hook_ingest::` (the built test binary) 30 times in a row | **30/30** (201 tests each). An earlier loop caught a race in the #6 test itself (fay placed again before host-a's link was seen down); it now waits for it |
+| `turn-snapshots.sh` `20261027T061221Z`, `drain-move.sh` `20261027T061456Z`, `three-process-msg.sh` `20261027T061622Z` | **7/7, 4/4, 4/4 PASS** |
+| `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3` (throwaway HOME) | **5401 passed, 0 failed**, 6 ignored, 162 binaries (before the S10 test was added; that test alone changed afterwards) |

@@ -114,70 +114,98 @@ pub fn move_after(get: impl Fn(&str) -> Option<String>) -> Duration {
 /// is running, and (K2-f) how many prompts and turn ends it had. Kept
 /// after its CLI exits until the controller has been told
 /// ([`Turns::take`]), so a link outage loses nothing.
-#[derive(Default)]
-pub struct Turns(Mutex<HashMap<String, PaneTurns>>);
+pub struct Turns {
+    panes: Mutex<HashMap<String, PaneTurns>>,
+    /// Panes kept at most: the least recently heard go first, the exited
+    /// ones before the rest (a pane handed over before its CLI exited is
+    /// never told `gone`).
+    keep: usize,
+    /// Orders the panes by when they were last heard of.
+    tick: std::sync::atomic::AtomicU64,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 struct PaneTurns {
     counts: TurnCounts,
     /// The pane's owner exited.
     gone: bool,
+    heard: u64,
 }
 
-/// Panes kept after their CLI exits, at most (the oldest reported ones go
-/// first; an unreported one is the controller's to learn on relink).
-const KEEP_GONE: usize = 4096;
+/// [`Turns::keep`] in production.
+const KEEP_PANES: usize = 4096;
+
+impl Default for Turns {
+    fn default() -> Self {
+        Self::with_keep(KEEP_PANES)
+    }
+}
 
 impl Turns {
-    /// One hook from the pane's owner. A subagent's (`agent_id` set) never
-    /// starts or ends the lead's turn.
+    pub fn with_keep(keep: usize) -> Self {
+        Turns { panes: Mutex::default(), keep: keep.max(1), tick: Default::default() }
+    }
+
+    fn touch(&self, m: &mut HashMap<String, PaneTurns>, pane: &str) -> u64 {
+        let t = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
+        if !m.contains_key(pane) && m.len() >= self.keep {
+            let mut order: Vec<(bool, u64, String)> = m.iter().map(|(p, v)| (!v.gone, v.heard, p.clone())).collect();
+            order.sort();
+            for (_, _, p) in order.into_iter().take(m.len() + 1 - self.keep) {
+                m.remove(&p);
+            }
+        }
+        t
+    }
+
+    /// One hook from the pane's owner. A subagent's (`agent_id` set) or a
+    /// nested CLI's (`from_descendant`) never starts or ends the lead's turn.
     pub fn note(&self, pane: &str, event: &str, subagent: bool) {
         if subagent {
             return;
         }
-        let mut m = self.0.lock();
-        match event {
-            "UserPromptSubmit" => {
-                let t = m.entry(pane.to_string()).or_default();
-                t.counts.prompts += 1;
-                t.counts.running = true;
-            }
-            "Stop" | "StopFailure" | "SessionEnd" => {
-                let t = m.entry(pane.to_string()).or_default();
-                t.counts.stops += 1;
-                t.counts.running = false;
-            }
-            _ => {}
+        let mut m = self.panes.lock();
+        let (prompt, stop) = match event {
+            "UserPromptSubmit" => (true, false),
+            "Stop" | "StopFailure" | "SessionEnd" => (false, true),
+            _ => return,
+        };
+        let heard = self.touch(&mut m, pane);
+        let t = m.entry(pane.to_string()).or_default();
+        t.heard = heard;
+        if prompt {
+            t.counts.prompts += 1;
+            t.counts.running = true;
+        }
+        if stop {
+            t.counts.stops += 1;
+            t.counts.running = false;
         }
     }
 
     /// The pane's owner exited. Its counts stay (running or not: a turn
     /// still running is one its CLI died in) until [`Self::take`].
     pub fn gone(&self, pane: &str) {
-        let mut m = self.0.lock();
+        let mut m = self.panes.lock();
+        let heard = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(t) = m.get_mut(pane) {
             t.gone = true;
-        }
-        if m.len() > KEEP_GONE {
-            let old: Vec<String> = m.iter().filter(|(_, t)| t.gone).map(|(p, _)| p.clone()).take(m.len() - KEEP_GONE).collect();
-            for p in old {
-                m.remove(&p);
-            }
+            t.heard = heard;
         }
     }
 
     pub fn in_turn(&self, pane: &str) -> bool {
-        self.0.lock().get(pane).is_some_and(|t| t.counts.running && !t.gone)
+        self.panes.lock().get(pane).is_some_and(|t| t.counts.running && !t.gone)
     }
 
     /// K2-f: the pane's counts, for the controller.
     pub fn counts(&self, pane: &str) -> Option<TurnCounts> {
-        self.0.lock().get(pane).map(|t| t.counts)
+        self.panes.lock().get(pane).map(|t| t.counts)
     }
 
     /// K2-f: the counts of a pane whose CLI exited, now reported: forgotten.
     pub fn take(&self, pane: &str) -> Option<TurnCounts> {
-        let mut m = self.0.lock();
+        let mut m = self.panes.lock();
         match m.get(pane) {
             Some(t) if t.gone => m.remove(pane).map(|t| t.counts),
             Some(t) => Some(t.counts),
@@ -191,13 +219,20 @@ fn turns() -> &'static Turns {
     T.get_or_init(Turns::default)
 }
 
+/// K2-f: a hook that is not the lead's own: a subagent's (`agent_id` set)
+/// or a CLI nested in the lead's (`from_descendant`, a `claude -p` run from
+/// a Bash tool) shares the pane but not its turn.
+pub fn is_subagent(envelope: &k2_core::agent_hooks::envelope::HookEnvelope) -> bool {
+    envelope.agent_id.is_some() || envelope.from_descendant
+}
+
 /// [`Turns`] from this process's hook ingest, as each hook is posted
 /// (`hook_ingest::publish`): synchronous, so a pane's last `Stop` is counted
 /// before its CLI exits and the exit is reported.
 pub fn note_ingest(ev: &crate::hook_ingest::IngestEvent) {
     use crate::hook_ingest::IngestEvent;
     match ev {
-        IngestEvent::Envelope { envelope, .. } => turns().note(&envelope.pane, &envelope.event, envelope.agent_id.is_some()),
+        IngestEvent::Envelope { envelope, .. } => turns().note(&envelope.pane, &envelope.event, is_subagent(envelope)),
         IngestEvent::OwnerReleased { pane, .. } => turns().gone(pane),
         _ => {}
     }
@@ -519,6 +554,23 @@ mod tests {
         t.note("p2", "UserPromptSubmit", false);
         assert_eq!(t.take("p2"), Some(TurnCounts { prompts: 1, stops: 0, running: true }), "a live pane is kept");
         assert!(t.in_turn("p2"));
+    }
+
+    /// K2-f.2 #8: past `keep` panes, the least recently heard go first,
+    /// the exited ones before the live ones.
+    #[test]
+    fn panes_are_evicted_oldest_first_exited_ones_before_live_ones() {
+        let t = Turns::with_keep(2);
+        t.note("p1", "UserPromptSubmit", false);
+        t.note("p2", "UserPromptSubmit", false);
+        t.gone("p2");
+        t.note("p3", "UserPromptSubmit", false);
+        assert!(t.counts("p2").is_none(), "the exited one goes first");
+        assert!(t.counts("p1").is_some() && t.counts("p3").is_some());
+        t.note("p1", "Stop", false);
+        t.note("p4", "UserPromptSubmit", false);
+        assert!(t.counts("p3").is_none(), "then the least recently heard");
+        assert!(t.counts("p1").is_some() && t.counts("p4").is_some());
     }
 
     #[test]

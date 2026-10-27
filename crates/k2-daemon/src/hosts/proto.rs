@@ -86,16 +86,27 @@ pub struct ResumePlacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// K2-f: the agent's turn as this host followed it, through any link
-    /// outage. With `child_alive: false` the CLI ended while the link was
-    /// down: reported once, so the controller knows how its turn ended.
+    /// outage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<TurnCounts>,
 }
 
+/// K2-f: a placement whose CLI ended while the link was down, reported
+/// once in `hello`'s `ended` with how its turn ended. A controller that
+/// doesn't know the field ignores it (and finds the agent gone, as before).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EndedPlacement {
+    pub agent_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+    pub turn: TurnCounts,
+}
+
 /// K2-f: a pane's turn as the host's hook stream saw it: how many prompts
 /// (`UserPromptSubmit`) and turn ends (`Stop`, `StopFailure`, `SessionEnd`)
-/// it had, and whether a turn was running at the last hook. The controller
-/// compares them with the hooks it was forwarded to learn what it missed.
+/// the lead had since its CLI started, and whether a turn was running at
+/// the last hook. Absolute: the controller takes them as they are (a hook
+/// it never got is in the next counts it gets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TurnCounts {
     pub prompts: u64,
@@ -264,6 +275,9 @@ pub enum Frame {
         /// Protocol 2: placements this host still runs (S9 re-adoption).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         resume: Vec<ResumePlacement>,
+        /// K2-f: placements whose CLI ended while the link was down.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<EndedPlacement>,
     },
     #[serde(rename = "welcome")]
     Welcome {
@@ -346,10 +360,14 @@ pub enum Frame {
         at_ms: i64,
         #[serde(default)]
         epoch: Option<u64>,
-        /// K2-f: from a subagent (its `agent_id` set): it never starts or
-        /// ends the lead's turn.
+        /// K2-f: from a subagent (its `agent_id` set) or a CLI nested in
+        /// the lead's (`from_descendant`): it never starts or ends the
+        /// lead's turn.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         subagent: bool,
+        /// K2-f: the lead's turn counts on the host after this hook.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnCounts>,
     },
     #[serde(rename = "open_url")]
     OpenUrl { url: String, source: String },
@@ -457,6 +475,10 @@ pub enum Frame {
         status: DeliverStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// K2-f: the agent's prompt (its `UserPromptSubmit` count, from 1)
+        /// that submits the injected message: the turn that answers it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<u64>,
     },
 
     // ── protocol 2: inject (the `AgentHost::inject` flow, remote) ──────
@@ -655,7 +677,7 @@ mod tests {
         // must not appear when unset.
         for (f, want) in [
             (
-                Frame::Hello { protocol: 1, host_name: "h".into(), token: "t".into(), labels: vec![], resume: vec![] },
+                Frame::Hello { protocol: 1, host_name: "h".into(), token: "t".into(), labels: vec![], resume: vec![], ended: vec![] },
                 r#"{"t":"hello","protocol":1,"host_name":"h","token":"t","labels":[]}"#,
             ),
             (
@@ -686,7 +708,7 @@ mod tests {
         };
         let cases: Vec<(Frame, serde_json::Value)> = vec![
             (
-                Frame::Hello { protocol: 2, host_name: "h".into(), token: "t".into(), labels: vec![], resume: vec![resume] },
+                Frame::Hello { protocol: 2, host_name: "h".into(), token: "t".into(), labels: vec![], resume: vec![resume], ended: vec![] },
                 json!({"t": "hello", "protocol": 2, "host_name": "h", "token": "t", "labels": [],
                        "resume": [{"agent_id": "a1", "session_id": "s1", "epoch": 41,
                                    "ring": {"start": 100, "end": 4196}, "child_alive": true}]}),
@@ -704,11 +726,11 @@ mod tests {
                        "body": {"text": "hi"}, "attempt": 2}),
             ),
             (
-                Frame::DeliverAck { msg_id: "m-1".into(), status: DeliverStatus::Duplicate, reason: None },
+                Frame::DeliverAck { msg_id: "m-1".into(), status: DeliverStatus::Duplicate, reason: None, prompt: None },
                 json!({"t": "deliver.ack", "msg_id": "m-1", "status": "duplicate"}),
             ),
             (
-                Frame::DeliverAck { msg_id: "m-2".into(), status: DeliverStatus::Rejected, reason: Some("stale epoch".into()) },
+                Frame::DeliverAck { msg_id: "m-2".into(), status: DeliverStatus::Rejected, reason: Some("stale epoch".into()), prompt: None },
                 json!({"t": "deliver.ack", "msg_id": "m-2", "status": "rejected", "reason": "stale epoch"}),
             ),
             (

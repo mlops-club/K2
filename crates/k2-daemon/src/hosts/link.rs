@@ -171,10 +171,10 @@ pub(crate) fn placed_epoch(agent: &str) -> Option<u64> {
 }
 
 /// `hello.resume`: every placement this host still runs (S9), with its
-/// turn (K2-f). One whose CLI ended while the link was down is reported
-/// once with `child_alive: false` and how its turn ended, then dropped
-/// from `placed`.
-fn resume_list() -> Vec<super::proto::ResumePlacement> {
+/// turn (K2-f); and `hello.ended`: those whose CLI ended while the link was
+/// down, reported once with how their turn ended, then dropped from
+/// `placed`.
+fn resume_list() -> (Vec<super::proto::ResumePlacement>, Vec<super::proto::EndedPlacement>) {
     let placed = placed();
     let mut p = placed.lock();
     let mut out = Vec::new();
@@ -198,23 +198,18 @@ fn resume_list() -> Vec<super::proto::ResumePlacement> {
             _ => dead.push((agent.clone(), *epoch)),
         }
     }
+    let mut ended = Vec::new();
     for (agent, epoch) in dead {
         let pane = p.sessions.iter().find(|(_, a)| **a == agent).map(|(pane, _)| pane.clone());
         if let Some((pane, turn)) = pane.and_then(|pane| super::drain::take_turn_counts(&pane).map(|t| (pane, t))) {
-            out.push(super::proto::ResumePlacement {
-                agent_id: agent.clone(),
-                session_id: pane,
-                epoch,
-                child_alive: false,
-                turn: Some(turn),
-                ..Default::default()
-            });
+            ended.push(super::proto::EndedPlacement { agent_id: agent.clone(), session_id: pane, epoch, turn });
         }
         p.epochs.remove(&agent);
         p.sessions.retain(|_, a| a != &agent);
     }
+    ended.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
-    out
+    (out, ended)
 }
 
 /// The grid frame version a snapshot or delta carries (its offset in the
@@ -239,13 +234,15 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
         Err(_) => return Err(format!("connect: no answer within {:?}", t.connect)),
     };
     let (mut write, mut read) = ws.split();
+    let (resume, ended) = resume_list();
     let hello = Frame::Hello {
         protocol: PROTOCOL,
         host_name: cfg.host_name.clone(),
         token,
         labels: cfg.labels.clone(),
         // W3: the placements this host still runs (S9).
-        resume: resume_list(),
+        resume,
+        ended,
     };
     write.send(Message::Text(hello.encode())).await.map_err(|e| format!("send hello: {e}"))?;
     let host_id = match tokio::time::timeout(t.welcome, read.next()).await {
@@ -322,7 +319,10 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                         agent_pid: envelope.agent_pid,
                         at_ms: received_at_ms,
                         epoch,
-                        subagent: envelope.agent_id.is_some(),
+                        subagent: super::drain::is_subagent(&envelope),
+                        // K2-f: absolute, so a hook lost on the way (a
+                        // lagging forwarder) is in the next one's counts.
+                        turn: super::drain::turn_counts(&envelope.pane),
                     });
                 }
                 Ok(_) => {}
