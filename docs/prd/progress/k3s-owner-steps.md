@@ -4,7 +4,8 @@
 the kube context `default`. Every step is translated from what ran on the
 kind cluster `k2lab`, and each section says what was proven there and what
 was not. Untested steps are marked **(untested)**. The gaps are listed at
-the end.
+the end. Sections 1–3 and 6 (a) were followed as written on kind, in a
+fresh namespace ("Proven by following it", at the end).
 
 What ran on kind, and where the evidence is:
 
@@ -13,18 +14,19 @@ What ran on kind, and where the evidence is:
 | Controller plus hosts, signed enrollment, the pool, `K2_PTYD=1`: the owner's own `k2-kind-dist`, rolled onto wave3 with backup, rehearsal and owner-proof | `docs/prd/progress/kind-enroll.md` (k2-dist/kind-app), `scripts/kind/owner-roll-wave3.sh` |
 | The rc1 roll (c59acf7e0): home sync, the login copy to a second host, `POOL_MAX` | `scripts/kind/owner-roll-rc1.sh` (dry run OK; `--go` waits for the coordinator) |
 | The lab's S1–S9 and I1–I4 on the pool (rc1, MIN 2 MAX 3) | `lab-runs/kind-p4/pool-g2/`, this branch's `kind-p4.md` |
-| Hosts on different nodes with their own volumes; a drain: turn finished, home saved, released | `scripts/kind/drain-demo.sh`, `kind-p4.md` (the move to the other host fails on rc1: see "Hold") |
+| Hosts on different nodes with their own volumes; a drain: turn finished, home saved, released | `scripts/kind/drain-demo.sh`, `kind-p4.md` (the move to the other host: rc2 and later, "The hold is lifted") |
+| This runbook itself, followed as written on k2lab (namespace `k2-docs-proof`, wave3 4c4007b06): sections 1–3 and 6 (a), the pool (MIN 1, MAX 2), enroll mode and own disks; the app's path (login, spawn, attach) through a local port | "Proven by following it" below |
+| The rc2 roll (ec518d8c1, drain-move): pool MAX 2, a drained agent continues on another host | `kind-enroll.md` (roll #3), `drain-demo.sh` 7/7, `kind-pool-accept.sh` 8/8, G4 on kind |
 | Postgres through the Zalando operator, Apps as Deployments, mail (Stalwart) set up by the controller, a Gateway with TLS passthrough | `docs/prd/progress/k8s-capabilities.md` (k2-dist/k8s-capabilities, **not in rc1**) |
 
-## Hold: one host until drain-move lands
+## The hold is lifted (rc2 and later)
 
-On rc1, an agent that is drained off its host (pod deletion, node drain,
-the pool's own scale-down) is resumed only when that same host comes back.
-Until then its messages wait in the outbox. The fix is on
-`k2-dist/drain-move`. Until it is merged, run the pool with
-`K2_PROVISIONER_MIN_HOSTS=1` and `K2_PROVISIONER_MAX_HOSTS=1`, and don't
-drain the node your host runs on. This is the coordinator's decision for
-the kind roll as well.
+On rc1, an agent drained off its host (pod deletion, node drain, the
+pool's own scale-down) resumed only when that same host came back, so the
+pool ran at MIN = MAX = 1. `k2-dist/drain-move` fixed that and is in
+`k2-dist/wave3` from ec518d8c1 (rc2): a drained agent continues on another
+host with its home (`drain-demo.sh`, checks 5–7). With rc2 or later, run
+the pool with `K2_PROVISIONER_MAX_HOSTS=2` or more. On rc1, keep MAX at 1.
 
 ## Two levels
 
@@ -71,13 +73,17 @@ onto the nodes.
 e.g. `k2-dist/wave3` at c59acf7e0):
 
 ```sh
-# The daemon: a memory-capped compile, then a runtime-only image.
-scripts/kind/build-daemon.sh <source checkout> k2-daemon:0.47.0-rc1
+# The daemon: a memory-capped compile, then a runtime-only image. It needs
+# 6 GB and one job: at the default 4g the compile is OOM-killed, even with
+# one job (k2-daemon's lib alone; seen 2026-10-26 on rc2).
+K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1 scripts/kind/build-daemon.sh <source checkout> k2-daemon:0.47.0-rc1
 # The host: the daemon plus the Claude Code CLI (pinned in the Dockerfile; no credential inside).
 DOCKER_BUILDKIT=1 docker build -f deploy/kind/Dockerfile.agents \
     --build-arg BASE_IMAGE=k2-daemon:0.47.0-rc1 -t k2-agents:0.47.0-rc1 deploy/kind
 ```
 
+- The Docker VM needs room for that 6 GB cap plus what already runs there
+  (kind's nodes), or the build wedges it.
 - `build-daemon.sh` builds the dev profile. For a long-lived install,
   `K2_BUILD_PROFILE=ship packaging/oci/build.sh k2-daemon:<version>` builds
   the shipping profile **(untested on k3s)**.
@@ -151,7 +157,7 @@ patches:
                   - {name: K2_PROVISIONER, value: kubernetes}
                   - {name: K2_PROVISIONER_HOST_STATEFULSET, value: k2-host}
                   - {name: K2_PROVISIONER_MIN_HOSTS, value: "1"}
-                  - {name: K2_PROVISIONER_MAX_HOSTS, value: "1"}   # the hold: 2 or more after drain-move
+                  - {name: K2_PROVISIONER_MAX_HOSTS, value: "2"}   # 1 on rc1 (see "The hold is lifted")
   - target: {kind: StatefulSet, name: k2-host}
     patch: |-
       apiVersion: apps/v1
@@ -215,9 +221,60 @@ What this shape is, from `deploy/kind/dist`:
     drained waits Pending, and its agents move by home sync (after
     drain-move). Longhorn for `data` too would let the host pod itself
     move.
-  - `deploy/kind/p4` (no `k2-work` at all, each host its own work volume)
-    ran the drain demo and the home move on kind. It isn't a deployment
-    shape until the fs/git relay exists.
+  - **Own disks (no `k2-work`; each host its own workspaces volume)**, as
+    `deploy/kind/p4` ran the drain demo and the home move. Hosts then need
+    no RWX class and no affinity to the controller, and agents move
+    between hosts by home sync. Followed on kind as part of this runbook
+    (`k2-docs-proof`). Add `<checkout>/deploy/kind/p4/work-controller-pvc.yaml`
+    to `resources`, and to `patches`:
+
+    ```yaml
+      - target: {kind: PersistentVolumeClaim, name: k2-work}
+        patch: |-
+          $patch: delete
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata: {name: k2-work}
+      - target: {kind: StatefulSet, name: k2-controller}
+        patch: |-
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata: {name: k2-controller}
+          spec:
+            template:
+              spec:
+                volumes:
+                  - name: work
+                    persistentVolumeClaim: {claimName: k2-work-controller}
+      - target: {kind: StatefulSet, name: k2-host}
+        patch: |-
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata: {name: k2-host}
+          spec:
+            template:
+              spec:
+                affinity:
+                  podAffinity: null
+                volumes:
+                  - name: work
+                    $patch: delete
+            volumeClaimTemplates:
+              - metadata: {name: data}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  resources: {requests: {storage: 10Gi}}
+              - metadata: {name: work}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  resources: {requests: {storage: 5Gi}}
+    ```
+
+    **The limit until the fs/git relay exists:** the app's file browser,
+    git panel, project create/add and App deploy-from-folder use the
+    controller's own disk (`k2-work-controller`), not the agent's host. A
+    workspace made or browsed through the app is the controller's copy;
+    agents work in theirs. Agents, terminals and messages are unaffected.
 - `components/no-k2dev` turns off the tunnel lease, federation and relays,
   which talk to k2.dev. Leave it in unless you mean to use those.
 - Resources are kind-sized: the controller requests 512Mi and is limited to
@@ -231,17 +288,18 @@ These are `up.sh --dist`'s steps, in its order, without the kind parts.
 Secrets come from files or stdin and never go on a command line.
 
 ```sh
-kubectl --kubeconfig "$K" create namespace k2
+kubectl --kubeconfig "$K" create namespace k2 --save-config   # the render has the Namespace too; --save-config lets apply own it
 # k2-secrets: the controller's bootstrap token file (the dist overlay mounts it; hosts don't use it in enroll mode).
 head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' \
   | kk create secret generic k2-secrets --from-file=host-enroll-token=/dev/stdin
 kubectl kustomize --load-restrictor LoadRestrictionsNone ~/k2-k3s | kubectl --kubeconfig "$K" apply -f -
 kk rollout status statefulset/k2-controller --timeout=600s
-kk port-forward svc/k2-controller 7443:7420 &      # the API, for the next steps (section 6)
+export PORT=7460      # any free local port; never one the Mac already uses (kind's doors are 7440-7444)
+while true; do kk port-forward svc/k2-controller "$PORT":7420; sleep 1; done &   # the API, for the next steps (section 6); it drops on a controller restart
 # One-time token for k2-host-0, into Secret k2-host-enroll. The owner token goes on a pipe.
 kk exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
   | python3 -I scripts/kind/enroll.py mint --kubeconfig "$K" --namespace k2 \
-      --url http://127.0.0.1:7443 --hosts k2-host-0 --deploy-label k3s
+      --url "http://127.0.0.1:$PORT" --hosts k2-host-0 --deploy-label k3s
 kk scale statefulset k2-host --replicas=1     # from here the pool owns the replica count
 kk rollout status statefulset/k2-host --timeout=600s
 ```
@@ -292,7 +350,7 @@ kept that volume, so the login stayed.
   `kubectl --kubeconfig "$K" -n k2 exec -it k2-host-0 -c k2-host -- claude`,
   then `/login`, then exit. Check it in place without printing it:
   `kk exec k2-host-0 -c k2-host -- stat -c '%s %a' /var/lib/k2-host/.claude/.credentials.json`.
-- **More hosts, after the hold**: either `/login` on each host, or the
+- **More hosts** (rc2 and later): either `/login` on each host, or the
   `login-seed` init container (`up.sh --login-from=k2-host-0`, rendered in
   `owner-roll-rc1.sh`). A host with no login copies k2-host-0's
   (`.credentials.json`, 0600, and `.claude.json`) from `data-k2-host-0`,
@@ -316,9 +374,10 @@ NodePort. Across a real network, plain HTTP would carry the app's session
 in clear. Options, safest first:
 
 - **(a) `kubectl port-forward`** from the Mac:
-  `kubectl --kubeconfig "$K" -n k2 port-forward svc/k2-controller 7443:7420`,
-  then add `http://127.0.0.1:7443` in the app (Settings → Connected
-  Servers). The traffic is encrypted to the API server. This is the
+  `kubectl --kubeconfig "$K" -n k2 port-forward svc/k2-controller "$PORT":7420`
+  (the loop in section 3), then add `http://127.0.0.1:$PORT` in the app
+  (Settings → Connected Servers), with user `owner` and the password from
+  `~/.k2-k3s-owner-password`. The traffic is encrypted to the API server. This is the
   fallback that ran on kind (`scripts/kind/port-forward.sh`), and the
   recommended start. It drops on a controller restart, so run it in a
   loop the way `port-forward.sh` does.
@@ -395,14 +454,15 @@ The pattern `owner-roll-wave3.sh` and `owner-roll-rc1.sh` follow:
    - the login file's size and mtime are unchanged;
    - a short prompt is answered (`scripts/kind/owner-proof.py --port 7443
      --password-file ~/.k2-k3s-owner-password --kubeconfig "$K" --namespace k2`
-     takes any namespace and kubeconfig; it runs your real Claude once).
+     takes any namespace and kubeconfig; it runs your real Claude once;
+     pass your `$PORT`).
 6. Rollback: the previous tags, a restore of the backup, apply.
 
 ## Gaps
 
 | Gap | Effect | Owner of the fix |
 |---|---|---|
-| A drained agent moves only when its host returns (rc1) | Pool MAX stays 1; don't drain the host's node | `k2-dist/drain-move` (in progress) |
+| A drained agent moves only when its host returns (rc1 only) | On rc1, pool MAX stays 1; fixed in rc2 (drain-move) | done |
 | No published images; no arm64/amd64 multi-arch build tested | Build and import by hand; amd64 nodes need an amd64 build | packaging |
 | No `deploy/k3s` overlay; `deploy/kubernetes` isn't runnable as is | Write the overlay above. The end state lacks `K2_ROLE=host`, enroll and the pool's Secret RBAC; its readiness probe `k2-host health` doesn't exist in the image; its controller K2_HOME differs from the daemon's | kind-p4 (an overlay), deploy/kubernetes owner |
 | `backup-controller.sh` is kind-only | Backup and restore by hand | kind-p4 |
@@ -410,4 +470,30 @@ The pattern `owner-roll-wave3.sh` and `owner-roll-rc1.sh` follow:
 | Level B not in rc1; Sew has no image or TCP management API | Postgres/Apps/mail stay off; no Sew | k8s-capabilities merge; Sew (decision pending) |
 | Claude login copy and token rotation unverified | Prefer `/login` per host | – |
 | Resources sized for kind | Raise host limits and volume sizes | owner |
-| `k2-work` is required (the controller's fs/git/project/App-folder routes read its own disk); ReadWriteOnce keeps all K2 pods on one node | Single node without an RWX class; RWX (NFS/Longhorn) for several nodes, untested | dist-link: relay fs/git to the agent's host (after rc1) |
+| The controller's fs/git/project/App-folder routes read its own disk | With `k2-work`: ReadWriteOnce keeps all K2 pods on one node, RWX (untested) for several. With own disks: the app's browser and git panel show the controller's copy, not the agent's | dist-link: relay fs/git to the agent's host |
+
+## Proven by following it (kind, 2026-10-27)
+
+A worker followed sections 1–3 and 6 (a) as written on the kind cluster
+`k2lab`, in a fresh namespace `k2-docs-proof`, from `k2-dist/wave3`
+4c4007b06. Only the names changed: namespace, image tags `docs-proof`,
+the port, `kind load docker-image` for the import. The overlay was section
+2's, with MAX 2 and the own-disk patches.
+
+- Section 1: both images built (the daemon only at 6 GB, one job).
+- Section 3: the controller up; `k2-host-0`'s one-time token minted; the
+  host enrolled (`"linked":true`, its key 0600) and running on another node
+  than the controller, with its own `data` and `work` volumes; the app's
+  login made.
+- Section 6 (a): through the port-forward, the app's path: a password login
+  gives a session token; a terminal spawned with it runs on `k2-host-0`
+  (uid 10000, `/var/lib/k2/work`), its output arrives on
+  `/cli/sessions/grid`, and `claude` is on the agent's PATH
+  (`/usr/local/bin/claude`).
+- **Not done by the worker: section 5 and a real Claude turn.** A fresh
+  install has no Claude login, and only the owner signs in. After `/login`
+  (section 5), `owner-proof.py` (section 8) runs one real turn.
+
+Fixed in this runbook by that run: the build's memory (section 1), the hold
+lifted with rc2, the own-disk shape (section 2), the port (7443 is kind's
+own door for `k2-kind-dist`), `--save-config` on the namespace.
