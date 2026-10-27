@@ -300,7 +300,7 @@ async fn a_drained_agent_is_resumed_when_its_host_is_back_and_its_messages_wait_
     match recv(&mut a).await {
         Frame::Deliver { msg_id: got, agent_id, .. } => {
             assert_eq!((got.as_str(), agent_id.as_str()), (msg_id.as_str(), "bob"));
-            send(&mut a, &Frame::DeliverAck { msg_id: got, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: None }).await;
+            send(&mut a, &Frame::DeliverAck { msg_id: got, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
         }
         other => panic!("expected the waiting message, got {other:?}"),
     }
@@ -446,7 +446,7 @@ async fn a_message_for_an_agent_on_a_lost_host_keeps_waiting_and_lands_when_it_i
     match recv(&mut b).await {
         Frame::Deliver { msg_id, agent_id, .. } => {
             assert_eq!((msg_id.as_str(), agent_id.as_str()), (id.as_str(), "dave"));
-            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: None }).await;
+            send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
         }
         other => panic!("expected the held message, got {other:?}"),
     }
@@ -496,7 +496,6 @@ async fn a_delivery_whose_ack_died_with_the_host_is_reconciled_on_relink_not_fai
             msg_id: id.clone(),
             status: crate::hosts::proto::DeliverStatus::Delivered,
             reason: Some("found in the agent's transcript after a host restart".into()),
-            prompt: None,
         },
     )
     .await;
@@ -531,7 +530,7 @@ async fn an_uncertain_delivery_fails_visibly_with_delivery_uncertain() {
     drop(a);
     let mut a = fake_host(&url, "host-a").await;
     let why = format!("{UNCERTAIN_REASON}: interrupted by a host restart and the agent's transcript can't tell (home gone)");
-    send(&mut a, &Frame::DeliverAck { msg_id: id.clone(), status: crate::hosts::proto::DeliverStatus::Rejected, reason: Some(why), prompt: None }).await;
+    send(&mut a, &Frame::DeliverAck { msg_id: id.clone(), status: crate::hosts::proto::DeliverStatus::Rejected, reason: Some(why) }).await;
     let r = wait_final(&outbox, &id).await;
     assert_eq!(r.state, State::Failed);
     assert!(r.reason.as_deref().unwrap_or("").starts_with(UNCERTAIN_REASON), "{:?}", r.reason);
@@ -590,7 +589,7 @@ async fn resume_then_deliver(
     match recv(host).await {
         Frame::Deliver { msg_id: m, agent_id, attempt, .. } => {
             assert_eq!((m.as_str(), agent_id.as_str(), attempt), (msg_id, agent, 1), "after the spawn, its first attempt");
-            send(host, &Frame::DeliverAck { msg_id: m, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: None }).await;
+            send(host, &Frame::DeliverAck { msg_id: m, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
         }
         other => panic!("expected the waiting message after the spawn, got {other:?}"),
     }
@@ -848,7 +847,7 @@ async fn delivered(outbox: &crate::delivery_drain::Controller, host: &mut Ws, ag
     match recv(host).await {
         Frame::Deliver { msg_id, .. } => {
             assert_eq!(msg_id, id);
-            send(host, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: None }).await;
+            send(host, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
         }
         other => panic!("expected the delivery, got {other:?}"),
     }
@@ -906,16 +905,11 @@ async fn the_controller_follows_turns_and_a_close_mid_turn_fails_the_unanswered_
     close_on(remote, &mut a, "dan").await;
     assert_eq!(outbox.get(&m1).unwrap().state, State::Delivered);
 
-    // eve gets a message and its turn starts; something closes it anyway
-    // (a forced dismiss, a deadline): the message fails, saying why.
+    // eve gets a message and its turn starts, the host tying the message
+    // to that prompt (K2-f.3); something closes it anyway (a forced
+    // dismiss, a deadline): the message fails, saying why.
     let m2 = delivered(&outbox, &mut a, "eve", "second").await;
-    hook(&mut a, &sid(2), "UserPromptSubmit").await;
-    within("eve's turn to start", async {
-        while !remote.in_turn("eve") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
+    prompt_with(remote, &mut a, "eve", &sid(2), running(1, 0, &[&m2])).await;
     close_on(remote, &mut a, "eve").await;
     let row = outbox.get(&m2).unwrap();
     assert_eq!(row.state, State::Failed, "never left as answered");
@@ -944,16 +938,56 @@ async fn a_message_waits_for_the_spawn_to_answer_and_goes_out_on_its_first_attem
     resume_then_deliver(remote, &outbox, &mut b, "host-b", "ann", &sid(2), &id).await;
 }
 
-// ── K2-f: a turn cut by a crash fails its unanswered messages ──────────
+// ── K2-f: a turn cut by a crash or a lost host fails its messages ──────
+//
+// K2-f.3: the fake hosts here are K2-f.3 hosts: each hook carries the
+// host's counts after it, and `msgs`, the messages the running turn's
+// prompt submitted as the host matched them. A message fails only when its
+// host said it was in the cut turn.
 
-async fn turn_started(remote: &RemoteHost, host: &mut Ws, agent: &str, pane: &str) {
-    hook(host, pane, "UserPromptSubmit").await;
-    within("the turn to start", async {
-        while !remote.in_turn(agent) {
+fn counts(prompts: u64, stops: u64, running: bool) -> super::proto::TurnCounts {
+    super::proto::TurnCounts { prompts, stops, running, msgs: vec![] }
+}
+
+fn running(prompts: u64, stops: u64, msgs: &[&str]) -> super::proto::TurnCounts {
+    super::proto::TurnCounts { prompts, stops, running: true, msgs: msgs.iter().map(|m| m.to_string()).collect() }
+}
+
+/// A hook carrying the host's counts after it.
+async fn hook_at(host: &mut Ws, pane: &str, event: &str, turn: super::proto::TurnCounts) {
+    let f = Frame::Hook {
+        pane: pane.into(),
+        event: event.into(),
+        session_id: Some(pane.into()),
+        conversation: None,
+        agent_pid: None,
+        at_ms: 0,
+        epoch: None,
+        subagent: false,
+        turn: Some(turn),
+    };
+    send(host, &f).await;
+}
+
+async fn until(what: &str, f: impl Fn() -> bool) {
+    within(what, async {
+        while !f() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
+}
+
+/// A prompt starts a turn on `agent`; its host matched `msgs` to it.
+async fn prompt_with(remote: &RemoteHost, host: &mut Ws, agent: &str, pane: &str, turn: super::proto::TurnCounts) {
+    hook_at(host, pane, "UserPromptSubmit", turn).await;
+    until("the turn to start", || remote.in_turn(agent)).await;
+}
+
+/// The turn ends (`counts` after the Stop).
+async fn stop_with(remote: &RemoteHost, host: &mut Ws, agent: &str, pane: &str, turn: super::proto::TurnCounts) {
+    hook_at(host, pane, "Stop", turn).await;
+    until("the turn to end", || !remote.in_turn(agent)).await;
 }
 
 async fn interrupted(outbox: &crate::delivery_drain::Controller, msg_id: &str) -> String {
@@ -970,126 +1004,299 @@ async fn interrupted(outbox: &crate::delivery_drain::Controller, msg_id: &str) -
     row.reason.unwrap_or_default()
 }
 
-/// The CLI is SIGKILLed mid-turn: the host reports its session gone. The
-/// message it was answering fails `interrupted … crashed`, not resent. A
-/// CLI that exits after its turn ended leaves its message delivered.
+/// Nothing fails `msg_id`: a few passes, and it is still delivered.
+async fn stays_delivered(outbox: &crate::delivery_drain::Controller, msg_id: &str) {
+    for _ in 0..3 {
+        outbox.pass(k2_core::delivery::now_ms());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(outbox.get(msg_id).unwrap().state, k2_core::delivery::State::Delivered, "{msg_id}");
+}
+
+fn resumed(agent: &str, session: &str, epoch: u64, turn: Option<super::proto::TurnCounts>) -> super::proto::ResumePlacement {
+    super::proto::ResumePlacement {
+        agent_id: agent.into(),
+        session_id: session.into(),
+        epoch,
+        child_alive: true,
+        cwd: Some(format!("/w/{agent}")),
+        program: Some("claude".into()),
+        turn,
+        ..Default::default()
+    }
+}
+
+fn ended(agent: &str, session: &str, epoch: u64, turn: Option<super::proto::TurnCounts>) -> super::proto::EndedPlacement {
+    super::proto::EndedPlacement { agent_id: agent.into(), session_id: session.into(), epoch, turn }
+}
+
+async fn back(url: &str, host: &str, resume: Vec<super::proto::ResumePlacement>, ended: Vec<super::proto::EndedPlacement>) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: host.into(), token: TOKEN.into(), labels: vec![], resume, ended }).await;
+    assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
+    ws
+}
+
+fn epoch_of(remote: &RemoteHost, agent: &str) -> u64 {
+    remote.placement(agent).unwrap().epoch.0
+}
+
+/// The CLI is SIGKILLed mid-turn: the host reports it gone with its turn.
+/// The message its host matched to that turn fails `interrupted … crashed`,
+/// not resent. One answered before (its turn ended) stays delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cli_that_exits_mid_turn_fails_the_message_it_was_answering() {
-    use k2_core::delivery::State;
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
     let mut a = fake_host(&url, "host-a").await;
     spawn_on(remote, &mut a, "fan", "/w/fan", &sid(1)).await;
-    spawn_on(remote, &mut a, "gus", "/w/gus", &sid(2)).await;
-
+    let m0 = delivered(&outbox, &mut a, "fan", "turn two").await;
+    prompt_with(remote, &mut a, "fan", &sid(1), running(1, 0, &[&m0])).await;
+    stop_with(remote, &mut a, "fan", &sid(1), counts(1, 1, false)).await;
     let m1 = delivered(&outbox, &mut a, "fan", "turn three").await;
-    turn_started(remote, &mut a, "fan", &sid(1)).await;
-    gone(&mut a, remote, "fan").await;
-    let why = interrupted(&outbox, &m1).await;
-    assert_eq!(why, "interrupted: fan crashed mid-turn before it answered");
-    assert!(!remote.in_turn("fan"));
-
-    let m2 = delivered(&outbox, &mut a, "gus", "answered").await;
-    turn_started(remote, &mut a, "gus", &sid(2)).await;
-    hook(&mut a, &sid(2), "Stop").await;
-    within("gus's turn to end", async {
-        while remote.in_turn("gus") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    gone(&mut a, remote, "gus").await;
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    assert_eq!(outbox.get(&m2).unwrap().state, State::Delivered, "answered before its CLI went");
+    prompt_with(remote, &mut a, "fan", &sid(1), running(2, 1, &[&m1])).await;
+    send(&mut a, &Frame::SessionGone { agent_id: "fan".into(), epoch: None, exit_code: Some(137), turn: Some(running(2, 1, &[&m1])) }).await;
+    assert_eq!(interrupted(&outbox, &m1).await, "interrupted: fan crashed mid-turn before it answered");
+    stays_delivered(&outbox, &m0).await;
     assert_eq!(outbox.get(&m1).unwrap().attempts, 1, "not resent");
 }
 
-/// The host is SIGKILLed mid-turn. While it is only lost nothing is cut
-/// (it may come back still running the turn: a partition). Its daemon
-/// restarts without hal and knows nothing of hal's turn: adopt answers
-/// gone, and hal's message fails with its outcome unknown (not "crashed":
-/// nothing says the turn didn't end before the host went). ivy, resumed by
-/// the same host mid-turn, keeps its message and finishes its turn.
+/// K2-f.3 #2: a message typed while the user's own turn runs is folded
+/// into it (no prompt of its own: the host matched nothing). That turn
+/// ends; a close afterwards fails nothing. Nor does a crash in a turn its
+/// host never tied it to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_host_back_without_an_agent_that_was_mid_turn_fails_its_message() {
-    use k2_core::delivery::State;
+async fn a_message_folded_into_a_running_turn_is_never_failed() {
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
     let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "hal", "/w/hal", &sid(1)).await;
-    spawn_on(remote, &mut a, "ivy", "/w/ivy", &sid(2)).await;
-    let ivy_epoch = remote.placement("ivy").unwrap().epoch.0;
-    let m1 = delivered(&outbox, &mut a, "hal", "for hal").await;
-    let m2 = delivered(&outbox, &mut a, "ivy", "for ivy").await;
-    turn_started(remote, &mut a, "hal", &sid(1)).await;
-    turn_started(remote, &mut a, "ivy", &sid(2)).await;
-
-    drop(a);
-    wait_lost(remote, "host-a").await;
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    assert_eq!((outbox.get(&m1).unwrap().state, outbox.get(&m2).unwrap().state), (State::Delivered, State::Delivered), "lost is not gone");
-
-    let (mut a, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("dial");
-    let ivy = super::proto::ResumePlacement {
-        agent_id: "ivy".into(),
-        session_id: sid(2),
-        epoch: ivy_epoch,
-        ring: None,
-        child_alive: true,
-        cwd: Some("/w/ivy".into()),
-        program: Some("claude".into()),
-        args: vec![],
-        label: None,
-        turn: None,
-    };
-    send(&mut a, &Frame::Hello { protocol: PROTOCOL, host_name: "host-a".into(), token: TOKEN.into(), labels: vec![], resume: vec![ivy], ended: vec![] }).await;
-    assert!(matches!(recv(&mut a).await, Frame::Welcome { .. }));
-    assert_eq!(interrupted(&outbox, &m1).await, "outcome unknown: host lost mid-turn (hal had not answered when its host was lost)");
-    assert!(remote.placement("hal").is_none());
-    assert!(remote.in_turn("ivy"), "adopted mid-turn");
-    hook(&mut a, &sid(2), "Stop").await;
-    within("ivy's turn to end", async {
-        while remote.in_turn("ivy") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert_eq!(outbox.get(&m2).unwrap().state, State::Delivered);
+    spawn_on(remote, &mut a, "gil", "/w/gil", &sid(1)).await;
+    spawn_on(remote, &mut a, "hal", "/w/hal", &sid(2)).await;
+    // The user's own prompt (turn N); the message lands mid-turn.
+    prompt_with(remote, &mut a, "gil", &sid(1), running(1, 0, &[])).await;
+    let m = delivered(&outbox, &mut a, "gil", "typed mid-turn").await;
+    stop_with(remote, &mut a, "gil", &sid(1), counts(1, 1, false)).await;
+    close_on(remote, &mut a, "gil").await;
+    stays_delivered(&outbox, &m).await;
+    // hal: the same, and its CLI dies in the turn instead.
+    prompt_with(remote, &mut a, "hal", &sid(2), running(1, 0, &[])).await;
+    let mh = delivered(&outbox, &mut a, "hal", "typed mid-turn too").await;
+    send(&mut a, &Frame::SessionGone { agent_id: "hal".into(), epoch: None, exit_code: Some(137), turn: Some(running(1, 0, &[])) }).await;
+    until("hal to go", || remote.placement("hal").is_none()).await;
+    stays_delivered(&outbox, &mh).await;
 }
 
-/// A portable agent mid-turn on a host lost past K2_HOST_MOVE_AFTER moves:
-/// the turn it had there is gone with the host, and its message fails.
+/// K2-f.3 #3: two messages typed in a row are submitted as their own
+/// prompts; the host ties each to its own. The CLI dies in the second's
+/// turn: only that one fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_agent_moved_off_a_lost_host_mid_turn_fails_its_message() {
+async fn two_messages_in_a_row_are_each_in_their_own_prompts_turn() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "ivy", "/w/ivy", &sid(1)).await;
+    let ma = delivered(&outbox, &mut a, "ivy", "A").await;
+    let mb = delivered(&outbox, &mut a, "ivy", "B").await;
+    prompt_with(remote, &mut a, "ivy", &sid(1), running(1, 0, &[&ma])).await;
+    stop_with(remote, &mut a, "ivy", &sid(1), counts(1, 1, false)).await;
+    prompt_with(remote, &mut a, "ivy", &sid(1), running(2, 1, &[&mb])).await;
+    gone(&mut a, remote, "ivy").await;
+    assert_eq!(interrupted(&outbox, &mb).await, "interrupted: ivy crashed mid-turn before it answered");
+    stays_delivered(&outbox, &ma).await;
+}
+
+/// The host is SIGKILLed mid-turn. While it is only lost nothing is cut
+/// (a partition: it may come back still running the turn). Its daemon
+/// restarts without jo and knows nothing of jo's turn: jo's matched
+/// message fails with its outcome unknown. kim, resumed mid-turn by the
+/// same host, keeps its message and finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_back_without_an_agent_that_was_mid_turn_leaves_its_outcome_unknown() {
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
     let mut a = fake_host(&url, "host-a").await;
     spawn_on(remote, &mut a, "jo", "/w/jo", &sid(1)).await;
-    let m = delivered(&outbox, &mut a, "jo", "before the crash").await;
-    turn_started(remote, &mut a, "jo", &sid(1)).await;
+    spawn_on(remote, &mut a, "kim", "/w/kim", &sid(2)).await;
+    let ek = epoch_of(remote, "kim");
+    let mj = delivered(&outbox, &mut a, "jo", "for jo").await;
+    let mk = delivered(&outbox, &mut a, "kim", "for kim").await;
+    prompt_with(remote, &mut a, "jo", &sid(1), running(1, 0, &[&mj])).await;
+    prompt_with(remote, &mut a, "kim", &sid(2), running(1, 0, &[&mk])).await;
     drop(a);
     wait_lost(remote, "host-a").await;
-    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["jo"]);
-    assert_eq!(interrupted(&outbox, &m).await, "outcome unknown: host lost mid-turn (jo had not answered when its host was lost)");
+    stays_delivered(&outbox, &mj).await;
+    let mut a = back(&url, "host-a", vec![resumed("kim", &sid(2), ek, Some(running(1, 0, &[&mk])))], vec![]).await;
+    assert_eq!(interrupted(&outbox, &mj).await, "outcome unknown: host lost mid-turn (jo had not answered when its host was lost)");
+    assert!(remote.in_turn("kim"), "adopted mid-turn");
+    stop_with(remote, &mut a, "kim", &sid(2), counts(1, 1, false)).await;
+    stays_delivered(&outbox, &mk).await;
 }
 
-/// The direct path delivers without the outbox's deliver/ack: a wake of a
-/// sleeping agent (the gone rule), a host's message the controller handles
-/// itself, the controller's own `k2 msg`. Each is followed like an outbox
-/// delivery, so a crash mid-turn fails it too.
+/// A portable agent mid-turn on a host lost past K2_HOST_MOVE_AFTER moves:
+/// its turn there is gone with the host, and the matched message's
+/// outcome is unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_direct_delivery_cut_by_a_crash_fails_too() {
+async fn an_agent_moved_off_a_lost_host_mid_turn_leaves_its_outcome_unknown() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "lou", "/w/lou", &sid(1)).await;
+    let m = delivered(&outbox, &mut a, "lou", "before the crash").await;
+    let other = delivered(&outbox, &mut a, "lou", "not submitted").await;
+    prompt_with(remote, &mut a, "lou", &sid(1), running(1, 0, &[&m])).await;
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["lou"]);
+    assert_eq!(interrupted(&outbox, &m).await, "outcome unknown: host lost mid-turn (lou had not answered when its host was lost)");
+    stays_delivered(&outbox, &other).await;
+}
+
+/// #2 (K2-f.1): the link drops mid-turn; while it is down mo's turn ends
+/// (its Stop never forwarded), ned's CLI exits after answering, and pat's
+/// CLI dies mid-turn. The host's hello says so: mo's and ned's messages
+/// stay delivered (a later close of mo fails nothing), pat's fails
+/// "crashed".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_missed_in_a_link_outage_comes_back_in_the_hosts_hello() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "mo", "/w/mo", &sid(1)).await;
+    spawn_on(remote, &mut a, "ned", "/w/ned", &sid(2)).await;
+    spawn_on(remote, &mut a, "pat", "/w/pat", &sid(3)).await;
+    let (em, en, ep) = (epoch_of(remote, "mo"), epoch_of(remote, "ned"), epoch_of(remote, "pat"));
+    let mm = delivered(&outbox, &mut a, "mo", "for mo").await;
+    let mn = delivered(&outbox, &mut a, "ned", "for ned").await;
+    let mp = delivered(&outbox, &mut a, "pat", "for pat").await;
+    prompt_with(remote, &mut a, "mo", &sid(1), running(1, 0, &[&mm])).await;
+    prompt_with(remote, &mut a, "ned", &sid(2), running(1, 0, &[&mn])).await;
+    prompt_with(remote, &mut a, "pat", &sid(3), running(1, 0, &[&mp])).await;
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    let mut a = back(
+        &url,
+        "host-a",
+        vec![resumed("mo", &sid(1), em, Some(counts(1, 1, false)))],
+        vec![ended("ned", &sid(2), en, Some(counts(1, 1, false))), ended("pat", &sid(3), ep, Some(running(1, 0, &[&mp])))],
+    )
+    .await;
+    assert_eq!(interrupted(&outbox, &mp).await, "interrupted: pat crashed mid-turn before it answered");
+    assert!(!remote.in_turn("mo"), "its missed Stop applied");
+    close_on(remote, &mut a, "mo").await;
+    stays_delivered(&outbox, &mm).await;
+    stays_delivered(&outbox, &mn).await;
+}
+
+/// #4 (K2-f.1): `session_gone` carries the turn, so a Stop hook that comes
+/// after it (or never) can't fail an answered message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_gone_carries_the_turn_so_a_late_stop_hook_cant_fail_an_answer() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "quin", "/w/quin", &sid(1)).await;
+    let m = delivered(&outbox, &mut a, "quin", "answered, then exited").await;
+    prompt_with(remote, &mut a, "quin", &sid(1), running(1, 0, &[&m])).await;
+    send(&mut a, &Frame::SessionGone { agent_id: "quin".into(), epoch: None, exit_code: Some(0), turn: Some(counts(1, 1, false)) }).await;
+    until("quin to go", || remote.placement("quin").is_none()).await;
+    hook_at(&mut a, &sid(1), "Stop", counts(1, 1, false)).await;
+    stays_delivered(&outbox, &m).await;
+}
+
+/// #1 (K2-f.1): the host's daemon restarts while a turn runs. Without
+/// ptyd adoption (S3) the CLI doesn't outlive its daemon, and the new
+/// daemon knows nothing of the turn: its matched message's outcome is
+/// unknown, not a crash, and nothing is resent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_daemon_restart_mid_turn_leaves_the_outcome_unknown() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "rex", "/w/rex", &sid(1)).await;
+    let m = delivered(&outbox, &mut a, "rex", "mid-turn").await;
+    prompt_with(remote, &mut a, "rex", &sid(1), running(1, 0, &[&m])).await;
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    let _a = back(&url, "host-a", vec![], vec![]).await;
+    assert_eq!(interrupted(&outbox, &m).await, "outcome unknown: host lost mid-turn (rex had not answered when its host was lost)");
+    assert_eq!(outbox.get(&m).unwrap().attempts, 1, "not resent");
+}
+
+/// K2-f.3 #1: an agent that never sends hooks (a provider without them):
+/// nothing ever ties its messages to a turn, so neither a close, nor a
+/// controller restart then a close, nor its CLI ending while the link was
+/// down (reported with no turn) fails them, or calls them unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_without_hooks_never_has_its_messages_failed() {
+    let placements = k2_core::test_env::unique_temp_path("k2f3-unhooked.db");
+    let open = |restore: bool| {
+        let store = Arc::new(PlacementStore::open_file(&placements).unwrap());
+        let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::with_store(store, None)));
+        if restore {
+            remote.restore();
+        }
+        remote
+    };
+    let remote = open(false);
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "sid", "/w/sid", &sid(1)).await;
+    spawn_on(remote, &mut a, "tom", "/w/tom", &sid(2)).await;
+    let et = epoch_of(remote, "tom");
+    let m1 = delivered(&outbox, &mut a, "sid", "no hooks").await;
+    let m2 = delivered(&outbox, &mut a, "tom", "no hooks either").await;
+    close_on(remote, &mut a, "sid").await;
+    stays_delivered(&outbox, &m1).await;
+    drop(a);
+    // A controller restart on the same table; tom's CLI ended meanwhile.
+    let remote = open(true);
+    let url = serve(remote).await;
+    let outbox2 = outbox_for(remote);
+    let _a = back(&url, "host-a", vec![], vec![ended("tom", &sid(2), et, None)]).await;
+    until("tom to go", || remote.placement("tom").is_none()).await;
+    stays_delivered(&outbox, &m2).await;
+    assert!(outbox2.get(&m2).is_none(), "the new outbox never had it");
+    std::fs::remove_file(&placements).unwrap();
+}
+
+/// K2-f.1 #6, K2-f.3 #6: a direct delivery's row is written whole or not
+/// at all, and a failure says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_direct_is_one_transaction_and_reports_failure() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let outbox = outbox_for(remote);
+    let body = json!({"kind": "msg", "text": "x"});
+    let now = k2_core::delivery::now_ms();
+    outbox.record_direct("m_0000000000008_one", "agent:alice", "uma", &body, now).unwrap();
+    assert_eq!(outbox.get("m_0000000000008_one").unwrap().state, State::Delivered);
+    let err = outbox.record_direct("m_0000000000008_one", "agent:alice", "uma", &body, now).unwrap_err();
+    assert!(err.contains("already finished"), "{err}");
+    assert!(outbox.record_direct("", "agent:alice", "uma", &body, now).is_err());
+    assert_eq!(outbox.get("").map(|r| r.state), None, "nothing half written");
+}
+
+/// The direct path: the gone rule's wake, a host's message the controller
+/// handles itself, and the controller's own `k2 msg`. Each runs under its
+/// message's id (so the spawn or inject names it to the host), each has a
+/// delivered row, and a crash in the turn the host tied it to fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_delivery_its_host_tied_to_a_cut_turn_fails() {
     use crate::delivery_drain::{start_controller, Direct};
     use k2_core::delivery::State;
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
+    let named: Arc<parking_lot::Mutex<Vec<Option<String>>>> = Arc::default();
+    let seen = Arc::clone(&named);
     let outbox = start_controller(
         remote,
         mem_db(),
@@ -1097,8 +1304,10 @@ async fn a_direct_delivery_cut_by_a_crash_fails_too() {
         Direct {
             resolves: Box::new(|_| true),
             aliases: Box::new(|_| Vec::new()),
-            // The wake: the agent is placed by the time it answers.
+            // The wake: the agent is placed by the time it answers, and the
+            // delivery's id is on this thread for the spawn or inject.
             deliver: Box::new(move |to, _, _| {
+                seen.lock().push(crate::delivery_drain::direct_delivery_id());
                 for _ in 0..3000 {
                     if remote.placement(to).is_some_and(|p| p.session_id.is_some()) {
                         return Ok(());
@@ -1112,261 +1321,42 @@ async fn a_direct_delivery_cut_by_a_crash_fails_too() {
     outbox.set_gone_grace(Duration::ZERO);
     let mut a = fake_host(&url, "host-a").await;
 
-    // 1. The gone rule wakes lee (asleep) and delivers directly.
-    remote.set_session_ended_for_test("lee", 0);
-    let m1 = outbox.send("agent:alice", "lee", json!({"kind": "msg", "text": "wake up", "wake": true})).unwrap();
-    // Handed to the direct path (by this pass or the drain's own) before
-    // lee is placed, so it never goes the outbox's way.
-    within("the message to go to the direct path", async {
-        while !outbox.is_handing(&m1) {
-            for r in outbox.pass(k2_core::delivery::now_ms()) {
-                let c = Arc::clone(&outbox);
-                tokio::task::spawn_blocking(move || c.deliver_gone(&r));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    // 1. The gone rule wakes vic (asleep) and delivers directly.
+    remote.set_session_ended_for_test("vic", 0);
+    let m1 = outbox.send("agent:alice", "vic", json!({"kind": "msg", "text": "wake up", "wake": true})).unwrap();
+    until("the message to go to the direct path", || outbox.is_handing(&m1) || {
+        for r in outbox.pass(k2_core::delivery::now_ms()) {
+            let c = Arc::clone(&outbox);
+            tokio::task::spawn_blocking(move || c.deliver_gone(&r));
         }
+        outbox.is_handing(&m1)
     })
     .await;
-    spawn_on(remote, &mut a, "lee", "/w/lee", &sid(1)).await;
+    spawn_on(remote, &mut a, "vic", "/w/vic", &sid(1)).await;
     assert_eq!(wait_final(&outbox, &m1).await.state, State::Delivered);
-    turn_started(remote, &mut a, "lee", &sid(1)).await;
-    gone(&mut a, remote, "lee").await;
-    assert_eq!(interrupted(&outbox, &m1).await, "interrupted: lee crashed mid-turn before it answered");
+    prompt_with(remote, &mut a, "vic", &sid(1), running(1, 0, &[&m1])).await;
+    gone(&mut a, remote, "vic").await;
+    assert_eq!(interrupted(&outbox, &m1).await, "interrupted: vic crashed mid-turn before it answered");
 
     // 2. A host's message the controller delivered itself, and 3. the
     // controller's own k2 msg: each now has a delivered row.
-    spawn_on(remote, &mut a, "max", "/w/max", &sid(2)).await;
+    spawn_on(remote, &mut a, "wes", "/w/wes", &sid(2)).await;
     let body = json!({"kind": "msg", "text": "direct"});
     let now = k2_core::delivery::now_ms();
-    let (st, _) = tokio::task::block_in_place(|| outbox.deliver_direct("m_0000000000003_up", "agent:alice", "max", &body, now));
+    let (st, _) = tokio::task::block_in_place(|| outbox.deliver_direct("m_0000000000003_up", "agent:alice", "wes", &body, now));
     assert_eq!(st, crate::hosts::proto::DeliverStatus::Delivered);
-    outbox.record_direct("m_0000000000004_own", "user:owner", "max", &body, &outbox.turn_mark("max"), now).unwrap();
+    outbox.record_direct("m_0000000000004_own", "user:owner", "wes", &body, now).unwrap();
+    prompt_with(remote, &mut a, "wes", &sid(2), running(1, 0, &["m_0000000000003_up", "m_0000000000004_own"])).await;
+    gone(&mut a, remote, "wes").await;
     for id in ["m_0000000000003_up", "m_0000000000004_own"] {
-        assert_eq!(outbox.get(id).unwrap().state, State::Delivered, "{id}");
+        assert_eq!(interrupted(&outbox, id).await, "interrupted: wes crashed mid-turn before it answered", "{id}");
     }
-    turn_started(remote, &mut a, "max", &sid(2)).await;
-    gone(&mut a, remote, "max").await;
-    for id in ["m_0000000000003_up", "m_0000000000004_own"] {
-        assert_eq!(interrupted(&outbox, id).await, "interrupted: max crashed mid-turn before it answered", "{id}");
-    }
+    assert_eq!(named.lock().clone(), vec![Some(m1.clone()), Some("m_0000000000003_up".to_string())], "each direct delivery named its message");
 }
 
-// ── K2-f.1: the host's own turn counts ─────────────────────────────────
-
-fn resumed(agent: &str, session: &str, epoch: u64, alive: bool, turn: super::proto::TurnCounts) -> super::proto::ResumePlacement {
-    super::proto::ResumePlacement {
-        agent_id: agent.into(),
-        session_id: session.into(),
-        epoch,
-        child_alive: alive,
-        cwd: Some(format!("/w/{agent}")),
-        program: Some("claude".into()),
-        turn: Some(turn),
-        ..Default::default()
-    }
-}
-
-async fn back(url: &str, host: &str, resume: Vec<super::proto::ResumePlacement>) -> Ws {
-    back_with_ended(url, host, resume, vec![]).await
-}
-
-async fn back_with_ended(url: &str, host: &str, resume: Vec<super::proto::ResumePlacement>, ended: Vec<super::proto::EndedPlacement>) -> Ws {
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: host.into(), token: TOKEN.into(), labels: vec![], resume, ended }).await;
-    assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
-    ws
-}
-
-fn ended(agent: &str, session: &str, epoch: u64, turn: super::proto::TurnCounts) -> super::proto::EndedPlacement {
-    super::proto::EndedPlacement { agent_id: agent.into(), session_id: session.into(), epoch, turn }
-}
-
-fn counts(prompts: u64, stops: u64, running: bool) -> super::proto::TurnCounts {
-    super::proto::TurnCounts { prompts, stops, running }
-}
-
-/// #2: the link drops mid-turn; the turn ends while it is down (its Stop
-/// hook is never forwarded). The host comes back and says so in its
-/// resume: kay's turn ended, and a later close doesn't fail the message
-/// it answered. lou's CLI exited during the outage after answering: gone,
-/// its message delivered. mo's CLI died mid-turn during the outage: its
-/// message fails "crashed" (the host knows).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stop_missed_in_a_link_outage_comes_back_in_the_hosts_resume() {
-    use k2_core::delivery::State;
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "kay", "/w/kay", &sid(1)).await;
-    spawn_on(remote, &mut a, "lou", "/w/lou", &sid(2)).await;
-    spawn_on(remote, &mut a, "mo", "/w/mo", &sid(3)).await;
-    let epoch = |agent: &str| remote.placement(agent).unwrap().epoch.0;
-    let (ek, el, em) = (epoch("kay"), epoch("lou"), epoch("mo"));
-    let mk = delivered(&outbox, &mut a, "kay", "for kay").await;
-    let ml = delivered(&outbox, &mut a, "lou", "for lou").await;
-    let mm = delivered(&outbox, &mut a, "mo", "for mo").await;
-    turn_started(remote, &mut a, "kay", &sid(1)).await;
-    turn_started(remote, &mut a, "lou", &sid(2)).await;
-    turn_started(remote, &mut a, "mo", &sid(3)).await;
-    drop(a);
-    wait_lost(remote, "host-a").await;
-
-    let mut a = back_with_ended(
-        &url,
-        "host-a",
-        vec![resumed("kay", &sid(1), ek, true, counts(1, 1, false))],
-        vec![ended("lou", &sid(2), el, counts(1, 1, false)), ended("mo", &sid(3), em, counts(1, 0, true))],
-    )
-    .await;
-    assert_eq!(interrupted(&outbox, &mm).await, "interrupted: mo crashed mid-turn before it answered");
-    assert!(remote.placement("lou").is_none() && remote.placement("mo").is_none(), "gone");
-    assert!(!remote.in_turn("kay"), "its missed Stop applied");
-    close_on(remote, &mut a, "kay").await;
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    assert_eq!((outbox.get(&mk).unwrap().state, outbox.get(&ml).unwrap().state), (State::Delivered, State::Delivered), "answered");
-}
-
-/// #4: the host reports a CLI's exit with its turn counts. Its last Stop
-/// is in them even if that hook arrives after `session_gone`, or never.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_gone_carries_the_turn_so_a_late_stop_hook_cant_fail_an_answer() {
-    use k2_core::delivery::State;
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "ned", "/w/ned", &sid(1)).await;
-    let m = delivered(&outbox, &mut a, "ned", "answered, then exited").await;
-    turn_started(remote, &mut a, "ned", &sid(1)).await;
-    // The CLI answers and exits; session_gone overtakes its Stop hook.
-    send(&mut a, &Frame::SessionGone { agent_id: "ned".into(), epoch: None, exit_code: Some(0), turn: Some(counts(1, 1, false)) }).await;
-    within("ned to go", async {
-        while remote.placement("ned").is_some() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    hook(&mut a, &sid(1), "Stop").await;
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    assert_eq!(outbox.get(&m).unwrap().state, State::Delivered);
-}
-
-/// #3: a note can only be made after its delivery answered (the direct
-/// path), or the ack comes late. If the prompt was submitted and its turn
-/// ended meanwhile, the note doesn't carry into the next turn: a crash in
-/// that one doesn't fail a message it never had. A note whose prompt runs
-/// in the turn now is in that turn.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_late_note_lands_in_the_turn_that_had_its_prompt_not_the_next() {
-    use k2_core::delivery::State;
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "oz", "/w/oz", &sid(1)).await;
-    let body = json!({"kind": "msg", "text": "direct"});
-
-    // A direct delivery whose turn ran and ended before it answered.
-    let mark = outbox.turn_mark("oz");
-    turn_started(remote, &mut a, "oz", &sid(1)).await;
-    hook(&mut a, &sid(1), "Stop").await;
-    within("oz's turn to end", async {
-        while remote.in_turn("oz") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    outbox.record_direct("m_0000000000005_late", "agent:alice", "oz", &body, &mark, k2_core::delivery::now_ms()).unwrap();
-    // And one submitted in the turn that runs now: in it.
-    let mark = outbox.turn_mark("oz");
-    turn_started(remote, &mut a, "oz", &sid(1)).await;
-    outbox.record_direct("m_0000000000006_now", "agent:alice", "oz", &body, &mark, k2_core::delivery::now_ms()).unwrap();
-    // An outbox message whose ack comes after its turn's Stop: noted when
-    // it was sent, so that Stop answers it.
-    let m = outbox.send("agent:alice", "oz", json!({"kind": "msg", "text": "late ack"})).unwrap();
-    let Frame::Deliver { msg_id, .. } = recv(&mut a).await else { panic!("expected the delivery") };
-    assert_eq!(msg_id, m);
-    hook(&mut a, &sid(1), "Stop").await;
-    turn_started(remote, &mut a, "oz", &sid(1)).await; // the next turn: the late ack's prompt
-    hook(&mut a, &sid(1), "Stop").await;
-    send(&mut a, &Frame::DeliverAck { msg_id: m.clone(), status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: None }).await;
-    assert_eq!(wait_final(&outbox, &m).await.state, State::Delivered);
-
-    // A new turn, then the CLI dies in it: none of the three was in it.
-    turn_started(remote, &mut a, "oz", &sid(1)).await;
-    gone(&mut a, remote, "oz").await;
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    for id in ["m_0000000000005_late", "m_0000000000006_now", m.as_str()] {
-        assert_eq!(outbox.get(id).unwrap().state, State::Delivered, "{id}");
-    }
-}
-
-/// #3, the other side: the "now" note above is in its turn, and a crash in
-/// that turn fails it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_late_note_for_the_running_turn_is_cut_with_it() {
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "pia", "/w/pia", &sid(1)).await;
-    let mark = outbox.turn_mark("pia");
-    turn_started(remote, &mut a, "pia", &sid(1)).await;
-    outbox.record_direct("m_0000000000007_run", "agent:alice", "pia", &json!({"kind": "msg", "text": "x"}), &mark, k2_core::delivery::now_ms()).unwrap();
-    gone(&mut a, remote, "pia").await;
-    assert_eq!(interrupted(&outbox, "m_0000000000007_run").await, "interrupted: pia crashed mid-turn before it answered");
-}
-
-/// #1: the host's daemon restarts while an agent's turn runs. Without
-/// ptyd adoption (S3) the CLI does not outlive its daemon, and the
-/// restarted daemon knows nothing of its turn: the message fails with its
-/// outcome unknown, not as a crash, and nothing is resent.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_host_daemon_restart_mid_turn_leaves_the_outcome_unknown() {
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "quin", "/w/quin", &sid(1)).await;
-    let m = delivered(&outbox, &mut a, "quin", "mid-turn").await;
-    turn_started(remote, &mut a, "quin", &sid(1)).await;
-    drop(a);
-    wait_lost(remote, "host-a").await;
-    let _a = back(&url, "host-a", vec![]).await;
-    assert_eq!(interrupted(&outbox, &m).await, "outcome unknown: host lost mid-turn (quin had not answered when its host was lost)");
-    assert_eq!(outbox.get(&m).unwrap().attempts, 1, "not resent");
-}
-
-/// #6: a direct delivery's row is written whole or not at all, and a
-/// failure says so.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn record_direct_is_one_transaction_and_reports_failure() {
-    use k2_core::delivery::State;
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let outbox = outbox_for(remote);
-    let body = json!({"kind": "msg", "text": "x"});
-    let mark = crate::agent_host::remote::TurnMark::default();
-    let now = k2_core::delivery::now_ms();
-    outbox.record_direct("m_0000000000008_one", "agent:alice", "rex", &body, &mark, now).unwrap();
-    assert_eq!(outbox.get("m_0000000000008_one").unwrap().state, State::Delivered);
-    let err = outbox.record_direct("m_0000000000008_one", "agent:alice", "rex", &body, &mark, now).unwrap_err();
-    assert!(err.contains("already finished"), "{err}");
-    assert!(outbox.record_direct("", "agent:alice", "rex", &body, &mark, now).is_err());
-    assert_eq!(outbox.get("").map(|r| r.state), None, "nothing half written");
-}
-
-/// #5 (lab S10, seed 7 round 3): the controller restarts between a
-/// delivery and the crash that cuts its turn. The turn and its unanswered
-/// message are in the controller's store: restored, the host's resume
-/// reconciled against them, and the crash after the restart fails the
-/// message.
+/// #5 (K2-f.1): the controller restarts between a delivery and the crash
+/// that cuts its turn. The turn and its matched message are in the
+/// controller's store: restored, and the crash after the restart fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_turn_survives_a_controller_restart_and_a_crash_after_it_fails_the_message() {
     use crate::delivery_drain::{start_controller, Direct};
@@ -1395,124 +1385,86 @@ async fn a_turn_survives_a_controller_restart_and_a_crash_after_it_fails_the_mes
     let url = serve(remote).await;
     let mut a = fake_host(&url, "host-a").await;
     spawn_on(remote, &mut a, "sam", "/w/sam", &sid(1)).await;
-    let epoch = remote.placement("sam").unwrap().epoch.0;
+    let epoch = epoch_of(remote, "sam");
     let m = delivered(&outbox, &mut a, "sam", "before the restart").await;
-    turn_started(remote, &mut a, "sam", &sid(1)).await;
+    prompt_with(remote, &mut a, "sam", &sid(1), running(1, 0, &[&m])).await;
     drop(a);
 
-    // A new controller process on the same databases.
+    // A new controller process on the same databases; the host's resume
+    // says nothing of the turn (an older host): the stored turn stands.
     let (remote, outbox) = start(true);
     let url = serve(remote).await;
-    let mut a = back(&url, "host-a", vec![resumed("sam", &sid(1), epoch, true, counts(1, 0, true))]).await;
-    within("sam to be adopted mid-turn", async {
-        while !remote.in_turn("sam") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
+    let mut a = back(&url, "host-a", vec![resumed("sam", &sid(1), epoch, None)], vec![]).await;
+    until("sam adopted mid-turn", || remote.in_turn("sam")).await;
     gone(&mut a, remote, "sam").await;
     assert_eq!(interrupted(&outbox, &m).await, "interrupted: sam crashed mid-turn before it answered");
     std::fs::remove_file(&placements).unwrap();
     std::fs::remove_file(&outbox_db).unwrap();
 }
 
-// ── K2-f.2: the host's absolute counts and each message's prompt ───────
-
-/// A hook carrying the host's counts after it (a K2-f.2 host).
-async fn hook_at(host: &mut Ws, pane: &str, event: &str, turn: super::proto::TurnCounts) {
-    let f = Frame::Hook {
-        pane: pane.into(),
-        event: event.into(),
-        session_id: Some(pane.into()),
-        conversation: None,
-        agent_pid: None,
-        at_ms: 0,
-        epoch: None,
-        subagent: false,
-        turn: Some(turn),
-    };
-    send(host, &f).await;
-}
-
-/// The outbox sends `text` to `agent`; the host types it for its
-/// `prompt`th prompt and says so in its ack.
-async fn delivered_for(outbox: &crate::delivery_drain::Controller, host: &mut Ws, agent: &str, text: &str, prompt: u64) -> String {
-    let id = outbox.send("agent:alice", agent, json!({"kind": "msg", "text": text})).unwrap();
-    match recv(host).await {
-        Frame::Deliver { msg_id, .. } => {
-            assert_eq!(msg_id, id);
-            send(host, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: Some(prompt) }).await;
-        }
-        other => panic!("expected the delivery, got {other:?}"),
-    }
-    assert_eq!(wait_final(outbox, &id).await.state, k2_core::delivery::State::Delivered);
-    id
-}
-
-async fn until(what: &str, f: impl Fn() -> bool) {
-    within(what, async {
-        while !f() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-}
-
-/// #1: A goes in prompt 1; B, typed while that turn runs, in prompt 2.
-/// The forwarder drops two hooks (A's Stop, B's prompt): the next hook's
-/// counts carry them. Then the host is lost (nothing more from it): A is
-/// known answered, B's outcome is unknown. (Counted from forwarded hooks
-/// alone, A looked unanswered too.) And a CLI dying with counts in its
-/// `session_gone` gets the same split.
+/// K2-f.3 #6: a turn row written by K2-f.1 (`current_json`) or K2-f.2
+/// (`notes_json`) is read into this one: its messages in the running turn
+/// are the turn's, the rest are dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn absolute_counts_survive_hooks_the_forwarder_dropped() {
-    use k2_core::delivery::State;
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "ada", "/w/ada", &sid(1)).await;
-    let ma = delivered_for(&outbox, &mut a, "ada", "A", 1).await;
-    hook_at(&mut a, &sid(1), "UserPromptSubmit", counts(1, 0, true)).await;
-    until("ada's turn", || remote.in_turn("ada")).await;
-    let mb = delivered_for(&outbox, &mut a, "ada", "B", 2).await;
-    // (Stop 1,1 and UserPromptSubmit 2,1 are lost.) A tool hook in B's turn:
-    hook_at(&mut a, &sid(1), "PreToolUse", counts(2, 1, true)).await;
-    spawn_on(remote, &mut a, "bea", "/w/bea", &sid(2)).await; // the hook is in by now (one link, in order)
-    drop(a);
-    wait_lost(remote, "host-a").await;
-    let moved = remote.move_lost(std::time::Instant::now(), Duration::ZERO);
-    assert!(moved.contains(&"ada".to_string()), "{moved:?}");
-    assert_eq!(interrupted(&outbox, &mb).await, "outcome unknown: host lost mid-turn (ada had not answered when its host was lost)");
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
+async fn older_turn_rows_are_migrated() {
+    let placements = k2_core::test_env::unique_temp_path("k2f3-migrate.db");
+    {
+        let _store = PlacementStore::open_file(&placements).unwrap();
+        let c = rusqlite::Connection::open(&placements).unwrap();
+        for (agent, n) in [("ari", 1), ("bev", 2)] {
+            c.execute(
+                "INSERT INTO host_placements (agent_id, host_id, session_id, epoch) VALUES (?1, 'host-a', ?2, ?3)",
+                rusqlite::params![agent, sid(n), n as i64 + 40],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO host_turns (agent_id, pane, running, prompts, stops, pending_json, current_json) VALUES ('ari', ?1, 1, 2, 1, '[\"m_pending\"]', '[\"m_current\"]')",
+            [sid(1)],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO host_turns (agent_id, pane, running, prompts, stops, notes_json) VALUES ('bev', ?1, 1, 3, 2, ?2)",
+            rusqlite::params![sid(2), r#"[{"msg_id":"m_in_turn","prompt":3},{"msg_id":"m_next","prompt":4},{"msg_id":"m_old","prompt":2}]"#],
+        )
+        .unwrap();
     }
-    assert_eq!(outbox.get(&ma).unwrap().state, State::Delivered, "answered in prompt 1");
-
-    let mut b = fake_host(&url, "host-b").await;
-    spawn_on(remote, &mut b, "cal", "/w/cal", &sid(3)).await;
-    let mc = delivered_for(&outbox, &mut b, "cal", "C", 1).await;
-    hook_at(&mut b, &sid(3), "UserPromptSubmit", counts(1, 0, true)).await;
-    let md = delivered_for(&outbox, &mut b, "cal", "D", 2).await;
-    send(&mut b, &Frame::SessionGone { agent_id: "cal".into(), epoch: None, exit_code: Some(137), turn: Some(counts(2, 1, true)) }).await;
-    assert_eq!(interrupted(&outbox, &md).await, "interrupted: cal crashed mid-turn before it answered");
-    assert_eq!(outbox.get(&mc).unwrap().state, State::Delivered);
+    let store = Arc::new(PlacementStore::open_file(&placements).unwrap());
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::with_store(store, None)));
+    remote.restore();
+    let outbox = outbox_for(remote);
+    let now = k2_core::delivery::now_ms();
+    for id in ["m_pending", "m_current", "m_in_turn", "m_next", "m_old"] {
+        outbox.record_direct(id, "agent:alice", "x", &json!({"kind": "msg", "text": id}), now).unwrap();
+    }
+    let url = serve(remote).await;
+    let mut a = back(&url, "host-a", vec![resumed("ari", &sid(1), 41, None), resumed("bev", &sid(2), 42, None)], vec![]).await;
+    gone(&mut a, remote, "ari").await;
+    gone(&mut a, remote, "bev").await;
+    for id in ["m_current", "m_in_turn"] {
+        assert!(interrupted(&outbox, id).await.starts_with("interrupted: "), "{id}");
+    }
+    for id in ["m_pending", "m_next", "m_old"] {
+        stays_delivered(&outbox, id).await;
+    }
+    std::fs::remove_file(&placements).unwrap();
 }
 
-/// #1: a controller that never followed an agent's turn (adopted after an
-/// upgrade or a restart without its table) takes it from the resume.
+/// K2-f.2 #1: a controller that never followed an agent's turn (adopted
+/// after an upgrade or a restart without its table) takes it from the
+/// resume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_adopted_agent_gets_its_turn_from_the_resume() {
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
-    let _a = back(&url, "host-a", vec![resumed("bo", &sid(1), 7, true, counts(3, 2, true))]).await;
+    let _a = back(&url, "host-a", vec![resumed("bo", &sid(1), 7, Some(running(3, 2, &[])))], vec![]).await;
     until("bo adopted", || remote.placement("bo").is_some()).await;
     assert!(remote.in_turn("bo"), "in its third turn, as the host says");
 }
 
-/// #2: a CLI nested in the lead's (a `claude -p` run by a Bash tool) posts
-/// hooks for the same pane; its Stop doesn't end the lead's turn, on the
-/// host or on the controller.
+/// K2-f.2 #2: a CLI nested in the lead's (a `claude -p` run by a Bash
+/// tool) posts hooks for the same pane; its Stop doesn't end the lead's
+/// turn, on the host or on the controller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_nested_clis_hooks_are_not_the_leads() {
     use k2_core::agent_hooks::envelope::{parse, HookHeaders};
@@ -1526,7 +1478,7 @@ async fn a_nested_clis_hooks_are_not_the_leads() {
     let url = serve(remote).await;
     let mut a = fake_host(&url, "host-a").await;
     spawn_on(remote, &mut a, "cy", "/w/cy", &sid(1)).await;
-    turn_started(remote, &mut a, "cy", &sid(1)).await;
+    prompt_with(remote, &mut a, "cy", &sid(1), running(1, 0, &[])).await;
     let nested = Frame::Hook {
         pane: sid(1),
         event: "Stop".into(),
@@ -1544,99 +1496,67 @@ async fn a_nested_clis_hooks_are_not_the_leads() {
     assert!(remote.in_turn("cy"), "the lead's turn still runs");
 }
 
-/// #4: an idle agent; B is typed (prompt 1) and submitted, but its host
-/// is lost before that UserPromptSubmit is forwarded. The agent moves: B's
-/// outcome is unknown, and it says so (it isn't left delivered).
+/// K2-f.2 #1: hooks lost on the way (a lagging forwarder) are in the next
+/// hook's absolute counts. A goes in prompt 1, B in prompt 2; A's Stop and
+/// B's prompt are lost; a tool hook in B's turn carries them. The host is
+/// then lost: A is known answered, B's outcome is unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_host_leaves_a_submitted_message_unknown_not_delivered() {
+async fn absolute_counts_survive_hooks_the_forwarder_dropped() {
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
     let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "dee", "/w/dee", &sid(1)).await;
-    hook(&mut a, &sid(1), "SessionStart").await;
-    let mb = delivered_for(&outbox, &mut a, "dee", "B", 1).await;
+    spawn_on(remote, &mut a, "ada", "/w/ada", &sid(1)).await;
+    let ma = delivered(&outbox, &mut a, "ada", "A").await;
+    let mb = delivered(&outbox, &mut a, "ada", "B").await;
+    prompt_with(remote, &mut a, "ada", &sid(1), running(1, 0, &[&ma])).await;
+    hook_at(&mut a, &sid(1), "PreToolUse", running(2, 1, &[&mb])).await;
+    spawn_on(remote, &mut a, "bea", "/w/bea", &sid(2)).await; // the hook is in by now (one link, in order)
     drop(a);
     wait_lost(remote, "host-a").await;
-    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["dee"]);
-    assert_eq!(interrupted(&outbox, &mb).await, "outcome unknown: host lost mid-turn (dee had not answered when its host was lost)");
+    let moved = remote.move_lost(std::time::Instant::now(), Duration::ZERO);
+    assert!(moved.contains(&"ada".to_string()), "{moved:?}");
+    assert_eq!(interrupted(&outbox, &mb).await, "outcome unknown: host lost mid-turn (ada had not answered when its host was lost)");
+    stays_delivered(&outbox, &ma).await;
 }
 
-/// #5: two messages typed while a turn runs are submitted as their own
-/// prompts (2 and 3). The CLI dies in prompt 3's turn: only that one
-/// fails; prompt 2's was answered.
+/// K2-f.2 #6, lab's S10: attempt 1 goes to host-1, killed before it acks;
+/// the agent moves to host-2, where attempt 2 is the first real delivery
+/// and its prompt carries it. The CLI is killed mid-turn: it fails.
+/// Attempt 1, never acked, fails nothing (the row was only `sent`). And a
+/// resend the host calls a duplicate takes nothing back: notes come from
+/// the host's prompts, not from sends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn each_message_is_answered_by_its_own_prompts_turn() {
+async fn attempt_one_lost_unacked_attempt_two_delivered_then_a_crash_fails_it() {
     use k2_core::delivery::State;
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "eli", "/w/eli", &sid(1)).await;
-    hook_at(&mut a, &sid(1), "UserPromptSubmit", counts(1, 0, true)).await;
-    until("eli's turn", || remote.in_turn("eli")).await;
-    let m2 = delivered_for(&outbox, &mut a, "eli", "second", 2).await;
-    let m3 = delivered_for(&outbox, &mut a, "eli", "third", 3).await;
-    hook_at(&mut a, &sid(1), "Stop", counts(1, 1, false)).await;
-    hook_at(&mut a, &sid(1), "UserPromptSubmit", counts(2, 1, true)).await;
-    hook_at(&mut a, &sid(1), "Stop", counts(2, 2, false)).await;
-    hook_at(&mut a, &sid(1), "UserPromptSubmit", counts(3, 2, true)).await;
-    send(&mut a, &Frame::SessionGone { agent_id: "eli".into(), epoch: None, exit_code: Some(137), turn: Some(counts(3, 2, true)) }).await;
-    assert_eq!(interrupted(&outbox, &m3).await, "interrupted: eli crashed mid-turn before it answered");
-    assert_eq!(outbox.get(&m2).unwrap().state, State::Delivered);
-}
+    let mut a = fake_host(&url, "host-1").await;
+    spawn_on(remote, &mut a, "notes", "/w/notes", &sid(1)).await;
+    let m = outbox.send("agent:alice", "notes", json!({"kind": "msg", "text": "turn three"})).unwrap();
+    assert!(matches!(recv(&mut a).await, Frame::Deliver { attempt: 1, .. }));
+    drop(a); // SIGKILL before the ack
+    wait_lost(remote, "host-1").await;
+    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["notes"]);
+    assert_eq!(outbox.get(&m).unwrap().state, State::Sent);
 
-/// #6: a message sent to host-a goes unanswered (no ack) and its agent
-/// ends there; placed again on host-b, the resend is noted, and a crash in
-/// its turn fails it. A resend the host calls a duplicate (typed and
-/// answered before, its ack lost) is not noted again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_resend_is_followed_and_a_duplicate_one_is_not() {
-    use k2_core::delivery::State;
-    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
-    let url = serve(remote).await;
-    let outbox = outbox_for(remote);
-    outbox.set_gone_grace(Duration::from_secs(3600));
-    let mut a = fake_host(&url, "host-a").await;
-    spawn_on(remote, &mut a, "fay", "/w/fay", &sid(1)).await;
-    hook(&mut a, &sid(1), "SessionStart").await;
-    let m = outbox.send("agent:alice", "fay", json!({"kind": "msg", "text": "resent"})).unwrap();
-    assert!(matches!(recv(&mut a).await, Frame::Deliver { attempt: 1, .. }), "the first send; never acked");
-    gone(&mut a, remote, "fay").await;
-    assert_eq!(outbox.get(&m).unwrap().state, State::Sent, "not delivered: nothing to fail");
-    let mut b = fake_host(&url, "host-b").await;
-    drop(a);
-    // host-a's link is down before fay is placed again: on host-b.
+    let mut b = fake_host(&url, "host-2").await;
     wait_hosts(remote, 1).await;
-    spawn_on(remote, &mut b, "fay", "/w/fay", &sid(2)).await;
+    spawn_on(remote, &mut b, "notes", "/w/notes", &sid(2)).await;
     let Frame::Deliver { msg_id, attempt, .. } = recv(&mut b).await else { panic!("expected the resend") };
     assert_eq!((msg_id.as_str(), attempt > 1), (m.as_str(), true));
-    send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: Some(1) }).await;
+    send(&mut b, &Frame::DeliverAck { msg_id: msg_id.clone(), status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
     assert_eq!(wait_final(&outbox, &m).await.state, State::Delivered);
-    turn_started(remote, &mut b, "fay", &sid(2)).await;
-    gone(&mut b, remote, "fay").await;
-    assert_eq!(interrupted(&outbox, &m).await, "interrupted: fay crashed mid-turn before it answered");
-
-    // The duplicate: typed and answered on gus's first send, its ack lost.
-    spawn_on(remote, &mut b, "gus", "/w/gus", &sid(3)).await;
-    let g = outbox.send("agent:alice", "gus", json!({"kind": "msg", "text": "once"})).unwrap();
-    assert!(matches!(recv(&mut b).await, Frame::Deliver { attempt: 1, .. }));
-    turn_started(remote, &mut b, "gus", &sid(3)).await;
-    hook(&mut b, &sid(3), "Stop").await;
-    until("gus's turn to end", || !remote.in_turn("gus")).await;
-    let Frame::Deliver { msg_id, .. } = recv(&mut b).await else { panic!("expected the resend") };
-    send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Duplicate, reason: None, prompt: None }).await;
-    assert_eq!(wait_final(&outbox, &g).await.state, State::Delivered);
-    turn_started(remote, &mut b, "gus", &sid(3)).await;
-    gone(&mut b, remote, "gus").await;
-    for _ in 0..3 {
-        outbox.pass(k2_core::delivery::now_ms());
-    }
-    assert_eq!(outbox.get(&g).unwrap().state, State::Delivered, "answered in its first turn");
+    prompt_with(remote, &mut b, "notes", &sid(2), running(1, 0, &[&m])).await;
+    // A late duplicate ack of the same message changes nothing.
+    send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Duplicate, reason: None }).await;
+    gone(&mut b, remote, "notes").await;
+    assert_eq!(interrupted(&outbox, &m).await, "interrupted: notes crashed mid-turn before it answered");
 }
 
-/// #7: the v2 close route (HTTP) and a drain's release at its deadline
-/// cut a running turn like `unplace` does.
+/// K2-f.2 #7: the v2 close route (HTTP) and a drain's release at its
+/// deadline cut a running turn like `unplace` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_close_route_and_a_drain_release_cut_a_running_turn() {
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
@@ -1647,8 +1567,8 @@ async fn the_close_route_and_a_drain_release_cut_a_running_turn() {
     spawn_on(remote, &mut a, "io", "/w/io", &sid(2)).await;
     let mh = delivered(&outbox, &mut a, "hy", "closed").await;
     let mi = delivered(&outbox, &mut a, "io", "drained").await;
-    turn_started(remote, &mut a, "hy", &sid(1)).await;
-    turn_started(remote, &mut a, "io", &sid(2)).await;
+    prompt_with(remote, &mut a, "hy", &sid(1), running(1, 0, &[&mh])).await;
+    prompt_with(remote, &mut a, "io", &sid(2), running(1, 0, &[&mi])).await;
 
     let close = tokio::spawn(async move { remote.close(br#"{"agent_name":"hy"}"#).await });
     match recv(&mut a).await {
@@ -1663,37 +1583,55 @@ async fn the_close_route_and_a_drain_release_cut_a_running_turn() {
     assert!(!remote.in_turn("hy") && !remote.in_turn("io"));
 }
 
-/// #6, lab's S10 (heavy chaos on f76dce00d, 1/10 green): turn three's
-/// attempt 1 goes to host-1, which is killed before it acks. The agent
-/// moves to host-2, where attempt 2 is the first real delivery: noted (its
-/// ack, from a host that gives no prompt, keeps the estimate). The CLI is
-/// killed mid-turn: the message fails `interrupted`, not left delivered.
-/// Attempt 1's note, cut with the lost host, fails nothing: that row was
-/// only `sent`.
+/// Lab S10, seed 7 round 3 (wave3 6ffcbb9da): a cut before the delivery's
+/// ack. The message is typed on host-2 and its prompt starts the turn (the
+/// host tied it), then host-2 is SIGKILLed before it acks: the row is still
+/// `sent`. host-2 relinks without the agent: adopt says gone, the turn is
+/// cut, and the row ends failed then, with the cut's reason. host-2's
+/// relink report then re-sends its ack from its seen table: the row stays
+/// failed (never delivered-and-unanswered), and it is not resent. A message
+/// whose ack died the same way but that no prompt carried ends delivered
+/// with its late ack, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attempt_one_lost_unacked_attempt_two_delivered_then_a_crash_fails_it() {
+async fn a_cut_before_the_ack_keeps_its_result_when_the_ack_comes_late() {
     use k2_core::delivery::State;
     let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
     let url = serve(remote).await;
     let outbox = outbox_for(remote);
-    let mut a = fake_host(&url, "host-1").await;
-    spawn_on(remote, &mut a, "notes", "/w/notes", &sid(1)).await;
-    hook(&mut a, &sid(1), "SessionStart").await;
-    let m = outbox.send("agent:alice", "notes", json!({"kind": "msg", "text": "turn three"})).unwrap();
-    assert!(matches!(recv(&mut a).await, Frame::Deliver { attempt: 1, .. }));
-    drop(a); // SIGKILL before the ack
-    wait_lost(remote, "host-1").await;
-    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["notes"]);
-    assert_eq!(outbox.get(&m).unwrap().state, State::Sent, "the cut on the move fails nothing that wasn't delivered");
-
     let mut b = fake_host(&url, "host-2").await;
-    wait_hosts(remote, 1).await;
-    spawn_on(remote, &mut b, "notes", "/w/notes", &sid(2)).await;
-    let Frame::Deliver { msg_id, attempt, .. } = recv(&mut b).await else { panic!("expected the resend") };
-    assert_eq!((msg_id.as_str(), attempt > 1), (m.as_str(), true));
-    send(&mut b, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None, prompt: None }).await;
-    assert_eq!(wait_final(&outbox, &m).await.state, State::Delivered);
-    turn_started(remote, &mut b, "notes", &sid(2)).await;
-    gone(&mut b, remote, "notes").await;
-    assert_eq!(interrupted(&outbox, &m).await, "interrupted: notes crashed mid-turn before it answered");
+    spawn_on(remote, &mut b, "notes", "/w/notes", &sid(1)).await;
+    spawn_on(remote, &mut b, "pal", "/w/pal", &sid(2)).await;
+    let m = outbox.send("agent:alice", "notes", json!({"kind": "msg", "text": "turn three"})).unwrap();
+    assert!(matches!(recv(&mut b).await, Frame::Deliver { msg_id, .. } if msg_id == m));
+    // (Messages go out one at a time per recipient: the control is pal's.)
+    let n = outbox.send("agent:alice", "pal", json!({"kind": "msg", "text": "typed, never submitted"})).unwrap();
+    within("pal's delivery", async {
+        loop {
+            if let Frame::Deliver { msg_id, .. } = recv(&mut b).await {
+                if msg_id == n {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    prompt_with(remote, &mut b, "notes", &sid(1), running(1, 0, &[&m])).await;
+    assert_eq!((outbox.get(&m).unwrap().state, outbox.get(&n).unwrap().state), (State::Sent, State::Sent), "neither acked");
+    drop(b); // SIGKILL before the acks
+    wait_lost(remote, "host-2").await;
+
+    // Its daemon restarts without notes or pal: gone, notes' turn cut.
+    let mut b = back(&url, "host-2", vec![], vec![]).await;
+    let why = "outcome unknown: host lost mid-turn (notes had not answered when its host was lost)";
+    assert_eq!(interrupted(&outbox, &m).await, why);
+    // The relink report: both acks, late.
+    for id in [&m, &n] {
+        send(&mut b, &Frame::DeliverAck { msg_id: id.clone(), status: crate::hosts::proto::DeliverStatus::Delivered, reason: Some("reported on relink".into()) }).await;
+    }
+    assert_eq!(wait_final(&outbox, &n).await.state, State::Delivered, "no evidence it was in the cut turn");
+    for _ in 0..3 {
+        outbox.pass(k2_core::delivery::now_ms());
+    }
+    let row = outbox.get(&m).unwrap();
+    assert_eq!((row.state, row.reason.as_deref(), row.attempts), (State::Failed, Some(why), 1), "the cut's result stands; not resent");
 }

@@ -966,7 +966,10 @@ pub(crate) fn deliver_live_with_receipt(
     if let Some(sent) = crate::delivery_drain::send(from, workspace_token, body.clone()) {
         return MsgResponse::from_outbox(sent);
     }
-    let mark = crate::delivery_drain::turn_mark(workspace_token);
+    // K2-f: on a controller the cascade's delivery has an id from the
+    // start, so the host it types into can match the prompt to it.
+    let direct_id = crate::delivery_drain::direct_msg_id();
+    let _direct = direct_id.as_deref().map(crate::delivery_drain::DirectDelivery::during);
     let mut r = deliver_live_inner(
         workspace_token,
         text,
@@ -979,8 +982,10 @@ pub(crate) fn deliver_live_with_receipt(
     );
     // K2-f: on a controller, what the cascade delivered (a wake included)
     // gets an outbox row whose turn is followed: a crash mid-turn fails it.
-    if r.success && r.msg_id.is_none() {
-        r.msg_id = crate::delivery_drain::direct_delivered(from, workspace_token, body, mark);
+    if let Some(id) = direct_id.filter(|_| r.success && r.msg_id.is_none()) {
+        if crate::delivery_drain::direct_delivered(&id, from, workspace_token, body) {
+            r.msg_id = Some(id);
+        }
     }
     r
 }

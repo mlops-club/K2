@@ -158,6 +158,10 @@ pub(crate) async fn run_with(cfg: HostConfig, t: Timings, observe: Option<mpsc::
 struct Placed {
     epochs: HashMap<String, u64>,
     sessions: HashMap<String, String>,
+    /// K2-f.3: agents whose CLI ended, with how their turn ended, until a
+    /// `hello` has carried them: a `session_gone` lost with its link is
+    /// told again in the next `hello.ended`.
+    ended: Vec<super::proto::EndedPlacement>,
 }
 
 fn placed() -> Arc<Mutex<Placed>> {
@@ -198,18 +202,26 @@ fn resume_list() -> (Vec<super::proto::ResumePlacement>, Vec<super::proto::Ended
             _ => dead.push((agent.clone(), *epoch)),
         }
     }
-    let mut ended = Vec::new();
     for (agent, epoch) in dead {
         let pane = p.sessions.iter().find(|(_, a)| **a == agent).map(|(pane, _)| pane.clone());
-        if let Some((pane, turn)) = pane.and_then(|pane| super::drain::take_turn_counts(&pane).map(|t| (pane, t))) {
-            ended.push(super::proto::EndedPlacement { agent_id: agent.clone(), session_id: pane, epoch, turn });
+        if let Some(pane) = pane {
+            // `turn: None`: it never sent a hook (nothing of its turn is known).
+            let turn = super::drain::take_turn_counts(&pane);
+            p.ended.push(super::proto::EndedPlacement { agent_id: agent.clone(), session_id: pane, epoch, turn });
         }
         p.epochs.remove(&agent);
         p.sessions.retain(|_, a| a != &agent);
     }
+    let mut ended = p.ended.clone();
     ended.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     (out, ended)
+}
+
+/// K2-f.3: drop the ended records a welcomed `hello` carried (others, ended
+/// since, wait for the next one).
+fn forget_ended(sent: &[super::proto::EndedPlacement]) {
+    placed().lock().ended.retain(|e| !sent.iter().any(|s| s.agent_id == e.agent_id && s.epoch == e.epoch));
 }
 
 /// The grid frame version a snapshot or delta carries (its offset in the
@@ -249,6 +261,10 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
         Ok(Some(Ok(Message::Text(t)))) => match Frame::decode(&t)? {
             Frame::Welcome { host_id, protocol, controller } => {
                 log_debug!("[hosts/link] linked as {host_id} to {controller} (protocol {protocol})");
+                // K2-f.3: the ended agents this hello carried are told.
+                if let Frame::Hello { ended, .. } = &hello {
+                    forget_ended(ended);
+                }
                 host_id
             }
             Frame::Refused { code, message } => return Err(format!("refused: {code}: {message}")),
@@ -344,6 +360,16 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                         let pane = p.sessions.iter().find(|(_, a)| **a == agent_name).map(|(pane, _)| pane.clone());
                         let turn = pane.as_deref().and_then(super::drain::take_turn_counts);
                         p.sessions.retain(|_, a| a != &agent_name);
+                        // K2-f.3: kept until a hello carries it, in case this
+                        // frame dies with the link before it is written.
+                        if let Some(pane) = pane {
+                            p.ended.push(super::proto::EndedPlacement {
+                                agent_id: agent_name.clone(),
+                                session_id: pane,
+                                epoch,
+                                turn: turn.clone(),
+                            });
+                        }
                         let _ = tx.send(Frame::SessionGone { agent_id: agent_name, epoch: Some(epoch), exit_code: None, turn });
                     }
                 }
@@ -533,7 +559,7 @@ fn handle(
                 }
             }
         }
-        Frame::Inject { req, agent_id, epoch, steps, .. } => {
+        Frame::Inject { req, agent_id, epoch, steps, msg_id } => {
             let current = placed.lock().epochs.get(&agent_id).copied();
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || {
@@ -543,6 +569,13 @@ fn handle(
                     (Some(_), Some(e)) if e != epoch => InjectOutcome::NotPlaced,
                     (None, _) => InjectOutcome::NotPlaced,
                     (Some(s), _) => {
+                        // K2-f.3: the message it types, for the prompt that
+                        // submits it.
+                        if let Some(id) = &msg_id {
+                            let text: String =
+                                steps.iter().filter_map(|st| if let super::proto::InjectStep::Write { text } = st { Some(text.as_str()) } else { None }).collect();
+                            super::drain::note_typed(&s.session_id().to_string(), id, &text);
+                        }
                         let actions: Result<Vec<_>, String> = steps.iter().map(|st| st.to_action()).collect();
                         match actions {
                             Ok(actions) => match crate::agent_host::host().inject(&s, actions) {
@@ -744,7 +777,8 @@ fn spawn_workspace(request: serde_json::Value) -> Result<super::proto::SpawnedSe
     let delivery = request.get("deliveryId").and_then(|v| v.as_str()).map(str::to_string);
     let req: crate::spawn::SpawnWorkspaceSessionRequest =
         serde_json::from_value(request).map_err(|e| format!("spawn request: {e}"))?;
-    let (out, already_delivered) = match delivery {
+    let launch_prompt = req.launch_prompt.clone();
+    let (out, already_delivered) = match delivery.clone() {
         Some(msg_id) => crate::delivery_drain::host_launch_once(&msg_id, |with_prompt| {
             let mut req = req.clone();
             if !with_prompt {
@@ -756,6 +790,10 @@ fn spawn_workspace(request: serde_json::Value) -> Result<super::proto::SpawnedSe
         })?,
         None => (crate::spawn::spawn_agent_session_v2_blocking(req)?, false),
     };
+    // K2-f.3: the message it put on argv, for the prompt that submits it.
+    if let (Some(id), Some(text), true, false) = (&delivery, &launch_prompt, out.launch_prompt_attached, already_delivered) {
+        super::drain::note_typed(&out.session_id.to_string(), id, text);
+    }
     let s = crate::agent_host::host()
         .find_session(&out.session_id)
         .ok_or_else(|| format!("session {} vanished right after its spawn", out.session_id))?;
@@ -823,4 +861,39 @@ fn run_op(s: &crate::agent_host::AgentSession, op: super::proto::SessionOp) -> R
         })
         .map_err(|e| e.to_string())?,
     })
+}
+
+#[cfg(test)]
+mod ended_tests {
+    use super::*;
+
+    /// K2-f.3 #5: an agent whose CLI ended is in every `hello.ended` until
+    /// a welcomed hello carried it (its `session_gone` may have died with
+    /// the link); then it is told, and drops out.
+    #[test]
+    fn an_ended_agent_is_in_each_hello_until_one_is_welcomed() {
+        let mine = |id: &str| super::super::proto::EndedPlacement {
+            agent_id: id.into(),
+            session_id: format!("pane-{id}"),
+            epoch: 9,
+            turn: Some(super::super::proto::TurnCounts { prompts: 1, stops: 0, running: true, msgs: vec!["m_x".into()] }),
+        };
+        let a = mine("k2f3-ended-a");
+        let b = mine("k2f3-ended-b");
+        placed().lock().ended.push(a.clone());
+        let has = |list: &[super::super::proto::EndedPlacement], e: &super::super::proto::EndedPlacement| list.iter().any(|x| x == e);
+        let (_, first) = resume_list();
+        assert!(has(&first, &a));
+        // That hello wasn't welcomed (the link dropped): the next one has it.
+        let (_, again) = resume_list();
+        assert!(has(&again, &a));
+        // b ends between that hello and its welcome: told on the next one.
+        placed().lock().ended.push(b.clone());
+        forget_ended(&again);
+        let (_, next) = resume_list();
+        assert!(!has(&next, &a) && has(&next, &b));
+        forget_ended(&next);
+        let (_, last) = resume_list();
+        assert!(!has(&last, &a) && !has(&last, &b));
+    }
 }

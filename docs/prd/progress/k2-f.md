@@ -263,3 +263,131 @@ K2-f.1; its pending/current columns are no longer read).
 | `hosts:: agent_host:: delivery_drain:: active_reaper:: hook_ingest::` (the built test binary) 30 times in a row | **30/30** (201 tests each). An earlier loop caught a race in the #6 test itself (fay placed again before host-a's link was seen down); it now waits for it |
 | `turn-snapshots.sh` `20261027T061221Z`, `drain-move.sh` `20261027T061456Z`, `three-process-msg.sh` `20261027T061622Z` | **7/7, 4/4, 4/4 PASS** |
 | `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3` (throwaway HOME) | **5401 passed, 0 failed**, 6 ignored, 162 binaries (before the S10 test was added; that test alone changed afterwards) |
+
+## K2-f.3: no false positives
+
+Branch `k2-dist/k2-f3`, from `k2-dist/wave3` 6ffcbb9da.
+
+The review of c504e6819 found items 2, 3, 7 and 8 correct and I2 holding,
+but new false positives. The coordinator's principle: **a message fails
+only with positive evidence that it was in the cut turn; when unsure, it
+stays delivered.**
+
+### The model
+
+K2-f.2 estimated each message's turn on the controller (count + 1 at
+typing, a note at every send). Those estimates were the false positives.
+K2-f.3 drops them: only the host, which typed the message, ties it to a
+turn.
+
+- **The host registers what it types** (`hosts::drain::note_typed`): the
+  message id and the digest of its text.
+  - **Outbox delivery:** the write-ahead needle.
+  - **Wake:** the launch prompt, when K2-c's `deliveryId` names the
+    message.
+  - **Inject from the controller:** the typed text, when the inject names
+    the message (`Inject.msg_id`).
+- **The hook carries a digest of the prompt.** `HookEnvelope.prompt_digest`
+  (k2-core) is the SHA-256 of the normalized `UserPromptSubmit` prompt. The
+  text is still dropped, as before.
+- **A prompt whose digest equals a registered message takes it into its
+  turn** (`TurnCounts.msgs`), and that turn's end releases it.
+  - A message folded into a running turn (no prompt of its own) matches
+    nothing.
+  - So do two messages submitted as one prompt.
+- **The controller takes `msgs` as the host reports them**, in every hook,
+  `resume`, `ended` and `session_gone`. A cut fails exactly the running
+  turn's `msgs`.
+  - Closed, or the CLI crashed: `interrupted`.
+  - A lost host (no counts at the end): its last known `msgs`, as
+    `outcome unknown`. The evidence: the message was submitted and no
+    `Stop` came.
+- **Direct deliveries name their message to the host** (`DirectDelivery`):
+  - the gone rule's wake;
+  - a host's message the controller delivers itself;
+  - the controller's own `k2 msg`, whose id now exists before its cascade
+    runs.
+
+| # | Item | As built | Test |
+|---|---|---|---|
+| 1 | Unhooked agents lost every delivered message (`hooked` forced true on load; `ended` needed counts) | No message is ever tied to a turn without its host matching a prompt, so an agent that never hooks has none to fail. `EndedPlacement.turn` is optional: an agent with no hooks is reported with none, and nothing is cut (not "outcome unknown"). `hooked` is gone | `an_agent_without_hooks_never_has_its_messages_failed` (a close, a controller restart, the CLI ending while unlinked: all stay delivered) |
+| 2 | A message folded into a running turn was noted for the next prompt | Matched by prompt text on the host, so a folded message is in no turn | `a_message_folded_into_a_running_turn_is_never_failed` (typed mid-turn, folded, Stop, then close: not failed; and a crash in that turn: not failed); `hosts::drain::tests::a_message_is_in_the_turn_whose_prompt_is_its_text` |
+| 3 | Two messages in a row got the same index | Each is matched to its own prompt | `two_messages_in_a_row_are_each_in_their_own_prompts_turn` |
+| 4 | A duplicate ack dropped the only note | Nothing is noted at send, so an ack (duplicate or not) takes nothing away. The coordinator's suggested fix (the ack naming its session) isn't needed | the S10 test now sends a late duplicate ack mid-turn; the crash still fails the message |
+| 5 | A `session_gone` lost with its link left the agent unreported | Each ended agent is kept (`Placed.ended`) and sent in every `hello.ended` until a welcomed hello carried it | `link::ended_tests::an_ended_agent_is_in_each_hello_until_one_is_welcomed` |
+| 6 | K2-f.1 rows' pending/current lists weren't migrated | `host_turns` gains `msgs_json`. A K2-f.1 row's `current` and a K2-f.2 row's notes for its running prompt become the turn's `msgs` on load; pending messages and other prompts' notes are dropped (no evidence). A row is rewritten in the new form | `older_turn_rows_are_migrated` |
+
+**Lab S10 on K2-f.2 (wave3 6ffcbb9da):** 9 of 10 rounds green, I1–I4
+passing, no false positives (5 `interrupted`, 3 `outcome unknown`, all
+real). The red was a cut before the delivery's ack:
+1. Seed 7 round 3: attempt 2 was typed on host-2, its prompt started the
+   turn, and host-2 was SIGKILLed before acking.
+2. On relink, adopt said gone and the turn was cut, but the row was still
+   `sent`. `mark_interrupted` only changed `delivered` rows.
+3. Seven ms later host-2's relink report re-sent the ack, and the row read
+   delivered and unanswered.
+
+**The fix:** a cut fails a message its host tied to the cut turn whether
+its row is `delivered` or still `sent` (`outbox::mark_interrupted`). The
+late ack then finds the row finished and changes nothing.
+
+This is the coordinator's decision (the cut's result stands when the ack
+comes late) taken one step further. The row ends at the cut, not at the
+ack, so a host that never comes back can't leave it `sent` to be resent to
+the agent's next placement: a second delivery of a message the cut turn
+already had.
+
+It applies only to messages in the host's `msgs` for that turn (evidence
+they were typed and submitted). A `sent` message no prompt carried isn't
+touched, and its late ack ends it delivered.
+
+Tests:
+- `a_cut_before_the_ack_keeps_its_result_when_the_ack_comes_late` (that
+  exact sequence, with the unmatched control);
+- k2-core `an_interrupted_message_ends_failed_and_a_late_ack_changes_nothing`.
+
+With the old rule, the first fails. The same pattern showed in this
+branch's own turn-snapshots run `20261027T083234Z`: the cut on the move
+had the host-matched turn-three message, still `sent`, and failed nothing.
+
+**The other tests, rewritten for this model** (the fake hosts report
+which messages their prompts matched):
+- a CLI exiting mid-turn;
+- a host back without the agent;
+- a move off a lost host;
+- the outage in hello;
+- `session_gone` carrying the turn;
+- a host-daemon restart;
+- a controller restart;
+- the direct paths (each names its message on its thread);
+- absolute counts;
+- an adopted agent;
+- nested CLIs;
+- S10 (attempt 1 lost unacked, attempt 2 on host-2);
+- the close route and drain;
+- K2-d's close test.
+
+**Removed:**
+- `DeliverAck.prompt`: the count-based index.
+- The controller's note API: `note_delivered`, `set_note_prompt`,
+  `unnote_*`, `TurnMark`.
+- The two "late note" tests, which modeled the estimates.
+
+**Known limits, all on the safe side** (a message stays delivered, never a
+false failure):
+- A prompt the CLI rewrites before `UserPromptSubmit` (a hook that edits
+  it) won't match its message.
+- Neither will a message typed by a path that doesn't name it: a `k2 msg`
+  through `deliver_live` or `with_via`, or an older host.
+
+### Results (K2-f.3)
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host:: delivery_drain:: active_reaper:: workspace_msg:: hook_ingest::` | **288 passed**, 0 failed |
+| `cargo test -p k2-core --lib -- agent_hooks:: delivery::` | **77 passed** (the prompt digest; `mark_interrupted` on `sent`) |
+| Mutations | host assigns every typed message on any prompt (no digest match) → the drain matching test fails; a welcome forgets every ended record → the #5 test fails; no migration → the #6 test fails; a cut only fails `delivered` rows (K2-f.2) → the seed-7 test fails. One mutation went unnoticed: the controller keeping a turn's `msgs` after it ends. The host already empties them at the turn's end, so the controller's own clearing is a second line no test reaches |
+| `hosts:: agent_host:: delivery_drain:: active_reaper:: hook_ingest::` (the built test binary) 30 times in a row | **30/30** (204 tests each) |
+| `turn-snapshots.sh` `20261027T100447Z` | **7/7 PASS**, with real processes and the fake agent's hooks: host-1 matched turn three's message to its prompt. When host-1 was SIGKILLed and the agent moved, the cut failed it `outcome unknown: host lost mid-turn` while it was still `sent` (its ack died with host-1), and it was not resent (host-2's memory has turns one, two and four). In the run before the seed-7 fix (`20261027T083234Z`) the same cut failed nothing |
+| `drain-move.sh` `20261027T100623Z`, `three-process-msg.sh` `20261027T100750Z` | **4/4, 4/4 PASS** |
+| `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3` (throwaway HOME) | **5405 passed, 0 failed**, 6 ignored, 162 binaries |

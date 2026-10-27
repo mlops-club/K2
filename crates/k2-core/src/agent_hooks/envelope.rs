@@ -167,6 +167,10 @@ pub struct HookEnvelope {
     /// ([`super::owner::Verdict::Descendant`]). The row merges its events
     /// into the pane's turn but never lets it change the session.
     pub from_descendant: bool,
+    /// K2-f: the SHA-256 of a `UserPromptSubmit`'s prompt, normalized
+    /// ([`prompt_digest`]): a host matches it against the messages it typed,
+    /// without keeping the text.
+    pub prompt_digest: Option<String>,
 }
 
 /// Why a body didn't parse. Every case is answered 204 and counted
@@ -214,6 +218,7 @@ pub fn parse(headers: &HookHeaders, body: &[u8]) -> Result<HookEnvelope, Envelop
         background_tasks: None,
         session_crons: None,
         prompt_thread_addr: None,
+        prompt_digest: None,
         task_notification_ids: Vec::new(),
         launched_task: None,
         stopped_task_id: None,
@@ -280,8 +285,20 @@ pub fn parse(headers: &HookHeaders, body: &[u8]) -> Result<HookEnvelope, Envelop
     if let Some(prompt) = obj.get("prompt").and_then(Value::as_str) {
         env.prompt_thread_addr = thread_addr(prompt);
         env.task_notification_ids = task_notification_ids(prompt);
+        env.prompt_digest = Some(prompt_digest(prompt));
     }
     Ok(env)
+}
+
+/// K2-f: a prompt's digest, the same for the text a host typed and the
+/// prompt the CLI submitted: line ends unified, terminal escapes (a
+/// bracketed paste's markers) and outer whitespace dropped, then SHA-256.
+pub fn prompt_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let t = text.replace("\r\n", "\n").replace("\x1b[200~", "").replace("\x1b[201~", "");
+    let t: String = t.chars().filter(|&c| c != '\u{1b}').collect();
+    let d = Sha256::digest(t.trim().as_bytes());
+    d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The address inside the first `[thread:<addr>]` stamp
@@ -412,6 +429,9 @@ mod tests {
         }));
         assert_eq!(env.prompt_thread_addr.as_deref(), Some("sales/reviewer"));
         assert!(!format!("{env:?}").contains("private plan"));
+        // K2-f: only its digest, which a typed copy of the text matches.
+        assert_eq!(env.prompt_digest, Some(prompt_digest("\x1b[200~[from sam] [thread:sales/reviewer] please run the private plan\x1b[201~\r\n")));
+        assert_ne!(env.prompt_digest, Some(prompt_digest("[from sam] please run the private plan")));
 
         let env = parse_json(json!({
             "hook_event_name": "UserPromptSubmit",

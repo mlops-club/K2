@@ -43,7 +43,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
-use crate::agent_host::remote::{RemoteHost, RemotePlacement, TurnMark};
+use crate::agent_host::remote::{RemoteHost, RemotePlacement};
 use crate::hosts::proto::{trace_events, DeliverStatus, Frame};
 
 pub type Db = Arc<ReentrantMutex<Connection>>;
@@ -148,12 +148,6 @@ pub fn outbox_status(query: &str) -> Option<Value> {
     }
 }
 
-/// A `kind=msg` body (or one with no kind): typed into the agent as a
-/// prompt, so a turn answers it. An inbox item isn't.
-fn is_prompt(body: &str) -> bool {
-    serde_json::from_str::<Value>(body).is_ok_and(|b| matches!(b.get("kind").and_then(Value::as_str), Some("msg") | None))
-}
-
 /// The deliver frame for an outbox row.
 fn deliver_frame(r: &Row, epoch: Option<u64>, attempt: u32) -> Frame {
     Frame::Deliver {
@@ -228,12 +222,14 @@ thread_local! {
     static DIRECT_DELIVERY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The message [`Controller::deliver_gone`] is delivering on this thread,
-/// while it runs: a spawn it wakes the agent with names it (K2-c).
-struct DirectDelivery;
+/// The message the direct path is delivering on this thread, while it
+/// runs: a spawn it wakes the agent with names it (K2-c), and so does an
+/// inject into a live session (K2-f.3: the host matches it to the prompt
+/// that submits it).
+pub(crate) struct DirectDelivery;
 
 impl DirectDelivery {
-    fn during(msg_id: &str) -> Self {
+    pub(crate) fn during(msg_id: &str) -> Self {
         DIRECT_DELIVERY.with(|d| *d.borrow_mut() = Some(msg_id.to_string()));
         DirectDelivery
     }
@@ -368,7 +364,7 @@ pub fn on_host_frame(remote: &RemoteHost, host_id: &str, frame: Frame) {
                         .attr("attempt", attempt)
                         .attr("status", format!("{status:?}").to_lowercase())
                 });
-                if let Err(e) = c.remote.send_frame(host_id, Frame::DeliverAck { msg_id, status, reason, prompt: None }) {
+                if let Err(e) = c.remote.send_frame(host_id, Frame::DeliverAck { msg_id, status, reason }) {
                     log_debug!("[delivery] ack to host {host_id}: {e} (the host resends)");
                 }
             };
@@ -384,8 +380,8 @@ pub fn on_host_frame(remote: &RemoteHost, host_id: &str, frame: Frame) {
                 }
             }
         }
-        Frame::DeliverAck { msg_id, status, reason, prompt } => {
-            c.on_ack_prompt(host_id, &msg_id, status, reason.as_deref(), prompt, delivery::now_ms());
+        Frame::DeliverAck { msg_id, status, reason } => {
+            c.on_ack(host_id, &msg_id, status, reason.as_deref(), delivery::now_ms());
         }
         other => log_debug!("[delivery] unexpected {} from host {host_id}", other.kind()),
     }
@@ -479,29 +475,13 @@ impl Controller {
         self.handing.lock().contains(msg_id)
     }
 
-    /// K2-f: where `recipient`'s turns stand before a direct delivery, so
-    /// its note (made once the delivery answered) lands in the right turn.
-    pub fn turn_mark(&self, recipient: &str) -> TurnMark {
-        self.placed(recipient).map(|p| self.remote.turn_mark(&p.agent_id)).unwrap_or_default()
-    }
-
-    /// K2-f: `msg_id` went into `recipient`'s session by the direct path (a
-    /// wake, a live inject) after `mark`: unanswered until the turn that
-    /// submits it ends, as an outbox delivery is
-    /// ([`RemoteHost::note_delivered`]).
-    fn delivered_to(&self, recipient: &str, msg_id: &str, mark: &TurnMark) {
-        match self.placed(recipient) {
-            Some(p) => self.remote.note_delivered(&p.agent_id, msg_id, Some(mark), false),
-            None => log_debug!("[delivery] {msg_id} delivered directly to {recipient}, which is not placed: its turn isn't followed"),
-        }
-    }
-
     /// K2-f: a message the direct path delivered with no outbox row (a
     /// host's message the controller handled itself, or the controller's
     /// own `k2 msg`) gets one, `delivered` (one transaction), so a crash
     /// mid-turn can fail it where every message's end is read
-    /// (`GET /cli/hosts/outbox`). `mark`: before the delivery.
-    pub fn record_direct(&self, msg_id: &str, from: &str, recipient: &str, body: &Value, mark: &TurnMark, now: i64) -> Result<(), String> {
+    /// (`GET /cli/hosts/outbox`): its host matches it to the prompt that
+    /// submits it, when its delivery named it ([`DirectDelivery`]).
+    pub fn record_direct(&self, msg_id: &str, from: &str, recipient: &str, body: &Value, now: i64) -> Result<(), String> {
         let m = NewMessage { msg_id: msg_id.into(), sender: from.into(), recipient: recipient.into(), body: body.to_string() };
         {
             let conn = self.db.lock();
@@ -512,17 +492,18 @@ impl Controller {
             }
             tx.commit().map_err(|e| e.to_string())?;
         }
-        self.delivered_to(recipient, msg_id, mark);
         Ok(())
     }
 
     /// Deliver a host's message through [`Direct::deliver`] and remember
     /// the answer for its resends.
     pub fn deliver_direct(&self, msg_id: &str, from: &str, agent_id: &str, body: &Value, now: i64) -> (DeliverStatus, Option<String>) {
-        let mark = self.turn_mark(agent_id);
-        let r = (self.direct.deliver)(agent_id, from, body);
+        let r = {
+            let _id = DirectDelivery::during(msg_id);
+            (self.direct.deliver)(agent_id, from, body)
+        };
         if r.is_ok() {
-            if let Err(e) = self.record_direct(msg_id, from, agent_id, body, &mark, now) {
+            if let Err(e) = self.record_direct(msg_id, from, agent_id, body, now) {
                 log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
             }
         }
@@ -549,11 +530,6 @@ impl Controller {
     }
 
     pub fn on_ack(&self, host_id: &str, msg_id: &str, status: DeliverStatus, reason: Option<&str>, now: i64) {
-        self.on_ack_prompt(host_id, msg_id, status, reason, None, now)
-    }
-
-    /// [`Self::on_ack`] with the prompt the host typed it for (K2-f).
-    pub fn on_ack_prompt(&self, host_id: &str, msg_id: &str, status: DeliverStatus, reason: Option<&str>, prompt: Option<u64>, now: i64) {
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new(trace_events::CTL_DELIVER_ACK)
                 .msg(msg_id)
@@ -586,22 +562,11 @@ impl Controller {
         }
         drop(conn);
         // K2-d: delivered into the agent's session: activity for the idle
-        // reaper. K2-f: its turn was noted when it was sent; the host says
-        // which prompt it typed it for, a refusal takes the note back, and a
-        // duplicate takes back a resend's (it was typed before).
-        if let Some(p) = recipient.and_then(|r| self.placed(&r)).filter(|p| p.host_id == host_id) {
-            match status {
-                DeliverStatus::Delivered => {
-                    if let Some(k) = prompt {
-                        self.remote.set_note_prompt(&p.agent_id, msg_id, k);
-                    }
-                    if now_delivered {
-                        let activity = Arc::clone(&self.activity.read());
-                        activity(&p.agent_id);
-                    }
-                }
-                DeliverStatus::Duplicate => self.remote.unnote_resend(&p.agent_id, msg_id),
-                DeliverStatus::Rejected => self.remote.unnote_delivered(&p.agent_id, msg_id),
+        // reaper. (Which turn has it, its host tells: K2-f.3.)
+        if matches!(status, DeliverStatus::Delivered) && now_delivered {
+            if let Some(p) = recipient.and_then(|r| self.placed(&r)).filter(|p| p.host_id == host_id) {
+                let activity = Arc::clone(&self.activity.read());
+                activity(&p.agent_id);
             }
         }
         self.nudge.notify_one();
@@ -699,7 +664,6 @@ impl Controller {
         // K2-c: a host may have delivered it before its agent died; the
         // spawn that wakes the agent carries the id, so that host's seen
         // table decides before the prompt goes on argv.
-        let mark = self.turn_mark(&r.recipient);
         let res = {
             let _id = DirectDelivery::during(&r.msg_id);
             (self.direct.deliver)(&r.recipient, &r.sender, &body)
@@ -721,9 +685,6 @@ impl Controller {
             }
         }
         drop(conn);
-        if res.is_ok() {
-            self.delivered_to(&r.recipient, &r.msg_id, &mark);
-        }
         k2_core::trace::emit(|| {
             let e = k2_core::trace::Event::new(events::CTL_MSG_GONE_DIRECT)
                 .msg(r.msg_id.as_str())
@@ -776,13 +737,6 @@ impl Controller {
                 continue;
             }
             let attempt = r.attempts + 1;
-            // K2-f: noted before it can reach the agent (a note after its
-            // ack could come after its turn's Stop), on every send: a resend
-            // may reach another host. A resend the host answers `duplicate`
-            // was typed before: that note is taken back.
-            if is_prompt(&r.body) {
-                self.remote.note_delivered(&p.agent_id, &r.msg_id, None, attempt > 1);
-            }
             let mut frame = deliver_frame(&r, Some(p.epoch.0), attempt);
             if let Frame::Deliver { agent_id, .. } = &mut frame {
                 agent_id.clone_from(&p.agent_id);
@@ -1126,7 +1080,7 @@ impl HostSide {
             return None;
         }
         let _one = self.receiving.lock();
-        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason, prompt: None });
+        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason });
         let before = seen::status(&self.db.lock(), &m.msg_id);
         let out = match before {
             Ok(Some(s)) if s == "rejected" => ack(DeliverStatus::Rejected, Some("rejected before".into())),
@@ -1166,8 +1120,9 @@ impl HostSide {
     /// row `delivering`, and where the agent's transcript stands), inject,
     /// then the answer.
     fn deliver_fresh(&self, m: &Incoming, now: i64) -> Option<Frame> {
-        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason, prompt: None });
+        let ack = |status, reason: Option<String>| Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status, reason });
         let mark = self.transcripts.mark(&m.agent_id);
+        let needle = crate::workspace_msg::injected_text(&m.from, &m.body);
         let w = seen::WriteAhead {
             msg_id: m.msg_id.clone(),
             agent_id: m.agent_id.clone(),
@@ -1175,7 +1130,7 @@ impl HostSide {
             conversation: mark.conversation,
             cwd: mark.cwd,
             offset: mark.offset,
-            needle: crate::workspace_msg::injected_text(&m.from, &m.body),
+            needle: needle.clone(),
             started_ms: now,
         };
         if let Err(e) = seen::write_ahead(&self.db.lock(), &w) {
@@ -1184,15 +1139,16 @@ impl HostSide {
         // From here a kill leaves the id on record, settled from the
         // transcript on the next receive or link.
         self.record_seen(&m.msg_id, DELIVERING, now);
-        // K2-f: the prompt that will submit it, counted before it is typed
-        // (its UserPromptSubmit can follow at once): the turn that answers it.
-        let prompt = crate::agent_host::host()
-            .find_agent(&m.agent_id)
-            .map(|s| crate::hosts::drain::turn_counts(&s.session_id().to_string()).map(|c| c.prompts).unwrap_or(0) + 1);
+        // K2-f.3: registered before it is typed (its UserPromptSubmit can
+        // follow at once): the prompt that is exactly this text takes it
+        // into its turn.
+        if let (Some(text), Some(s)) = (&needle, crate::agent_host::host().find_agent(&m.agent_id)) {
+            crate::hosts::drain::note_typed(&s.session_id().to_string(), &m.msg_id, text);
+        }
         let out = match (self.deliver)(m) {
             LocalDelivery::Delivered => {
                 self.record_seen(&m.msg_id, "delivered", now);
-                Some(Frame::DeliverAck { msg_id: m.msg_id.clone(), status: DeliverStatus::Delivered, reason: None, prompt })
+                ack(DeliverStatus::Delivered, None)
             }
             LocalDelivery::Rejected(why) => {
                 self.record_seen(&m.msg_id, "rejected", now);
@@ -1442,7 +1398,7 @@ impl HostSide {
             } else {
                 (DeliverStatus::Delivered, Some(REPORTED.to_string()))
             };
-            let _ = tx.send(Frame::DeliverAck { msg_id, status, reason, prompt: None });
+            let _ = tx.send(Frame::DeliverAck { msg_id, status, reason });
         }
     }
 
@@ -1594,27 +1550,24 @@ pub fn send(from: &str, agent_id: &str, body: Value) -> Option<Result<Sent, Stri
     }
 }
 
-/// K2-f: on a controller, a `k2 msg` the cascade delivered itself
-/// ([`send`] answered `None`): recorded as a delivered outbox row whose
-/// turn the controller follows. Its id, for the caller's answer.
-/// `mark`: from [`turn_mark`], before the cascade ran.
-pub fn direct_delivered(from: &str, agent_id: &str, body: Value, mark: Option<TurnMark>) -> Option<String> {
-    let mark = mark?;
-    let now = delivery::now_ms();
-    let msg_id = delivery::new_msg_id(now);
-    match ensure_controller_drain().record_direct(&msg_id, &sender_address(from), agent_id, &body, &mark, now) {
-        Ok(()) => Some(msg_id),
-        Err(e) => {
-            log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
-            None
-        }
-    }
+/// K2-f: on a controller, the id a `k2 msg` the cascade delivers itself
+/// ([`send`] answered `None`) goes by; `None` elsewhere. The cascade runs
+/// inside [`DirectDelivery::during`] it, so its host can match the prompt
+/// it types; once delivered, [`direct_delivered`] records it.
+pub fn direct_msg_id() -> Option<String> {
+    (crate::runtime_role::current() == crate::runtime_role::Role::Controller).then(|| delivery::new_msg_id(delivery::now_ms()))
 }
 
-/// K2-f: on a controller, where `agent_id`'s turns stand before the
-/// cascade delivers to it ([`direct_delivered`]); `None` elsewhere.
-pub fn turn_mark(agent_id: &str) -> Option<TurnMark> {
-    (crate::runtime_role::current() == crate::runtime_role::Role::Controller).then(|| ensure_controller_drain().turn_mark(agent_id))
+/// K2-f: the cascade delivered `msg_id`: a delivered outbox row, so a
+/// crash mid-turn can fail it. False if it couldn't be written.
+pub fn direct_delivered(msg_id: &str, from: &str, agent_id: &str, body: Value) -> bool {
+    match ensure_controller_drain().record_direct(msg_id, &sender_address(from), agent_id, &body, delivery::now_ms()) {
+        Ok(()) => true,
+        Err(e) => {
+            log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
+            false
+        }
+    }
 }
 
 /// The wake timeout a `kind=msg` body asks for (zero without a wake).

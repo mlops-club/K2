@@ -242,13 +242,16 @@ pub fn mark_failed(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_
     Ok(n == 1)
 }
 
-/// A `delivered` message whose recipient was stopped before it answered
-/// (K2-d: its turn was cut): it ends `failed` with `reason` instead of
-/// reading as answered. Returns false unless the row was `delivered`.
+/// A message whose recipient was stopped before it answered (K2-d: its
+/// turn was cut): it ends `failed` with `reason` instead of reading as
+/// answered. K2-f.3: also while still `sent`: the caller knows the agent
+/// had it (its host tied it to the cut turn's prompt) though the ack died
+/// with the host; the late ack then finds it finished, and it is never
+/// resent. Returns false unless the row was `delivered` or `sent`.
 pub fn mark_interrupted(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_ms: i64) -> rusqlite::Result<bool> {
     let n = conn.execute(
         "UPDATE delivery_outbox SET state = 'failed', reason = ?3, updated_ms = ?4
-         WHERE hop = ?1 AND msg_id = ?2 AND state = 'delivered'",
+         WHERE hop = ?1 AND msg_id = ?2 AND state IN ('delivered', 'sent')",
         params![hop.as_str(), msg_id, reason, now_ms],
     )?;
     Ok(n == 1)
