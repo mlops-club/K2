@@ -594,19 +594,36 @@ fn post_blocking(remote: &RemoteHost, path: &str, query: &str, body: &[u8], not_
         Decision::Relay { host, maps } => {
             let a = exchange(remote, &host, &maps, "POST", path, query, body);
             if a.status.starts_with('2') {
-                mirror_worktree_rows(path, body, &a);
+                // The host's worktrees of a project, in this controller's
+                // names (a relayed `git/worktrees`), for a prune.
+                let listed = |project: &str| -> Option<Vec<String>> {
+                    let q = format!("path={}", encode(project));
+                    let l = exchange(remote, &host, &maps, "GET", "/cli/git/worktrees", &q, b"");
+                    if !l.status.starts_with('2') {
+                        return None;
+                    }
+                    let v: Value = serde_json::from_str(&l.body).ok()?;
+                    v.as_array()?.iter().map(|w| w.get("path").and_then(Value::as_str).map(str::to_string)).collect()
+                };
+                mirror_worktree_rows(path, body, &a, &listed);
             }
             Some(a)
         }
     }
 }
 
-/// K5: a worktree made or removed on a host, in this controller's registry
-/// too, under the same ids: the workspace row the host made
-/// (`workspaceId`, its branch, its path in this controller's names) for
-/// the project the request named, or the one the request removes. The
-/// app lists workspaces from here.
-fn mirror_worktree_rows(path: &str, body: &[u8], answer: &Answer) {
+/// K5: a worktree made, removed or pruned on a host, in this controller's
+/// registry too (the app lists workspaces from here), under the same ids:
+/// - create: the workspace row the host made (`workspaceId`, its branch,
+///   its path in this controller's names) for the project the request
+///   named;
+/// - remove: the row the request names (`workspaceId`), and any worktree
+///   row at its `worktreePath`;
+/// - prune: the project's worktree rows whose worktree the host no longer
+///   lists (`listed`, its `git worktree list`). When the host's list can't
+///   be had, or names a worktree that isn't under the project's path,
+///   nothing is removed.
+fn mirror_worktree_rows(path: &str, body: &[u8], answer: &Answer, listed: &dyn Fn(&str) -> Option<Vec<String>>) {
     use k2_core::db::schema::Workspace;
     let (Ok(req), Ok(ans)) = (serde_json::from_slice::<Value>(body), serde_json::from_str::<Value>(&answer.body)) else { return };
     let db = k2_core::db::shared();
@@ -631,14 +648,61 @@ fn mirror_worktree_rows(path: &str, body: &[u8], answer: &Answer) {
             }
         }
         "/cli/git/remove-worktree" => {
+            let mut gone = false;
             if let Some(ws_id) = req.get("workspaceId").and_then(Value::as_str) {
-                if Workspace::get(&conn, ws_id).is_ok() && Workspace::delete(&conn, ws_id).is_ok() {
-                    crate::db_routes::emit_projects_changed();
+                gone |= Workspace::get(&conn, ws_id).is_ok() && Workspace::delete(&conn, ws_id).is_ok();
+            }
+            if let (Some(project), Some(wt)) = (req.get("projectPath").and_then(Value::as_str), req.get("worktreePath").and_then(Value::as_str)) {
+                let wt = wt.trim_end_matches('/');
+                for ws in worktree_rows(&conn, project) {
+                    if ws.worktree_path.as_deref().map(|p| p.trim_end_matches('/')) == Some(wt) {
+                        gone |= Workspace::delete(&conn, &ws.id).is_ok();
+                    }
                 }
+            }
+            if gone {
+                crate::db_routes::emit_projects_changed();
+            }
+        }
+        "/cli/git/prune-worktrees" => {
+            let Some(project) = req.get("projectPath").and_then(Value::as_str) else { return };
+            let rows = worktree_rows(&conn, project);
+            if rows.is_empty() {
+                return;
+            }
+            // The lock isn't held across the host's answer.
+            drop(conn);
+            let Some(listed) = listed(project) else { return };
+            let base = Path::new(project.trim_end_matches('/'));
+            let mut kept = Vec::new();
+            for l in &listed {
+                match Path::new(l.trim_end_matches('/')).strip_prefix(base) {
+                    Ok(rel) => kept.push(rel.to_path_buf()),
+                    // Not in this controller's names: unsure, keep all.
+                    Err(_) => return,
+                }
+            }
+            let conn = db.lock();
+            let mut gone = false;
+            for ws in rows {
+                let rel = ws.worktree_path.as_deref().and_then(|p| Path::new(p.trim_end_matches('/')).strip_prefix(base).ok().map(Path::to_path_buf));
+                if rel.is_some_and(|r| !kept.contains(&r)) {
+                    gone |= Workspace::delete(&conn, &ws.id).is_ok();
+                }
+            }
+            if gone {
+                crate::db_routes::emit_projects_changed();
             }
         }
         _ => {}
     }
+}
+
+/// The worktree rows of the project registered at `project` (this
+/// controller's name).
+fn worktree_rows(conn: &rusqlite::Connection, project: &str) -> Vec<k2_core::db::schema::Workspace> {
+    let Some((id, _)) = crate::git_notes_routes::owning_project(project) else { return Vec::new() };
+    k2_core::db::schema::Workspace::list(conn, &id).unwrap_or_default().into_iter().filter(|w| w.type_ == "worktree").collect()
 }
 
 /// resolve-links' body with its `workspace` as the registered path.

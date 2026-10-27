@@ -639,9 +639,16 @@ kind-app's K5 passed 49 of 50 checks. Two things are fixed here.
     reproduces the error with the fix taken out. Also
     `k5_a_project_registered_under_the_hosts_id` and
     `k5_the_controller_records_a_relayed_worktree`.
-  - **Not covered:** prune-worktrees does not update the controller's
-    registry. The host deletes rows for worktrees whose folder is gone on
-    its disk; the controller keeps its rows.
+  - **Prune and remove (follow-up).** prune-worktrees now updates the
+    controller's registry too. After a relayed prune, the controller asks
+    the host for the project's worktrees (a relayed `git/worktrees`) and
+    removes its own worktree rows the host no longer lists.
+    - When the host's list can't be had, or names a path outside the
+      project's, nothing is removed.
+    - remove-worktree also removes a row by its `worktreePath` when the
+      request names no `workspaceId`.
+    - Test: `k5_a_relayed_prune_or_remove_updates_the_controllers_registry`,
+      which fails with the fix taken out.
 - **Commit failed with "Failed to get signature".** A fresh host had no git
   identity, and K2 set one only when it ran `git init` itself. Now a host
   sets one at start, as K2 does locally before its first commit
