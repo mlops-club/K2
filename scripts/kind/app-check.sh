@@ -17,8 +17,8 @@
 # 5. POST /cli/sessions/v2/close
 #
 # Passes when the line arrives through the door and the shell runs in the
-# agents pod (k2-host-0 with --dist) and, with --dist, not in the
-# controller. Prints no password and no token.
+# agents pod (with --dist, whichever host the controller chose) and, with
+# --dist, not in the controller. Prints no password and no token.
 set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -120,8 +120,17 @@ py=$!
 msg=""
 read -r -t 120 msg <&3 || true
 if [ "$msg" = scan ]; then
-    agents=$(proc_scan "$KIND_AGENT_POD" "$KIND_AGENT_CONTAINER")
-    echo "     /proc in $KIND_AGENT_POD: ${agents:-(none)}"
+    if [ "$dist" = 1 ]; then
+        # Any host: the controller places it (with a pool it need not be
+        # k2-host-0).
+        for h in $(kc -n "$KIND_NS" get pods -l app.kubernetes.io/name=k2-host -o jsonpath='{.items[*].metadata.name}'); do
+            agents=$(proc_scan "$h" "$KIND_AGENT_CONTAINER")
+            [ -n "$agents" ] && { KIND_AGENT_POD=$h; break; }
+        done
+    else
+        agents=$(proc_scan "$KIND_AGENT_POD" "$KIND_AGENT_CONTAINER")
+    fi
+    echo "     /proc in $KIND_AGENT_POD ($(kc -n "$KIND_NS" get pod "$KIND_AGENT_POD" -o jsonpath='{.spec.nodeName}')): ${agents:-(none)}"
     ctl=""
     if [ "$KIND_AGENT_POD" != "$KIND_POD" ]; then
         ctl=$(proc_scan "$KIND_POD" k2-daemon)
