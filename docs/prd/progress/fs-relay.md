@@ -524,6 +524,154 @@ commit.
   repository, or one outside the enclosing checkout, is never reached.
   Test: `rv11_exception_reaches_sibling_in_same_checkout`; it records the
   reach and asserts nothing.
+## K5: turning fs-relay on, on kind (runbook)
+
+For kind-app, once the review of fs-relay is clean. Everything here is on
+the kind cluster `k2lab`, namespace `k2-kind-p4` (the P4 overlay,
+`deploy/kind/p4`), through an explicit kubeconfig. Never the current
+context, and never the other `k2-kind*` namespaces.
+
+```sh
+kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
+kn() { kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind-p4 "$@"; }
+```
+
+### What it needs
+
+- **An image with fs-relay.** Build `k2-daemon` from `k2-dist/fs-relay2`
+  (or wave3 once fs-relay is merged), under the Docker lock, with
+  `scripts/kind/build-daemon.sh`. Then bring P4 up from it:
+  `scripts/kind/p4-up.sh --daemon-image=<that image>`. The controller and
+  the hosts run the same image; never mix in a host built before fs-relay.
+- **Volumes: nothing new.** The P4 overlay already has what K5 is about:
+  - no shared `k2-work`;
+  - the controller has its own workspaces volume (`k2-work-controller` at
+    `/var/lib/k2/work`);
+  - each host has its own (claim template `work` at `/var/lib/k2/work`).
+- **RBAC: nothing new.** The relay goes over the host link the hosts
+  already hold (`http.relay`/`http.reply` frames). Hosts never call the
+  API server, and the controller's pool rights
+  (`deploy/kind/dist/pool-rbac.yaml`) are unchanged.
+- **The hosts' env: what P4 already sets.** `K2_WORK_ROOT=/var/lib/k2/work`
+  is set by `p4-up.sh` for home sync. With it, each host:
+  - says `k2.work_root=…` in its labels;
+  - runs K2's git hardened (no hooks, filters or fsmonitor; it refuses a
+    config with `hook.*`);
+  - sends what goes to the Trash to `/var/lib/k2/work/.k2-trash`;
+  - lists a symlink's own size.
+
+  Nothing to add.
+- **The controller's env: two variables.**
+  - `K2_FS_RELAY=1`: the switch. Off by default, and off is the
+    controller as it was.
+  - `K2_WORK_ROOT=/var/lib/k2/work`: the controller's own work root. Only
+    paths under it are relayed, mapped to the same relative path under the
+    host's root.
+  - Optional:
+    - `K2_HOST_WORK_ROOT` (default `/var/lib/k2/work`, which the P4 hosts
+      use);
+    - `K2_HOST_WORK_ROOTS=host=path,…` when hosts differ;
+    - `K2_RELAY_SPACE_TTL_SECS` (default 7 days): how long a workspace
+      stays bound to its host after its agent is gone.
+
+  `p4-up.sh` has no flag for these yet, so set them on the running
+  StatefulSet:
+
+  ```sh
+  kn set env statefulset/k2-controller -c k2-daemon K2_FS_RELAY=1 K2_WORK_ROOT=/var/lib/k2/work
+  kn rollout status statefulset/k2-controller
+  ```
+
+  To turn it off again: `kn set env statefulset/k2-controller -c k2-daemon
+  K2_FS_RELAY-`, then wait for the rollout.
+
+### What the app then shows
+
+A workspace is bound to a host when the controller spawns an agent in it
+(its cwd under `K2_WORK_ROOT`), or when it is created, added or cloned
+through the controller (phase 2). For a bound workspace:
+
+- **The file browser** (read-dir, read-file, stat, search, uploads,
+  create, rename, move, copy, delete, write) shows and changes the host's
+  disk, at the controller's paths. The controller's own copy of that
+  folder is never read or written.
+- **The git panel** (snapshot, diff, stage, commit, discard, branches,
+  worktrees, merge) acts on the host's repository.
+- **Thread file links** (resolve-links) resolve against the host's
+  workspace.
+- **Phase 2:**
+  - New Project and Add Project make or seed the folder on a host;
+  - Clone-to unpacks on a host;
+  - App deploy from a folder builds from a copy of the host's folder (no
+    links).
+
+What it refuses, and how the app sees it:
+
+| Case | Answer |
+|---|---|
+| A workspace whose host is away | `503 host_away`; the controller's copy is never served instead |
+| An App pass (`k2skn_`) on a host workspace | `501 not_relayed` |
+| compress / extract on a host workspace | `501 not_relayed` |
+| A path with `..`, a relative path, or two workspaces in one request | `400 bad_path` / `relative_path` / `cross_host` |
+| A key the route doesn't take | `400 undeclared_key` |
+| On the host: anything outside the routed workspace, after every link | `403 outside_work_root`, `link_outside_worktree`, `link_into_git_dir`, `walk_budget` |
+
+A workspace that isn't bound (no agent has run there, nothing was created
+through the controller) is the controller's own, as without fs-relay.
+
+### End-to-end check
+
+1. **Both sides are set.**
+   - `kn exec k2-controller-0 -c k2-daemon -- env | grep -E 'K2_FS_RELAY|K2_WORK_ROOT'`
+     shows `1` and `/var/lib/k2/work`.
+   - `GET /cli/hosts/status` on the controller (port 7444, owner token)
+     lists each host as linked, with `k2.work_root=/var/lib/k2/work` in its
+     labels.
+2. **An agent on a host.**
+   - `scripts/kind/app-check.sh --p4 --password-file=…` spawns in
+     `/var/lib/k2/work/demo` and prints which host the agent ran on (call
+     it `k2-host-N`).
+   - Then write a file there from inside that host's pod:
+     `kn exec k2-host-N -- sh -c 'echo on-host > /var/lib/k2/work/demo/k5.md'`.
+3. **The file browser reads the host.**
+   - With the app's session token,
+     `GET /cli/fs/read-dir?path=/var/lib/k2/work/demo` through the
+     controller lists `k5.md`, and `read-file` returns `on-host`.
+   - `kn exec k2-controller-0 -c k2-daemon -- ls /var/lib/k2/work/demo` does
+     not have it.
+   - The controller's log has `ctl.fs_relay`; the host's has
+     `host.fs_served`.
+4. **Writes land on the host.**
+   - `POST /cli/fs/write-file {path: /var/lib/k2/work/demo/k5b.md}` through
+     the controller.
+   - `kn exec k2-host-N -- cat /var/lib/k2/work/demo/k5b.md` shows it, and
+     the controller's volume still lacks it.
+5. **The git panel works on the host.**
+   - `POST /cli/git/init`, then `stage-all` and `commit {message: "k5"}`
+     on `/var/lib/k2/work/demo`.
+   - `kn exec k2-host-N -- git -C /var/lib/k2/work/demo log --oneline`
+     shows `k5`.
+   - `GET /cli/git/snapshot?path=…` through the controller shows the same
+     HEAD.
+6. **Refusals.**
+   - `read-file?path=/var/lib/k2/work/demo/../../../etc/passwd` → `400 bad_path`.
+   - An extra key (`…&mode=x`) → `400 undeclared_key`.
+   - In the host pod, `ln -s /etc /var/lib/k2/work/demo/etc-link`, then
+     `read-file?path=/var/lib/k2/work/demo/etc-link/passwd` → `403
+     outside_work_root`.
+7. **The host is away.**
+   - `kn delete pod k2-host-N`, then, before it relinks,
+     `read-dir?path=/var/lib/k2/work/demo` → `503 host_away`, never the
+     controller's empty copy.
+   - Once it is back (its `work` volume keeps the files), the same request
+     shows `k5.md` again.
+8. **Off is the old behaviour.**
+   - Unset `K2_FS_RELAY` (above) and wait for the rollout.
+   - `read-dir?path=/var/lib/k2/work/demo` now lists the controller's own
+     volume (no `k5.md`).
+
+The same checks run without kind, on two processes, in
+`scripts/lab/topology/fs-relay.sh` (7 checks; it sets `K2_FS_RELAY=1`).
 
 ## Round 12 review of f2950fe82: the strict git policy
 
