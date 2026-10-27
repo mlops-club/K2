@@ -282,9 +282,8 @@ struct LiveChat {
 /// JoinHandle (not currently aborted on shutdown; the task exits when
 /// the runtime drops). Mirrors `watchdog::spawn`'s shape.
 pub fn spawn() -> JoinHandle<()> {
-    // K2-d: this process's turns, from its own hooks (a controller's come
-    // from its hosts instead).
-    crate::hosts::drain::track_turns();
+    // K2-d: this process's turns come from its own hook ingest
+    // (`hosts::drain::note_ingest`; a controller's from its hosts).
     tokio::spawn(async move { run().await })
 }
 

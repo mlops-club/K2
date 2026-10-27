@@ -49,8 +49,8 @@ where
         Ok(Some(Ok(Message::Text(t)))) => Frame::decode(&t),
         _ => Err("expected hello".to_string()),
     };
-    let (host_name, labels, protocol, resume) = match hello {
-        Ok(Frame::Hello { protocol, host_name, token: presented, labels, resume }) => {
+    let (host_name, labels, protocol, resume, ended) = match hello {
+        Ok(Frame::Hello { protocol, host_name, token: presented, labels, resume, ended }) => {
             let Some(protocol) = negotiate(protocol) else {
                 return refuse(
                     &mut ws,
@@ -65,7 +65,7 @@ where
             if host_name.trim().is_empty() {
                 return refuse(&mut ws, "protocol", "host_name is empty").await;
             }
-            (host_name, labels, protocol, resume)
+            (host_name, labels, protocol, resume, ended)
         }
         Ok(other) => return refuse(&mut ws, "protocol", &format!("expected hello, got {}", other.kind())).await,
         Err(e) => return refuse(&mut ws, "protocol", &e).await,
@@ -75,7 +75,7 @@ where
     remote.set_labels(&host_id, labels);
     if protocol >= 2 {
         // W3: reconcile what this host still runs with the table (S9).
-        remote.adopt(&host_id, &resume);
+        remote.adopt_with(&host_id, &resume, &ended);
     }
     let welcome = Frame::Welcome {
         protocol,

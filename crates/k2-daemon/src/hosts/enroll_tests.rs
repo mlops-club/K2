@@ -374,7 +374,7 @@ async fn recv(ws: &mut Ws) -> Frame {
 /// Dial and say `hello` with `token`; the controller's answer.
 async fn link(c: &Controller, name: &str, token: &str) -> (Ws, Frame) {
     let (mut ws, _) = within("dial", tokio_tungstenite::connect_async(c.attach_url.as_str())).await.expect("dial");
-    let hello = Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: token.into(), labels: vec![], resume: vec![] };
+    let hello = Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: token.into(), labels: vec![], resume: vec![], ended: vec![] };
     ws.send(Message::Text(hello.encode())).await.unwrap();
     let answer = recv(&mut ws).await;
     (ws, answer)

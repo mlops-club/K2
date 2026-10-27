@@ -171,7 +171,7 @@ async fn recv(ws: &mut Ws) -> Frame {
 async fn host(url: &str, name: &str, labels: &[&str]) -> Ws {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
     let labels = labels.iter().map(|l| l.to_string()).collect();
-    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![] }).await;
+    send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels, resume: vec![], ended: vec![] }).await;
     assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
     ws
 }
@@ -684,7 +684,7 @@ async fn n3_a_binding_lives_while_its_agent_is_placed() {
     place(remote, &mut h, "notes", "/ctl/work/notes").await;
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(matches!(remote.workspace_route(&strs(&["/ctl/work/notes/a"])), WorkspaceRoute::Relay { .. }), "placed: kept past the TTL");
-    send(&mut h, &Frame::SessionGone { agent_id: "notes".into(), epoch: None, exit_code: Some(0) }).await;
+    send(&mut h, &Frame::SessionGone { agent_id: "notes".into(), epoch: None, exit_code: Some(0), turn: None }).await;
     within("the placement to go", async {
         while remote.placement("notes").is_some() {
             tokio::time::sleep(Duration::from_millis(10)).await;

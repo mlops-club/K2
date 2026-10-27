@@ -75,6 +75,10 @@ pub fn subscribe() -> broadcast::Receiver<IngestEvent> {
 }
 
 fn publish(ev: IngestEvent) {
+    // K2-f: the host's turn counts, before anything else hears of it: a
+    // CLI's Stop hook is counted before the CLI can exit, so its exit
+    // (another channel) always finds it.
+    crate::hosts::drain::note_ingest(&ev);
     // No subscriber yet (S1 alone, or tests) is fine.
     let _ = bus().send(ev);
 }
