@@ -16,6 +16,7 @@
 pub mod byte_ring;
 pub mod drain;
 pub mod enroll;
+pub mod fs_relay;
 pub mod gate;
 pub mod health;
 pub mod home;
@@ -114,6 +115,14 @@ pub fn host_config(get: impl Fn(&str) -> Option<String>) -> Result<HostConfig, S
     if get(home::WORK_ROOT_VAR).is_some_and(|v| !v.trim().is_empty()) && !labels.iter().any(|l| l.trim() == home::LABEL_HOME_SYNC) {
         labels.push(home::LABEL_HOME_SYNC.to_string());
     }
+    // fs-relay: a host on its own disk says where its workspaces are, so
+    // the controller relays the app's fs/git requests for them here.
+    if let Some(root) = home::work_root(&get) {
+        let label = fs_relay::LABEL_WORK_ROOT;
+        if !labels.iter().any(|l| l.split('=').next().map(str::trim) == Some(label)) {
+            labels.push(format!("{label}={}", root.display()));
+        }
+    }
     Ok(HostConfig { attach_url, token, host_name, labels })
 }
 
@@ -151,10 +160,12 @@ pub fn controller() -> Option<&'static ControllerConfig> {
 
 /// Start this role's background half after boot is ready: the host's
 /// link. A controller has nothing to start (hosts dial in).
-pub fn start() {
+pub fn start(port: u16, token: &str) {
     match crate::runtime_role::current() {
         crate::runtime_role::Role::Host => match host_config(env) {
             Ok(cfg) => {
+                // fs-relay: a relayed request runs through this daemon's own route.
+                fs_relay::set_local_daemon(port, token);
                 k2_core::log_debug!("[hosts] K2_ROLE=host: linking to {} as {}", cfg.attach_url, cfg.host_name);
                 byte_ring::set(Some(host_ptyd_ring));
                 tokio::spawn(link::run(cfg));
@@ -305,9 +316,21 @@ mod config_tests {
             .unwrap()
             .labels
         };
-        assert_eq!(syncing("/var/lib/k2/work", "gpu"), vec!["gpu", home::LABEL_HOME_SYNC]);
-        assert_eq!(syncing("/var/lib/k2/work", home::LABEL_HOME_SYNC), vec![home::LABEL_HOME_SYNC], "once");
+        // (and, its own disk, where its workspaces are: fs-relay's label)
+        let work_label = "k2.work_root=/var/lib/k2/work".to_string();
+        assert_eq!(syncing("/var/lib/k2/work", "gpu"), vec!["gpu".to_string(), home::LABEL_HOME_SYNC.into(), work_label.clone()]);
+        assert_eq!(syncing("/var/lib/k2/work", home::LABEL_HOME_SYNC), vec![home::LABEL_HOME_SYNC.to_string(), work_label], "once");
         assert_eq!(syncing(" ", "gpu"), vec!["gpu"], "an empty K2_WORK_ROOT is unset");
+        // fs-relay: a host on its own disk says where its workspaces are.
+        let work = std::env::temp_dir();
+        let cfg = host_config(getter(&[
+            (CONTROLLER_URL_VAR, "ws://ctl:7420".into()),
+            (ENROLL_TOKEN_FILE_VAR, tok.clone()),
+            (home::WORK_ROOT_VAR, work.to_string_lossy().into_owned()),
+        ]))
+        .unwrap();
+        let canonical = std::fs::canonicalize(&work).unwrap();
+        assert_eq!(cfg.labels, vec![home::LABEL_HOME_SYNC.to_string(), format!("k2.work_root={}", canonical.display())]);
         assert_eq!(
             host_config(getter(&[(CONTROLLER_URL_VAR, "http://ctl".into()), (ENROLL_TOKEN_FILE_VAR, tok)])),
             Err("K2_CONTROLLER_URL=\"http://ctl\" must start with ws:// or wss://".into())

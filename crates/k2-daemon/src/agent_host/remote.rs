@@ -228,6 +228,33 @@ struct Turn {
 }
 
 
+/// fs-relay: a workspace `cwd` (as a session or the affinity table has it:
+/// the host's path, or the one the controller asked for) as the controller
+/// names it and as the host does. The same path relative to each work root
+/// (D2); without the controller's root, one name for both.
+fn workspace_forms(cwd: &Path, host_root: &Path, ctl_root: Option<&Path>) -> (PathBuf, PathBuf) {
+    if let Ok(rel) = cwd.strip_prefix(host_root) {
+        return (ctl_root.map(|c| c.join(rel)).unwrap_or_else(|| cwd.to_path_buf()), cwd.to_path_buf());
+    }
+    if let Some(rel) = ctl_root.and_then(|c| cwd.strip_prefix(c).ok()) {
+        return (cwd.to_path_buf(), host_root.join(rel));
+    }
+    (cwd.to_path_buf(), cwd.to_path_buf())
+}
+
+/// fs-relay: where an fs/git request goes ([`RemoteHost::workspace_route`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceRoute {
+    /// The controller's own disk (no host on its own disk holds the paths).
+    Local,
+    /// Over `host`'s link, each path's `from` prefix mapped to its `to`.
+    Relay { host: String, maps: Vec<(PathBuf, PathBuf)> },
+    /// The workspace is on `host`, which isn't linked.
+    Away { host: String, path: String },
+    /// The paths are on more than one host.
+    Split(Vec<String>),
+}
+
 /// An HTTP-shaped answer for the controller's routes: status line and
 /// JSON body, as `HandlerResult` has them.
 pub type Answer = (String, String);
@@ -951,7 +978,7 @@ impl RemoteHost {
             return;
         }
         match frame {
-            reply @ (Frame::Reply { req, .. } | Frame::OpResult { req, .. } | Frame::InjectResult { req, .. }) => {
+            reply @ (Frame::Reply { req, .. } | Frame::OpResult { req, .. } | Frame::InjectResult { req, .. } | Frame::HttpReply { req, .. }) => {
                 if let Some(waiter) = inner.links.get_mut(host_id).and_then(|l| l.pending.remove(&req)) {
                     waiter.send(reply);
                 }
@@ -1771,6 +1798,76 @@ impl RemoteHost {
         link.tx
             .send(Frame::Op { req: None, session_id: s.session_id.to_string(), epoch: s.epoch.0, op })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, format!("agent host {} link is closing", s.host_id)))
+    }
+
+    /// fs-relay: is any host that linked on its own disk (`k2.work_root`)?
+    pub fn any_host_on_own_disk(&self) -> bool {
+        self.inner.lock().host_labels.values().any(|l| crate::hosts::fs_relay::work_root_label(l).is_some())
+    }
+
+    /// fs-relay: where the workspace `paths` name is. A path is in an
+    /// agent's workspace when it is under the cwd the agent runs (or last
+    /// ran) in on a host on its own disk, as the host names it, or as the
+    /// controller does (the same path under `ctl_root` as under the host's
+    /// work root). A placed agent wins over one that ran there before.
+    pub fn workspace_route(&self, paths: &[String], ctl_root: Option<&Path>) -> WorkspaceRoute {
+        let inner = self.inner.lock();
+        let roots: HashMap<&str, PathBuf> = inner
+            .host_labels
+            .iter()
+            .filter_map(|(h, l)| crate::hosts::fs_relay::work_root_label(l).map(|r| (h.as_str(), r)))
+            .collect();
+        if roots.is_empty() || paths.is_empty() {
+            return WorkspaceRoute::Local;
+        }
+        // (host, its cwd, placed now)
+        let mut spaces: Vec<(String, PathBuf, bool)> =
+            inner.sessions.values().filter_map(|s| Some((s.host_id.clone(), s.cwd.clone()?, true))).collect();
+        spaces.extend(inner.last_host_for_cwd.iter().map(|(cwd, h)| (h.clone(), cwd.clone(), false)));
+        spaces.retain(|(h, _, _)| roots.contains_key(h.as_str()));
+        let mut chosen: Vec<(String, PathBuf, PathBuf)> = Vec::new(); // (host, from, to)
+        let mut away: Option<(String, String)> = None;
+        for p in paths {
+            let p = Path::new(p);
+            let best = spaces
+                .iter()
+                .filter_map(|(h, cwd, live)| {
+                    let (ctl_form, host_form) = workspace_forms(cwd, &roots[h.as_str()], ctl_root);
+                    [ctl_form, host_form.clone()]
+                        .into_iter()
+                        .filter(|from| p.starts_with(from))
+                        .map(|from| (*live, from.components().count(), h.clone(), from, host_form.clone()))
+                        .max_by_key(|(_, n, ..)| *n)
+                })
+                .max_by_key(|(live, n, ..)| (*live, *n));
+            if let Some((_, _, host, from, to)) = best {
+                if !inner.links.contains_key(&host) {
+                    away.get_or_insert((host.clone(), p.to_string_lossy().into_owned()));
+                }
+                if !chosen.iter().any(|(h, f, _)| h == &host && f == &from) {
+                    chosen.push((host, from, to));
+                }
+            }
+        }
+        let mut hosts: Vec<String> = chosen.iter().map(|(h, ..)| h.clone()).collect();
+        hosts.sort();
+        hosts.dedup();
+        match hosts.len() {
+            0 => WorkspaceRoute::Local,
+            1 => match away {
+                Some((host, path)) => WorkspaceRoute::Away { host, path },
+                None => WorkspaceRoute::Relay {
+                    host: hosts.remove(0),
+                    maps: chosen.into_iter().map(|(_, f, t)| (f, t)).collect(),
+                },
+            },
+            _ => WorkspaceRoute::Split(hosts),
+        }
+    }
+
+    /// A request to `host_id` and its answer (blocking; the fs relay).
+    pub fn relay_blocking(&self, host_id: &str, make: impl FnOnce(u64) -> Frame, deadline: Duration) -> Result<Frame, String> {
+        self.request_blocking(host_id, make, deadline)
     }
 
     /// The resume decision's disk check, asked of the hosts (the
