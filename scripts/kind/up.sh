@@ -39,6 +39,9 @@
 # CPU and memory. Scaling down keeps the removed hosts' volumes.
 # --ptyd=0|1 sets K2_PTYD on the hosts (default KIND_PTYD_DEFAULT in
 # lib.sh, else K2_KIND_PTYD): agent PTYs in k2-ptyd. Changing it rolls them.
+# With 1, k2-ptyd runs as a sidecar container of each host pod
+# (K2_PTYD_SIDECAR=1), so the agents outlive a daemon container restart
+# and the restarted daemon adopts them (ptyd S3).
 # --host-auth=enroll turns on signed host enrollment (K2_HOST_AUTH=enroll;
 # the owner's k2-kind-dist too since the owner's decision of 2026-10-26,
 # docs/prd/progress/kind-enroll.md): up.sh mints a one-time token per new
@@ -364,8 +367,52 @@ EOF
                 env:
 EOF
             [ "$ptyd" = 1 ] && echo '                  - {name: K2_PTYD, value: "1"}'
+            [ "$ptyd" = 1 ] && echo '                  - {name: K2_PTYD_SIDECAR, value: "1"}'
             [ -n "$work_root" ] && echo "                  - {name: K2_WORK_ROOT, value: \"$work_root\"}"
             [ -n "$max_awake" ] && echo "                  - {name: K2_HOST_MAX_AWAKE, value: \"$max_awake\"}"
+        fi
+        if [ "$ptyd" = 1 ]; then
+            # ptyd S3's sidecar: k2-ptyd in its own container (a native
+            # sidecar: started, and ready, before the daemon; stopped after
+            # it), sharing the K2 home, the workspaces and /tmp, and the
+            # pod's process namespace (the daemon checks its agents' pids).
+            # The agent CLIs are ptyd's children, so a daemon container that
+            # restarts or crashes leaves them running and adopts them.
+            # Same image as the host: the CLIs run from it.
+            cat <<EOF
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: k2-host
+      spec:
+        template:
+          spec:
+            shareProcessNamespace: true
+            initContainers:
+              - name: k2-ptyd
+                image: $KIND_IMAGE
+                imagePullPolicy: Never
+                restartPolicy: Always
+                command: [/usr/bin/k2-ptyd, --serve]
+                env:
+                  - {name: K2_HOME, value: /var/lib/k2-host/.k2}
+                  - {name: HOME, value: /var/lib/k2-host}
+                startupProbe:
+                  exec:
+                    command: [test, -S, /var/lib/k2-host/.k2/run/ptyd/ctl.sock]
+                  periodSeconds: 1
+                  failureThreshold: 60
+                resources:
+                  requests: {cpu: 100m, memory: 256Mi}
+                  limits: {memory: 3Gi}          # the agents' memory now: they are ptyd's children
+                securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+                volumeMounts:
+                  - {name: data, mountPath: /var/lib/k2-host}
+                  - {name: work, mountPath: /var/lib/k2/work}
+                  - {name: tmp, mountPath: /tmp}
+EOF
         fi
         if [ -n "$login_from" ]; then
             # The variant's agents image by its own name: the base's images:

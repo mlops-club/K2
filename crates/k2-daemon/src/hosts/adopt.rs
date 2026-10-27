@@ -201,18 +201,22 @@ pub fn at_process_start() {
 static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
 /// How long a host waits at boot for ptyd before it links without adopting
-/// (`K2_PTYD_ADOPT_WAIT` seconds, default 10).
+/// (`K2_PTYD_ADOPT_WAIT` seconds; default 10, or 60 with a sidecar ptyd,
+/// `K2_PTYD_SIDECAR`, which may come up after the daemon's container).
 pub const ADOPT_WAIT_VAR: &str = "K2_PTYD_ADOPT_WAIT";
 pub const DEFAULT_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const DEFAULT_SIDECAR_ADOPT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub fn adopt_wait(get: impl Fn(&str) -> Option<String>) -> std::time::Duration {
+    let sidecar = matches!(get("K2_PTYD_SIDECAR").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1" | "on" | "true"));
+    let default = if sidecar { DEFAULT_SIDECAR_ADOPT_WAIT } else { DEFAULT_ADOPT_WAIT };
     match get(ADOPT_WAIT_VAR).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
-        None => DEFAULT_ADOPT_WAIT,
+        None => default,
         Some(v) => match v.parse::<u64>() {
             Ok(n) => std::time::Duration::from_secs(n),
             Err(_) => {
-                k2_core::log_debug!("[hosts/adopt] {ADOPT_WAIT_VAR}={v:?} is not a number of seconds; using {}", DEFAULT_ADOPT_WAIT.as_secs());
-                DEFAULT_ADOPT_WAIT
+                k2_core::log_debug!("[hosts/adopt] {ADOPT_WAIT_VAR}={v:?} is not a number of seconds; using {}", default.as_secs());
+                default
             }
         },
     }
@@ -471,5 +475,8 @@ mod tests {
         assert_eq!(env(None), DEFAULT_ADOPT_WAIT);
         assert_eq!(env(Some("3")), std::time::Duration::from_secs(3));
         assert_eq!(env(Some("soon")), DEFAULT_ADOPT_WAIT);
+        let sidecar = |v: Option<&str>| adopt_wait(move |k| if k == "K2_PTYD_SIDECAR" { Some("1".into()) } else { v.map(str::to_string) });
+        assert_eq!(sidecar(None), DEFAULT_SIDECAR_ADOPT_WAIT, "a sidecar ptyd may start after the daemon");
+        assert_eq!(sidecar(Some("5")), std::time::Duration::from_secs(5));
     }
 }
