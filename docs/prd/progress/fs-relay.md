@@ -376,6 +376,43 @@ F1(a) (links inside the git dir) was confirmed fixed. F1(b) was partial.
 
 Each of the three tests fails with its fix reverted (checked by mutation).
 
+## Round 9 review of 57002f441: X1, X2, X3
+
+B2 is closed. B1 reopened as X1.
+
+- **X1 (high): a checkout through the object store.** The work-tree walk
+  skipped the repository's git dir, and the git-dir check never listed
+  `objects/xx` or `objects/pack`. So `.git/objects/ab/deep -> outside`,
+  reached through a tracked `sub -> .git/objects/ab`, let abort-merge delete
+  outside the root. Fixed both ways:
+  - any link in the work tree whose target is inside the git dir or common
+    dir is refused (403 `link_into_git_dir`);
+  - the git-dir check lists every fan-out folder and `pack`, and refuses a
+    link or a folder in one.
+- **X2: a folder a check can't read was skipped.** Any read error other
+  than NotFound now fails the check, closed (`read_dir_all`), in all three
+  walks: the checkout's work tree, the git dir, and a copy's source.
+- **X3 (medium): resolve-links' candidates ran outside the budget.** 2000
+  candidates took 17 s.
+  - One budget now covers the whole request (`check_request`), including
+    `split_links`.
+  - Past 500 candidates, the rest are answered `linkable: false` without
+    being checked.
+- **Lows done now:**
+  - the git-dir walk counts against the budget;
+  - the budget is an RAII guard, reset on drop (a panic too). A nested
+    guard shares the request's budget.
+
+| Item | Test |
+|---|---|
+| X1 (the repro) | `r9_x1_a_checkout_through_the_object_store_is_refused` |
+| X1, each half on its own (with controls) | `r9_x1_links_into_the_git_dir_and_into_its_object_folders` |
+| X2: all three walks (mode 0300), with a control | `r9_x2_a_folder_the_check_cant_list_fails_it` |
+| X3: a small budget refuses; the default budget checks all; the cap | `r9_x3_resolve_links_candidates_are_in_the_budget_and_capped` |
+
+Each test fails with its fix reverted (checked by mutation; the repro
+fails only with both halves of X1 reverted).
+
 ## Checks
 
 | Check | Result |

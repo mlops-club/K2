@@ -1618,3 +1618,116 @@ fn r8_c_the_checks_stop_at_their_walk_budget() {
     // The budget is per request: the next check starts afresh.
     assert!(schema::confine(&d.root, route_schema("GET", "/cli/fs/read-file"), &[("path".into(), repo.join("a").to_string_lossy().into())], &Value::Null).is_ok());
 }
+
+// ── round 9 ────────────────────────────────────────────────────────────
+
+fn mode(p: &Path, m: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+}
+
+/// R9 X1 (the repro): `.git/objects/ab/deep` linking out, reached through
+/// a tracked `sub` linked to `.git/objects/ab`: refused, nothing outside
+/// deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9_x1_a_checkout_through_the_object_store_is_refused() {
+    let d = host_disk();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(d.ws.join("sub/deep")).unwrap();
+    std::fs::write(d.ws.join("sub/deep/f"), "tracked\n").unwrap();
+    host_git(&d.ws, &["add", "-A"]);
+    host_git(&d.ws, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-x1");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::create_dir_all(d.ws.join(".git/objects/ab")).unwrap();
+    link(&outside, &d.ws.join(".git/objects/ab/deep"));
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    link(&d.ws.join(".git/objects/ab"), &d.ws.join("sub"));
+    let (st, v) = served("POST", "/cli/git/abort-merge", "", Some(json!({"path": d.ws}))).await;
+    assert_eq!(st, "403 Forbidden", "{v}");
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+}
+
+/// R9 X1, each half on its own: (a) a work-tree link into the git dir is
+/// refused even when the git dir itself is clean; (b) the git dir's
+/// fan-out folders and `pack` are listed: a link or a folder in one is
+/// refused, for every git route.
+#[test]
+fn r9_x1_links_into_the_git_dir_and_into_its_object_folders() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let abort = route_schema("POST", "/cli/git/abort-merge");
+    let body = json!({"path": d.ws});
+    link(&d.ws.join(".git/refs"), &d.ws.join("refs-link"));
+    let r = schema::confine(&d.root, abort, &[], &body);
+    assert!(matches!(r, Err(schema::Refusal::Coded("link_into_git_dir", _))), "{r:?}");
+    std::fs::remove_file(d.ws.join("refs-link")).unwrap();
+    assert!(schema::confine(&d.root, abort, &[], &body).is_ok(), "the control");
+    let outside = d.root.parent().unwrap().join("outside-x1b");
+    std::fs::create_dir_all(&outside).unwrap();
+    let snap = route_schema("GET", "/cli/git/snapshot");
+    let q = vec![("path".to_string(), d.ws.to_string_lossy().into_owned())];
+    for (at, what) in [("objects/cd", "a link"), ("objects/pack", "a link")] {
+        std::fs::create_dir_all(d.ws.join(".git").join(at)).unwrap();
+        let l = d.ws.join(".git").join(at).join("x");
+        link(&outside, &l);
+        assert!(matches!(schema::confine(&d.root, snap, &q, &Value::Null), Err(schema::Refusal::Outside(_))), "{at}: {what}");
+        std::fs::remove_file(&l).unwrap();
+        std::fs::create_dir_all(&l).unwrap();
+        assert!(matches!(schema::confine(&d.root, snap, &q, &Value::Null), Err(schema::Refusal::Outside(_))), "{at}: a folder");
+        std::fs::remove_dir(&l).unwrap();
+    }
+    assert!(schema::confine(&d.root, snap, &q, &Value::Null).is_ok(), "the control");
+}
+
+/// R9 X2: a folder a check can't list (mode 0300) fails it, closed, in
+/// all three walks: the checkout's work tree, the git dir, a copy's
+/// source.
+#[test]
+fn r9_x2_a_folder_the_check_cant_list_fails_it() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let hidden = d.ws.join("hidden");
+    std::fs::create_dir_all(&hidden).unwrap();
+    mode(&hidden, 0o300);
+    let abort = route_schema("POST", "/cli/git/abort-merge");
+    let r = schema::confine(&d.root, abort, &[], &json!({"path": d.ws}));
+    mode(&hidden, 0o755);
+    assert!(r.is_err(), "the work tree: {r:?}");
+    let refs = d.ws.join(".git/refs/tags");
+    std::fs::create_dir_all(&refs).unwrap();
+    mode(&refs, 0o300);
+    let q = vec![("path".to_string(), d.ws.to_string_lossy().into_owned())];
+    let r = schema::confine(&d.root, route_schema("GET", "/cli/git/snapshot"), &q, &Value::Null);
+    mode(&refs, 0o755);
+    assert!(r.is_err(), "the git dir: {r:?}");
+    let src = d.ws.join("src-folder");
+    std::fs::create_dir_all(src.join("inner")).unwrap();
+    mode(&src.join("inner"), 0o300);
+    let copy = json!({"sources": [src], "destination": d.ws.join("hidden")});
+    let r = schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy);
+    mode(&src.join("inner"), 0o755);
+    assert!(r.is_err(), "a copy's source: {r:?}");
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy).is_ok(), "the control");
+}
+
+/// R9 X3: resolve-links' candidates are checked within the request's one
+/// budget (a small one refuses), and past a cap they are answered
+/// unchecked.
+#[test]
+fn r9_x3_resolve_links_candidates_are_in_the_budget_and_capped() {
+    let d = host_disk();
+    std::fs::create_dir_all(d.ws.join("a")).unwrap();
+    // Each candidate a link whose target is a long `a/../` chain.
+    link(Path::new(&format!("{}a", "a/../".repeat(40))), &d.ws.join("lk"));
+    let links = route_schema("POST", "/cli/fs/resolve-links");
+    let body = |n: usize| json!({"workspace": d.ws, "paths": vec!["lk"; n]});
+    let r = check_request(&d.root, links, &[], body(100), 2_000, Duration::from_secs(60));
+    assert!(matches!(r, Err(schema::Refusal::Coded("walk_budget", _))), "a small budget: {:?}", r.err());
+    let (_, refused) = check_request(&d.root, links, &[], body(100), schema::WALK_STEPS, schema::WALK_TIME).unwrap();
+    assert!(refused.is_empty(), "within the default budget, all checked");
+    let (c, refused) = check_request(&d.root, links, &[], body(2_000), schema::WALK_STEPS, schema::WALK_TIME).unwrap();
+    assert_eq!(refused.len(), 1_500, "past the cap: answered unchecked");
+    assert_eq!(c.body["paths"].as_array().unwrap().len(), 500);
+}

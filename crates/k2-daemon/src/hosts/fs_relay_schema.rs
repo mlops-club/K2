@@ -293,9 +293,9 @@ pub fn confine_within(
     steps: usize,
     time: std::time::Duration,
 ) -> Result<Confined, Refusal> {
-    super::budget::start(steps, time);
+    let guard = super::budget::guard(steps, time);
     let r = confine_unbudgeted(root, s, query, body);
-    if super::budget::end() {
+    if guard.spent() {
         return Err(Refusal::Coded("walk_budget", format!("checking {}'s paths took more than a relayed request may", s.route)));
     }
     r
@@ -462,13 +462,15 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
 /// tree. The work tree of the repository at `path` is walked (every
 /// folder but the repository's own git dir, by path: B1) without following
 /// a link; a link to a folder, or a dangling one, whose target is outside
-/// the work tree is refused (`link_outside_worktree`, B2). A link to a file
-/// is the checkout's to replace.
+/// the work tree is refused (`link_outside_worktree`, B2), and so is any
+/// link into the repository's git dir or common dir (`link_into_git_dir`,
+/// X1). A link to a file elsewhere is the checkout's to replace. A folder
+/// the walk can't list fails it (X2).
 fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
     let out = Refusal::Outside;
-    let (git_dir, work) = match k2_core::git::repo_dirs(&path.to_string_lossy()) {
-        Ok((g, _, Some(w))) => (resolve(&g), w),
-        _ => (None, path.to_path_buf()),
+    let (git_dir, common, work) = match k2_core::git::repo_dirs(&path.to_string_lossy()) {
+        Ok((g, c, Some(w))) => (resolve(&g), resolve(&c), w),
+        _ => (None, None, path.to_path_buf()),
     };
     let work = resolve(&work).ok_or_else(|| out(format!("{} can't be resolved", work.display())))?;
     if !work.starts_with(root) {
@@ -477,16 +479,19 @@ fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
     let mut todo = vec![work.clone()];
     let mut n = 0usize;
     while let Some(d) = todo.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.filter_map(Result::ok) {
+        for e in super::read_dir_all(&d).map_err(out)? {
             n += 1;
             if n > TREE_LIMIT || !super::budget::charge() {
                 return Err(Refusal::Coded("walk_budget", format!("{} is too big to check for a relayed checkout", work.display())));
             }
-            let Ok(ft) = e.file_type() else { continue };
-            let p = e.path();
+            let (ft, p) = (e.ft, e.path);
             if ft.is_symlink() {
                 let r = resolve(&p);
+                // X1: never into the repository's own git dir.
+                let git = r.as_ref().is_some_and(|r| [&git_dir, &common].iter().any(|g| g.as_ref().is_some_and(|g| r.starts_with(g))));
+                if git {
+                    return Err(Refusal::Coded("link_into_git_dir", format!("{} links into the repository's git dir; a checkout would go through it", p.display())));
+                }
                 let file = r.as_ref().is_some_and(|r| r.is_file());
                 let leaves = r.as_ref().is_none_or(|r| !r.starts_with(&work));
                 if leaves && !file {
@@ -520,9 +525,7 @@ fn tree_inside(root: &Path, src: &Path) -> Result<(), String> {
         }
         let real = inside(root, &p.display().to_string(), &p)?;
         if real.is_dir() && seen.insert(real.clone()) {
-            if let Ok(rd) = std::fs::read_dir(&real) {
-                todo.extend(rd.filter_map(Result::ok).map(|e| e.path()));
-            }
+            todo.extend(super::read_dir_all(&real)?.into_iter().map(|e| e.path));
         }
     }
     Ok(())

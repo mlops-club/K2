@@ -626,15 +626,36 @@ pub(crate) mod budget {
         static SPENT: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub fn start(steps: usize, time: Duration) {
-        LEFT.set(Some((steps, Instant::now() + time)));
-        SPENT.set(false);
+    /// A request's budget, for as long as the guard lives (reset on
+    /// drop, a panic too). Inside another request's guard: that one's.
+    #[must_use]
+    pub struct Guard {
+        owner: bool,
     }
 
-    /// Ends it: was it spent?
-    pub fn end() -> bool {
-        LEFT.set(None);
-        SPENT.replace(false)
+    pub fn guard(steps: usize, time: Duration) -> Guard {
+        if LEFT.get().is_some() {
+            return Guard { owner: false };
+        }
+        LEFT.set(Some((steps, Instant::now() + time)));
+        SPENT.set(false);
+        Guard { owner: true }
+    }
+
+    impl Guard {
+        /// Was the budget spent?
+        pub fn spent(&self) -> bool {
+            SPENT.get()
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.owner {
+                LEFT.set(None);
+                SPENT.set(false);
+            }
+        }
     }
 
     /// One step: `false` once the budget is spent.
@@ -744,6 +765,11 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
     let mut kept = Vec::new();
     let mut refused = Vec::new();
     for (i, p) in paths.into_iter().enumerate() {
+        // X3: past the cap, or the budget, unchecked: not linkable.
+        if i >= MAX_LINK_CANDIDATES || !budget::charge() {
+            refused.push((i, p));
+            continue;
+        }
         let candidate = if has_dot_dot(&p) {
             None
         } else if p.starts_with('/') {
@@ -829,31 +855,34 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
 /// The most entries a git dir may hold for the host to check it.
 const GIT_DIR_LIMIT: usize = 200_000;
 
-/// F1 (round 7): no symlink anywhere in a repository's git dir (libgit2 and
-/// git write refs, logs, worktrees and objects through any link there), and
-/// no `objects/info/alternates` naming objects outside the work root. A
-/// loose-object fan-out folder or `objects/pack` is checked itself, not
-/// each object in it.
+/// F1 (round 7), X1 (round 9): no symlink anywhere in a repository's git
+/// dir (libgit2 and git write refs, logs, worktrees and objects through
+/// any link there), every entry listed, a loose-object fan-out folder and
+/// `objects/pack` holding files only; and no `objects/info/alternates`
+/// naming objects outside the work root. Within the request's budget.
 fn git_dir_without_links(root: &Path, dir: &Path) -> Result<(), String> {
     let objects = dir.join("objects");
-    let mut todo = vec![dir.to_path_buf()];
+    // (folder, is it a loose-object fan-out folder or `objects/pack`)
+    let mut todo = vec![(dir.to_path_buf(), false)];
     let mut n = 0usize;
-    while let Some(d) = todo.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.filter_map(Result::ok) {
+    while let Some((d, leaf)) = todo.pop() {
+        // X2: a folder the check can't read is refused, not skipped.
+        for e in read_dir_all(&d)? {
             n += 1;
-            if n > GIT_DIR_LIMIT {
-                return Err(format!("{} holds over {GIT_DIR_LIMIT} entries; too many to check for a relayed request", dir.display()));
+            if n > GIT_DIR_LIMIT || !budget::charge() {
+                return Err(format!("{} holds too much to check for a relayed request", dir.display()));
             }
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_symlink() {
-                return Err(format!("{} is a symlink in a repository's git dir", e.path().display()));
+            if e.ft.is_symlink() {
+                return Err(format!("{} is a symlink in a repository's git dir", e.path.display()));
             }
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            let leaf = d == objects && (name == "pack" || (name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())));
-            if ft.is_dir() && !leaf {
-                todo.push(e.path());
+            if e.ft.is_dir() {
+                // X1: a fan-out folder or `pack` holds files only.
+                if leaf {
+                    return Err(format!("{} is a folder where git keeps objects", e.path.display()));
+                }
+                let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let is_leaf = d == objects && (name == "pack" || (name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())));
+                todo.push((e.path, is_leaf));
             }
         }
     }
@@ -866,6 +895,60 @@ fn git_dir_without_links(root: &Path, dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A folder entry, its type as `lstat` says.
+pub(crate) struct Entry {
+    pub path: PathBuf,
+    pub ft: std::fs::FileType,
+}
+
+/// X2 (round 9): every entry of `dir`, or why not. A folder that is gone
+/// has none; any other error (no permission to list it, an entry whose
+/// type can't be read) fails the check that walks it, closed.
+pub(crate) fn read_dir_all(dir: &Path) -> Result<Vec<Entry>, String> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{} can't be listed to check it: {e}", dir.display())),
+    };
+    rd.map(|e| {
+        let e = e.map_err(|e| format!("{} can't be listed to check it: {e}", dir.display()))?;
+        let ft = e.file_type().map_err(|err| format!("{} can't be checked: {err}", e.path().display()))?;
+        Ok(Entry { path: e.path(), ft })
+    })
+    .collect()
+}
+
+/// The most resolve-links candidates a host checks one by one; the rest
+/// answer `linkable: false` unchecked (X3).
+const MAX_LINK_CANDIDATES: usize = 500;
+
+/// A relayed request's checks (resolve-links' candidates, the route's
+/// schema), all within one walk budget of `steps` and `time` (X3): the
+/// confined request and resolve-links' refused candidates.
+pub(crate) fn check_request(
+    root: &Path,
+    route: &'static schema::Schema,
+    query: &[(String, String)],
+    body: Value,
+    steps: usize,
+    time: Duration,
+) -> Result<(schema::Confined, Vec<(usize, String)>), schema::Refusal> {
+    let guard = budget::guard(steps, time);
+    let mut refused_links = Vec::new();
+    let body = if route.route == "/cli/fs/resolve-links" {
+        let (b, refused) = split_links(root, &body);
+        refused_links = refused;
+        b
+    } else {
+        body
+    };
+    let r = schema::confine(root, route, query, &body);
+    if guard.spent() {
+        return Err(schema::Refusal::Coded("walk_budget", format!("checking {}'s paths took more than a relayed request may", route.route)));
+    }
+    r.map(|c| (c, refused_links))
 }
 
 /// The link's `http.relay`: run the request through this daemon's own
@@ -900,19 +983,8 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
     // derived path confined, and the daemon gets the confined values only.
     // R8 C: off the link's task (the checks walk the disk), in a budget.
     let checked = {
-        let (root, path, query) = (root.clone(), path.to_string(), pairs(query));
-        tokio::task::spawn_blocking(move || {
-            let mut refused_links = Vec::new();
-            let body_json = if path == "/cli/fs/resolve-links" {
-                let (b, refused) = split_links(&root, &body_json);
-                refused_links = refused;
-                b
-            } else {
-                body_json
-            };
-            schema::confine(&root, route, &query, &body_json).map(|c| (c, refused_links))
-        })
-        .await
+        let (root, query) = (root.clone(), pairs(query));
+        tokio::task::spawn_blocking(move || check_request(&root, route, &query, body_json, schema::WALK_STEPS, schema::WALK_TIME)).await
     };
     let (query_pairs, body, refused_links) = match checked {
         Ok(Ok((c, refused))) => (c.query, if c.body.is_null() { Vec::new() } else { c.body.to_string().into_bytes() }, refused),
