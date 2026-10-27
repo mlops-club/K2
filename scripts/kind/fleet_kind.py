@@ -24,6 +24,8 @@ the same "<pid>@<start time>". The backend:
   start   removes the hold file; waits for a new k2-daemon process
   CLIs    "<host>:<pid>" of processes run from the fake-agent shim dir
           (listed with kubectl exec over /proc; the image has no ps)
+  files   with own work volumes (up.sh --host-work=own), a host's
+          workspaces are read in its pod (grep), not from /var/lib/k2/work
 
 Every daemon's API is on 127.0.0.1:<port> in the runner (the state file's
 ports), forwarded to its pod: `forward` runs that, closing a port while its
@@ -220,6 +222,19 @@ def cli_alive(st, host, pid):
     return bool(pid) and "%s:%s" % (host, pid) in agent_cli_pids(st)
 
 
+def host_files(st, host, root, needle):
+    """With own work volumes (k2-host's claim template has `work`) each
+    host's workspaces are on its own disk: grep there, in its pod. With the
+    shared k2-work, None: the runner sees the same files."""
+    if not st["kind"].get("own_work"):
+        return None
+    try:
+        r = _exec(st, host, "grep", "-rlF", "--", needle, root)
+    except (subprocess.TimeoutExpired, KeyError):
+        return []
+    return sorted(line for line in r.stdout.splitlines() if line.strip())
+
+
 def down(st):
     """Leave every daemon running (the deployment stays; fleet-g2.sh and
     down.sh own it)."""
@@ -269,6 +284,7 @@ def install(fleet):
     fleet.ours, fleet.start, fleet.kill = ours, k_start, k_kill
     fleet.agent_cli_pids, fleet.kill_cli, fleet.cli_alive = agent_cli_pids, k_kill_cli, cli_alive
     fleet.down, fleet.cli_key = down, k_cli_key
+    fleet.host_files = host_files
     return True
 
 
@@ -284,6 +300,9 @@ def plan(state_path, run_dir, namespace, hosts, kill_mode, pool=None):
           "kind": {"namespace": namespace, "kill": kill_mode, "pods": {}, "containers": {}, "upstream": {},
                    "pod_home": {}, "pool": pool}}
     k = st["kind"]
+    tpl = kubectl(st, "get", "statefulset", "k2-host", "-o",
+                  "jsonpath={.spec.volumeClaimTemplates[*].metadata.name}").stdout.split()
+    k["own_work"] = "work" in tpl
 
     def proc(name, pod, role, container, upstream, pod_home, port):
         home = "/lab/homes/%s" % pod
