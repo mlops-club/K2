@@ -856,6 +856,11 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
         let (git_dir, common, work) = match k2_core::git::repo_dirs(&open_at.to_string_lossy()) {
             Ok(d) => d,
             // No repository at all: nothing git can reach; the route answers.
+            // Round 12 (c): but a `.git` at or above it that libgit2 can't
+            // open is refused, never skipped (the git CLI might open it).
+            Err(_) if open_at.ancestors().any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok()) => {
+                return Err(format!("the repository for {p} can't be opened here"));
+            }
             Err(_) => continue,
         };
         // (D3: an outside path is never named in a refusal.)
@@ -889,32 +894,46 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
         let in_ws = |d: &Path| d.starts_with(&within);
         let enclosing_checkout = |c: &Path| c.file_name().is_some_and(|n| n == ".git") && c.parent().is_some_and(|top| within.starts_with(top));
         let enclosing = w.as_ref().is_some_and(|w| within.starts_with(w) && g == w.join(".git") && c == g);
+        // Round 12 (b): the pointer files are one clean path line each.
+        let back_link = k2_core::git::path_line(&g.join("gitdir"))?;
+        if let Some(w) = &w {
+            if std::fs::symlink_metadata(w.join(".git")).is_ok_and(|m| m.is_file()) {
+                let gitfile = k2_core::git::path_line(&w.join(".git"))?;
+                if !gitfile.as_deref().is_some_and(|l| l.starts_with("gitdir: ")) {
+                    return Err(format!("the repository for {p} has a .git file that isn't one gitdir line"));
+                }
+            }
+        }
         let linked = w.as_ref().is_some_and(|w| {
             *w == within
                 && g.parent() == Some(c.join("worktrees").as_path())
-                && std::fs::read_to_string(g.join("gitdir"))
-                    .ok()
-                    .and_then(|l| resolve(Path::new(l.trim())))
-                    .is_some_and(|back| back == w.join(".git"))
+                // The back-link may be relative to the git dir (git 2.48's
+                // relative worktrees).
+                && back_link.as_deref().and_then(|l| resolve(&g.join(l))).is_some_and(|back| back == w.join(".git"))
                 && (in_ws(&c) || enclosing_checkout(&c))
         });
         let own = in_ws(&g) && in_ws(&c) && w.as_deref().is_none_or(in_ws);
         if !(own || enclosing || linked) {
             return Err(format!("the repository for {p} is not this workspace's own"));
         }
-        // N1 (round 11): objects it borrows (alternates) come from the
-        // same place: the workspace, or the checkout git acts on.
-        let allowed = if enclosing {
-            w.clone().unwrap_or_else(|| within.clone())
-        } else if linked && !in_ws(&c) {
-            c.parent().map(Path::to_path_buf).unwrap_or_else(|| within.clone())
-        } else {
-            within.clone()
-        };
+        // Round 12 (a): no alternates at all (a K2 workspace never needs
+        // to borrow objects); this replaces round 11's alternates walk.
+        for d in [&g, &c] {
+            for f in ["objects/info/alternates", "objects/info/http-alternates"] {
+                if std::fs::symlink_metadata(d.join(f)).is_ok() {
+                    return Err(format!("the repository for {p} borrows objects (alternates): not served here"));
+                }
+            }
+        }
+        // Round 12 (e): a format and extensions K2 knows.
+        k2_core::git::known_repo_format(&c).map_err(|e| format!("the repository for {p}: {e}"))?;
+        // Round 12 (d): the git CLI, run as the routes run it, opens the
+        // same repository libgit2 did.
+        cli_sees_the_same(&open_at, &g, &c, w.as_deref()).map_err(|e| format!("the repository for {p}: {e}"))?;
         // F1 (round 7): what git writes inside them stays there too.
-        git_dir_without_links(&allowed, &git_dir)?;
+        git_dir_without_links(&git_dir)?;
         if common != git_dir {
-            git_dir_without_links(&allowed, &common)?;
+            git_dir_without_links(&common)?;
         }
     }
     Ok(())
@@ -923,12 +942,38 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
 /// The most entries a git dir may hold for the host to check it.
 const GIT_DIR_LIMIT: usize = 200_000;
 
+/// Round 12 (d): `git rev-parse` from `dir`, run as the routes run git
+/// (K2's hardened command there), names the same git dir, common dir and
+/// work tree libgit2 opened; else the two disagree on what they act on.
+fn cli_sees_the_same(dir: &Path, g: &Path, c: &Path, w: Option<&Path>) -> Result<(), String> {
+    let mut git = k2_core::git::git_command_in(dir)?;
+    git.args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
+    if w.is_some() {
+        git.arg("--show-toplevel");
+    }
+    let out = git.output().map_err(|e| format!("git rev-parse: {e}"))?;
+    if !out.status.success() {
+        return Err("git can't open it".into());
+    }
+    let text = String::from_utf8(out.stdout).map_err(|_| "git names it in bytes that aren't UTF-8".to_string())?;
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |i: usize| -> Option<PathBuf> {
+        let l = lines.get(i)?;
+        let p = Path::new(l);
+        resolve(&if p.is_absolute() { p.to_path_buf() } else { dir.join(p) })
+    };
+    let same = at(0).as_deref() == Some(g) && at(1).as_deref() == Some(c) && w.is_none_or(|w| at(2).as_deref() == Some(w));
+    if !same {
+        return Err("git and libgit2 open different repositories".into());
+    }
+    Ok(())
+}
+
 /// F1 (round 7), X1 (round 9): no symlink anywhere in a repository's git
 /// dir (libgit2 and git write refs, logs, worktrees and objects through
 /// any link there), every entry listed, a loose-object fan-out folder and
-/// `objects/pack` holding files only; and no `objects/info/alternates`
-/// naming objects outside the work root. Within the request's budget.
-fn git_dir_without_links(allowed: &Path, dir: &Path) -> Result<(), String> {
+/// `objects/pack` holding files only. Within the request's budget.
+fn git_dir_without_links(dir: &Path) -> Result<(), String> {
     let objects = dir.join("objects");
     // (folder, is it a loose-object fan-out folder or `objects/pack`)
     let mut todo = vec![(dir.to_path_buf(), false)];
@@ -951,14 +996,6 @@ fn git_dir_without_links(allowed: &Path, dir: &Path) -> Result<(), String> {
                 let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let is_leaf = d == objects && (name == "pack" || (name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())));
                 todo.push((e.path, is_leaf));
-            }
-        }
-    }
-    if let Ok(alt) = std::fs::read_to_string(objects.join("info/alternates")) {
-        for line in alt.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-            let p = if Path::new(line).is_absolute() { PathBuf::from(line) } else { objects.join(line) };
-            if !resolve(&p).is_some_and(|r| r.starts_with(allowed)) {
-                return Err("the repository's alternates name objects outside this workspace".into());
             }
         }
     }

@@ -2305,3 +2305,392 @@ fn rv11_exception_reaches_sibling_in_same_checkout() {
     let st = std::process::Command::new("git").args(["diff", "--cached", "--name-only"]).current_dir(&mono).output().unwrap();
     eprintln!("RV11 exception: check={ok:?} staged={staged} cached={}", String::from_utf8_lossy(&st.stdout));
 }
+
+
+// ── review round 12 (scratch) ──────────────────────────────────────────
+
+fn rv12_scoped(d: &HostDisk, ws: &Path, m: &str, r: &str, extra: &[(&str, String)], body: Value) -> Result<(), String> {
+    let mut q: Vec<(String, String)> = extra.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    q.push((SCOPE_KEY.to_string(), ws.to_string_lossy().into_owned()));
+    check_request(&d.root, route_schema(m, r), &q, body, schema::WALK_STEPS, schema::WALK_TIME).map(|_| ()).map_err(|e| format!("{e:?}"))
+}
+
+/// `other` with a committed secret; returns its HEAD sha.
+fn rv12_secret_repo(other: &Path) -> String {
+    std::fs::create_dir_all(other).unwrap();
+    k2_core::git::init_repo(&other.to_string_lossy()).unwrap();
+    std::fs::write(other.join("secret.txt"), "TOP-SECRET\n").unwrap();
+    host_git(other, &["add", "-A"]);
+    host_git(other, &["commit", "-qm", "s"]);
+    let out = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(other).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// file-at-ref routed to `ws` for `sha`: Err(refusal) or Ok(what libgit2 read).
+fn rv12_file_at_ref(d: &HostDisk, ws: &Path, sha: &str) -> Result<Result<String, String>, String> {
+    let extra = [("path", ws.to_string_lossy().into_owned()), ("file_path", "secret.txt".to_string()), ("git_ref", sha.to_string())];
+    rv12_scoped(d, ws, "GET", "/cli/git/file-at-ref", &extra, Value::Null)?;
+    Ok(k2_core::git::file_content_at_ref(&ws.to_string_lossy(), "secret.txt", sha))
+}
+
+fn rv12_assert_no_leak(what: &str, r: Result<Result<String, String>, String>) {
+    if let Ok(Ok(s)) = &r {
+        assert!(!s.contains("TOP-SECRET"), "{what}: check passed and libgit2 read the sibling's secret: {s:?}");
+    }
+    eprintln!("RV12 {what}: {r:?}");
+}
+
+/// N1 control: direct alternates (absolute and relative) into a sibling are refused.
+#[test]
+fn rv12_n1_direct_alternates_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    let alt = d.ws.join(".git/objects/info/alternates");
+    std::fs::write(&alt, format!("{}\n", other.join(".git/objects").display())).unwrap();
+    assert!(rv12_file_at_ref(&d, &d.ws, &sha).is_err(), "absolute");
+    std::fs::write(&alt, "../../../other/.git/objects\n").unwrap();
+    assert!(rv12_file_at_ref(&d, &d.ws, &sha).is_err(), "relative");
+    // Policy (a), round 12 (the coordinator's decision): alternates are
+    // refused even when they point inside the workspace.
+    std::fs::create_dir_all(d.ws.join("store/objects")).unwrap();
+    std::fs::write(&alt, format!("{}\n", d.ws.join("store/objects").display())).unwrap();
+    assert!(rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws})).is_err(), "in-ws alternates: refused (policy a)");
+}
+
+/// N1 bypass: alternates of alternates. notes' alternates name an objects
+/// dir inside notes, whose own alternates name other's objects.
+#[test]
+fn rv12_n1_nested_alternates_into_sibling() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::create_dir_all(d.ws.join("store/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", d.ws.join("store/objects").display())).unwrap();
+    std::fs::write(d.ws.join("store/objects/info/alternates"), format!("{}\n", other.join(".git/objects").display())).unwrap();
+    rv12_assert_no_leak("nested alternates", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// N1 bypass: the alternate objects dir is inside notes but its fan-out
+/// folders are symlinks into other's objects.
+#[test]
+fn rv12_n1_alternate_with_linked_fanout() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    let store = d.ws.join("store/objects");
+    std::fs::create_dir_all(&store).unwrap();
+    for e in std::fs::read_dir(other.join(".git/objects")).unwrap() {
+        let e = e.unwrap();
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.len() == 2 {
+            link(&e.path(), &store.join(&n));
+        }
+    }
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", store.display())).unwrap();
+    rv12_assert_no_leak("alternate with symlinked fan-out", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// N1 bypass: an alternates file that isn't UTF-8 is skipped by the check
+/// (read_to_string fails) but git/libgit2 read it as bytes.
+#[test]
+fn rv12_n1_non_utf8_alternates() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    let mut bytes = b"# \xff\xfe\n".to_vec();
+    bytes.extend_from_slice(format!("{}\n", other.join(".git/objects").display()).as_bytes());
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), bytes).unwrap();
+    rv12_assert_no_leak("non-UTF-8 alternates", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// http-alternates: git uses it only for dumb-HTTP fetch; libgit2 ignores it.
+#[test]
+fn rv12_n1_http_alternates_inert() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/http-alternates"), format!("{}\n", other.join(".git/objects").display())).unwrap();
+    rv12_assert_no_leak("http-alternates", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// Same class as N1 at the common dir: a `commondir` file that isn't UTF-8.
+/// repo_dirs' read_to_string fails, so the check sees common == git dir.
+/// (a) bytes after a NUL (libgit2 reads a C string); (b) a non-UTF-8
+/// symlink name (Linux only; APFS refuses such names).
+#[test]
+fn rv12_non_utf8_commondir_into_sibling() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    let mut bytes = other.join(".git").display().to_string().into_bytes();
+    bytes.extend_from_slice(b"\0\xff\n");
+    std::fs::write(d.ws.join(".git/commondir"), &bytes).unwrap();
+    eprintln!("RV12 commondir-nul repo_dirs={:?}", k2_core::git::repo_dirs(&d.ws.to_string_lossy()));
+    rv12_assert_no_leak("non-UTF-8 commondir (NUL)", rv12_file_at_ref(&d, &d.ws, &sha));
+    let name = std::ffi::OsStr::from_bytes(b"x\xff");
+    if std::os::unix::fs::symlink(other.join(".git"), d.ws.join(name)).is_ok() {
+        std::fs::write(d.ws.join(".git/commondir"), b"../x\xff\n").unwrap();
+        rv12_assert_no_leak("non-UTF-8 commondir (name)", rv12_file_at_ref(&d, &d.ws, &sha));
+    } else {
+        eprintln!("RV12 commondir-name: filesystem refuses non-UTF-8 names (untested here)");
+    }
+}
+
+/// res(): an unresolvable (link loop) git dir fails closed.
+#[test]
+fn rv12_res_fails_closed() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    // .git a gitfile naming a path through a symlink loop
+    link(&d.ws.join("loopb"), &d.ws.join("loopa"));
+    link(&d.ws.join("loopa"), &d.ws.join("loopb"));
+    std::fs::rename(d.ws.join(".git"), d.ws.join("real.git")).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", d.ws.join("real.git").display())).unwrap();
+    assert!(rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws})).is_ok(), "control: gitfile in ws");
+    // commondir through the loop: libgit2 can't open it either, but the check must refuse
+    std::fs::write(d.ws.join("real.git/commondir"), format!("{}\n", d.ws.join("loopa/x").display())).unwrap();
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    let opened = k2_core::git::repo_dirs(&d.ws.to_string_lossy());
+    eprintln!("RV12 res loop commondir: check={r:?} repo_dirs={opened:?}");
+    assert!(r.is_err() || opened.is_err(), "libgit2 opened it and the check passed");
+    let fn_src = include_str!("fs_relay.rs");
+    assert!(!fn_src.contains("unwrap_or_else(|| d.to_path_buf())"), "old res() fallback still present");
+}
+
+/// N2: K2 linked worktree workspace: info, changes, stage-all, commit pass and work.
+#[test]
+fn rv12_n2_linked_worktree_functional() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    host_git(&d.ws, &["config", "user.name", "lab"]);
+    host_git(&d.ws, &["config", "user.email", "lab@example.invalid"]);
+    k2_core::git::create_worktree(&d.ws.to_string_lossy(), "feat").unwrap();
+    let wt = d.ws.join(".worktrees/feat");
+    let p = wt.to_string_lossy().into_owned();
+    std::fs::write(wt.join("new.txt"), "n\n").unwrap();
+    for (m, r) in [("GET", "/cli/git/info"), ("GET", "/cli/git/changes")] {
+        assert!(rv12_scoped(&d, &wt, m, r, &[("path", p.clone())], Value::Null).is_ok(), "{r}");
+    }
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/stage-all", &[], json!({"path": p})).is_ok());
+    k2_core::git::stage_all(&p).unwrap();
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/commit", &[], json!({"path": p, "message": "m"})).is_ok());
+    k2_core::git::commit(&p, "m").unwrap();
+    assert!(k2_core::git::get_changed_files(&p).is_empty());
+    // the project, nested repo-in-checkout still fine
+    assert!(rv12_scoped(&d, &d.ws, "GET", "/cli/git/info", &[("path", d.ws.to_string_lossy().into_owned())], Value::Null).is_ok());
+}
+
+/// N2 for a project nested in a bigger checkout: mono/proj is the K2
+/// project (no own .git, mono's), its linked worktree mono/proj/.worktrees/feat.
+#[test]
+fn rv12_n2_nested_workspace_and_linked_in_checkout() {
+    let d = host_disk();
+    let mono = d.root.join("mono");
+    let ws = mono.join("team/notes");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("a.txt"), "a\n").unwrap();
+    committed_repo(&mono);
+    host_git(&mono, &["config", "user.name", "lab"]);
+    host_git(&mono, &["config", "user.email", "lab@example.invalid"]);
+    std::fs::write(ws.join("a.txt"), "b\n").unwrap();
+    let p = ws.to_string_lossy().into_owned();
+    for (m, r) in [("GET", "/cli/git/info"), ("GET", "/cli/git/changes")] {
+        assert!(rv12_scoped(&d, &ws, m, r, &[("path", p.clone())], Value::Null).is_ok(), "{r}");
+    }
+    assert!(rv12_scoped(&d, &ws, "POST", "/cli/git/stage-all", &[], json!({"path": p})).is_ok());
+    k2_core::git::stage_all(&p).unwrap();
+    assert!(rv12_scoped(&d, &ws, "POST", "/cli/git/commit", &[], json!({"path": p, "message": "m"})).is_ok());
+    k2_core::git::commit(&p, "m").unwrap();
+    // linked worktree of mono placed at mono/.worktrees/feat
+    k2_core::git::create_worktree(&mono.to_string_lossy(), "feat").unwrap();
+    let wt = mono.join(".worktrees/feat");
+    let wp = wt.to_string_lossy().into_owned();
+    std::fs::write(wt.join("w.txt"), "w\n").unwrap();
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/stage-all", &[], json!({"path": wp})).is_ok(), "linked in mono");
+    k2_core::git::stage_all(&wp).unwrap();
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/commit", &[], json!({"path": wp, "message": "m"})).is_ok());
+    k2_core::git::commit(&wp, "m").unwrap();
+}
+
+/// N2 abuse probes: each must be refused.
+#[test]
+fn rv12_n2_abuse_probes() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    k2_core::git::create_worktree(&other.to_string_lossy(), "feat").unwrap();
+    let stage = |d: &HostDisk, ws: &Path| rv12_scoped(d, ws, "POST", "/cli/git/stage-all", &[], json!({"path": ws}));
+    let mut passed = Vec::new();
+    // a) notes/.git gitfile into other's linked worktree git dir (abs and rel)
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/feat").display())).unwrap();
+    if stage(&d, &d.ws).is_ok() { passed.push("gitfile abs into other's worktree"); }
+    std::fs::write(d.ws.join(".git"), "gitdir: ../other/.git/worktrees/feat\n").unwrap();
+    if stage(&d, &d.ws).is_ok() { passed.push("gitfile rel into other's worktree"); }
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    // b) other's linked worktree workspace (other/.worktrees/feat) gitfile -> other/.git/worktrees/<id of another branch>
+    k2_core::git::create_worktree(&other.to_string_lossy(), "two").unwrap();
+    let feat = other.join(".worktrees/feat");
+    let saved = std::fs::read_to_string(feat.join(".git")).unwrap();
+    std::fs::write(feat.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/two").display())).unwrap();
+    if stage(&d, &feat).is_ok() { passed.push("linked ws gitfile into a sibling linked worktree"); }
+    std::fs::write(feat.join(".git"), saved).unwrap();
+    assert!(stage(&d, &feat).is_ok(), "control: linked ws passes");
+    // c) nested ws inside other (other/sub) with gitfile -> other/.git/worktrees/feat (back-link is feat's)
+    let sub = other.join("sub");
+    std::fs::write(sub.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/feat").display())).unwrap();
+    if stage(&d, &sub).is_ok() { passed.push("nested ws gitfile into project's linked worktree"); }
+    std::fs::remove_file(sub.join(".git")).unwrap();
+    // d) forged back-link: notes has its own fake common dir whose worktrees/x gitdir -> notes/.git,
+    //    but commondir points to other/.git
+    let fake = d.ws.join("fake");
+    std::fs::create_dir_all(fake.join("worktrees/x")).unwrap();
+    std::fs::copy(other.join(".git/worktrees/feat/HEAD"), fake.join("worktrees/x/HEAD")).unwrap();
+    std::fs::write(fake.join("worktrees/x/gitdir"), format!("{}\n", d.ws.join(".git").display())).unwrap();
+    std::fs::write(fake.join("worktrees/x/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", fake.join("worktrees/x").display())).unwrap();
+    if stage(&d, &d.ws).is_ok() { passed.push("forged back-link, commondir other"); }
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    // e) common an ancestor-looking .git that isn't an ancestor: mono/.git where ws is monorepo/x (prefix trick)
+    let mono = d.root.join("mono");
+    committed_repo(&mono);
+    k2_core::git::create_worktree(&mono.to_string_lossy(), "m1").unwrap();
+    let ws2 = d.root.join("monox");
+    std::fs::create_dir_all(&ws2).unwrap();
+    std::fs::write(ws2.join(".git"), format!("gitdir: {}\n", mono.join(".git/worktrees/m1").display())).unwrap();
+    std::fs::write(mono.join(".git/worktrees/m1/gitdir"), format!("{}\n", ws2.join(".git").display())).unwrap();
+    if stage(&d, &ws2).is_ok() { passed.push("common mono/.git, ws monox (string prefix)"); }
+    // f) enclosing_checkout with common a .git that's a gitfile/symlink into other
+    let top = d.root.join("top");
+    let inner = top.join("w");
+    std::fs::create_dir_all(&inner).unwrap();
+    link(&other.join(".git"), &top.join(".git"));
+    std::fs::write(inner.join(".git"), format!("gitdir: {}\n", top.join(".git/worktrees/feat").display())).unwrap();
+    if stage(&d, &inner).is_ok() { passed.push("ancestor .git symlink to other"); }
+    eprintln!("RV12 n2 abuse passed: {passed:?}");
+    assert!(passed.is_empty(), "passed: {passed:?}");
+}
+
+/// N2 functional: a worktree made with relative paths (git >= 2.48
+/// `--relative-paths` / worktree.useRelativePaths): gitfile and back-link relative.
+#[test]
+fn rv12_n2_relative_backlink() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".worktrees")).unwrap();
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "--relative-paths", "-b", "rel", ".worktrees/rel"])
+        .current_dir(&d.ws).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+    if !out.status.success() {
+        eprintln!("RV12 relative: git lacks --relative-paths: {}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+    let wt = d.ws.join(".worktrees/rel");
+    eprintln!("RV12 relative gitfile={:?} backlink={:?}", std::fs::read_to_string(wt.join(".git")), std::fs::read_to_string(d.ws.join(".git/worktrees/rel/gitdir")));
+    let r = rv12_scoped(&d, &wt, "POST", "/cli/git/stage-all", &[], json!({"path": wt}));
+    eprintln!("RV12 relative backlink linked ws: {r:?}");
+    // Round 12 (c): libgit2 (1.8) can't open a relative-paths worktree, so
+    // K2's handlers couldn't serve it either; the host refuses it rather
+    // than skip its checks. K2 makes worktrees with absolute paths.
+    if k2_core::git::repo_dirs(&wt.to_string_lossy()).is_err() {
+        assert!(r.is_err(), "unopenable by libgit2, yet passed: {r:?}");
+    } else {
+        assert!(r.is_ok(), "relative-paths linked worktree refused: {r:?}");
+    }
+}
+
+/// Gap: a repository libgit2 can't open (an extension git knows and
+/// libgit2 doesn't) skips git_precheck (`Err(_) => continue`), while routes
+/// that run the git CLI (worktrees list, prune) open it and follow its
+/// commondir into a sibling.
+#[test]
+fn rv12_libgit2_unopenable_skips_check_cli_follows() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    k2_core::git::create_worktree(&other.to_string_lossy(), "feat").unwrap();
+    committed_repo(&d.ws);
+    std::fs::write(d.ws.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    let mut hit = Vec::new();
+    for ext in ["partialclone", "relativeworktrees", "refstorage"] {
+        let cfg = other.join(".git/config");
+        let saved = std::fs::read_to_string(&cfg).unwrap();
+        let val = if ext == "refstorage" { "files" } else if ext == "partialclone" { "origin" } else { "true" };
+        host_git(&d.ws, &["config", "core.repositoryformatversion", "1"]);
+        host_git(&d.ws, &["config", &format!("extensions.{ext}"), val]);
+        let opened = k2_core::git::repo_dirs(&d.ws.to_string_lossy());
+        let p = d.ws.to_string_lossy().into_owned();
+        let r = rv12_scoped(&d, &d.ws, "GET", "/cli/git/worktrees", &[("path", p.clone())], Value::Null);
+        let wts = if r.is_ok() { k2_core::git::list_worktrees(&p).into_iter().map(|w| format!("{w:?}")).collect::<Vec<_>>() } else { vec![] };
+        eprintln!("RV12 ext {ext}: repo_dirs_ok={} check={r:?} worktrees={wts:?}", opened.is_ok());
+        if r.is_ok() && wts.iter().any(|w| w.contains("other")) {
+            hit.push(ext);
+        }
+        std::fs::write(&cfg, saved).unwrap();
+        // (Round 12: this `git config` in notes follows its commondir into
+        // other's config, just restored: the key may be gone already, so
+        // its status is not asserted.)
+        let _ = std::process::Command::new("git")
+            .args(["config", "--unset", &format!("extensions.{ext}")])
+            .current_dir(&d.ws)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output();
+    }
+    assert!(hit.is_empty(), "check skipped, git CLI reached the sibling via: {hit:?}");
+}
+
+/// Same gap, a write: create-worktree routed to notes writes a branch and
+/// worktree metadata into other's repository.
+#[test]
+fn rv12_libgit2_unopenable_create_worktree_writes_sibling() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::write(d.ws.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    host_git(&d.ws, &["config", "core.repositoryformatversion", "1"]);
+    host_git(&d.ws, &["config", "extensions.partialclone", "origin"]);
+    let p = d.ws.to_string_lossy().into_owned();
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/create-worktree", &[], json!({"projectPath": p, "branch": "pwned"}));
+    eprintln!("RV12 create-worktree check={r:?}");
+    if r.is_ok() {
+        let made = k2_core::git::create_worktree(&p, "pwned");
+        let refs = std::process::Command::new("git").args(["branch", "--list"]).current_dir(&other).output().unwrap();
+        let b = String::from_utf8_lossy(&refs.stdout).to_string();
+        eprintln!("RV12 create-worktree made={made:?} other branches={b:?} other wt meta={:?}", std::fs::read_dir(other.join(".git/worktrees")).map(|r| r.count()));
+        assert!(!b.contains("pwned"), "branch written into other's repository");
+    }
+}
+
+// ── round 12 ───────────────────────────────────────────────────────────
+
+/// Round 12 (d): the git CLI must name the git dir, common dir and work
+/// tree libgit2 opened; any other answer is refused. (The bypasses the
+/// review found are caught earlier, by (c); this is the cross-check itself.)
+#[test]
+fn r12_d_the_git_cli_must_open_what_libgit2_opened() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let (g, c, w) = k2_core::git::repo_dirs(&d.ws.to_string_lossy()).unwrap();
+    let (g, c, w) = (resolve(&g).unwrap(), resolve(&c).unwrap(), resolve(&w.unwrap()).unwrap());
+    assert!(cli_sees_the_same(&d.ws, &g, &c, Some(&w)).is_ok(), "the same repository");
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let og = resolve(&other.join(".git")).unwrap();
+    assert!(cli_sees_the_same(&d.ws, &og, &c, Some(&w)).is_err(), "another git dir");
+    assert!(cli_sees_the_same(&d.ws, &g, &og, Some(&w)).is_err(), "another common dir");
+    assert!(cli_sees_the_same(&d.ws, &g, &c, Some(&other)).is_err(), "another work tree");
+}

@@ -525,6 +525,59 @@ commit.
   Test: `rv11_exception_reaches_sibling_in_same_checkout`; it records the
   reach and asserts nothing.
 
+## Round 12 review of f2950fe82: the strict git policy
+
+N2 (linked worktrees) and fail-closed resolution are confirmed fixed. The
+review found three more ways to escape through git discovery (nested,
+linked or non-UTF-8 alternates; a non-UTF-8 `commondir`; a repository
+libgit2 can't open, whose check was skipped while the git CLI followed it).
+The coordinator decided to stop chasing git features one at a time and
+apply a strict policy instead. On a host, the repository a relayed git
+request opens must pass all of these:
+
+- **(a) No alternates at all.** An `objects/info/alternates` or
+  `http-alternates` in the git dir or common dir is refused, even one
+  pointing inside the workspace; a K2 workspace never borrows objects.
+  This replaces round 11's alternates walk.
+- **(b) Clean pointer files.** `commondir`, the `gitdir` back-link and a
+  `.git` gitfile are read as bytes (`k2_core::git::path_line`). Each must
+  be one line of UTF-8 with no NUL or control character. `repo_dirs`
+  refuses a `commondir` that isn't, instead of taking it as absent.
+- **(c) Fail closed.** A `.git` at or above the path that libgit2 can't
+  open is refused, not skipped.
+- **(d) The CLI agrees.** `git rev-parse --absolute-git-dir
+  --git-common-dir --show-toplevel`, run as the routes run git, must name
+  the same three folders libgit2 opened.
+- **(e) A known format.** `repositoryformatversion` must be 0 or 1. The
+  only extensions allowed are `noop`, `worktreeConfig`,
+  `relativeWorktrees` and `objectFormat=sha1`
+  (`k2_core::git::known_repo_format`).
+
+K2's linked worktrees keep working, including those of a project inside a
+larger checkout.
+
+**What the tests show (mutation, one item taken out at a time):**
+- Without (a) or (c), the review's tests fail.
+- Without (b), (d) or (e), nothing in the relay suite fails: the bypasses
+  the review found are already caught by (c), because libgit2 can't open
+  those repositories. (b), (d) and (e) are layers behind it, each with its
+  own test:
+  - `git::tests::a_pointer_file_is_one_clean_path_line`
+  - `r12_d_the_git_cli_must_open_what_libgit2_opened`
+  - `git::tests::a_repository_format_k2_knows`
+
+**The reviewer's tests (`rv12_*`) are added; three are changed:**
+- `rv12_n1_direct_alternates_refused` now expects alternates inside the
+  workspace to be refused, as policy (a) says.
+- `rv12_n2_relative_backlink` expects a refusal when libgit2 can't open
+  the worktree. libgit2 1.8 can't open git 2.48's `--relative-paths`
+  worktrees, so K2's handlers couldn't serve one either. K2 makes
+  worktrees with absolute paths.
+- `rv12_libgit2_unopenable_skips_check_cli_follows`: its cleanup
+  `git config --unset`, run in `notes`, follows `notes`' commondir into
+  `other`'s config, which the test had just restored. Its status is no
+  longer asserted. The check refuses all three extensions the test tries.
+
 ## Checks
 
 | Check | Result |

@@ -95,15 +95,62 @@ fn worktree_add_args<'a>(no_checkout: bool, new_branch: Option<&'a str>, worktre
 pub fn repo_dirs(path: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Option<std::path::PathBuf>), String> {
     let repo = Repository::discover(path).map_err(|e| format!("no git repository for {path}: {}", e.message()))?;
     let git_dir = repo.path().to_path_buf();
-    // A linked worktree's git dir names its common dir in `commondir`.
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(c) => {
-            let c = Path::new(c.trim());
+    // A linked worktree's git dir names its common dir in `commondir`: one
+    // clean path line, or the repository is refused (fs-relay round 12: a
+    // file that isn't UTF-8 was taken as no commondir while libgit2 read
+    // it).
+    let common = match path_line(&git_dir.join("commondir"))? {
+        Some(c) => {
+            let c = Path::new(&c);
             if c.is_absolute() { c.to_path_buf() } else { git_dir.join(c) }
         }
-        Err(_) => git_dir.clone(),
+        None => git_dir.clone(),
     };
     Ok((git_dir, common, repo.workdir().map(Path::to_path_buf)))
+}
+
+/// fs-relay round 12 (e): the repository's format is one K2 knows: version 0 or 1,
+/// and only the extensions both git and libgit2 read alike (`noop`,
+/// `worktreeConfig`, `relativeWorktrees`, `objectFormat=sha1`). A config
+/// libgit2 can't parse is refused too.
+pub fn known_repo_format(common: &Path) -> Result<(), String> {
+    const KNOWN: &[&str] = &["extensions.noop", "extensions.worktreeconfig", "extensions.relativeworktrees", "extensions.objectformat"];
+    let cfg = git2::Config::open(&common.join("config")).map_err(|_| "its config can't be read".to_string())?;
+    let version = cfg.get_i32("core.repositoryformatversion").unwrap_or(0);
+    if !(0..=1).contains(&version) {
+        return Err(format!("repository format {version} is not one K2 serves"));
+    }
+    let mut entries = cfg.entries(Some("extensions\\..*")).map_err(|_| "its config can't be read".to_string())?;
+    while let Some(e) = entries.next() {
+        let e = e.map_err(|_| "its config can't be read".to_string())?;
+        let name = e.name().unwrap_or("").to_ascii_lowercase();
+        let value = e.value().unwrap_or("").to_ascii_lowercase();
+        if !KNOWN.contains(&name.as_str()) || (name == "extensions.objectformat" && value != "sha1") {
+            return Err(format!("its extension {name} is not one K2 serves"));
+        }
+    }
+    Ok(())
+}
+
+/// fs-relay (round 12): a git pointer file (`commondir`, a `gitdir`
+/// back-link, a `.git` gitfile) read as bytes: `None` when absent, else
+/// its one line, which must be UTF-8 with no NUL or other control
+/// character, not empty, followed by at most one newline. Anything else
+/// is an error: git and libgit2 might read it differently.
+pub fn path_line(file: &Path) -> Result<Option<String>, String> {
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{} can't be read: {e}", file.display())),
+    };
+    let bad = || format!("{} is not one clean path line", file.display());
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad())?;
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() || line.chars().any(|c| c.is_control()) {
+        return Err(bad());
+    }
+    Ok(Some(line.to_string()))
 }
 
 /// `git`, with `-c core.hooksPath=/dev/null` once [`set_no_hooks`] is on.
@@ -1452,6 +1499,53 @@ mod tests {
         resolve_conflict(&repo, "a.md", "theirs").unwrap();
         assert_eq!(conflicted(), 1);
         assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "theirs\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fs-relay round 12 (b): a pointer file is one clean UTF-8 path line,
+    /// or an error (never read as absent).
+    #[test]
+    fn a_pointer_file_is_one_clean_path_line() {
+        let dir = crate::test_env::unique_temp_path("git-path-line");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("commondir");
+        assert_eq!(path_line(&f).unwrap(), None, "absent");
+        for (bytes, want) in [(&b"../..\n"[..], Some("../..")), (b"/a/b", Some("/a/b")), (b"/a b\r\n", Some("/a b"))] {
+            std::fs::write(&f, bytes).unwrap();
+            assert_eq!(path_line(&f).unwrap().as_deref(), want, "{bytes:?}");
+        }
+        for bytes in [&b"/a\xff\n"[..], b"/a\0\xff\n", b"/a\n/b\n", b"\n", b"", b"/a\tb\n"] {
+            std::fs::write(&f, bytes).unwrap();
+            assert!(path_line(&f).is_err(), "{bytes:?}");
+        }
+        // repo_dirs refuses a repository whose commondir isn't clean,
+        // rather than taking it as no commondir.
+        init_repo(&dir.to_string_lossy()).unwrap();
+        std::fs::write(dir.join(".git/commondir"), b"/elsewhere\0\xff\n").unwrap();
+        assert!(repo_dirs(&dir.to_string_lossy()).is_err());
+        std::fs::remove_file(dir.join(".git/commondir")).unwrap();
+        assert!(repo_dirs(&dir.to_string_lossy()).is_ok(), "the control");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fs-relay round 12 (e): format 0 or 1, the known extensions only.
+    #[test]
+    fn a_repository_format_k2_knows() {
+        let dir = crate::test_env::unique_temp_path("git-format");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config");
+        for (text, ok) in [
+            ("[core]\n\trepositoryformatversion = 0\n", true),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tnoop = true\n\tworktreeConfig = true\n", true),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha1\n", true),
+            ("[core]\n\trepositoryformatversion = 2\n", false),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tpartialclone = origin\n", false),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n", false),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n", false),
+        ] {
+            std::fs::write(&cfg, text).unwrap();
+            assert_eq!(known_repo_format(&dir).is_ok(), ok, "{text}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
