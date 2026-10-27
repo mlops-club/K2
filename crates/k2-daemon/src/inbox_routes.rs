@@ -311,7 +311,7 @@ pub fn handle_compose_post(params: &HashMap<String, String>) -> CliResponse {
         let from = opt_param(params, "from").unwrap_or_default();
         return match crate::delivery_drain::send(&from, &target_token, body) {
             Some(Ok(sent)) if sent.state != "failed" => CliResponse::ok_json(
-                serde_json::json!({"queued": true, "msgId": sent.msg_id, "delivery": sent.state}).to_string(),
+                serde_json::json!({"queued": true, "msgId": sent.msg_id, "delivery": sent.state, "held": sent.held}).to_string(),
             ),
             Some(Ok(sent)) => CliResponse::bad_request(format!(
                 "delivery failed for {}: {}",

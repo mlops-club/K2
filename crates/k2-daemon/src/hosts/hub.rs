@@ -13,13 +13,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use super::presence::{Presence, Why};
 use super::proto::{negotiate, Frame, MIN_PROTOCOL, PROTOCOL};
 use crate::agent_host::remote::{GridEvent, RemoteHost};
 
 /// How long a host has to send `hello` after the upgrade.
 const HELLO_DEADLINE: Duration = Duration::from_secs(10);
-/// WebSocket ping cadence on an idle link.
-const PING_EVERY: Duration = Duration::from_secs(15);
+/// WebSocket ping cadence on an idle link (more often for a short
+/// `K2_HOST_AWAY_AFTER`: [`super::presence::ping_every`]).
+pub(crate) const PING_EVERY: Duration = Duration::from_secs(15);
 
 async fn refuse<S>(ws: &mut WebSocketStream<S>, code: &str, message: &str)
 where
@@ -87,36 +89,73 @@ where
         return;
     }
     let (mut write, mut read) = ws.split();
-    let mut ping = tokio::time::interval(PING_EVERY);
+    // P3 T3: every message from the host (its pongs included) is a sign
+    // of life; silent for `away_after`, the link is closed and the host is
+    // away from when it was last heard. A write to a host that stopped
+    // reading (a full socket) can't hold the loop past that deadline.
+    let away_after = remote.away_after();
+    let mut presence = Presence::new(std::time::Instant::now(), away_after);
+    let mut ping = tokio::time::interval(super::presence::ping_every(away_after));
     ping.tick().await;
+    let mut why = Why::Unlinked;
+    let deadline = |p: &Presence| tokio::time::Instant::from_std(p.deadline());
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline(&presence)) => {
+                if let Some(silent) = presence.away(std::time::Instant::now()) {
+                    why = Why::Silent(silent);
+                    break;
+                }
+            }
             f = out.recv() => match f {
                 Some(f) => {
                     let refused = matches!(f, Frame::Refused { .. });
-                    if write.send(Message::Text(f.encode())).await.is_err() || refused {
-                        break;
+                    match tokio::time::timeout_at(deadline(&presence), write.send(Message::Text(f.encode()))).await {
+                        Ok(Ok(())) if !refused => {}
+                        Ok(_) => break,
+                        Err(_) => {
+                            why = Why::Silent(presence.away(std::time::Instant::now()).unwrap_or(away_after));
+                            break;
+                        }
                     }
                 }
                 None => break,
             },
-            m = read.next() => match m {
-                Some(Ok(Message::Text(t))) => match Frame::decode(&t) {
-                    Ok(f) => remote.on_frame(&host_id, conn, f),
-                    Err(e) => log_debug!("[hosts] host {host_id}: {e}"),
-                },
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                Some(Ok(_)) => {}
+            m = read.next() => {
+                if let Some(Ok(_)) = &m {
+                    presence.heard(std::time::Instant::now());
+                }
+                match m {
+                    Some(Ok(Message::Text(t))) => match Frame::decode(&t) {
+                        Ok(f) => remote.on_frame(&host_id, conn, f),
+                        Err(e) => log_debug!("[hosts] host {host_id}: {e}"),
+                    },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
             },
             _ = ping.tick() => {
-                if write.send(Message::Ping(Vec::new())).await.is_err() {
-                    break;
+                match tokio::time::timeout_at(deadline(&presence), write.send(Message::Ping(Vec::new()))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        why = Why::Silent(presence.away(std::time::Instant::now()).unwrap_or(away_after));
+                        break;
+                    }
                 }
             }
         }
     }
-    let _ = write.close().await;
-    remote.disconnect(&host_id, conn);
+    if matches!(why, Why::Silent(_)) {
+        log_debug!("[hosts] host {host_id}: nothing heard for {away_after:?} ({}): closing its link", super::presence::AWAY_AFTER_VAR);
+        // Don't wait on a peer that stopped reading.
+        let _ = tokio::time::timeout(Duration::from_secs(1), write.close()).await;
+    } else {
+        let _ = write.close().await;
+    }
+    // A silent host is away from when it was last heard; a closed link, now.
+    let since = if matches!(why, Why::Silent(_)) { presence.last_heard() } else { std::time::Instant::now() };
+    remote.disconnect_away(&host_id, conn, since, why);
 }
 
 /// The grid protocol's error event (`sessions_grid_ws::Outbound::Error`).

@@ -211,6 +211,11 @@ pub struct MsgResponse {
     /// `failed`. `GET /cli/hosts/outbox?msg_id=` reports the final state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<String>,
+
+    /// P3 T3: accepted, and held for an agent whose host is away (a
+    /// laptop's lid closed): `{agent, host, awaySinceMs, why}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<crate::agent_host::remote::Held>,
 }
 
 /// serde `skip_serializing_if` helper — keep `woke: false` out of the wire.
@@ -220,7 +225,7 @@ fn is_false(b: &bool) -> bool {
 
 impl MsgResponse {
     /// A send handed to the delivery outbox (K2_ROLE=host / controller).
-    fn from_outbox(sent: Result<crate::delivery_drain::Sent, String>) -> Self {
+    pub(crate) fn from_outbox(sent: Result<crate::delivery_drain::Sent, String>) -> Self {
         let mut r = Self::fail(MsgReason::SpawnFailed);
         r.branch = Some("outbox".to_string());
         match sent {
@@ -236,11 +241,13 @@ impl MsgResponse {
                         format!("delivery_failed: {why}")
                     }
                 });
-                r.hint = match sent.state {
-                    "queued" => Some("queued on this host; it forwards the message when the controller link is back".into()),
-                    "failed" => Some("the controller refused the message; see GET /cli/hosts/outbox".into()),
+                r.hint = match (sent.state, &sent.held) {
+                    ("queued", _) => Some("queued on this host; it forwards the message when the controller link is back".into()),
+                    ("failed", _) => Some("the controller refused the message; see GET /cli/hosts/outbox".into()),
+                    (_, Some(h)) => Some(format!("held: {h}; GET /cli/hosts/outbox?msg_id={} shows when it lands", sent.msg_id)),
                     _ => Some(format!("queued for delivery; GET /cli/hosts/outbox?msg_id={} shows when it lands", sent.msg_id)),
                 };
+                r.held = sent.held;
                 r.msg_id = Some(sent.msg_id);
                 r.delivery = Some(sent.state.to_string());
             }
@@ -266,6 +273,7 @@ impl MsgResponse {
             moved_from: None,
             msg_id: None,
             delivery: None,
+            held: None,
         }
     }
 
@@ -293,6 +301,7 @@ impl MsgResponse {
             moved_from: None,
             msg_id: None,
             delivery: None,
+            held: None,
         }
     }
 }
@@ -2895,6 +2904,7 @@ mod tests {
                 msg_id: "m_1".into(),
                 state: "failed",
                 reason: Some(why.into()),
+                held: None,
             }))
         };
         let r = failed("rejected by the controller: dormant_no_wake");

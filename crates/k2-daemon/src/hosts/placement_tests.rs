@@ -1696,3 +1696,193 @@ async fn after_a_hard_loss_only_untyped_messages_reach_the_new_placement_once() 
     assert_eq!(outbox.get(&n).unwrap().state, State::Delivered);
     assert_eq!(outbox.get(&m).unwrap().state, State::Failed);
 }
+
+// ── P3 T3: a laptop that comes and goes ────────────────────────────────
+
+/// A fake laptop (`k2.kind=laptop`), linking with `resume`.
+async fn laptop(url: &str, name: &str, resume: Vec<super::proto::ResumePlacement>) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.expect("dial");
+    let hello = Frame::Hello { protocol: PROTOCOL, host_name: name.into(), token: TOKEN.into(), labels: vec!["k2.kind=laptop".into()], resume, ended: vec![] };
+    send(&mut ws, &hello).await;
+    assert!(matches!(recv(&mut ws).await, Frame::Welcome { .. }));
+    ws
+}
+
+/// A host that stays awake: a task reads its link (answering the hub's
+/// pings) and passes its frames on.
+fn awake(mut ws: Ws) -> tokio::sync::mpsc::UnboundedReceiver<Frame> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(Ok(m)) = ws.next().await {
+            if let Message::Text(t) = m {
+                let _ = tx.send(Frame::decode(&t).expect("frame"));
+            }
+        }
+    });
+    rx
+}
+
+async fn wait_away(remote: &RemoteHost, host: &str) -> Value {
+    within("the host to be away", async {
+        loop {
+            let s = remote.status_json();
+            if s["away"].as_array().is_some_and(|a| a.iter().any(|h| h == host)) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
+/// S11: the laptop's lid closes with notes on it. Its link stays open but
+/// nothing comes (no frames, no pongs): after `K2_HOST_AWAY_AFTER` the hub
+/// closes it, the laptop is away (silent) and notes is paused, not placed
+/// on host-1 although host-1 has room. A message for notes from a cloud
+/// agent is accepted and held, and nothing is sent. The lid opens: the
+/// laptop links again still running notes (W3), and the message is
+/// delivered on its first attempt, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_laptop_is_away_its_agent_paused_and_its_message_held_until_it_is_back() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new().with_away_after(Duration::from_secs(2))));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut lap = laptop(&url, "eric-mbp", vec![]).await;
+    let mut host1 = awake(fake_host(&url, "host-1").await);
+    wait_hosts(remote, 2).await;
+    spawn_on(remote, &mut lap, "notes", "/w/notes", &sid(1)).await;
+    let e1 = remote.placement("notes").unwrap().epoch.0;
+    assert_eq!(
+        remote.policy().get("notes").unwrap().mode,
+        crate::provisioner::Mode::Pinned { host: "eric-mbp".into() },
+        "first placed on a laptop: pinned (D5)"
+    );
+
+    // The lid closes: the test stops reading the laptop's link.
+    let before = k2_core::delivery::now_ms();
+    let status = wait_away(remote, "eric-mbp").await;
+    let away = &status["away_hosts"].as_array().unwrap().iter().find(|h| h["host_id"] == "eric-mbp").unwrap().clone();
+    assert!(away["why"].as_str().unwrap().starts_with("silent for "), "{away}");
+    let since = away["since_ms"].as_i64().unwrap();
+    assert!(since <= before + 1, "away from when it was last heard: {since} vs {before}");
+    assert_eq!(status["paused"], json!([{"agent": "notes", "host": "eric-mbp", "epoch": e1}]));
+    assert_eq!(remote.placement("notes").unwrap().host_id, "eric-mbp", "kept (W3)");
+
+    // A message from a cloud agent (the up hop): accepted, held.
+    let id = "m_0000000000001_laptop".to_string();
+    let body = json!({"kind": "msg", "text": "after the lid closed"});
+    let (status, reason) = outbox.accept(&id, "agent:alice", "notes", &body, k2_core::delivery::now_ms());
+    assert_eq!(status, crate::hosts::proto::DeliverStatus::Delivered);
+    let held: crate::agent_host::remote::Held = serde_json::from_str(&reason.expect("held")).unwrap();
+    assert_eq!((held.agent.as_str(), held.host.as_str(), held.away_since_ms), ("notes", "eric-mbp", Some(since)));
+    assert!(held.why.unwrap().starts_with("silent for "));
+    for _ in 0..3 {
+        assert!(outbox.pass(k2_core::delivery::now_ms()).is_empty());
+    }
+    let row = outbox.get(&id).unwrap();
+    assert_eq!((row.state, row.attempts), (State::Queued, 0), "held: nothing sent to an away host");
+    // The app's spawn for notes goes to its placement, on the away laptop:
+    // refused, not placed on host-1.
+    let wake = json!({"agent_name": "notes", "cwd": "/w/notes", "command": "claude"}).to_string();
+    let (code, why) = remote.spawn(wake.as_bytes()).await;
+    assert!(!code.starts_with('2'), "{code} {why}");
+    assert_eq!(remote.placement("notes").unwrap().host_id, "eric-mbp");
+    assert!(host1.try_recv().is_err(), "nothing for notes on host-1");
+
+    // The lid opens: the laptop links again, still running notes.
+    drop(lap);
+    let mut lap = {
+        let resume = super::proto::ResumePlacement {
+            agent_id: "notes".into(),
+            session_id: sid(1),
+            epoch: e1,
+            ring: None,
+            child_alive: true,
+            cwd: Some("/w/notes".into()),
+            program: Some("claude".into()),
+            args: vec![],
+            label: None,
+            turn: None,
+        };
+        laptop(&url, "eric-mbp", vec![resume]).await
+    };
+    match recv(&mut lap).await {
+        Frame::Deliver { msg_id, agent_id, attempt, epoch, .. } => {
+            assert_eq!((msg_id.as_str(), agent_id.as_str(), attempt, epoch), (id.as_str(), "notes", 1, Some(e1)));
+            send(&mut lap, &Frame::DeliverAck { msg_id, status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+        }
+        other => panic!("expected the held message, got {other:?}"),
+    }
+    let row = wait_final(&outbox, &id).await;
+    assert_eq!((row.state, row.attempts), (State::Delivered, 1), "delivered once");
+    assert!(outbox.held("notes").is_none());
+    let status = remote.status_json();
+    assert_eq!(status["paused"], json!([]));
+    assert!(!status["away"].as_array().unwrap().iter().any(|h| h == "eric-mbp"));
+    assert!(host1.try_recv().is_err(), "nothing for notes on host-1");
+}
+
+/// S11 with `--wake`: lap sleeps (no placement), pinned to a laptop that
+/// is away. A wake message is not handed to the cascade (which can't place
+/// it); the outbox holds it. When the laptop links, the direct path wakes
+/// lap there and delivers it, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wake_for_a_sleeping_agent_pinned_to_an_away_laptop_is_held_not_cascaded() {
+    use crate::delivery_drain::{start_controller, Direct, Taken};
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let delivered: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&delivered);
+    let outbox = start_controller(
+        remote,
+        mem_db(),
+        FAST,
+        Direct {
+            resolves: Box::new(|_| true),
+            aliases: Box::new(|_| Vec::new()),
+            deliver: Box::new(move |to, _, _| {
+                seen.lock().push(to.to_string());
+                Ok(())
+            }),
+        },
+    );
+    outbox.set_gone_grace(Duration::ZERO);
+    remote.policy().set_mode("lap", &crate::provisioner::Mode::Pinned { host: "eric-mbp".into() }).unwrap();
+    let body = json!({"kind": "msg", "text": "wake up", "wake": true, "wake_timeout_ms": 1000});
+    assert!(!outbox.is_direct("lap", &body), "held, not the cascade");
+    let held = outbox.held("lap").expect("held");
+    assert_eq!((held.agent.as_str(), held.host.as_str(), held.away_since_ms), ("lap", "eric-mbp", None), "never seen: no since");
+
+    let id = "m_0000000000002_wake".to_string();
+    match outbox.take(&id, "agent:alice", "lap", &body, k2_core::delivery::now_ms()) {
+        Taken::Ack(crate::hosts::proto::DeliverStatus::Delivered, Some(reason)) => {
+            assert_eq!(serde_json::from_str::<crate::agent_host::remote::Held>(&reason).unwrap(), held);
+        }
+        other => panic!("expected an accepted, held message, got {other:?}"),
+    }
+    for _ in 0..3 {
+        assert!(outbox.pass(k2_core::delivery::now_ms()).is_empty(), "not handed to the direct path while away");
+    }
+    assert_eq!(outbox.get(&id).unwrap().state, State::Queued);
+    assert!(delivered.lock().is_empty());
+
+    // The laptop links: the direct path wakes lap and delivers. The
+    // controller's own drain loop may hand the row over first; either way
+    // it goes once.
+    let _lap = laptop(&url, "eric-mbp", vec![]).await;
+    wait_hosts(remote, 1).await;
+    assert!(outbox.held("lap").is_none());
+    within("the held wake to be delivered", async {
+        while outbox.get(&id).unwrap().state != State::Delivered {
+            for r in outbox.pass(k2_core::delivery::now_ms()) {
+                outbox.deliver_gone(&r);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(outbox.pass(k2_core::delivery::now_ms()).is_empty());
+    assert_eq!(*delivered.lock(), vec!["lap".to_string()], "once");
+}

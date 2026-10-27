@@ -43,7 +43,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
-use crate::agent_host::remote::{RemoteHost, RemotePlacement};
+use crate::agent_host::remote::{Held, RemoteHost, RemotePlacement};
 use crate::hosts::proto::{trace_events, DeliverStatus, Frame};
 
 pub type Db = Arc<ReentrantMutex<Connection>>;
@@ -89,6 +89,8 @@ pub mod events {
     /// A queued message whose recipient's session ended went through the
     /// direct path (attrs: ok, reason).
     pub const CTL_MSG_GONE_DIRECT: &str = "ctl.msg_gone_direct";
+    /// A message was queued for an agent whose host is away (attrs: host).
+    pub const CTL_MSG_HELD: &str = "ctl.msg_held";
 }
 
 fn ready(db: Db) -> Db {
@@ -118,18 +120,30 @@ fn report_failed(hop: Hop, rows: &[Row]) {
     }
 }
 
-fn outbox_json(db: &Db, hop: Hop, query: &str) -> Value {
+/// A row as the status route shows it: on the controller, a message still
+/// waiting for an agent whose host is away says so (`held`, P3 T3).
+fn row_json(r: &Row, held: &dyn Fn(&str) -> Option<Held>) -> Value {
+    let mut v = r.to_json();
+    if matches!(r.state, State::Queued | State::Sent) {
+        if let (Some(h), Some(m)) = (held(&r.recipient), v.as_object_mut()) {
+            m.insert("held".into(), json!(h));
+        }
+    }
+    v
+}
+
+fn outbox_json(db: &Db, hop: Hop, query: &str, held: &dyn Fn(&str) -> Option<Held>) -> Value {
     let params = crate::routes::http::parse_params(OUTBOX_PATH, query);
     let conn = db.lock();
     if let Some(id) = params.get("msg_id").filter(|s| !s.is_empty()) {
         return match outbox::get(&conn, hop, id) {
-            Ok(Some(r)) => json!({"hop": hop.as_str(), "message": r.to_json()}),
+            Ok(Some(r)) => json!({"hop": hop.as_str(), "message": row_json(&r, held)}),
             Ok(None) => json!({"hop": hop.as_str(), "message": null}),
             Err(e) => json!({"error": e.to_string()}),
         };
     }
     let (queued, sent, delivered, failed) = outbox::counts(&conn, hop).unwrap_or_default();
-    let rows: Vec<Value> = outbox::list(&conn, hop, 500).unwrap_or_default().iter().map(Row::to_json).collect();
+    let rows: Vec<Value> = outbox::list(&conn, hop, 500).unwrap_or_default().iter().map(|r| row_json(r, held)).collect();
     json!({
         "hop": hop.as_str(),
         "counts": {"queued": queued, "sent": sent, "delivered": delivered, "failed": failed},
@@ -141,9 +155,10 @@ fn outbox_json(db: &Db, hop: Hop, query: &str) -> Value {
 pub fn outbox_status(query: &str) -> Option<Value> {
     match crate::runtime_role::current() {
         crate::runtime_role::Role::Controller => {
-            Some(outbox_json(&ensure_controller_drain().db, Hop::Down, query))
+            let c = ensure_controller_drain();
+            Some(outbox_json(&c.db, Hop::Down, query, &|r| c.held(r)))
         }
-        crate::runtime_role::Role::Host => Some(outbox_json(&host_side().db, Hop::Up, query)),
+        crate::runtime_role::Role::Host => Some(outbox_json(&host_side().db, Hop::Up, query, &|_| None)),
         crate::runtime_role::Role::All => None,
     }
 }
@@ -399,7 +414,9 @@ impl Controller {
             Ok(Enqueued::New) => {
                 log_debug!("[delivery] queued {msg_id} {from} → {agent_id}");
                 self.nudge.notify_one();
-                (DeliverStatus::Delivered, None)
+                // P3 T3: the sender learns that its message waits for an
+                // away host (older hosts ignore a reason on `delivered`).
+                (DeliverStatus::Delivered, self.held_noted(msg_id, agent_id).and_then(|h| serde_json::to_string(&h).ok()))
             }
             Ok(Enqueued::Exists(_)) => (DeliverStatus::Duplicate, None),
             // Not acked: the host keeps it and resends.
@@ -410,6 +427,34 @@ impl Controller {
         }
     }
 
+    /// P3 T3: is `recipient` (or the agent it resolves to) paused on an
+    /// away host, or waiting to resume on its own away host? Its messages
+    /// wait for that host (pinned), or for a move (portable, after
+    /// `K2_HOST_MOVE_AFTER`).
+    pub fn held(&self, recipient: &str) -> Option<Held> {
+        if let Some(p) = self.placed(recipient) {
+            return self.remote.held_on(&[p.agent_id]);
+        }
+        self.remote.held_on(&self.ids(recipient))
+    }
+
+    /// `recipient` and its [`Direct::aliases`].
+    fn ids(&self, recipient: &str) -> Vec<String> {
+        let mut ids = vec![recipient.to_string()];
+        ids.extend((self.direct.aliases)(recipient));
+        ids
+    }
+
+    /// [`Self::held`] for a message just queued, logged and traced.
+    fn held_noted(&self, msg_id: &str, recipient: &str) -> Option<Held> {
+        let h = self.held(recipient)?;
+        log_debug!("[delivery] {msg_id} held: {h}");
+        k2_core::trace::emit(|| {
+            k2_core::trace::Event::new(events::CTL_MSG_HELD).msg(msg_id).agent(h.agent.as_str()).attr("host", h.host.as_str())
+        });
+        Some(h)
+    }
+
     /// Does `recipient` skip the outbox? A `kind=msg` body for a recipient
     /// with no placement that this controller resolves itself.
     pub fn is_direct(&self, recipient: &str, body: &Value) -> bool {
@@ -417,6 +462,9 @@ impl Controller {
             && self.placed(recipient).is_none()
             && !self.awaiting_resume(recipient)
             && (self.direct.resolves)(recipient)
+            // P3 T3: asleep and pinned to an away host: the outbox holds it
+            // (a `--wake` too) instead of a cascade that can't place it.
+            && self.held(recipient).is_none()
     }
 
     /// Where `recipient` runs: its own placement, else one of its
@@ -630,7 +678,17 @@ impl Controller {
             needs.push((ids, format!("message {} waits for it", r.msg_id)));
             return None;
         }
-        let ended = self.ended_at(&r.recipient)?;
+        // P3 T3: pinned to an away host: it waits for that host to link.
+        if self.held(&r.recipient).is_some() {
+            return None;
+        }
+        let ended = match self.ended_at(&r.recipient) {
+            Some(t) => t,
+            // Pinned and asleep since before this process saw it end: its
+            // messages were held for its host, which is back now.
+            None if self.remote.pinned_to(&self.ids(&r.recipient)).is_some() => 0,
+            None => return None,
+        };
         let grace = self.gone_grace_ms.load(Ordering::SeqCst);
         if now - ended < grace {
             return None;
@@ -834,6 +892,8 @@ type Deliverer = Box<dyn Fn(&Incoming) -> LocalDelivery + Send + Sync>;
 pub enum Accepted {
     /// The controller has it.
     Accepted,
+    /// The controller has it, and holds it for an away host (P3 T3).
+    Held(Held),
     /// The controller refused it, or it failed on the up hop.
     Failed(String),
 }
@@ -1326,7 +1386,10 @@ impl HostSide {
             match status {
                 DeliverStatus::Delivered | DeliverStatus::Duplicate => {
                     let _ = outbox::mark_delivered(&conn, Hop::Up, msg_id, now);
-                    Accepted::Accepted
+                    match reason.and_then(|r| serde_json::from_str::<Held>(r).ok()) {
+                        Some(h) => Accepted::Held(h),
+                        None => Accepted::Accepted,
+                    }
                 }
                 DeliverStatus::Rejected => {
                     let why = format!("rejected by the controller: {}", reason.unwrap_or("no reason given"));
@@ -1524,6 +1587,8 @@ pub struct Sent {
     /// host, waiting for the link) or `failed`.
     pub state: &'static str,
     pub reason: Option<String>,
+    /// P3 T3: accepted, and waiting for an agent whose host is away.
+    pub held: Option<Held>,
 }
 
 /// `k2 msg` / inbox compose on a host or a controller: hand the message
@@ -1541,7 +1606,10 @@ pub fn send(from: &str, agent_id: &str, body: Value) -> Option<Result<Sent, Stri
             if c.is_direct(agent_id, &body) {
                 return None;
             }
-            Some(c.send(&sender, agent_id, body).map(|msg_id| Sent { msg_id, state: "accepted", reason: None }))
+            Some(c.send(&sender, agent_id, body).map(|msg_id| {
+                let held = c.held_noted(&msg_id, agent_id);
+                Sent { msg_id, state: "accepted", reason: None, held }
+            }))
         }
         crate::runtime_role::Role::Host => {
             let wait = ACCEPT_WAIT + wake_wait(&body);
@@ -1589,9 +1657,10 @@ fn host_send(h: &HostSide, sender: &str, agent_id: &str, body: Value, wait: Dura
         _ => rx.recv_timeout(wait).ok(),
     };
     Ok(match outcome {
-        Some(Accepted::Accepted) => Sent { msg_id, state: "accepted", reason: None },
-        Some(Accepted::Failed(why)) => Sent { msg_id, state: "failed", reason: Some(why) },
-        None => Sent { msg_id, state: "queued", reason: None },
+        Some(Accepted::Accepted) => Sent { msg_id, state: "accepted", reason: None, held: None },
+        Some(Accepted::Held(h)) => Sent { msg_id, state: "accepted", reason: None, held: Some(h) },
+        Some(Accepted::Failed(why)) => Sent { msg_id, state: "failed", reason: Some(why), held: None },
+        None => Sent { msg_id, state: "queued", reason: None, held: None },
     })
 }
 
