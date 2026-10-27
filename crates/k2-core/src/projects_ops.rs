@@ -748,14 +748,8 @@ pub fn projects_add_from_path_ex(
     } else {
         crate::git::git_command_in(p)
             .ok()
-            .and_then(|mut git| {
-                git.args(["rev-parse", "--show-toplevel"])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .ok()
-            })
-            .map(|s| s.success())
+            .and_then(|mut git| crate::git::run(git.args(["rev-parse", "--show-toplevel"])).ok())
+            .map(|o| o.status.success())
             .unwrap_or(false)
     };
 
@@ -804,7 +798,7 @@ pub fn projects_add_from_path_ex(
 
     let current_branch = crate::git::git_command_in(Path::new(path))
         .ok()
-        .and_then(|mut git| git.args(["rev-parse", "--abbrev-ref", "HEAD"]).output().ok())
+        .and_then(|mut git| crate::git::run(git.args(["rev-parse", "--abbrev-ref", "HEAD"])).ok())
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "main".to_string());
@@ -971,17 +965,13 @@ pub fn projects_init_git_and_open_ex(
     // already configured (Rosson 2026-08-11 — fresh Windows install pain).
     crate::git_identity::ensure_git_identity()?;
 
-    let init_output = crate::git::git_command_in(Path::new(path))?
-        .args(["init", &format!("--initial-branch={}", branch_name)])
-        .output()
+    let init_output = crate::git::run(crate::git::git_command_in(Path::new(path))?.args(["init", &format!("--initial-branch={}", branch_name)]))
         .map_err(|e| format!("Failed to run git init: {}", e))?;
     if !init_output.status.success() {
         let stderr = String::from_utf8_lossy(&init_output.stderr);
         return Err(format!("Failed to initialize git: {}", stderr));
     }
-    let commit_output = crate::git::git_command_in(Path::new(path))?
-        .args(["commit", "--allow-empty", "-m", "Initial commit"])
-        .output()
+    let commit_output = crate::git::run(crate::git::git_command_in(Path::new(path))?.args(["commit", "--allow-empty", "-m", "Initial commit"]))
         .map_err(|e| format!("Failed to run git commit: {}", e))?;
     if !commit_output.status.success() {
         let stderr = String::from_utf8_lossy(&commit_output.stderr);
