@@ -591,7 +591,53 @@ fn post_blocking(remote: &RemoteHost, path: &str, query: &str, body: &[u8], not_
             "413 Payload Too Large",
             json!({"error": format!("this workspace is on agent host {host}; a request to it carries at most {MAX_RELAY_BODY} bytes (send smaller upload chunks)"), "code": "too_large"}),
         )),
-        Decision::Relay { host, maps } => Some(exchange(remote, &host, &maps, "POST", path, query, body)),
+        Decision::Relay { host, maps } => {
+            let a = exchange(remote, &host, &maps, "POST", path, query, body);
+            if a.status.starts_with('2') {
+                mirror_worktree_rows(path, body, &a);
+            }
+            Some(a)
+        }
+    }
+}
+
+/// K5: a worktree made or removed on a host, in this controller's registry
+/// too, under the same ids: the workspace row the host made
+/// (`workspaceId`, its branch, its path in this controller's names) for
+/// the project the request named, or the one the request removes. The
+/// app lists workspaces from here.
+fn mirror_worktree_rows(path: &str, body: &[u8], answer: &Answer) {
+    use k2_core::db::schema::Workspace;
+    let (Ok(req), Ok(ans)) = (serde_json::from_slice::<Value>(body), serde_json::from_str::<Value>(&answer.body)) else { return };
+    let db = k2_core::db::shared();
+    let conn = db.lock();
+    match path {
+        "/cli/git/create-worktree" => {
+            let (Some(ws_id), Some(project_id), Some(branch), Some(wt)) = (
+                ans.get("workspaceId").and_then(Value::as_str),
+                req.get("projectId").and_then(Value::as_str),
+                ans.get("branch").and_then(Value::as_str),
+                ans.get("path").and_then(Value::as_str),
+            ) else {
+                return;
+            };
+            if Workspace::get(&conn, ws_id).is_ok() {
+                return;
+            }
+            let order = Workspace::list(&conn, project_id).unwrap_or_default().iter().map(|w| w.tab_order).max().unwrap_or(-1) + 1;
+            match Workspace::create(&conn, ws_id, project_id, None, "worktree", Some(branch), branch, order, Some(wt)) {
+                Ok(_) => crate::db_routes::emit_projects_changed(),
+                Err(e) => log_debug!("[hosts/fs-relay] record worktree {ws_id} here: {e}"),
+            }
+        }
+        "/cli/git/remove-worktree" => {
+            if let Some(ws_id) = req.get("workspaceId").and_then(Value::as_str) {
+                if Workspace::get(&conn, ws_id).is_ok() && Workspace::delete(&conn, ws_id).is_ok() {
+                    crate::db_routes::emit_projects_changed();
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -698,11 +744,13 @@ fn host_for_workspace(remote: &RemoteHost, ctl_path: &str, existing: bool) -> Re
 }
 
 /// Create or add a workspace on the host that will hold it, then register
-/// it here. Create: the host registers it (and makes its folder, and its
-/// CLI's trust), then the controller's own handler runs (`None`). Add: the
-/// host checks and seeds the folder; the controller registers it here,
-/// registry only. The controller authorised the caller before (the role
-/// gate and the arm's token check); the host acts only in its work root.
+/// it here. The host registers it (create also makes its folder and its
+/// CLI's trust; add checks and seeds it); the controller then registers it
+/// here, registry only, under the host's project id (K5: one id end to
+/// end, so a relayed request naming the project, create-worktree's
+/// `projectId`, means the same project on the host). The controller
+/// authorised the caller before (the role gate and the arm's token check);
+/// the host acts only in its work root.
 fn register(remote: &RemoteHost, path: &str, query: &str, body: &[u8]) -> Option<Answer> {
     let v: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -723,22 +771,19 @@ fn register(remote: &RemoteHost, path: &str, query: &str, body: &[u8]) -> Option
     if !a.status.starts_with('2') {
         return Some(a);
     }
-    if path == PROJECTS_CREATE {
-        remote.note_relay_space(&host, "", Path::new(&ctl_path));
-        log_debug!("[hosts/fs-relay] workspace {ctl_path} made on host {host} ({})", host_path.display());
-        return None;
-    }
     let hv: Value = serde_json::from_str(&a.body).unwrap_or(Value::Null);
     if hv.get("needsGitInit").and_then(Value::as_bool) == Some(true) {
         return Some(a);
     }
     remote.note_relay_space(&host, "", Path::new(&ctl_path));
-    let name = hv.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+    // The name and color as asked (create) or as the host found them (add).
+    let name = v.get("name").or_else(|| hv.get("name")).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
         Path::new(&ctl_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ctl_path.clone())
     });
-    let color = hv.get("color").and_then(Value::as_str);
-    log_debug!("[hosts/fs-relay] workspace {ctl_path} added on host {host} ({}); registered here", host_path.display());
-    Some(match k2_core::projects_ops::projects_create(&name, &ctl_path, color) {
+    let color = v.get("color").or_else(|| hv.get("color")).and_then(Value::as_str);
+    let host_id = hv.get("id").and_then(Value::as_str);
+    log_debug!("[hosts/fs-relay] workspace {ctl_path} on host {host} ({}); registered here as project {}", host_path.display(), host_id.unwrap_or("(new)"));
+    Some(match k2_core::projects_ops::projects_create_as(host_id, &name, &ctl_path, color) {
         Ok(p) => {
             crate::db_routes::emit_projects_changed();
             Answer::json("200 OK", serde_json::to_value(&p).unwrap_or(Value::Null))

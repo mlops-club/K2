@@ -317,15 +317,32 @@ pub fn handle_git_create_worktree(body: &[u8]) -> CliResponse {
         Err(e) => return CliResponse::bad_request(e),
     };
 
+    // fs-relay (K5): on an agent host, a relayed request names the
+    // controller's project; one this host doesn't know is its own project
+    // for that path, or, with none, is registered here under that id.
+    let project_id = {
+        let known = k2_core::db::schema::Project::get(&db::shared().lock(), &b.project_id).is_ok();
+        if known {
+            b.project_id.clone()
+        } else if let Some((id, _)) = crate::git_notes_routes::owning_project(&b.project_path) {
+            id
+        } else {
+            let name = std::path::Path::new(&b.project_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match k2_core::projects_ops::projects_create_as(Some(&b.project_id), &name, &b.project_path, None) {
+                Ok(p) => p.id,
+                Err(e) => return CliResponse::bad_request(e),
+            }
+        }
+    };
     let db = db::shared();
     let conn = db.lock();
     let ws_id = uuid::Uuid::new_v4().to_string();
-    let existing = Workspace::list(&conn, &b.project_id).unwrap_or_default();
+    let existing = Workspace::list(&conn, &project_id).unwrap_or_default();
     let max_order = existing.iter().map(|w| w.tab_order).max().unwrap_or(-1) + 1;
     if let Err(e) = Workspace::create(
         &conn,
         &ws_id,
-        &b.project_id,
+        &project_id,
         None,
         "worktree",
         Some(&result.branch),
