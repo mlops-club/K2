@@ -1570,6 +1570,25 @@ pub fn wait_for_decision(
 // no real sends (pre-mortem #1).
 // ──────────────────────────────────────────────────────────────────────
 
+/// Tests: does this Email object carry a Bcc anywhere, as a field (any
+/// case, at any depth) or as a raw header named Bcc? Not a substring
+/// search of the JSON: a random Message-ID or domain may hold the letters
+/// "bcc" (`…340bcca467@…`), which once failed a test about one run in
+/// a hundred and forty.
+#[cfg(test)]
+pub(crate) fn email_has_bcc(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(o) => o.iter().any(|(k, x)| {
+            k.eq_ignore_ascii_case("bcc")
+                || k.to_ascii_lowercase().starts_with("header:bcc")
+                || (k == "name" && x.as_str().is_some_and(|n| n.eq_ignore_ascii_case("bcc")))
+                || email_has_bcc(x)
+        }),
+        serde_json::Value::Array(a) => a.iter().any(email_has_bcc),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2369,10 +2388,32 @@ mod tests {
         let v = submission_email_json(&m);
         assert!(v.get("bcc").is_none(), "no bcc field on the Email object: {v}");
         let wire = v.to_string();
-        assert!(!wire.to_ascii_lowercase().contains("bcc"), "no Bcc header anywhere: {wire}");
+        assert!(!email_has_bcc(&v), "no Bcc header anywhere: {wire}");
         assert!(!wire.contains("boss@shop.example"), "agent bcc leaked into headers: {wire}");
         assert!(!wire.contains("owner@shop.example"), "policy bcc leaked into headers: {wire}");
         assert_eq!(v["cc"][0]["email"], "cc@example.com");
+    }
+
+    /// The Bcc check is about fields and headers, never letters: a
+    /// Message-ID or domain holding "bcc" is no Bcc; a field, a header
+    /// entry or a `header:Bcc` property of any case is.
+    #[test]
+    fn email_has_bcc_looks_for_bcc_fields_not_the_letters() {
+        let clean = serde_json::json!({
+            "from": [{"email": "bot@abcc12.example", "name": "abcc12"}],
+            "messageId": ["9b6227c6f4af48619df289340bcca467@abcc12.example"],
+            "to": [{"email": "human@example.com"}],
+        });
+        assert!(clean.to_string().contains("bcc"), "the letters are there");
+        assert!(!email_has_bcc(&clean));
+        for bad in [
+            serde_json::json!({"bcc": [{"email": "boss@shop.example"}]}),
+            serde_json::json!({"Bcc": []}),
+            serde_json::json!({"headers": [{"name": "BCC", "value": "boss@shop.example"}]}),
+            serde_json::json!({"header:Bcc:asAddresses": [{"email": "boss@shop.example"}]}),
+        ] {
+            assert!(email_has_bcc(&bad), "{bad}");
+        }
     }
 
     /// The policy stamps over an agent BCC of the same address (recorded
