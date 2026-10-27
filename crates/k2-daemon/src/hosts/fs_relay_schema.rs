@@ -81,9 +81,9 @@ const fn post(route: &'static str, keys: &'static [(&'static str, Kind)], derive
 
 /// Every relayed route, exactly. Not the git notes (they live in the
 /// controller's database and are checked by author), not `open-changes`
-/// (an event on the controller's bus).
+/// (an event on the controller's bus), not `/cli/fs/info` (it names no
+/// path, so it is the controller's own: never the host's home, F4).
 pub const SCHEMAS: &[Schema] = &[
-    get("/cli/fs/info", &[], &[]),
     get("/cli/fs/read-dir", &[("path", Abs), ("show_hidden", Plain)], &[]),
     get("/cli/fs/read-file", &[("path", Abs)], &[]),
     get("/cli/fs/read-binary", &[("path", Abs)], &[]),

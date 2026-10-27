@@ -1168,7 +1168,6 @@ fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
     let git = include_str!("../git_routes.rs");
     let dispatch = [include_str!("../routes/dispatcher.rs"), include_str!("../misc_routes.rs"), git];
     let handlers: &[(&str, &str, &str)] = &[
-        ("/cli/fs/info", "fs", "handle_info"),
         ("/cli/fs/read-dir", "fs", "handle_read_dir"),
         ("/cli/fs/read-file", "fs", "handle_read_file"),
         ("/cli/fs/read-binary", "fs", "handle_read_binary"),
@@ -1769,4 +1768,29 @@ fn f3_the_trash_stays_inside_the_work_root() {
     assert!(!d.ws.join("gone.md").exists() && !d.ws.join("wt").exists());
     let names: Vec<String> = std::fs::read_dir(&trash).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     assert!(names.iter().any(|n| n.starts_with("gone.md-")) && names.iter().any(|n| n.starts_with("wt-")), "{names:?}");
+}
+
+/// F4: what a host tells about outside its work root. A listing gives a
+/// link's own size, never its target's; resolve-links' answer carries the
+/// workspace's root only (no `~/…` or canonical spelling); `/cli/fs/info`
+/// (the host's home) is never relayed.
+#[test]
+fn f4_a_host_tells_nothing_about_outside_its_work_root() {
+    let d = host_disk();
+    let outside = d.root.parent().unwrap().join("outside-f4");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("big"), vec![b'x'; 12_345]).unwrap();
+    link(&outside.join("big"), &d.ws.join("big-link"));
+    let size = |follow_off: bool| {
+        k2_core::fs_commands::set_list_without_following(follow_off);
+        let entries = k2_core::fs_commands::read_dir(&d.ws.to_string_lossy(), true).unwrap();
+        k2_core::fs_commands::set_list_without_following(false);
+        entries.into_iter().find(|e| e.name == "big-link").unwrap().size
+    };
+    assert_ne!(size(true), 12_345, "the link's own size on a host");
+    assert_eq!(size(false), 12_345, "the control: a local listing follows it, as before");
+    let answer = json!({"root": "/h1/work/notes", "prefixes": ["/h1/work/notes", "/private/h1/work/notes", "~/work/notes"], "links": []}).to_string();
+    let v: Value = serde_json::from_str(&links_prefixes_root_only(&answer).unwrap()).unwrap();
+    assert_eq!(v["prefixes"], json!(["/h1/work/notes"]));
+    assert!(!relayed("GET", "/cli/fs/info"));
 }

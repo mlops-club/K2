@@ -795,6 +795,16 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
     (out, refused)
 }
 
+/// F4: resolve-links' answer from a host names the workspace's root (the
+/// controller maps it back) and no other spelling of it: never the host's
+/// home (`~/…`) or its own canonical paths.
+fn links_prefixes_root_only(answer: &str) -> Option<String> {
+    let mut v: Value = serde_json::from_str(answer).ok()?;
+    let root = v.get("root")?.clone();
+    v["prefixes"] = json!([root]);
+    Some(v.to_string())
+}
+
 /// resolve-links' answer with the refused candidates back in their places.
 fn merge_links(answer: &str, refused: &[(usize, String)]) -> Option<String> {
     let mut v: Value = serde_json::from_str(answer).ok()?;
@@ -1039,6 +1049,9 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
                     let mut body = String::from_utf8_lossy(&b).into_owned();
                     if !refused_links.is_empty() {
                         body = merge_links(&body, &refused_links).unwrap_or(body);
+                    }
+                    if path == "/cli/fs/resolve-links" {
+                        body = links_prefixes_root_only(&body).unwrap_or(body);
                     }
                     Frame::HttpReply { req, status, content_type: ct, body }
                 }
