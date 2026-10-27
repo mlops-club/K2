@@ -368,6 +368,70 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### S10 under heavier chaos on wave3 ec518d8c1 (`LAB_S10_CHAOS=1`)
+
+Before this, S10 held the fleet for most of each round, so chaos was light
+in S10 runs (7 kills, 15 steps skipped). With `LAB_S10_CHAOS=1` under
+`--chaos`, chaos acts during S10's hold:
+
+- S10 takes the control lock only to SIGKILL its host and to start it
+  again.
+- Between those two moments it guards that host (`fleet.set_guard`). Chaos
+  neither kills nor starts a guarded host and makes its pick among the
+  rest, with the same seeded draws.
+- Chaos inside the open hold excuses no red: the attempt isn't redone.
+- The checks stay the same: one move, never before `K2_HOST_MOVE_AFTER`; a
+  resume in the same session after the snapshot is restored, with turn
+  two's memory; turn three's message delivered once and answered, or failed
+  with a reason after a chaos hit; never doubled; one live CLI; I1–I4.
+
+Runs: procs, `LAB_G2_ONLY=S10 LAB_G2_ROUNDS=5`, with `LAB_S10=1` and
+`LAB_S8_RESUME_ELSEWHERE=1`, on throwaway branch `k2-dist/lab-g2-wave3g-run`
+(ec518d8c1 + lab-g2, deleted after).
+
+| Seed | `lab-runs/G2/` | Chaos SIGKILLs (host / controller / CLI) | Of those, inside S10's holds | S10 | I1–I4 |
+|---|---|---|---|---|---|
+| 4117 | `2026-10-27T00-18-03Z` | 45 / 29 / 4 (67 CLI steps skipped: no live CLI) | 25 / 18 / 4 = 47 | 0/5 | pass |
+| 7 | `2026-10-27T00-42-54Z` | 48 / 45 / 6 (88 skipped) | 24 / 18 / 4 = 46 | 1/5 | I1–I3 pass; I4's 2 violations were the lab's (below); pass after the fix |
+
+What held in all 10 rounds:
+
+- The agent moved once, never early, and resumed in the same session
+  after the snapshot was restored, with turn two's memory and turns one
+  and two in its transcript.
+- Never two live CLIs, and no message was doubled.
+- When n4 found the agent's CLI killed, it failed loudly
+  (`dormant_no_wake`).
+
+Every red, classified:
+
+- (c) K2-d follow-up, for outbox: a turn cut by a crash leaves its message
+  `delivered` and unanswered. This was 9 of 10 rounds.
+  - Turn three's message is redelivered on the new host and acked
+    (`ctl.deliver_ack delivered`).
+  - Chaos then SIGKILLs that CLI or its host 0.5–12.5 s into the 30 s
+    turn.
+  - On relink, `ctl.adopt` says `gone`. The row stays `delivered`, and the
+    turn is never rerun or answered, though the prompt is in the
+    transcript.
+  - The only green round is the one where the first kill came at +30.2 s,
+    after the turn ended.
+  - K2-d fails a cut turn's messages ("interrupted") only when the reaper
+    closes a chat. A crash-cut turn (the CLI exits without `Stop`, or
+    adopt says `gone`) needs the same treatment.
+  - Same gap on the direct wake path (first run, seed 4117 round 4): the
+    wake answered `woke: true`, and chaos killed that CLI 0.4 s into its
+    turn.
+- (a) the lab, all fixed:
+  - I2 "accepted without a msg id": my first version sent n4 woken under
+    chaos. A woken send answers without an outbox id. n4 is `wake=false`
+    again (b0333187c).
+  - A synchronous loud failure (`spawn_failed` with a reason) wasn't
+    accepted (b0333187c).
+  - I4 matched workspaces by string prefix, so a redone attempt's
+    `s10-x-2` read as `s10-x`. It now compares whole path components,
+    with a regression test (d8c157794).
+
 ### G2 on wave3 d34b7292c (drain-move, K2-d)
 
 Throwaway branch `k2-dist/lab-g2-wave3e-run` (d34b7292c + lab-g2 ba2c0240a,

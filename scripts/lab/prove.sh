@@ -7,7 +7,9 @@
 #                        [--chaos seed=N] [--parity full|none] [--record-baseline]
 #                        [--linux-gate hold|run]
 #
-# Implemented: G0 on solo; G2 on solo and fleet (docs/prd/progress/lab-g2.md).
+# Implemented: G0 on solo; G2 on solo and fleet (docs/prd/progress/lab-g2.md);
+# G4 on kind (scripts/lab/topology/kind.sh: the k2lab cluster, the host pool,
+# the kind scripts of k2-dist/kind-p4; LAB_KIND_WORK=shared|own).
 # Anything else exits 2. LAB_FLEET_BACKEND=procs (default) or compose picks
 # how fleet runs.
 #
@@ -73,8 +75,8 @@ if [ "${LAB_HOST_PTYD:-0}" = 1 ] && [ "${LAB_FLEET_BACKEND:-procs}" = compose ];
 fi
 case "$TOPOLOGY" in solo|container|fleet|kind) ;; *) echo "prove.sh: unknown topology '$TOPOLOGY' (solo, container, fleet, kind)" >&2; exit 2 ;; esac
 case "$GATE/$TOPOLOGY" in
-    G0/solo|G2/solo|G2/fleet) ;;
-    *) echo "prove.sh: $GATE on topology $TOPOLOGY is not implemented (G0 solo; G2 solo, fleet)" >&2; exit 2 ;;
+    G0/solo|G2/solo|G2/fleet|G4/kind) ;;
+    *) echo "prove.sh: $GATE on topology $TOPOLOGY is not implemented (G0 solo; G2 solo, fleet; G4 kind)" >&2; exit 2 ;;
 esac
 if [ "$RECORD_BASELINE" = 1 ] && { [ "$PARITY" != full ] || [ "$GATE/$TOPOLOGY" != G0/solo ]; }; then
     echo "prove.sh: --record-baseline needs G0 --topology solo --parity full" >&2; exit 2
@@ -130,6 +132,55 @@ fi
 
 source "$LAB_REPO/scripts/lab/lib/toolchain.sh"
 source "$LAB_REPO/scripts/lab/lib/parity.sh"
+
+finish() {
+    local rc
+    run_set finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" notes "$(json_list "${NOTES[@]+"${NOTES[@]}"}")"
+    python3 -I tests/lab/lab.py report --run-dir "$RUN" | tee -a "$RUN/prove.log"
+    rc=${PIPESTATUS[0]}
+    say "bundle: ${RUN#$LAB_REPO/}/ (open report.html first)"
+    exit "$rc"
+}
+
+# ── G4 on kind: the cluster runs the scenarios (scripts/lab/topology/kind.sh) ──
+if [ "$GATE/$TOPOLOGY" = G4/kind ]; then
+    source "$LAB_REPO/scripts/lab/topology/kind.sh"
+    trap 'rm -rf "$LAB_TMP"' EXIT
+    trap 'say "interrupted"; exit 130' INT TERM
+    run_set kind_work "$LAB_KIND_WORK" kind_pool "$LAB_KIND_POOL" kind_repo "$LAB_KIND_REPO" \
+        kind_daemon_image "$LAB_KIND_DAEMON_IMAGE" kind_drain_move "$LAB_KIND_DRAIN_MOVE" \
+        kind_daemon_src "$LAB_KIND_DAEMON_SRC" kind_fake_agents "$LAB_KIND_FAKE_AGENTS" \
+        kind_daemon_revision "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$LAB_KIND_DAEMON_IMAGE" 2>/dev/null)"
+    NOTES+=("G4 on kind: the daemon is the image $LAB_KIND_DAEMON_IMAGE (revision in run.json), not this checkout's build; this tree gives the scenarios and the fake agent.")
+    NOTES+=("Hosts' workspaces: $LAB_KIND_WORK ($( [ "$LAB_KIND_WORK" = own ] && echo "each host its own work volume, K2_WORK_ROOT, home sync" || echo "the shared k2-work volume, K2_WORK_ROOT, home sync")); pool MIN:MAX $LAB_KIND_POOL.")
+    say "gate G4, topology kind, lab ${LAB_SHA:0:12}, daemon $LAB_KIND_DAEMON_IMAGE, work $LAB_KIND_WORK, run ${RUN#$LAB_REPO/}"
+    echo "metric,value,unit,note" >"$RUN/metrics.csv"
+    if topo_up "$RUN/topology" 2>"$RUN/topology/up.err"; then
+        topo_describe "$RUN/topology"
+        topo_metrics >>"$RUN/metrics.csv"
+        kind_g4
+        topo_metrics | sed 's/^daemon_rss,/daemon_rss_end,/' >>"$RUN/metrics.csv"
+    else
+        say "topology kind failed to start: $(tail -1 "$RUN/topology/up.err")"
+        python3 -I - "$RUN/scenarios/S1.json" "$(tail -3 "$RUN/topology/up.err" "$RUN/topology/up.log" 2>/dev/null | tr '\n' ' ')" <<'PY'
+import json, sys
+json.dump({"scenario": "S1", "title": "Spawn, attach, type, see output", "status": "not_run",
+           "reason": "topology kind failed to start: " + sys.argv[2][-400:], "checks": []}, open(sys.argv[1], "w"), indent=2)
+PY
+    fi
+    # The parity suites don't depend on the topology: G2 runs them on this
+    # tree. Here they are NOT RUN (and so is I5).
+    NOTES+=("Parity suites: not run on kind (they don't depend on the topology; G2 on this tree runs them), so they and I5 show NOT RUN.")
+    parity_none
+    if [ -d "$RUN/traces" ]; then
+        cat "$RUN"/scenarios/S1.trace.jsonl "$RUN"/traces/*.jsonl 2>/dev/null >"$RUN/traces/all.jsonl.tmp"
+        mv "$RUN/traces/all.jsonl.tmp" "$RUN/flows-trace.jsonl"
+    fi
+    python3 -I tests/lab/lab.py flows --flows-dir docs/prd/flows ${RUN:+--trace "$RUN/flows-trace.jsonl"} \
+        --out "$RUN/flows.json" >>"$RUN/prove.log" 2>&1 \
+        || python3 -I tests/lab/lab.py flows --flows-dir docs/prd/flows --out "$RUN/flows.json" >>"$RUN/prove.log" 2>&1
+    finish
+fi
 if [ "$GATE" = G2 ]; then
     # Both G2 topologies run under the fleet manager (layout = topology).
     export LAB_FLEET_LAYOUT=$TOPOLOGY
@@ -153,15 +204,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'say "interrupted"; exit 130' INT TERM
-
-finish() {
-    local rc
-    run_set finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" notes "$(json_list "${NOTES[@]+"${NOTES[@]}"}")"
-    python3 -I tests/lab/lab.py report --run-dir "$RUN" | tee -a "$RUN/prove.log"
-    rc=${PIPESTATUS[0]}
-    say "bundle: ${RUN#$LAB_REPO/}/ (open report.html first)"
-    exit "$rc"
-}
 
 # ── G2: scenarios S2 to S9, chaos, invariants (topology up) ─────────────
 g2_scenarios() {

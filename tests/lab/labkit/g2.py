@@ -381,6 +381,11 @@ class Client:
         # Direct only when the controller answered and has no row for it.
         return self.traced_final(msg_id, direct=resp is not None and st is None) or st
 
+    def final_reason(self, msg_id):
+        """Why the outbox row ended (a failure's reason), or None."""
+        resp = self.outbox(None, msg_id) or {}
+        return (resp.get("message") or {}).get("reason")
+
     def wait_final(self, msg_id, deadline=DEADLINE_S):
         return wait_until(lambda: self.final_state(msg_id) in ("delivered", "failed") and self.final_state(msg_id),
                           deadline, 0.3) or self.final_state(msg_id)
@@ -715,6 +720,22 @@ def inbox_files(cwd, title):
     return sorted(hits)
 
 
+def placed_host(c, agent):
+    """The host holding `agent`'s placement (GET /cli/hosts/placements on
+    the controller: last_host), or None."""
+    st, _, resp = c.http("GET", "/cli/hosts/placements")
+    p = next((x for x in resp.get("agents", []) if x.get("agent") == agent), {}) if st == 200 else {}
+    return p.get("last_host") or p.get("pinned_host")
+
+
+def inbox_on_host(c, host, cwd, title):
+    """bob's inbox item as his host sees it: through the host when the
+    hosts have their own disks (the item is delivered there, not to the
+    controller's or the runner's copy), else read here."""
+    files = c.fleet.host_files(host, os.path.join(cwd, ".k2"), title) if host else None
+    return inbox_files(cwd, title) if files is None else files
+
+
 def compose_inbox(c, host, to, title, sender):
     h = c.fleet.host(host)
     st, raw, resp = c.http("POST", "/cli/inbox/compose", form={
@@ -788,7 +809,10 @@ def s6(c, sc):
         if b:
             agents[bob] = (bob_cwd, agents[bob][1], b, hb)
         state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
-        files = wait_until(lambda: inbox_files(bob_cwd, title), 30 if state != "failed" else 3)
+        # Read through bob's host (delivery, not the fs relay, is under test).
+        hb_now = placed_host(c, agents[bob][1]) or hb
+        sc.info["bob_inbox_read_on"] = hb_now
+        files = wait_until(lambda: inbox_on_host(c, hb_now, bob_cwd, title), 30 if state != "failed" else 3)
         # PRD failure table: when --chaos killed bob's CLI, or his host with
         # it, before the item landed (the host answers retry while no session
         # is live), the gone rule failing it with a reason is the right end;
@@ -1185,10 +1209,14 @@ def redo_on_chaos(c, sc, attempt_fn, what, attempts=5):
         mark, since = len(sc.checks), now_iso()
         sc.info.pop("cli_pid", None)
         sc.info.pop("host", None)  # set again by the attempt (S8: the crash half set them)
+        sc.info.pop("no_redo_after", None)
         if attempt_fn(c, sc, attempt) == "redo":
             continue
         failed = [x["name"] for x in sc.checks[mark:] if not x["ok"]]
         hits = chaos_hit(sc.info.get("host"), sc.info.get("cli_pid"), since) if failed else []
+        # From no_redo_after on, chaos is part of what the attempt checks
+        # (S10 under LAB_S10_CHAOS): its hits there excuse nothing.
+        hits = [e for e in hits if (e.get("ts") or "") < sc.info.get("no_redo_after", "~")]
         if failed and len(sc.checks) == mark + 1 and "spawned" in failed[0]:
             # The spawn itself was lost: --chaos killed the controller while
             # it was in flight (a spawn is never sent twice), so S9 never got
@@ -1381,14 +1409,28 @@ def s10_attempt(c, sc, attempt):
             return
         sock.close()
         sock = None
-        with c.fleet.control():
-            t_kill = now_iso()
-            killed = c.fleet.kill(h1)
-            # Its CLI goes with it (the host's process tree), as outbox's
-            # turn-snapshots.sh does.
-            with contextlib.suppress(fleetlib.FleetError, ProcessLookupError, TypeError):
-                if c.fleet.cli_alive(h1, cli_pid):
-                    c.fleet.kill_cli(cli_pid, host=h1)
+        # The hold. Without LAB_S10_CHAOS, S10 holds the fleet from the kill
+        # until the agent goes on on the other host: what it checks is the
+        # lab's own host loss, not one --chaos adds on top. With it (under
+        # --chaos), S10 holds the fleet only to kill h1 and to start it
+        # again, and guards h1 in between; chaos kills the controller, the
+        # other host and CLIs meanwhile, and the checks say what must still
+        # hold: one move, the home intact, no message lost or doubled (a
+        # message may end failed, with a reason, only after chaos hit).
+        free = s10_chaos()
+        hold = contextlib.nullcontext() if free else c.fleet.control()
+        with hold:
+            with c.fleet.control() if free else contextlib.nullcontext():
+                t_kill = now_iso()
+                killed = c.fleet.kill(h1)
+                # Its CLI goes with it (the host's process tree), as outbox's
+                # turn-snapshots.sh does.
+                with contextlib.suppress(fleetlib.FleetError, ProcessLookupError, TypeError):
+                    if c.fleet.cli_alive(h1, cli_pid):
+                        c.fleet.kill_cli(cli_pid, host=h1)
+                if free:
+                    c.fleet.set_guard([h1])
+                    sc.info["no_redo_after"] = t_kill
             sc.check("%s SIGKILLed with its CLI mid-turn (no drain, no release save)" % h1,
                      killed and wait_until(lambda: not c.fleet.cli_alive(h1, cli_pid), 10)
                      and len(c.turn_events(csid, "cli.turn.end")) == starts,
@@ -1399,8 +1441,10 @@ def s10_attempt(c, sc, attempt):
                      if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill]
             sc.check("no move before %s has been lost for K2_HOST_MOVE_AFTER (%d s)" % (h1, after), not early,
                      json.dumps(early)[:200])
+            # A controller restart counts the loss again from its start.
             moves = wait_until(lambda: [e for e in c.fleet.daemon_events("controller", "ctl.move_decision")
-                                        if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill], after + 30, 0.5) or []
+                                        if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill],
+                               after + (120 if free else 30), 0.5) or []
             mv = moves[0] if moves else {}
             lost_ms = (mv.get("attrs") or {}).get("lost_ms") or 0
             sc.check("the controller moves the agent once %s has been lost for %d s (ctl.move_decision)" % (h1, after),
@@ -1410,18 +1454,18 @@ def s10_attempt(c, sc, attempt):
             # restoring the last turn's snapshot first.
             resumed = wait_until(lambda: [e for e in c.fake("cli.exec", csid)
                                           if e.get("host") not in (None, h1) and (e.get("ts") or "") >= t_kill
-                                          and (e.get("attrs") or {}).get("resumed")], 60) or []
+                                          and (e.get("attrs") or {}).get("resumed")], 120 if free else 60) or []
             rx = resumed[0] if resumed else {}
             h2 = rx.get("host")
             sc.info["moved_to"] = h2
             ra = rx.get("attrs") or {}
             new_places = [e for e in c.fleet.daemon_events("controller", "ctl.place")
-                          if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill]
+                          if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill
+                          and (e.get("attrs") or {}).get("host") == h2]
             epoch2 = (new_places[0].get("attrs") or {}).get("epoch") if new_places else None
             sc.check("it resumes on the other host, same session, --resume, at a new epoch (no lab spawn)",
                      bool(rx) and "--resume" in (ra.get("argv") or []) and csid in (ra.get("argv") or [])
-                     and bool(new_places) and (new_places[0].get("attrs") or {}).get("host") == h2
-                     and epoch1 is not None and epoch2 is not None and epoch2 > epoch1,
+                     and bool(new_places) and epoch1 is not None and epoch2 is not None and epoch2 > epoch1,
                      "exec %s; epoch %s -> %s" % (json.dumps(rx)[:250], epoch1, epoch2))
             restored = [e for e in c.fleet.daemon_events(h2, "host.home_restored")
                         if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill] if h2 else []
@@ -1441,41 +1485,95 @@ def s10_attempt(c, sc, attempt):
             # The lost turn's message is delivered again there, once, and answered.
             key3 = n3.split(" [[")[0]
             wait_until(lambda: c.replied(cwd, key3) and [p for p in c.prompts_with(cwd, key3) if p[0] == h2],
-                       gone_wait_s() + 30)
+                       gone_wait_s() + (90 if free else 30))
             on2 = [p for p in c.prompts_with(cwd, key3) if p[0] == h2]
             state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
-            sc.check("turn three's message, never acked, is delivered again on %s exactly once and answered" % h2,
-                     len(on2) == 1 and c.replied(cwd, key3) and state == "delivered",
-                     "on %s %d time(s); outbox state %s" % (h2, len(on2), state))
+            why3 = c.final_reason(msg_id) if msg_id else None
+            ok3 = len(on2) == 1 and c.replied(cwd, key3) and state == "delivered"
+            hit3 = s10_hits(h2, t_kill) if free and not ok3 else []
+            sc.check("turn three's message, never acked, is delivered again on %s exactly once and answered%s"
+                     % (h2, " (or failed with a reason after --chaos hit)" if free else ""),
+                     ok3 or (bool(hit3) and state == "failed" and bool(why3) and len(on2) <= 1),
+                     "on %s %d time(s); outbox state %s %s; chaos %s"
+                     % (h2, len(on2), state, why3 or "", [(e["ts"], e.get("kind"), e.get("target")) for e in hit3]))
+            elsewhere = [p[0] for p in c.prompts_with(cwd, key3) if p[0] not in (h1, h2)]
+            sc.check("turn three's message reached no third place (never doubled)",
+                     not elsewhere and len([p for p in c.prompts_with(cwd, key3) if p[0] == h1]) == 1,
+                     "%s" % [p[0] for p in c.prompts_with(cwd, key3)])
             mem_now = c.memory_file(h2, cwd) if h2 else ""
             mem_bytes = open(mem_now, "rb").read() if os.path.isfile(mem_now) else b""
             sc.check("MEMORY.md on %s holds turns one and two" % h2, all(f.encode() in mem_bytes for f in facts), mem_now)
             # The dead host returns: the agent stays where it moved (I1).
-            # Still holding the fleet: what S10 checks is the lab's own host
-            # loss, not one --chaos adds on top.
-            t_back = now_iso()
-            c.fleet.start(h1)  # waits for its link
+            with c.fleet.control() if free else contextlib.nullcontext():
+                t_back = now_iso()
+                c.fleet.start(h1)  # waits for its link
+                if free:
+                    c.fleet.clear_guard()
             most, live = 0, []
             end = time.monotonic() + 15
             while time.monotonic() < end:
                 live = [e for e in c.fake("cli.exec", csid) if c.fleet.cli_alive(e.get("host"), e.get("pid"))]
                 most = max(most, len(live))
                 time.sleep(0.5)
+            # Under chaos its CLI may be killed meanwhile (none live): never two.
             sc.check("I1: once %s is back, one live CLI for the agent, on %s (not adopted back, not placed twice)" % (h1, h2),
-                     most == 1 and [e.get("host") for e in live] == [h2] and c.placed_host(pid, t_back) in (None, h2),
+                     (most <= 1 if free else most == 1) and all(e.get("host") == h2 for e in live)
+                     and c.placed_host(pid, t_back) in (None, h2),
                      "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
             # And it goes on there.
             n4 = "s10 after %s" % uuid.uuid4().hex[:6]
             st, raw, resp = c.msg(cwd, n4, wake=False)  # it is live there: queued, with a msg id (I2)
             wait_until(lambda: c.replied(cwd, n4), DEADLINE_S)
-            sc.check("a message after the move lands on %s and is answered" % h2,
-                     c.replied(cwd, n4) and [p[0] for p in c.prompts_with(cwd, n4)] == [h2],
-                     "HTTP %s; prompts %s" % (st, [p[0] for p in c.prompts_with(cwd, n4)]))
+            at4 = [p[0] for p in c.prompts_with(cwd, n4)]
+            ok4 = c.replied(cwd, n4) and at4 == [h2]
+            if free and not ok4:
+                # chaos killed its CLI (or h2) first: answered once, or a
+                # loud failure (the outbox row's, or the controller's own
+                # answer when nothing placed it then: success false and a
+                # reason). Never delivered-and-silent.
+                hit4 = s10_hits(h2, t_back)
+                mid4 = resp.get("msgId")
+                state4 = c.wait_final(mid4, gone_wait_s()) if mid4 else (
+                    "failed" if resp.get("success") is False else None)
+                why4 = c.final_reason(mid4) if mid4 else resp.get("reason")
+                ok4 = bool(hit4) and ((c.replied(cwd, n4) and len(at4) == 1)
+                                      or (state4 == "failed" and bool(why4) and len(at4) <= 1))
+                sc.info["n4_after_chaos"] = {"prompts": at4, "state": state4, "reason": why4,
+                                             "chaos": [(e["ts"], e.get("kind"), e.get("target")) for e in hit4]}
+            sc.check("a message after the move lands on %s and is answered" % h2, ok4,
+                     "HTTP %s; prompts %s" % (st, at4))
+            # One move, whatever chaos did meanwhile.
+            all_moves = [e for e in c.fleet.daemon_events("controller", "ctl.move_decision")
+                         if e.get("agent_id") == pid and (e.get("ts") or "") >= t_kill]
+            sc.check("the agent moved once (one ctl.move_decision since the kill)", len(all_moves) == 1,
+                     json.dumps([(e.get("ts"), (e.get("attrs") or {}).get("from")) for e in all_moves])[:300])
+            if free:
+                # The hold: from the kill until h1 is back (the guard).
+                sc.info["hold"] = [t_kill, t_back]
+                sc.info["chaos_in_hold"] = [(e["ts"], e.get("kind"), e.get("target") or e.get("host"))
+                                            for e in s10_hits(None, t_kill) if e["ts"] <= t_back]
     finally:
+        if s10_chaos():
+            c.fleet.clear_guard()
         if sock:
             sock.close()
         c.close(pid)
 
+
+def s10_chaos():
+    """LAB_S10_CHAOS=1 under --chaos: chaos acts during S10's hold."""
+    return os.environ.get("LAB_S10_CHAOS") == "1" and bool(os.environ.get("LAB_CHAOS"))
+
+
+def s10_hits(host, since):
+    """chaos.log SIGKILLs since `since`: of `host`, of any agent CLI on it,
+    or of the controller (host None: every SIGKILL)."""
+    path = os.environ.get("LAB_CHAOS_LOG")
+    if not (path and os.path.isfile(path)):
+        return []
+    return [e for e in fleetlib.read_jsonl(path)
+            if (e.get("ts") or "") >= since and e.get("action") == "SIGKILL"
+            and (host is None or e.get("kind") == "controller" or e.get("host") == host or e.get("target") == host)]
 
 SCENARIOS = {"S2": s2, "S3": s3, "S6": s6, "S7": s7, "S8": s8, "S9": s9, "S10": s10}
 
