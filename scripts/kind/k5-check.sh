@@ -213,8 +213,8 @@ fi
 
 if [ "$off_after" = 1 ]; then
     echo "== 8. off is the old behaviour"
-    "$KIND_REPO/scripts/kind/p4-up.sh" ${daemon_image:+--daemon-image="$daemon_image"} ${fake_src:+--fake-src="$fake_src"} >"$PRIV/p4-up-off.log" 2>&1 \
-        && ok "p4-up.sh without --fs-relay" || bad "p4-up.sh without --fs-relay ($(tail -1 "$PRIV/p4-up-off.log"))"
+    "$KIND_REPO/scripts/kind/p4-up.sh" ${daemon_image:+--daemon-image="$daemon_image"} ${fake_src:+--fake-src="$fake_src"} >"$KIND_STATE/k5-p4-up-off.log" 2>&1 \
+        && ok "p4-up.sh without --fs-relay" || bad "p4-up.sh without --fs-relay ($(grep '^FAIL' "$KIND_STATE/k5-p4-up-off.log" | tr '\n' ';' | cut -c1-200))"
     cenv=$(kn exec k2-controller-0 -c k2-daemon -- env | grep -cE '^K2_FS_RELAY=')
     check "$( [ "$cenv" = 0 ] && echo 1)" "the controller's env has no K2_FS_RELAY"
     # The controller's own volume: its copy of the folder, or none at all

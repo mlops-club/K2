@@ -82,6 +82,9 @@ for h in $hosts; do
     done
 done
 kn get pvc k2-work >/dev/null 2>&1 && bad "a shared k2-work exists" || ok "no shared k2-work"
-[ "$(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}')" = 1 ] && ok "PDB k2-host allows one disruption" || bad "PDB k2-host: $(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}') allowed"
+# Hosts are Ready only when linked: right after a controller roll the PDB
+# allows 0 until they relink.
+for _ in $(seq 1 30); do [ "$(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}')" = 1 ] && break; sleep 2; done
+[ "$(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}')" = 1 ] && ok "PDB k2-host allows one disruption" || bad "PDB k2-host: $(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}') allowed (60 s)"
 echo
 [ "$fails" = 0 ] && echo "PASS p4-up: k2-kind-p4 on 127.0.0.1:$KIND_PORT" || { echo "FAIL p4-up: $fails check(s)"; exit 1; }
