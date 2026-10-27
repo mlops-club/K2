@@ -684,7 +684,7 @@ async fn n3_a_binding_lives_while_its_agent_is_placed() {
     place(remote, &mut h, "notes", "/ctl/work/notes").await;
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(matches!(remote.workspace_route(&strs(&["/ctl/work/notes/a"])), WorkspaceRoute::Relay { .. }), "placed: kept past the TTL");
-    send(&mut h, &Frame::SessionGone { agent_id: "notes".into(), epoch: None, exit_code: Some(0) }).await;
+    send(&mut h, &Frame::SessionGone { agent_id: "notes".into(), epoch: None, exit_code: Some(0), turn: None }).await;
     within("the placement to go", async {
         while remote.placement("notes").is_some() {
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -8,8 +8,8 @@
 //! 2. tell the controller: `refused {code: "draining"}` on the link;
 //! 3. wait for each placed agent's turn to end: from its `UserPromptSubmit`
 //!    hook to its `Stop` (or `StopFailure`, `SessionEnd`, the CLI exiting),
-//!    followed from the host's hook stream since the host linked
-//!    ([`track_turns`]), or its activity row being `Working`. Up to
+//!    counted from the host's hook ingest ([`note_ingest`]), or its
+//!    activity row being `Working`. Up to
 //!    `K2_HOST_DRAIN_SECS` (default 600, the PRD's grace); an agent still in
 //!    its turn then is released anyway and the log says so;
 //! 4. per agent, save its home (P3 T1, `hosts::home`: under `K2_WORK_ROOT`
@@ -41,7 +41,7 @@ use k2_core::log_debug;
 use parking_lot::Mutex;
 use serde_json::json;
 
-use super::proto::Frame;
+use super::proto::{Frame, TurnCounts};
 use crate::agent_host::remote::{RemoteHost, StoredPlacement};
 
 /// Host: how long a drain waits for turns to end, in seconds.
@@ -110,9 +110,23 @@ pub fn move_after(get: impl Fn(&str) -> Option<String>) -> Duration {
     }
 }
 
-/// Panes (v2 session ids) whose turn is running, from their own hooks.
+/// Each pane's (v2 session id's) turns, from its own hooks: whether one
+/// is running, and (K2-f) how many prompts and turn ends it had. Kept
+/// after its CLI exits until the controller has been told
+/// ([`Turns::take`]), so a link outage loses nothing.
 #[derive(Default)]
-pub struct Turns(Mutex<HashMap<String, ()>>);
+pub struct Turns(Mutex<HashMap<String, PaneTurns>>);
+
+#[derive(Debug, Default, Clone, Copy)]
+struct PaneTurns {
+    counts: TurnCounts,
+    /// The pane's owner exited.
+    gone: bool,
+}
+
+/// Panes kept after their CLI exits, at most (the oldest reported ones go
+/// first; an unreported one is the controller's to learn on relink).
+const KEEP_GONE: usize = 4096;
 
 impl Turns {
     /// One hook from the pane's owner. A subagent's (`agent_id` set) never
@@ -121,24 +135,54 @@ impl Turns {
         if subagent {
             return;
         }
+        let mut m = self.0.lock();
         match event {
             "UserPromptSubmit" => {
-                self.0.lock().insert(pane.to_string(), ());
+                let t = m.entry(pane.to_string()).or_default();
+                t.counts.prompts += 1;
+                t.counts.running = true;
             }
             "Stop" | "StopFailure" | "SessionEnd" => {
-                self.0.lock().remove(pane);
+                let t = m.entry(pane.to_string()).or_default();
+                t.counts.stops += 1;
+                t.counts.running = false;
             }
             _ => {}
         }
     }
 
-    /// The pane's owner exited.
+    /// The pane's owner exited. Its counts stay (running or not: a turn
+    /// still running is one its CLI died in) until [`Self::take`].
     pub fn gone(&self, pane: &str) {
-        self.0.lock().remove(pane);
+        let mut m = self.0.lock();
+        if let Some(t) = m.get_mut(pane) {
+            t.gone = true;
+        }
+        if m.len() > KEEP_GONE {
+            let old: Vec<String> = m.iter().filter(|(_, t)| t.gone).map(|(p, _)| p.clone()).take(m.len() - KEEP_GONE).collect();
+            for p in old {
+                m.remove(&p);
+            }
+        }
     }
 
     pub fn in_turn(&self, pane: &str) -> bool {
-        self.0.lock().contains_key(pane)
+        self.0.lock().get(pane).is_some_and(|t| t.counts.running && !t.gone)
+    }
+
+    /// K2-f: the pane's counts, for the controller.
+    pub fn counts(&self, pane: &str) -> Option<TurnCounts> {
+        self.0.lock().get(pane).map(|t| t.counts)
+    }
+
+    /// K2-f: the counts of a pane whose CLI exited, now reported: forgotten.
+    pub fn take(&self, pane: &str) -> Option<TurnCounts> {
+        let mut m = self.0.lock();
+        match m.get(pane) {
+            Some(t) if t.gone => m.remove(pane).map(|t| t.counts),
+            Some(t) => Some(t.counts),
+            None => None,
+        }
     }
 }
 
@@ -147,39 +191,38 @@ fn turns() -> &'static Turns {
     T.get_or_init(Turns::default)
 }
 
-/// Follow this host's hook stream into [`Turns`] (once per process). The
-/// outbox calls it when the host links, before any agent of this link runs.
-pub fn track_turns() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        let mut rx = crate::hook_ingest::subscribe();
-        tokio::spawn(async move {
-            use crate::hook_ingest::IngestEvent;
-            use tokio::sync::broadcast::error::RecvError;
-            loop {
-                match rx.recv().await {
-                    Ok(IngestEvent::Envelope { envelope, .. }) => {
-                        turns().note(&envelope.pane, &envelope.event, envelope.agent_id.is_some())
-                    }
-                    Ok(IngestEvent::OwnerReleased { pane, .. }) => turns().gone(&pane),
-                    Ok(_) => {}
-                    Err(RecvError::Lagged(n)) => log_debug!("[hosts/drain] turn tracker lagged, {n} hook(s) missed"),
-                    Err(RecvError::Closed) => break,
-                }
-            }
-        });
-    });
+/// [`Turns`] from this process's hook ingest, as each hook is posted
+/// (`hook_ingest::publish`): synchronous, so a pane's last `Stop` is counted
+/// before its CLI exits and the exit is reported.
+pub fn note_ingest(ev: &crate::hook_ingest::IngestEvent) {
+    use crate::hook_ingest::IngestEvent;
+    match ev {
+        IngestEvent::Envelope { envelope, .. } => turns().note(&envelope.pane, &envelope.event, envelope.agent_id.is_some()),
+        IngestEvent::OwnerReleased { pane, .. } => turns().gone(pane),
+        _ => {}
+    }
 }
 
-/// Tests (integration): a hook from the lead of `pane`, as [`track_turns`]
+/// Tests (integration): a hook from the lead of `pane`, as [`note_ingest`]
 /// would see it.
 #[doc(hidden)]
 pub fn note_turn_hook(pane: &str, event: &str) {
     turns().note(pane, event, false);
 }
 
+/// K2-f: `pane`'s turn counts on this host (reported in `hello`'s resume).
+pub fn turn_counts(pane: &str) -> Option<TurnCounts> {
+    turns().counts(pane)
+}
+
+/// K2-f: the counts of `pane`, whose CLI exited, as the controller is told
+/// of it (`session_gone`, or `hello`'s resume after an outage).
+pub fn take_turn_counts(pane: &str) -> Option<TurnCounts> {
+    turns().take(pane)
+}
+
 /// Is this process's session `session_id` in its turn: from its hooks
-/// ([`track_turns`]), or its activity row being `Working`?
+/// ([`note_ingest`]), or its activity row being `Working`?
 pub fn session_in_turn(session_id: &str) -> bool {
     turns().in_turn(session_id)
         || crate::activity_store::with_row(session_id, |r| r.lead.state == k2_core::activity::LeadState::Working).unwrap_or(false)
@@ -459,6 +502,23 @@ mod tests {
         t.note("p3", "UserPromptSubmit", false);
         t.note("p3", "StopFailure", false);
         assert!(!t.in_turn("p3"));
+    }
+
+    #[test]
+    fn turns_are_counted_and_kept_after_the_cli_exits_until_reported() {
+        let t = Turns::default();
+        t.note("p1", "UserPromptSubmit", false);
+        t.note("p1", "Stop", false);
+        t.note("p1", "UserPromptSubmit", false);
+        t.note("p1", "Stop", true);
+        assert_eq!(t.counts("p1"), Some(TurnCounts { prompts: 2, stops: 1, running: true }), "a subagent's Stop isn't counted");
+        t.gone("p1");
+        assert!(!t.in_turn("p1"));
+        assert_eq!(t.take("p1"), Some(TurnCounts { prompts: 2, stops: 1, running: true }), "it died mid-turn");
+        assert_eq!(t.take("p1"), None, "reported once");
+        t.note("p2", "UserPromptSubmit", false);
+        assert_eq!(t.take("p2"), Some(TurnCounts { prompts: 1, stops: 0, running: true }), "a live pane is kept");
+        assert!(t.in_turn("p2"));
     }
 
     #[test]

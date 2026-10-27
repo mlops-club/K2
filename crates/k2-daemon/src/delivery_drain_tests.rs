@@ -994,7 +994,7 @@ fn live_transcripts_locate_claudes_and_a_missing_one_is_uncertain() {
 
 /// The agent's session ended on its host (its CLI was killed).
 async fn session_gone(c: &Ctl, host: &mut Ws, agent: &str) {
-    send(host, &Frame::SessionGone { agent_id: agent.into(), epoch: None, exit_code: Some(137) }).await;
+    send(host, &Frame::SessionGone { agent_id: agent.into(), epoch: None, exit_code: Some(137), turn: None }).await;
     within("the placement to go", async {
         while c.remote.placement(agent).is_some() || c.remote.session_ended_at(agent).is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
