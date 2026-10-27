@@ -254,3 +254,53 @@ Fixed on the way (each caught before anything changed, or by the rehearsal):
 3. `scripts/kind/up.sh --dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes`
    (wave3's flags);
 4. check 7443 and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
+
+## Owner roll #3: k2-kind-dist onto rc2 (2026-10-27, applied)
+
+`k2-dist/wave3` ec518d8c1 (drain-move, K2-d, K2-e, the cli-stage fix):
+`RC_DAEMON=k2-daemon:rc2 RC_COMMIT=ec518d8c1… PREV=rc1 POOL_MAX=2
+scripts/kind/owner-roll-rc1.sh --go`, the pool MIN=1 MAX=2, home sync
+(K2_WORK_ROOT), the login copy to the second host by `login-seed`.
+
+Before it, on `:rc2` with the fake agents (k2lab):
+- `drain-demo.sh` (k2-kind-p4) 7/7, including 5–7: after the drain the agent
+  continues on k2-host-1 with k2-host-0's home and the same session;
+- `kind-pool-accept.sh` (k2-p4-pool-rc2) 8/8: 0 → 3 hosts, the MAX refusal,
+  the idle scale-down to 1 with the drained agent's home restored elsewhere;
+- the dry run: only `K2_PROVISIONER_MAX_HOSTS` 1 → 2 in the server-side diff.
+
+`k2-daemon:rc2` is `sha256:390cc5d126d0…` (revision ec518d8c1). It
+compiled only at `K2_KIND_BUILD_MEMORY=6g`, 2 CPUs, `CARGO_BUILD_JOBS=1`;
+4g was OOM-killed even at one job.
+
+Evidence (roll log, steps 1–10, all `ok`):
+- rehearsal on k2-kind-dist-fake: rolled; `k2-host-1` from a fresh volume
+  got k2-host-0's (dummy) login by `login-seed` (0600, onboarding done);
+  enroll-check, app-check, reconnect-check PASS;
+- backup PVC `k2-backup-controller-20261027-001906` (kept);
+- after the roll: PVC uids unchanged; k2-host-0's login unchanged; k2-host
+  at 1 replica; k2-controller runs `390cc5d126d0` and k2-host `65cde461451b`,
+  both labelled ec518d8c1; K2_WORK_ROOT on k2-host-0; app-check --dist,
+  reconnect-check --restart-live PASS;
+- **owner-proof PASS**: Claude Code answered on k2-host-0 (session
+  eaa94551…); a turn-end home snapshot in the controller's store before any
+  sleep (seq 1, 23 files, 260329 bytes, from k2-host-0); slept, woken,
+  answered again in the same session;
+- the second host: k2-host-1 minted, scaled up, `login-seed` copied
+  k2-host-0's login (0600, onboarding done), linked; back to 1 replica
+  (`data-k2-host-1` and its key stay for the pool's next scale-up);
+- 7443 answers.
+
+Fixed on the way: the first rehearsal hung because `up.sh` started
+enroll-mode hosts before minting whenever the Secret `k2-host-enroll` had
+an entry for them. After an interrupted fleet-g2 run that entry was a spent
+token against a fresh controller volume. `up.sh` now also asks the running
+controller for live keys (3dd8f4076). The owner's k2-host-0 has one, so its
+path is unchanged.
+
+**To go back to rc1:**
+1. `docker tag k2-daemon:dist-rc1 k2-daemon:dist && docker tag k2-agents:dist-rc1 k2-agents:dist`;
+2. `scripts/kind/backup-controller.sh --restore=k2-backup-controller-20261027-001906`;
+3. `scripts/kind/up.sh --dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=1 --work-root=/var/lib/k2/work --login-from=k2-host-0`
+   (rc1's flags);
+4. check 7443 and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
