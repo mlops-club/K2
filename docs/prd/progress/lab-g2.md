@@ -368,6 +368,51 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### S10 heavy chaos on wave3 838b70847 (K2-f)
+
+These runs used the same setup as the ec518d8c1 runs below.
+
+| Seed | `lab-runs/G2/` | Chaos SIGKILLs (host / controller / CLI) | Inside holds | S10 rounds | I1–I4 |
+|---|---|---|---|---|---|
+| 4117 | `2026-10-27T01-57-06Z` | 45 / 29 / 4 | 47 | 4/5 | pass |
+| 7 | `2026-10-27T02-26-32Z` | 57 / 54 / 5 | 43 | 4/5 | pass |
+
+- Turn three's crash-cut message now ends loud as `interrupted: <agent>
+  crashed mid-turn before it answered` in 8 rounds. In 6 of them the lab
+  accepted it: failed with a reason after a chaos hit.
+- The other 2 rounds that took the interrupted path were redone after
+  chaos hit before the hold.
+- False-positive check (traces): in all 8, the CLI that took the delivery
+  logged no `cli.turn.end` before chaos killed it. So no 'interrupted'
+  failure had an answered turn.
+- The lab now asserts this check in every S10 round.
+
+(c) Both reds, K2-f follow-up: a controller restart between the delivery and
+the crash loses the record, and the message stays `delivered` and
+unanswered.
+
+- K2-f's list of unanswered messages (`Turn.delivered`,
+  `agent_host/remote.rs:225`, filled by `note_delivered`, `:2557`) lives
+  only in the controller's memory.
+- Seed 4117 round 4: delivered on host-2 at 02:17:20.3. Chaos restarted
+  the controller at 02:17:24.8 and SIGKILLed the CLI mid-turn at
+  02:17:33.1. No `delivery.failed` followed.
+- Seed 7 round 3: chaos held the control lock, so S10's own kill of
+  host-1 came only at 02:47:02, after host-1 had acked turn three at
+  02:46:59.3. The controller restarted at 02:47:08 while host-1 was down.
+  The agent moved without the message: it stayed `delivered`, it was
+  never redelivered on host-2, and it was never answered.
+- In all 8 rounds where K2-f fired, no controller restart came in between.
+  Seed 7 round 1 had restarts in between but its turn ended before the
+  kill, so it passed.
+- Not in K2-f's known limits. Suggested fix: persist the list, for
+  example on the outbox row, or rebuild it at start from rows delivered
+  after the agent's last turn end.
+
+Note: hosts re-send `ctl.deliver_ack delivered` for every message in their
+seen table on each relink, 14–41 times per message in these runs. A
+`failed` row stays failed, so this is only noise.
+
 ### S10 under heavier chaos on wave3 ec518d8c1 (`LAB_S10_CHAOS=1`)
 
 Before this, S10 held the fleet for most of each round, so chaos was light
