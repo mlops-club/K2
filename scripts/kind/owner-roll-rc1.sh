@@ -70,7 +70,8 @@
 #
 # Roll #3 (onto rc2, from rc1): RC_DAEMON=k2-daemon:rc2 RC_COMMIT=<sha>
 # PREV=rc1 POOL_MAX=2; the rollback images are then :dist-rc1 and the
-# rollback goes back to rc1's flags.
+# rollback goes back to rc1's flags. Roll #4 (onto rc3, from rc2):
+# RC_DAEMON=k2-daemon:rc3 RC_COMMIT=<sha> PREV=rc2 POOL_MAX=2 (:dist-rc2).
 #
 # Only k2lab, through an explicit kubeconfig; never the current context. No
 # credential is read out of a pod or printed: files are checked in place.
@@ -94,14 +95,17 @@ POOL_MAX=${POOL_MAX:-1}
 case "$POOL_MAX" in 1|2) ;; *) echo "owner-roll-rc1.sh: POOL_MAX is 1 or 2" >&2; exit 2 ;; esac
 ROLL_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts="$POOL_MAX"
     --work-root=/var/lib/k2/work --login-from=k2-host-0)
-# What runs now, for the rollback: PREV=wave3 (roll #2, the default) or
-# PREV=rc1 (roll #3 onto rc2: rc1's shape, MIN = MAX = 1 with home sync).
+# What runs now, for the rollback: PREV=wave3 (roll #2, the default),
+# PREV=rc1 (roll #3 onto rc2: rc1's shape, MIN = MAX = 1 with home sync) or
+# PREV=rc2 (roll #4 onto rc3: rc2's shape, MAX 2).
 PREV=${PREV:-wave3}
 case "$PREV" in
     wave3) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes) ;;
     rc1) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=1
                      --work-root=/var/lib/k2/work --login-from=k2-host-0) ;;
-    *) echo "owner-roll-rc1.sh: PREV is wave3 or rc1" >&2; exit 2 ;;
+    rc2) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=2
+                     --work-root=/var/lib/k2/work --login-from=k2-host-0) ;;
+    *) echo "owner-roll-rc1.sh: PREV is wave3, rc1 or rc2" >&2; exit 2 ;;
 esac
 ROLLBACK_TAG=dist-$PREV                                           # k2-daemon:dist-<PREV>, k2-agents:dist-<PREV>
 RC_COMMIT=${RC_COMMIT:-c59acf7e02af4b2237e175546f6b1f7c76073068}   # k2-dist/wave3, the release candidate
@@ -206,6 +210,13 @@ login = (src.get("claimName") == "data-k2-host-0" and not src.get("readOnly") an
          and [m.get("readOnly") for m in seed_mount] == [True] and not others)
 print(("ok  " if login else "FAIL") + " (e) login-seed mounts %s read-only on its own mount (pod-level readOnly %s); other mounts of it: %s" % (
     src.get("claimName"), bool(src.get("readOnly")), others or "none"))
+# fs-relay stays off (the coordinator's call for this roll): K2_FS_RELAY=1
+# nowhere, neither a container's env nor a ConfigMap.
+relay = ["%s/%s %s" % (d["kind"], d["metadata"]["name"], v) for d in docs for v in
+         ([d.get("data", {}).get("K2_FS_RELAY")] if d["kind"] == "ConfigMap" else
+          [e.get("value") for c in (d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) if d["kind"] == "StatefulSet" else [])
+           for e in c.get("env", []) if e["name"] == "K2_FS_RELAY"]) if v is not None]
+print(("ok  " if not any(r.endswith(" 1") for r in relay) else "FAIL") + " (f) fs-relay off: K2_FS_RELAY %s" % (", ".join(relay) or "unset everywhere"))
 PY
 cat "$OUT/requirements.txt"
 fails=$((fails + $(grep -c '^FAIL' "$OUT/requirements.txt" || true)))
@@ -226,7 +237,7 @@ esac
 echo "== 5. the release candidate's image"
 rc_rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$RC_DAEMON" 2>/dev/null || true)
 if [ -z "$rc_rev" ]; then
-    note "$RC_DAEMON is not built yet (dist-link); --go needs it"
+    note "$RC_DAEMON is not built yet; --go needs it (K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1 scripts/kind/build-daemon.sh <checkout of ${RC_COMMIT:0:9}> $RC_DAEMON)"
     [ "$mode" = dry-run ] || bad "no $RC_DAEMON"
 elif [ "$rc_rev" = "$RC_COMMIT" ]; then
     ok "$RC_DAEMON is ${RC_COMMIT:0:9}'s build"
