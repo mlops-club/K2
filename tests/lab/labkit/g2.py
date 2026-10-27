@@ -1495,7 +1495,14 @@ def s10_attempt(c, sc, attempt):
             state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
             why3 = c.final_reason(msg_id) if msg_id else None
             ok3 = len(on2) == 1 and c.replied(cwd, key3) and state == "delivered"
-            hit3 = s10_hits(h2, t_kill) if free and not ok3 else []
+            # Chaos excuses a loud failure only when it hit after the move
+            # (the redelivery) and before the failure: one that S10's own
+            # host kill causes would fail without chaos too.
+            hit3 = []
+            if free and not ok3:
+                failed_at = min([e.get("ts") or "" for e in c.fleet.daemon_events("controller", "delivery.failed")
+                                 if e.get("msg_id") == msg_id] or ["~"])
+                hit3 = [e for e in s10_hits(h2, mv.get("ts") or t_kill) if e["ts"] <= failed_at]
             sc.check("turn three's message, never acked, is delivered again on %s exactly once and answered%s"
                      % (h2, " (or failed with a reason after --chaos hit)" if free else ""),
                      ok3 or (bool(hit3) and state == "failed" and bool(why3) and len(on2) <= 1),
