@@ -1440,3 +1440,97 @@ fn r6_an_uploads_files_and_a_copys_tree_are_confined() {
     std::fs::remove_file(d.ws.join("folder/deep/s")).unwrap();
     assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy).is_ok(), "the control");
 }
+
+// ── round 7 ────────────────────────────────────────────────────────────
+
+/// A host's workspace `ws` as a repository with one commit (`sub/f`).
+fn committed_repo(ws: &Path) {
+    k2_core::git::init_repo(&ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/f"), "tracked\n").unwrap();
+    host_git(ws, &["add", "-A"]);
+    host_git(ws, &["commit", "-qm", "first"]);
+}
+
+/// R7 F1(a): a symlink anywhere in the git dir (logs, refs, worktrees) or
+/// alternates outside the work root: every git route on that repository is
+/// refused before libgit2 or git writes through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_f1_a_link_in_the_git_dir_is_refused() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let outside = d.root.parent().unwrap().join("outside-git");
+    std::fs::create_dir_all(&outside).unwrap();
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let git = d.ws.join(".git");
+    let swap = |name: &str| {
+        let real = git.join(name);
+        let kept = git.join(format!("{name}.kept"));
+        std::fs::rename(&real, &kept).unwrap();
+        link(&outside, &real);
+        move || {
+            std::fs::remove_file(&real).unwrap();
+            std::fs::rename(&kept, &real).unwrap();
+        }
+    };
+    for name in ["logs", "refs/heads"] {
+        let back = swap(name);
+        let commit = json!({"path": d.ws, "message": "secret message"});
+        assert!(refused(served("POST", "/cli/git/commit", "", Some(commit)).await), "{name}");
+        assert!(refused(served("GET", "/cli/git/snapshot", &format!("path={}", encode(&d.ws.to_string_lossy())), None).await), "{name}: reads too");
+        back();
+    }
+    std::fs::create_dir_all(git.join("worktrees")).unwrap();
+    let back = swap("worktrees");
+    let wt = json!({"projectPath": d.ws, "branch": "evil", "projectId": "p"});
+    assert!(refused(served("POST", "/cli/git/create-worktree", "", Some(wt)).await));
+    back();
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside");
+    // Objects borrowed from outside the work root.
+    std::fs::create_dir_all(git.join("objects/info")).unwrap();
+    std::fs::write(git.join("objects/info/alternates"), format!("{}\n", outside.display())).unwrap();
+    let commit = json!({"path": d.ws, "message": "m"});
+    assert!(refused(served("POST", "/cli/git/commit", "", Some(commit.clone())).await), "alternates");
+    std::fs::remove_file(git.join("objects/info/alternates")).unwrap();
+    // The control: the same repository, no link, passes the host's checks.
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/commit"), &[], &commit).is_ok());
+}
+
+/// R7 F1(b): a forced checkout (abort-merge, a fast-forward merge,
+/// discard, resolve) through a tracked folder swapped for a link to a
+/// folder outside the work root is refused; nothing outside is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_f1_a_forced_checkout_through_a_folder_link_is_refused() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let outside = d.root.parent().unwrap().join("outside-co");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    link(&outside, &d.ws.join("sub"));
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let p = json!(d.ws);
+    for (route, body) in [
+        ("/cli/git/abort-merge", json!({"path": p})),
+        ("/cli/git/merge-branch", json!({"path": p, "branch": "main"})),
+        ("/cli/git/discard", json!({"path": p, "files": ["sub/f"]})),
+        ("/cli/git/resolve", json!({"path": p, "filePath": "a.md", "resolution": "ours"})),
+    ] {
+        assert!(refused(served("POST", route, "", Some(body)).await), "{route}");
+    }
+    // From a sub-folder of the repository too: the whole work tree counts.
+    std::fs::create_dir_all(d.ws.join("deeper")).unwrap();
+    assert!(refused(served("POST", "/cli/git/abort-merge", "", Some(json!({"path": d.ws.join("deeper")}))).await));
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+    // A dangling folder link out: refused too.
+    std::fs::remove_file(d.ws.join("sub")).unwrap();
+    link(&outside.join("gone"), &d.ws.join("sub"));
+    assert!(refused(served("POST", "/cli/git/abort-merge", "", Some(json!({"path": p}))).await), "dangling");
+    // The controls: a link to a folder inside the work root, and one to a
+    // file outside (the checkout replaces the link), pass.
+    std::fs::remove_file(d.ws.join("sub")).unwrap();
+    std::fs::create_dir_all(d.ws.join("real-sub")).unwrap();
+    link(&d.ws.join("real-sub"), &d.ws.join("sub"));
+    link(&outside.join("f"), &d.ws.join("file-link"));
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": p})).is_ok());
+}

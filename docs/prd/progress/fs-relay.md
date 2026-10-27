@@ -301,6 +301,41 @@ patch:
 | `file_path` joins the repository's work tree | `r6_a_repo_relative_path_joins_the_work_tree_the_handler_joins` |
 | An upload's files, a copy's tree | `r6_an_uploads_files_and_a_copys_tree_are_confined` (with controls) |
 
+## Round 7 review of e3b044365: F1
+
+Round 7 found it safe to merge with the flag off, and not yet safe to
+enable. F1 (medium) is fixed here; F2–F6 (low) are still open.
+
+- **F1(a): a link inside the git dir.** The `Repo` check confined only the
+  git dir, the common dir and the work tree themselves. A commit wrote its
+  ref and reflog through symlinked `.git/logs` and `refs/heads`, and
+  `worktree add` wrote through a symlinked `.git/worktrees`.
+  - Now `git_precheck` walks the git dir and the common dir and refuses any
+    symlink in them, for every git route, reads included.
+  - A loose-object fan-out folder and `objects/pack` are checked
+    themselves, not each object in them.
+  - `objects/info/alternates` naming objects outside the work root is
+    refused too.
+- **F1(b): a forced checkout through a folder link.** abort-merge, a
+  fast-forward merge, discard and resolve check out with force, and a
+  tracked folder swapped for a symlink let them delete or write outside the
+  root.
+  - A new derived path, `CheckoutTree`, walks the whole work tree of the
+    repository the route opens (not just the request's folder).
+  - It refuses a link to a folder outside the work root, or a dangling one.
+  - A link to a file is allowed, since the checkout replaces the link
+    itself, and so is a link that stays inside the root.
+- **Not closed:** this is still a check before use. A link swapped in
+  after the check races it (N2). Later hardening: `openat2` with
+  `RESOLVE_BENEATH`, or a separate uid for relayed serving.
+
+| Item | Test |
+|---|---|
+| F1(a): `logs`, `refs/heads`, `worktrees` links; alternates out; reads too (with a control) | `r7_f1_a_link_in_the_git_dir_is_refused` |
+| F1(b): abort-merge, merge-branch, discard, resolve; from a sub-folder; a dangling link (with controls: a folder link inside, a file link out) | `r7_f1_a_forced_checkout_through_a_folder_link_is_refused` |
+
+Both tests fail with the two checks taken out (checked by mutation).
+
 ## Checks
 
 | Check | Result |

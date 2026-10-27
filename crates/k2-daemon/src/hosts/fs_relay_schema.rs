@@ -48,6 +48,10 @@ pub enum Derived {
     /// Each copy's target, and every file under each source (followed
     /// the way the copy follows it).
     CopyTree,
+    /// A forced checkout's work tree (abort, a fast-forward merge, discard,
+    /// resolve): no link in it to a folder outside the work root (or a
+    /// dangling one), which the checkout would write or delete through.
+    CheckoutTree,
 }
 
 #[derive(Debug)]
@@ -131,7 +135,7 @@ pub const SCHEMAS: &[Schema] = &[
     ),
     post("/cli/fs/search-tree", &[("root", Abs), ("query", Plain), ("show_hidden", Plain), ("max_results", Plain)], &[]),
     post("/cli/fs/resolve-links", &[("workspace", Abs), ("paths", Candidates)], &[]),
-    post("/cli/git/abort-merge", &[("path", Abs)], &[D::Repo]),
+    post("/cli/git/abort-merge", &[("path", Abs)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/commit", &[("path", Abs), ("message", Plain)], &[D::Repo]),
     post(
         "/cli/git/create-worktree",
@@ -139,9 +143,9 @@ pub const SCHEMAS: &[Schema] = &[
         &[D::Repo, D::Worktree],
     ),
     post("/cli/git/delete-branch", &[("path", Abs), ("branch", Plain)], &[D::Repo]),
-    post("/cli/git/discard", &[("path", Abs), ("files", RepoRel("path")), ("includeStaged", Plain)], &[D::Repo]),
+    post("/cli/git/discard", &[("path", Abs), ("files", RepoRel("path")), ("includeStaged", Plain)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/init", &[("path", Abs)], &[D::GitDir]),
-    post("/cli/git/merge-branch", &[("path", Abs), ("branch", Plain)], &[D::Repo]),
+    post("/cli/git/merge-branch", &[("path", Abs), ("branch", Plain)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/prune-worktrees", &[("projectPath", Abs), ("projectId", Plain)], &[D::Repo]),
     post(
         "/cli/git/remove-worktree",
@@ -149,7 +153,7 @@ pub const SCHEMAS: &[Schema] = &[
         &[D::Repo],
     ),
     post("/cli/git/reopen-worktree", &[("projectPath", Abs), ("worktreePath", Abs), ("branch", Plain)], &[D::Repo]),
-    post("/cli/git/resolve", &[("path", Abs), ("filePath", RepoRel("path")), ("resolution", Plain)], &[D::Repo]),
+    post("/cli/git/resolve", &[("path", Abs), ("filePath", RepoRel("path")), ("resolution", Plain)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/stage", &[("path", Abs), ("filePath", RepoRel("path"))], &[D::Repo]),
     post("/cli/git/stage-all", &[("path", Abs)], &[D::Repo]),
     post("/cli/git/unstage", &[("path", Abs), ("filePath", RepoRel("path"))], &[D::Repo]),
@@ -395,6 +399,7 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
             }
             Ok(())
         }
+        Derived::CheckoutTree => checkout_tree_inside(root, &path_of("path").ok_or("a git request names its repository's path")?),
         Derived::CopyTree => {
             let (sources, dest): (Vec<PathBuf>, PathBuf) = if s.route == "/cli/fs/duplicate" {
                 let p = path_of("path").ok_or("duplicate names its path")?;
@@ -412,6 +417,39 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
             Ok(())
         }
     }
+}
+
+/// F1 (round 7): the work tree of the repository at `path` holds no link
+/// to a folder outside the work root, nor a dangling one (a forced
+/// checkout deletes and writes through a folder link). Links to files, and
+/// within the root, are the checkout's to replace. `.git` is the git dir's
+/// own check.
+fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), String> {
+    let work = repo_base(&path.to_string_lossy());
+    let mut todo = vec![work.clone()];
+    let mut n = 0usize;
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.filter_map(Result::ok) {
+            n += 1;
+            if n > TREE_LIMIT {
+                return Err(format!("{} holds over {TREE_LIMIT} entries; too many to check for a relayed checkout", work.display()));
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                let p = e.path();
+                let r = resolve(&p);
+                let out = r.as_ref().is_none_or(|r| !r.starts_with(root));
+                let file = r.as_ref().is_some_and(|r| r.is_file());
+                if out && !file {
+                    return Err(format!("{} links to a folder outside this host's work root; a checkout would go through it", p.display()));
+                }
+            } else if ft.is_dir() && e.file_name() != ".git" {
+                todo.push(e.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The most entries a copy's source may hold for the host to check it.

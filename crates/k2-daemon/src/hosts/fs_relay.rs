@@ -765,11 +765,58 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
             // No repository at all: nothing git can reach; the route answers.
             Err(_) => continue,
         };
-        for (what, dir) in [("git dir", Some(git_dir)), ("common dir", Some(common)), ("work tree", work)] {
+        for (what, dir) in [("git dir", Some(&git_dir)), ("common dir", Some(&common)), ("work tree", work.as_ref())] {
             if let Some(dir) = dir {
-                if !inside(&dir) {
+                if !inside(dir) {
                     return Err(format!("the repository for {p} has its {what} {} outside this host's work root", dir.display()));
                 }
+            }
+        }
+        // F1 (round 7): what git writes inside them stays there too.
+        git_dir_without_links(root, &git_dir)?;
+        if common != git_dir {
+            git_dir_without_links(root, &common)?;
+        }
+    }
+    Ok(())
+}
+
+/// The most entries a git dir may hold for the host to check it.
+const GIT_DIR_LIMIT: usize = 200_000;
+
+/// F1 (round 7): no symlink anywhere in a repository's git dir (libgit2 and
+/// git write refs, logs, worktrees and objects through any link there), and
+/// no `objects/info/alternates` naming objects outside the work root. A
+/// loose-object fan-out folder or `objects/pack` is checked itself, not
+/// each object in it.
+fn git_dir_without_links(root: &Path, dir: &Path) -> Result<(), String> {
+    let objects = dir.join("objects");
+    let mut todo = vec![dir.to_path_buf()];
+    let mut n = 0usize;
+    while let Some(d) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.filter_map(Result::ok) {
+            n += 1;
+            if n > GIT_DIR_LIMIT {
+                return Err(format!("{} holds over {GIT_DIR_LIMIT} entries; too many to check for a relayed request", dir.display()));
+            }
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                return Err(format!("{} is a symlink in a repository's git dir", e.path().display()));
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let leaf = d == objects && (name == "pack" || (name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())));
+            if ft.is_dir() && !leaf {
+                todo.push(e.path());
+            }
+        }
+    }
+    if let Ok(alt) = std::fs::read_to_string(objects.join("info/alternates")) {
+        for line in alt.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let p = if Path::new(line).is_absolute() { PathBuf::from(line) } else { objects.join(line) };
+            if !resolve(&p).is_some_and(|r| r.starts_with(root)) {
+                return Err(format!("the repository's alternates name {line}, outside this host's work root"));
             }
         }
     }
