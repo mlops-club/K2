@@ -368,6 +368,33 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### Linux pre-gate on wave3 353c69d65: GREEN
+
+`lab-runs/gate-debug/2026-10-27T03-18-03Z`, before K2-f.1:
+
+- Cold build: the target volume was emptied (approved).
+- Floor `K2_GATE_MIN_FREE_GB=12`, low-memory mode, Docker lock held. The
+  VM had 12.0G free at the start, after dist-link removed `k2-p4-target`.
+- The gate's own checks saw 10–11G free between steps.
+
+| Package | Test binaries | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| k2-core | 17 | 3886 | 0 | 1 (allowlisted) |
+| k2-daemon | 160 | 5397 | 0 | 9 (allowlisted) |
+| k2-daemon root-only `cell_egress` | 1 | 1 | 0 | 0 |
+| k2-ptyd | 5 | 42 | 0 | 0 |
+
+- No failures, compile errors or unlisted ignores.
+- The fixed bin list ran `contract-gen`, `k2-mail-helper`,
+  `k2-power-helper` and `k2-ptyd`, and not the fake test agent.
+- The k2_home failure (class b) and the T2 deliver-before-spawn race (class
+  c) from cfcb1e387 no longer fail.
+- A hard stop guarded the run: stop the gate if VM free < 3G. It fired at
+  05:48:57, a second after the gate had finished. It read `df` from the
+  exiting container, got a non-number and took it as 0, so it was a false
+  trigger after the end. The gate had already printed GREEN and done its
+  cleanup. Any later watcher must ignore non-numeric readings.
+
 ### S10 heavy chaos on wave3 838b70847 (K2-f)
 
 These runs used the same setup as the ec518d8c1 runs below.
