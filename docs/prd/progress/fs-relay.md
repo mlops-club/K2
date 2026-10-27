@@ -838,6 +838,146 @@ refusals of step 6 plus a git path outside the repository (`filePath
 The same checks run without kind, on two processes, in
 `scripts/lab/topology/fs-relay.sh` (7 checks; it sets `K2_FS_RELAY=1`).
 
+## The owner's K2 at rc3: fs-relay ON or OFF? (plan)
+
+Recommendation: **OFF for rc3.** Turning it on for the owner is a storage
+migration, not a switch, and it should be done as its own planned change
+after rc3.
+
+### The live shape (read 2026-10-27)
+
+Read on `k2lab`, namespace `k2-kind-dist`, `get` only, through an explicit
+kubeconfig. No exec, so the contents of the volumes were not listed.
+
+- **Pods:** `k2-controller-0` (`k2-daemon:dist`) and `k2-host-0`
+  (`k2-agents:dist`), both on `k2lab-worker2`. The host has `podAffinity` to
+  the controller's node.
+- **Controller env:**
+  - `K2_ROLE=controller`, `K2_HOST_AUTH=enroll`;
+  - `K2_PROVISIONER=kubernetes` with MIN 1 and MAX 2;
+  - no `K2_WORK_ROOT` and no `K2_FS_RELAY`.
+- **Host env:** `K2_WORK_ROOT=/var/lib/k2/work` (home sync, from the rc1
+  roll), `K2_PTYD=1`, `K2_HOST_MAX_AWAKE=100`.
+- **Volumes:**
+  - `k2-work` (5Gi, ReadWriteOnce) is mounted by **both** the controller
+    and the host at `/var/lib/k2/work`. This is the shared shape: there is
+    one copy of every workspace, and both see it.
+  - Each host has its own HOME (`data-k2-host-0`, and `data-k2-host-1` from
+    the pool's second host).
+  - The controller has `data-k2-controller-0`, plus three in-cluster
+    backups (`k2-backup-controller-*`).
+- **Where the workspaces live:** on `k2-work`, at `/var/lib/k2/work/<name>`.
+  It is one volume, so the controller and the host already see the same
+  files.
+
+### What turning the relay on would change
+
+- **As the owner's K2 stands, the relay can't usefully be on, and
+  `up.sh` refuses it.** `up.sh --fs-relay` needs hosts on their own work
+  volumes, and the owner's share the controller's. Forced on by hand, it
+  would serve the same bytes through the host, with only costs:
+  - a workspace whose host is away answers `503 host_away`, where today
+    the controller reads the shared file;
+  - App passes and compress/extract on such a workspace answer `501`;
+  - repositories that use alternates or config includes are refused;
+  - every request takes an extra hop.
+- **Really on means the P4 shape:** `--host-work=own`. Each host gets its
+  own `work` claim, and the controller keeps `k2-work` as its own copy.
+  The render-only diff of the roll, without and with (`up.sh --dist
+  --hosts=1 --ptyd=1 --work-root=/var/lib/k2/work`, then `+ --host-work=own
+  --fs-relay`; rendered with token auth and the static provisioner, so
+  `up.sh` reads none of the owner's Secrets; the delta is the same with
+  enroll and the pool):
+
+  ```diff
+  # k2-controller: the switch and its work root
+  -      - envFrom:
+  +      - env:
+  +        - name: K2_FS_RELAY
+  +          value: "1"
+  +        - name: K2_WORK_ROOT
+  +          value: /var/lib/k2/work
+  +        envFrom:
+  # k2-host: no longer mounts k2-work...
+  -      - name: work
+  -        persistentVolumeClaim:
+  -          claimName: k2-work
+  # ...but its own claim, per host
+  +  - metadata:
+  +      name: work
+  +    spec:
+  +      accessModes:
+  +      - ReadWriteOnce
+  +      resources:
+  +        requests:
+  +          storage: 2Gi
+  ```
+
+- **The data would have to move.** Every workspace on `k2-work` would need
+  copying onto the host that runs its agents (`work-k2-host-0`). Otherwise
+  the host's agents would wake in empty folders, and the app (which now
+  reads the host) would show them empty. Afterwards the controller's
+  `k2-work` copy is stale and must not be written. With the pool's second
+  host, a workspace lives on whichever host its agent was spawned on;
+  moving between hosts relies on home sync (P3), which the drain demo
+  tested on P4 but not on the owner's K2.
+- **What the migration would take, outside rc3:**
+  - **Backups:**
+    - the controller's volume, with `scripts/kind/backup-controller.sh`;
+    - `k2-work` copied in the cluster into `k2-backup-work-<UTC>` (a
+      Job on the controller's node mounting both).
+  - **Roll:**
+    - the claim template change needs StatefulSet `k2-host` deleted first,
+      as up.sh says; the host PVCs `data-k2-host-N` stay;
+    - roll with `--host-work=own --fs-relay`;
+    - a Job on the same node copies `k2-work` into `work-k2-host-0`, with a
+      checksum check;
+    - then K5's checks (`scripts/kind/k5-check.sh`) against the owner's
+      port.
+  - **Rollback:** roll again without `--host-work=own --fs-relay`, so the
+    host mounts `k2-work` again. Before that, copy `work-k2-host-0` back
+    over `k2-work`, so changes made while ON aren't lost. The backups are
+    the last resort.
+  - **kind-app's roll scripts need,** for ON:
+    - a size for the host's work claim (`up.sh` fixes it at 2Gi, but
+      `k2-work` is 5Gi);
+    - the copy Job, forward and back;
+    - a rehearsal of the whole thing on a test namespace first.
+
+### rc3, with the relay OFF
+
+- **The roll's flags stay as kind-app's owner roll has them:**
+  `--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes
+  --work-root=/var/lib/k2/work` and the pool, with no `--fs-relay` and no
+  `--host-work=own`. The rc3 image carries fs-relay inert: the controller
+  has no `K2_FS_RELAY`.
+- **What does change with rc3, relay off, on any host with
+  `K2_WORK_ROOT`** (the owner's has it):
+  - K2's own git on the host is hardened: no hooks or fsmonitor, the
+    10 s time limit, refused on a config naming `hook.*`;
+  - `worktree add` checks out with libgit2, so git-lfs files stay
+    pointers in worktrees K2 creates;
+  - a fresh host gets a git identity at start (K5);
+  - its Trash goes to `/var/lib/k2/work/.k2-trash`;
+  - its listings give a link's own size.
+
+  The app's file and git routes are still served by the controller (relay
+  off), so these touch only what the host's own daemon does. None of them
+  move data.
+
+### Why OFF for rc3
+
+1. **On the owner's shared volume the relay gives nothing.** It adds a hop,
+   new failure modes (host away, App passes, compress/extract) and
+   refusals, for files the controller already reads.
+2. **ON for real is a storage migration.** A StatefulSet recreate, a data
+   copy, a size the roll scripts can't set yet, and a rollback that has to
+   copy back: it deserves its own rehearsal and window, not a release roll.
+3. **The relay is new.** It was hardened across 13 review rounds and has
+   passed K5 on a test namespace, not yet under the owner's daily use.
+   rc3 ships it inert, so turning it on later is a flag and a migration,
+   not a new build.
+
 ## Checks
 
 | Check | Result |
