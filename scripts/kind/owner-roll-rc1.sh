@@ -2,10 +2,17 @@
 # The owner's second roll: k2-kind-dist (port 7443) from wave3 853157fee
 # onto the release candidate k2-dist/wave3 c59acf7e0 (images :rc1, built and
 # verified by dist-link), with home sync (K2_WORK_ROOT on the hosts, P3 T1)
-# and turn-end snapshots (P3 T2), and a pool that may grow to two hosts.
+# and turn-end snapshots (P3 T2), and a pool whose ceiling is POOL_MAX
+# (default 1: the coordinator's hold until k2-dist/drain-move lands, since
+# a drained agent doesn't move off its host in rc1; 2 after it).
 #
 #   scripts/kind/owner-roll-rc1.sh [--dry-run]     (the default)
 #   scripts/kind/owner-roll-rc1.sh --go [--skip-rehearsal]
+#   scripts/kind/owner-roll-rc1.sh --rehearse      (steps 1-7, then stops)
+#
+# --rehearse runs the dry run's checks, tags the rollback images (step 6)
+# and rehearses on k2-kind-dist-fake (step 7), then stops: no backup, and
+# nothing in k2-kind-dist changes.
 #
 # --dry-run changes nothing anywhere: no scale, no token, no tag, no apply.
 # It
@@ -14,7 +21,7 @@
 #      never its contents), and the images the pods run (the StatefulSets'
 #      k2.dev/image-id), which are the rollback images;
 #   2. renders the roll (up.sh --render-only: 1 host, enroll, K2_PTYD=1,
-#      K2_PROVISIONER=kubernetes with MIN=1 MAX=2, K2_WORK_ROOT=/var/lib/k2/work,
+#      K2_PROVISIONER=kubernetes with MIN=1 MAX=POOL_MAX, K2_WORK_ROOT=/var/lib/k2/work,
 #      --login-from=k2-host-0);
 #   3. checks the render:
 #      (a) k2-host keeps its name, serviceName and claim template, so
@@ -39,8 +46,8 @@
 # carry it: its secret scrub leaves credentials out on purpose.
 #
 # --go (only when the coordinator says so) also
-#   6. tags the running images (by id) k2-daemon:dist-wave3 and
-#      k2-agents:dist-wave3, the rollback;
+#   6. tags the running images (by id) k2-daemon:dist-$PREV and
+#      k2-agents:dist-$PREV (dist-wave3 or dist-rc1), the rollback;
 #   7. rehearses on k2-kind-dist-fake: k2-daemon:rc1 as :dist-fake, up.sh
 #      with the same flags; a dummy login (not a credential) on its
 #      k2-host-0 when it has none; the second host (below) gets it; then
@@ -52,7 +59,9 @@
 #  10. checks: the PVCs from before keep their uids; the login file is
 #      unchanged (size, mtime) with onboarding done; k2-host-0 linked by its
 #      key (0600) with K2_WORK_ROOT; app-check, reconnect-check
-#      --restart-live, owner-proof.py on k2-host-0 (one short prompt);
+#      --restart-live, owner-proof.py on k2-host-0 (one short prompt, a
+#      sleep and a wake into the same session, and the agent's turn-end
+#      home snapshot in the controller's store);
 #      then the second host: a token for k2-host-1 (enroll.py mint, as the
 #      pool does before it scales), k2-host at 2, k2-host-1 linked, its
 #      login-seed log "copied", its login file present (0600) with
@@ -64,6 +73,11 @@
 # data-k2-host-1 deleted when this roll made it (it holds a copy of the
 # login); 7443 and app-check again.
 #
+# Roll #3 (onto rc2, from rc1): RC_DAEMON=k2-daemon:rc2 RC_COMMIT=<sha>
+# PREV=rc1 POOL_MAX=2; the rollback images are then :dist-rc1 and the
+# rollback goes back to rc1's flags. Roll #4 (onto rc3, from rc2):
+# RC_DAEMON=k2-daemon:rc3 RC_COMMIT=<sha> PREV=rc2 POOL_MAX=2 (:dist-rc2).
+#
 # Only k2lab, through an explicit kubeconfig; never the current context. No
 # credential is read out of a pod or printed: files are checked in place.
 set -euo pipefail
@@ -74,6 +88,7 @@ for a in "$@"; do
     case "$a" in
         --dry-run) mode=dry-run ;;
         --go) mode=go ;;
+        --rehearse) mode=rehearse ;;
         --skip-rehearsal) rehearse=0 ;;
         -h|--help) sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "owner-roll-rc1.sh: unknown argument $a" >&2; exit 2 ;;
@@ -82,12 +97,26 @@ done
 kind_variant dist
 kind_kubeconfig
 NS=$KIND_NS PORT=$KIND_PORT
-ROLL_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=2
+POOL_MAX=${POOL_MAX:-1}
+case "$POOL_MAX" in 1|2) ;; *) echo "owner-roll-rc1.sh: POOL_MAX is 1 or 2" >&2; exit 2 ;; esac
+ROLL_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts="$POOL_MAX"
     --work-root=/var/lib/k2/work --login-from=k2-host-0)
-PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes)   # wave3's roll
+# What runs now, for the rollback: PREV=wave3 (roll #2, the default),
+# PREV=rc1 (roll #3 onto rc2: rc1's shape, MIN = MAX = 1 with home sync) or
+# PREV=rc2 (roll #4 onto rc3: rc2's shape, MAX 2).
+PREV=${PREV:-wave3}
+case "$PREV" in
+    wave3) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes) ;;
+    rc1) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=1
+                     --work-root=/var/lib/k2/work --login-from=k2-host-0) ;;
+    rc2) PREV_FLAGS=(--dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=2
+                     --work-root=/var/lib/k2/work --login-from=k2-host-0) ;;
+    *) echo "owner-roll-rc1.sh: PREV is wave3, rc1 or rc2" >&2; exit 2 ;;
+esac
+ROLLBACK_TAG=dist-$PREV                                           # k2-daemon:dist-<PREV>, k2-agents:dist-<PREV>
 RC_COMMIT=${RC_COMMIT:-c59acf7e02af4b2237e175546f6b1f7c76073068}   # k2-dist/wave3, the release candidate
 RC_DAEMON=${RC_DAEMON:-k2-daemon:rc1}                             # dist-link's verified build
-OUT="$KIND_STATE/owner-roll-rc1"
+OUT="$KIND_STATE/owner-roll-${RC_DAEMON#*:}"
 mkdir -p "$OUT" && chmod 700 "$OUT"
 kd() { kubectl --kubeconfig "$KIND_KUBECONFIG" -n "$NS" "$@"; }
 fails=0
@@ -135,8 +164,8 @@ echo "== 2. render the roll"
 "$KIND_REPO/scripts/kind/up.sh" "${ROLL_FLAGS[@]}" --render-only="$OUT/render.yaml" 2>&1 | sed 's/^/     /'
 
 echo "== 3. the hard requirements on the render"
-python3 -I - "$OUT/render.yaml" "$KIND_KUBECONFIG" "$NS" <<'PY' > "$OUT/requirements.txt"
-import json, subprocess, sys
+POOL_MAX=$POOL_MAX python3 -I - "$OUT/render.yaml" "$KIND_KUBECONFIG" "$NS" <<'PY' > "$OUT/requirements.txt"
+import json, os, subprocess, sys
 render, kubeconfig, ns = sys.argv[1:4]
 text = subprocess.run(["kubectl", "--kubeconfig", kubeconfig, "create", "--dry-run=client", "-o", "json", "-f", render],
                       capture_output=True, text=True, check=True).stdout
@@ -161,7 +190,7 @@ same = claims(host) == claims(live) and host["spec"]["serviceName"] == live["spe
 print(("ok  " if same else "FAIL") + " (a) k2-host keeps its claim template %s, serviceName %s and mount %s: k2-host-0 reuses data-k2-host-0" % (claims(host), host["spec"]["serviceName"], mount(host)))
 ctl = find("StatefulSet", "k2-controller")
 env = {e["name"]: e.get("value") for c in ctl["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
-floor = env.get("K2_PROVISIONER") == "kubernetes" and env.get("K2_PROVISIONER_MIN_HOSTS") == "1" and env.get("K2_PROVISIONER_MAX_HOSTS") == "2" and host["spec"]["replicas"] == 1
+floor = env.get("K2_PROVISIONER") == "kubernetes" and env.get("K2_PROVISIONER_MIN_HOSTS") == "1" and env.get("K2_PROVISIONER_MAX_HOSTS") == os.environ["POOL_MAX"] and host["spec"]["replicas"] == 1
 print(("ok  " if floor else "FAIL") + " (b) K2_PROVISIONER=%s, MIN_HOSTS=%s, MAX_HOSTS=%s; k2-host replicas %s" % (
     env.get("K2_PROVISIONER"), env.get("K2_PROVISIONER_MIN_HOSTS"), env.get("K2_PROVISIONER_MAX_HOSTS"), host["spec"]["replicas"]))
 stray = ["%s/%s" % (d["kind"], d["metadata"]["name"]) for d in docs if d["kind"] != "Namespace" and d["metadata"].get("namespace") != ns]
@@ -187,6 +216,13 @@ login = (src.get("claimName") == "data-k2-host-0" and not src.get("readOnly") an
          and [m.get("readOnly") for m in seed_mount] == [True] and not others)
 print(("ok  " if login else "FAIL") + " (e) login-seed mounts %s read-only on its own mount (pod-level readOnly %s); other mounts of it: %s" % (
     src.get("claimName"), bool(src.get("readOnly")), others or "none"))
+# fs-relay stays off (the coordinator's call for this roll): K2_FS_RELAY=1
+# nowhere, neither a container's env nor a ConfigMap.
+relay = ["%s/%s %s" % (d["kind"], d["metadata"]["name"], v) for d in docs for v in
+         ([d.get("data", {}).get("K2_FS_RELAY")] if d["kind"] == "ConfigMap" else
+          [e.get("value") for c in (d.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) if d["kind"] == "StatefulSet" else [])
+           for e in c.get("env", []) if e["name"] == "K2_FS_RELAY"]) if v is not None]
+print(("ok  " if not any(r.endswith(" 1") for r in relay) else "FAIL") + " (f) fs-relay off: K2_FS_RELAY %s" % (", ".join(relay) or "unset everywhere"))
 PY
 cat "$OUT/requirements.txt"
 fails=$((fails + $(grep -c '^FAIL' "$OUT/requirements.txt" || true)))
@@ -207,7 +243,7 @@ esac
 echo "== 5. the release candidate's image"
 rc_rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$RC_DAEMON" 2>/dev/null || true)
 if [ -z "$rc_rev" ]; then
-    note "$RC_DAEMON is not built yet (dist-link); --go needs it"
+    note "$RC_DAEMON is not built yet; --go needs it (K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1 scripts/kind/build-daemon.sh <checkout of ${RC_COMMIT:0:9}> $RC_DAEMON)"
     [ "$mode" = dry-run ] || bad "no $RC_DAEMON"
 elif [ "$rc_rev" = "$RC_COMMIT" ]; then
     ok "$RC_DAEMON is ${RC_COMMIT:0:9}'s build"
@@ -227,15 +263,16 @@ OWNER_PW=${K2_KIND_PASSWORD_FILE:-$HOME/.local/state/k2-kind/dist/owner-password
 FAKE_PW=${K2_KIND_FAKE_PASSWORD_FILE:-${TMPDIR:-/tmp}/k2-kind/dist-fake/owner-password}
 [ -r "$OWNER_PW" ] || { echo "owner-roll-rc1.sh: no owner password file at $OWNER_PW" >&2; exit 1; }
 
-# second_host <namespace> <port> [keep]: a token for k2-host-1 (as the pool
-# mints before it scales), k2-host at 2, k2-host-1 linked with k2-host-0's
-# login copied in, then back to 1 (unless keep). Facts only, never contents.
+# second_host <namespace> <port> [keep [renew]]: a token for k2-host-1 (as
+# the pool mints before it scales; --renew for a name whose old key was
+# revoked), k2-host at 2, k2-host-1 linked with k2-host-0's login copied
+# in, then back to 1 (unless keep). Facts only, never contents.
 second_host() {
-    local kcfg=$KIND_KUBECONFIG ns=$1 port=$2 keep=${3:-} log
+    local kcfg=$KIND_KUBECONFIG ns=$1 port=$2 keep=${3:-} renew=${4:-} log
     k() { kubectl --kubeconfig "$kcfg" -n "$ns" "$@"; }
     k exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
         | python3 -I "$KIND_REPO/scripts/kind/enroll.py" mint --kubeconfig "$kcfg" --namespace "$ns" \
-            --url "http://127.0.0.1:$port" --hosts k2-host-0,k2-host-1 >&2 || { bad "$ns: mint k2-host-1"; return; }
+            --url "http://127.0.0.1:$port" --hosts k2-host-0,k2-host-1 ${renew:+--renew k2-host-1} >&2 || { bad "$ns: mint k2-host-1"; return; }
     k scale statefulset k2-host --replicas=2 >&2
     k rollout status statefulset/k2-host --timeout=600s >&2 || { bad "$ns: k2-host-1 not ready"; return; }
     log=$(k logs k2-host-1 -c login-seed 2>&1 | tail -1)
@@ -253,35 +290,62 @@ second_host() {
 
 echo "== 6. the running images, for the rollback"
 for pair in k2-controller=k2-daemon k2-host=k2-agents; do
-    id=$(sed -n "s/^${pair%%=*} //p" "$OUT/before.txt")
+    id=$(sed -n '/^# images/,$p' "$OUT/before.txt" | awk -v n="${pair%%=*}" '$1 == n {print $2}')   # that section only
     case "$id" in sha256:*) ;; *) echo "owner-roll-rc1.sh: no image id for ${pair%%=*}" >&2; exit 1 ;; esac
     docker image inspect "$id" >/dev/null 2>&1 || { echo "owner-roll-rc1.sh: ${pair%%=*}'s image $id is not on this Mac" >&2; exit 1; }
-    docker tag "$id" "${pair#*=}:dist-wave3"
-    ok "${pair#*=}:dist-wave3 = ${id:7:12} (what ${pair%%=*} runs)"
+    docker tag "$id" "${pair#*=}:$ROLLBACK_TAG"
+    ok "${pair#*=}:$ROLLBACK_TAG = ${id:7:12} (what ${pair%%=*} runs)"
 done
 
 if [ "$rehearse" = 1 ]; then
     echo "== 7. rehearse on k2-kind-dist-fake"
     docker tag "$RC_DAEMON" k2-daemon:dist-fake
-    "$KIND_REPO/scripts/kind/up.sh" --fake "${ROLL_FLAGS[@]}" >&2 && ok "rehearsal: rolled" || bad "rehearsal: up.sh"
+    # G4's own-disk runs leave k2-host here with a "work" claim template,
+    # and a template can't change on a live StatefulSet: recreate it (its
+    # PVCs stay), as scripts/lab/topology/kind.sh does.
+    tpl=$(kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake get statefulset k2-host \
+        -o jsonpath='{.spec.volumeClaimTemplates[*].metadata.name}' 2>/dev/null || true)
+    if [ -n "$tpl" ] && [ "$tpl" != data ]; then
+        note "k2-kind-dist-fake: k2-host's claim templates are '$tpl', not 'data': recreating the StatefulSet (PVCs stay)"
+        kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake delete statefulset k2-host --wait=true >&2
+    fi
+    # The test login's password, if up.sh makes one, goes to FAKE_PW (0600), never the log.
+    "$KIND_REPO/scripts/kind/up.sh" --fake "${ROLL_FLAGS[@]}" --password-file="$FAKE_PW" >&2 && ok "rehearsal: rolled" || bad "rehearsal: up.sh"
     # A dummy login on the test host-0 when it has none: not a credential.
     kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake exec k2-host-0 -c k2-host -- sh -c '
-        [ -e /var/lib/k2-host/.claude/.credentials.json ] && exit 0
         umask 077; mkdir -p /var/lib/k2-host/.claude
-        echo "{\"dummy\":\"rehearsal, not a credential\"}" > /var/lib/k2-host/.claude/.credentials.json
-        [ -e /var/lib/k2-host/.claude.json ] || echo "{\"hasCompletedOnboarding\": true}" > /var/lib/k2-host/.claude.json' >&2
-    second_host k2-kind-dist-fake 7442 keep
+        [ -e /var/lib/k2-host/.claude/.credentials.json ] \
+            || echo "{\"dummy\":\"rehearsal, not a credential\"}" > /var/lib/k2-host/.claude/.credentials.json
+        # Like the owner'"'"'s host-0: onboarding done (the fake agent may have left a .claude.json without it).
+        grep -q "\"hasCompletedOnboarding\": *true" /var/lib/k2-host/.claude.json 2>/dev/null \
+            || echo "{\"hasCompletedOnboarding\": true}" > /var/lib/k2-host/.claude.json' >&2
+    # k2-host-1 as the owner's would first come: a new volume, no login.
+    # Its old volume (and the key on it) goes; the old key is revoked, so
+    # the name can enroll a new one (--renew, as enroll-check.sh restores).
+    kf() { kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake "$@"; }
+    kf scale statefulset k2-host --replicas=1 >&2
+    kf wait --for=delete pod/k2-host-1 --timeout=180s >&2 2>/dev/null || true
+    kf delete pvc data-k2-host-1 --ignore-not-found --wait=true >&2
+    kf exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
+        | python3 -I "$KIND_REPO/scripts/kind/enroll.py" revoke --url http://127.0.0.1:7442 --host k2-host-1 \
+            --reason "roll rehearsal: a fresh k2-host-1 volume" >&2 || true
+    second_host k2-kind-dist-fake 7442 keep renew
     "$KIND_REPO/scripts/kind/enroll-check.sh" >&2 && ok "rehearsal: enroll-check (k2-host-1)" || bad "rehearsal: enroll-check"
     kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake scale statefulset k2-host --replicas=1 >&2
+    # As the owner's will be: one host (a leaving k2-host-1 could still be placed on).
+    kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake wait --for=delete pod/k2-host-1 --timeout=180s >&2 2>/dev/null || true
     "$KIND_REPO/scripts/kind/app-check.sh" --dist --fake --password-file="$FAKE_PW" >&2 && ok "rehearsal: app-check" || bad "rehearsal: app-check"
     "$KIND_REPO/scripts/kind/reconnect-check.sh" --dist --fake --password-file="$FAKE_PW" >&2 && ok "rehearsal: reconnect-check" || bad "rehearsal: reconnect-check"
     [ "$fails" = 0 ] || { echo; echo "STOPPED: the rehearsal failed; k2-kind-dist is untouched"; exit 1; }
+fi
+if [ "$mode" = rehearse ]; then
+    echo; echo "REHEARSED: ${RC_DAEMON} on k2-kind-dist-fake; k2-kind-dist is untouched (--go rolls it)"; exit 0
 fi
 
 echo "== 8. back up the controller's volume (inside the cluster)"
 docker tag "$RC_DAEMON" k2-daemon:dist
 backup=$("$KIND_REPO/scripts/kind/backup-controller.sh" --leave-down) || {
-    docker tag k2-daemon:dist-wave3 k2-daemon:dist
+    docker tag "k2-daemon:$ROLLBACK_TAG" k2-daemon:dist
     echo "STOPPED: the backup failed; k2-kind-dist was not rolled" >&2; exit 1; }
 echo "$backup" > "$OUT/backup-pvc"
 ok "backup PVC $backup"
@@ -291,8 +355,8 @@ kd get pvc data-k2-host-1 >/dev/null 2>&1 && had_host1=1
 rollback() {
     echo "== ROLLBACK"
     kd scale statefulset k2-host --replicas=1 >&2 || true
-    docker tag k2-daemon:dist-wave3 k2-daemon:dist
-    docker tag k2-agents:dist-wave3 k2-agents:dist
+    docker tag "k2-daemon:$ROLLBACK_TAG" k2-daemon:dist
+    docker tag "k2-agents:$ROLLBACK_TAG" k2-agents:dist
     "$KIND_REPO/scripts/kind/backup-controller.sh" --restore="$backup" >&2 || echo "FAIL the restore" >&2
     "$KIND_REPO/scripts/kind/up.sh" "${PREV_FLAGS[@]}" >&2 || echo "FAIL up.sh ${PREV_FLAGS[*]}" >&2
     if [ "$had_host1" = 0 ] && kd get pvc data-k2-host-1 >/dev/null 2>&1; then
@@ -321,19 +385,25 @@ kd exec k2-host-0 -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7
     && ok "k2-host-0 linked" || bad "k2-host-0 not linked"
 [ "$(kd exec k2-host-0 -c k2-host -- stat -c %a /var/lib/k2-host/.k2/host-key.pem 2>/dev/null)" = 600 ] \
     && ok "host key 0600 on its volume" || bad "host key missing or not 0600"
+for sts in k2-controller k2-host; do
+    id=$(kd get statefulset "$sts" -o jsonpath='{.spec.template.metadata.annotations.k2\.dev/image-id}')
+    rev=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$id" 2>/dev/null)
+    [ "$rev" = "$RC_COMMIT" ] && ok "$sts runs ${id:7:12}, labelled ${rev:0:9}" || bad "$sts runs ${id:7:12}, labelled '${rev:0:9}', not ${RC_COMMIT:0:9}"
+done
 [ "$(kd exec k2-host-0 -c k2-host -- printenv K2_WORK_ROOT 2>/dev/null)" = /var/lib/k2/work ] \
     && ok "k2-host-0: K2_WORK_ROOT=/var/lib/k2/work" || bad "k2-host-0: no K2_WORK_ROOT"
 "$KIND_REPO/scripts/kind/app-check.sh" --dist --password-file="$OWNER_PW" >&2 && ok "app-check --dist" || bad "app-check --dist"
 "$KIND_REPO/scripts/kind/reconnect-check.sh" --dist --restart-live --password-file="$OWNER_PW" >&2 && ok "reconnect-check --dist --restart-live" || bad "reconnect-check"
 python3 -I "$KIND_REPO/scripts/kind/owner-proof.py" --port "$PORT" --password-file "$OWNER_PW" \
-    --kubeconfig "$KIND_KUBECONFIG" --namespace "$NS" | tee "$OUT/owner-proof.txt" | sed 's/^/     /'
+    --kubeconfig "$KIND_KUBECONFIG" --namespace "$NS" --home-snapshot | tee "$OUT/owner-proof.txt" | sed 's/^/     /'
 grep -q "^PASS owner-proof" "$OUT/owner-proof.txt" && ok "the owner's path (owner-proof.py)" || bad "the owner's path (owner-proof.py)"
-[ "$fails" = 0 ] && second_host "$NS" "$PORT"
+# The second host only when the pool may have one (POOL_MAX=2).
+if [ "$POOL_MAX" = 2 ] && [ "$fails" = 0 ]; then second_host "$NS" "$PORT"; else note "POOL_MAX=1: no k2-host-1 on $NS"; fi
 c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/boot-status" || true)
 [ "$c" = 200 ] && ok "127.0.0.1:$PORT answers" || bad "127.0.0.1:$PORT -> ${c:-no answer}"
 echo
 if [ "$fails" = 0 ]; then
-    echo "ROLLED: k2-kind-dist on rc1 ${RC_COMMIT:0:9} (backup PVC $backup kept; rollback images :dist-wave3)"
+    echo "ROLLED: k2-kind-dist on $RC_DAEMON ${RC_COMMIT:0:9} (backup PVC $backup kept; rollback images :$ROLLBACK_TAG)"
 else
     echo "ROLL: $fails check(s) failed; rolling back"; rollback; exit 1
 fi
