@@ -368,6 +368,36 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### S10 on wave3 551942095 (K2-f.3): turn three is no longer redelivered
+
+Heavy chaos, with the same setup: `lab-runs/G2/2026-10-27T10-54-17Z` (seed
+4117) and `2026-10-27T11-24-54Z` (seed 7).
+
+- The old lab reported 10/10, with I1–I4 pass.
+- In every round, turn three ended `failed outcome unknown: host lost
+  mid-turn` and was never redelivered: 0 prompts on the new host, only
+  attempt 1 ever sent.
+- The failure is traced in the same millisecond as `ctl.move_decision`,
+  20–53 s after S10's own SIGKILL of the first host.
+- It doesn't depend on chaos: one round without chaos
+  (`2026-10-27T11-50-26Z`) fails S10 the same way.
+
+**For the owner, a behavior change.** S10 (P3 T2) expects the message of
+the turn lost with its host, never acked, to be delivered again on the new
+host. Its home is restored from turn two's snapshot, so the moved agent
+never saw it. K2-f.3 instead fails it, loudly (no I2 break), as `outcome
+unknown`. That's defensible if the lost turn may have had side effects,
+but it is a change: either S10's expectation or K2-f.3 should change.
+
+(a) the lab, fixed: under chaos, S10 accepted a loud failure after any
+chaos kill since its own kill.
+
+- Chaos now excuses a failure only when it hit the new host, its CLI or
+  the controller after the move and before the failure (from
+  `delivery.failed`).
+- Replayed on the traces: the K2-f.2 runs are unchanged (every loud
+  failure there followed such a hit), and the 10 K2-f.3 rounds are red.
+
 ### S10 heavy chaos on wave3 6ffcbb9da (K2-f.2): 9/10
 
 The setup was the same, on throwaway branch `k2-dist/lab-g2-k2f2-run`
