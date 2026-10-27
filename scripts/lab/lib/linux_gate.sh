@@ -45,6 +45,16 @@ repo=$1 common=$2 sha=$3 run=$4 name=$5
 image=k2-lab-gate:3
 target_vol=k2-lab-gate-target
 registry_vol=k2-lab-gate-cargo-registry
+# LAB_GATE_TARGET_DIR=<dir on the Mac>: the cargo target as a bind mount
+# from that dir instead of the named volume, so the build's disk is the
+# Mac's, not the shared VM's (coordinator, 2026-10-27, VM at 7.8G free).
+# The VM then holds only the image and the container layer; set
+# LAB_GATE_MIN_FREE_GB to match. The caller removes the dir afterwards.
+target_mount=$target_vol
+if [ -n "${LAB_GATE_TARGET_DIR:-}" ]; then
+    mkdir -p "$LAB_GATE_TARGET_DIR" || { echo "lab: can't create LAB_GATE_TARGET_DIR $LAB_GATE_TARGET_DIR"; exit 2; }
+    target_mount=$(cd "$LAB_GATE_TARGET_DIR" && pwd -P)
+fi
 lock="$HOME/.cache/k2-dist-docker.lock"
 # 2026-10-25: the Docker VM is 14 GB; the coordinator caps gate containers at
 # 10g, without the low-memory build (the wave-1 gate compiled k2-daemon so).
@@ -85,7 +95,7 @@ docker build -q -t "$image" -f "$repo/scripts/lab/docker/gate.Dockerfile" "$repo
     echo "docker: $(docker version --format '{{.Server.Version}}') ($(docker info --format '{{.NCPU}} CPU, {{.MemTotal}} bytes'))"
     echo "limits: --memory=$mem --memory-swap=$mem --cpus 3, $low_desc, K2_GATE_THREADS=${LAB_TEST_THREADS:-3}"
     echo "user: tests as k2gate (uid 10001, K2_GATE_TEST_USER); the root-only allowlisted runs as root"
-    echo "volumes: $target_vol (target), $registry_vol (cargo registry)"
+    echo "volumes: $target_mount (target), $registry_vol (cargo registry)"
     echo "batch: K2_GATE_BATCH=$batch (integration test targets per cargo step; 0 = one cargo test -p)"
     echo "min free: K2_GATE_MIN_FREE_GB=${LAB_GATE_MIN_FREE_GB:-20 (the default)}"
 } >"$run/topology/linux-gate.txt"
@@ -103,7 +113,7 @@ docker run --rm --name "$name" \
     -e GIT_DIR=/src/git -e GIT_WORK_TREE=/src/wt \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
     -v "$repo:/src/wt:ro" -v "$common:/src/git:ro" \
-    -v "$target_vol:/cache/target" -v "$registry_vol:/usr/local/cargo/registry" \
+    -v "$target_mount:/cache/target" -v "$registry_vol:/usr/local/cargo/registry" \
     -v "$run/parity/linux-gate-logs:/out/logs" \
     -e K2_GATE_TEST_USER=k2gate \
     "$image" \
