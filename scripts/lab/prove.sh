@@ -148,7 +148,7 @@ if [ "$GATE/$TOPOLOGY" = G4/kind ]; then
     trap 'rm -rf "$LAB_TMP"' EXIT
     trap 'say "interrupted"; exit 130' INT TERM
     run_set kind_work "$LAB_KIND_WORK" kind_pool "$LAB_KIND_POOL" kind_repo "$LAB_KIND_REPO" \
-        kind_daemon_image "$LAB_KIND_DAEMON_IMAGE" kind_drain_move "$LAB_KIND_DRAIN_MOVE" \
+        kind_daemon_image "$LAB_KIND_DAEMON_IMAGE" kind_drain_move "$LAB_KIND_DRAIN_MOVE" kind_fs_relay "$LAB_KIND_FS_RELAY" \
         kind_daemon_src "$LAB_KIND_DAEMON_SRC" kind_fake_agents "$LAB_KIND_FAKE_AGENTS" \
         kind_daemon_revision "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$LAB_KIND_DAEMON_IMAGE" 2>/dev/null)"
     NOTES+=("G4 on kind: the daemon is the image $LAB_KIND_DAEMON_IMAGE (revision in run.json), not this checkout's build; this tree gives the scenarios and the fake agent.")
