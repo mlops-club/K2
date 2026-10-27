@@ -882,7 +882,12 @@ def ask_chat(c, sc, cwd, a, text, n=None, tries=3):
                 return False, a
             a = (sid, csid, reused, sock, grid)
             if not wait_until(lambda: c.prompts_with(cwd, text), 5):
-                c.type(sock, text)  # the prompt never reached the agent
+                # The prompt never reached the agent. Typing again can hit a
+                # stream a second controller restart closed: reattach again
+                # (the next attempt) rather than wait for a reply to nothing.
+                if not c.type(sock, text) and attempt < tries:
+                    sc.log("typing %r after the reattach failed too (attempt %d): reattaching again" % (text, attempt))
+                    continue
             return bool(wait_until(lambda: c.replied(cwd, text), DEADLINE_S)), a
         sc.info["retries_after_cli_death"] = sc.info.get("retries_after_cli_death", 0) + 1
         sc.log("the CLI died before answering %r (attempt %d): the next need reopens it" % (text, attempt))
