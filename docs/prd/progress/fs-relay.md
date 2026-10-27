@@ -640,13 +640,10 @@ kn() { kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind-p4 "$@"; }
   --fake-src=<its tree> --fs-relay`. The `--fs-relay` switch is in
   `k2-dist/wave3` from 454463cd9. The controller and the hosts run the
   same image; never mix in a host built before fs-relay.
-- **A git identity on each host.** A fresh host has no `user.name` or
-  `user.email`, and the git panel's commit then fails with `Failed to get
-  signature`. K2 sets one only when it runs `git init` itself (adding a
-  folder that isn't a repository yet); `up.sh` makes `demo` a repository
-  first, so that never happens. Set one once per host; it lives in the
-  host's `HOME`, on its own data volume:
-  `kn exec k2-host-N -c k2-host -- sh -c 'git config --global user.name "…" && git config --global user.email "…"'`.
+- **A git identity on each host: nothing to do** (wave3 85cf7e2f6). A
+  host fills in a missing `user.name` and `user.email` at start, in its
+  `HOME` on its own data volume, so the git panel's commit works on a
+  fresh host. Before that fix it failed with `Failed to get signature`.
 - **Volumes: nothing new.** The P4 overlay already has what K5 is about:
   - no shared `k2-work`;
   - the controller has its own workspaces volume (`k2-work-controller` at
@@ -758,8 +755,7 @@ through the controller) is the controller's own, as without fs-relay.
 5. **The git panel works on the host.**
    - Add the workspace through the controller, as the app's Add Workspace
      does: `POST /cli/projects/add-from-path {path: /var/lib/k2/work/demo}`
-     (its `id` is the `projectId` a worktree needs). Give the host a git
-     identity (above).
+     (its `id` is the `projectId` a worktree needs).
    - `demo` is already a repository (`up.sh` made it), so no
      `POST /cli/git/init`. Then `info`, `changes`, `stage {filePath}`,
      `stage-all` and `commit {message: "k5"}` on `/var/lib/k2/work/demo`.
@@ -769,12 +765,9 @@ through the controller) is the controller's own, as without fs-relay.
      HEAD.
    - A linked worktree: `POST /cli/git/create-worktree {projectPath,
      branch, projectId}` makes `.worktrees/<branch>` on the host, and the
-     same steps work in it. **Known defect (2026-10-27, 454463cd9):** the
-     route answers `400 FOREIGN KEY constraint failed`, although git made
-     the worktree. `add-from-path` registers the project twice, on the
-     controller and on the host, with different ids; `create-worktree` is
-     relayed with the controller's id, and the host's database refuses the
-     worktree's record.
+     same steps work in it. (On 454463cd9 the route answered `400 FOREIGN
+     KEY constraint failed`: the project had two ids, the controller's and
+     the host's. Fixed in wave3 85cf7e2f6: one id end to end.)
 6. **Refusals.**
    - `read-file?path=/var/lib/k2/work/demo/../../../etc/passwd` → `400 bad_path`.
    - An extra key (`…&mode=x`) → `400 undeclared_key`.

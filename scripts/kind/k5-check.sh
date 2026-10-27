@@ -17,11 +17,11 @@
 #   5. git through the controller on the host: info, changes, stage,
 #      stage-all, commit; the host's `git log` and the controller's
 #      snapshot agree. Then the same in a linked worktree
-#      (create-worktree → .worktrees/<branch>). Before it, as the runbook
-#      says: the workspace added through the controller (add-from-path, as
-#      the app's Add Workspace; its project id names the worktree), and a
-#      git identity on the host if it has none (commit needs one; K2 sets
-#      one only when it runs `git init` itself);
+#      (create-worktree → .worktrees/<branch>). Before it, as the app does:
+#      the workspace added through the controller (add-from-path, as the
+#      app's Add Workspace; its project id names the worktree). The host
+#      fills in a missing git identity at start (wave3 85cf7e2f6); nothing
+#      is set by hand;
 #   6. refusals: `..` (400 bad_path), an undeclared key (400
 #      undeclared_key), a link out of the workspace (403
 #      outside_work_root);
@@ -154,14 +154,9 @@ git_flow() { # <repo path> <label> <file> <message>
 r=$(api POST /cli/projects/add-from-path "$(js path $WS)")
 PID=$(body "$r" | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(d.get("id") or (d.get("project") or {}).get("id") or "")' 2>/dev/null)
 check "$( [ "$(code "$r")" = 200 ] && [ -n "$PID" ] && echo 1)" "add-from-path $WS through the controller: project ${PID:-none} ($(code "$r") $(body "$r" | cut -c1-80))"
-# A git identity on the host (its HOME, on its own volume), only if it has none.
-gid=$(kn exec "$H" -c k2-host -- sh -c 'git config --global user.name >/dev/null && git config --global user.email >/dev/null && echo set')
-if [ "$gid" != set ]; then
-    kn exec "$H" -c k2-host -- sh -c 'git config --global user.name "K2 on $(hostname)" && git config --global user.email "k2@$(hostname).local"'
-    ok "$H had no git identity: set one in its HOME (the runbook's step)"
-else
-    ok "$H has a git identity"
-fi
+# The host's git identity: filled in at its start, never set here.
+gid=$(kn exec "$H" -c k2-host -- sh -c 'printf "%s <%s>" "$(git config --global user.name)" "$(git config --global user.email)"')
+check "$( [ "$gid" != " <>" ] && [ -n "$gid" ] && echo 1)" "$H has a git identity from its start: ${gid:-none}"
 if [ "$(kn exec "$H" -c k2-host -- sh -c "test -e $WS/.git && echo y")" != y ]; then
     r=$(api POST /cli/git/init "$(js path $WS)")
     check "$( [ "$(code "$r")" = 200 ] && echo 1)" "git init $WS through the controller ($(code "$r") $(body "$r" | cut -c1-80))"
