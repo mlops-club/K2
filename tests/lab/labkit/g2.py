@@ -1501,21 +1501,25 @@ def s10_attempt(c, sc, attempt):
                      (most <= 1 if free else most == 1) and all(e.get("host") == h2 for e in live)
                      and c.placed_host(pid, t_back) in (None, h2),
                      "at most %d live over 15 s; now %s" % (most, [(e.get("host"), e.get("pid")) for e in live]))
-            # And it goes on there. Under chaos its CLI may be gone: a need.
+            # And it goes on there.
             n4 = "s10 after %s" % uuid.uuid4().hex[:6]
-            t_n4 = now_iso()
-            st, raw, resp = c.msg(cwd, n4, wake=free)  # it is live there: queued, with a msg id (I2)
+            st, raw, resp = c.msg(cwd, n4, wake=False)  # it is live there: queued, with a msg id (I2)
             wait_until(lambda: c.replied(cwd, n4), DEADLINE_S)
             at4 = [p[0] for p in c.prompts_with(cwd, n4)]
             ok4 = c.replied(cwd, n4) and at4 == [h2]
             if free and not ok4:
-                # chaos killed its CLI (or h2) first: it may resume anywhere
-                # (a fresh need, S7), once; or the message fails, loudly.
+                # chaos killed its CLI (or h2) first: answered once, or a
+                # loud failure (the outbox row's, or the controller's own
+                # answer when nothing placed it then: success false and a
+                # reason). Never delivered-and-silent.
                 hit4 = s10_hits(h2, t_back)
-                state4 = c.wait_final(resp.get("msgId"), gone_wait_s()) if resp.get("msgId") else None
+                mid4 = resp.get("msgId")
+                state4 = c.wait_final(mid4, gone_wait_s()) if mid4 else (
+                    "failed" if resp.get("success") is False else None)
+                why4 = c.final_reason(mid4) if mid4 else resp.get("reason")
                 ok4 = bool(hit4) and ((c.replied(cwd, n4) and len(at4) == 1)
-                                      or (state4 == "failed" and bool(c.final_reason(resp.get("msgId"))) and len(at4) <= 1))
-                sc.info["n4_after_chaos"] = {"prompts": at4, "state": state4,
+                                      or (state4 == "failed" and bool(why4) and len(at4) <= 1))
+                sc.info["n4_after_chaos"] = {"prompts": at4, "state": state4, "reason": why4,
                                              "chaos": [(e["ts"], e.get("kind"), e.get("target")) for e in hit4]}
             sc.check("a message after the move lands on %s and is answered" % h2, ok4,
                      "HTTP %s; prompts %s" % (st, at4))
@@ -1525,8 +1529,10 @@ def s10_attempt(c, sc, attempt):
             sc.check("the agent moved once (one ctl.move_decision since the kill)", len(all_moves) == 1,
                      json.dumps([(e.get("ts"), (e.get("attrs") or {}).get("from")) for e in all_moves])[:300])
             if free:
+                # The hold: from the kill until h1 is back (the guard).
+                sc.info["hold"] = [t_kill, t_back]
                 sc.info["chaos_in_hold"] = [(e["ts"], e.get("kind"), e.get("target") or e.get("host"))
-                                            for e in s10_hits(None, t_kill)]
+                                            for e in s10_hits(None, t_kill) if e["ts"] <= t_back]
     finally:
         if s10_chaos():
             c.fleet.clear_guard()
