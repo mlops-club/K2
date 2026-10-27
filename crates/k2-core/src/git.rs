@@ -732,7 +732,8 @@ pub fn diff_file(repo_path: &str, file_path: &str) -> Result<Vec<DiffHunk>, Stri
     };
 
     let mut opts = DiffOptions::new();
-    opts.pathspec(&rel_path);
+    // One file, literally (fs-relay F2: `*` is a name here, not a glob).
+    opts.pathspec(crate::git_changes::pathspec_literal(&rel_path));
     opts.context_lines(3);
 
     let head_tree = repo
@@ -1309,14 +1310,14 @@ pub fn resolve_conflict(repo_path: &str, file_path: &str, resolution: &str) -> R
         "ours" => {
             // Checkout our version
             let mut cb = git2::build::CheckoutBuilder::new();
-            cb.path(file_path).force().use_ours(true);
+            cb.path(crate::git_changes::pathspec_literal(file_path)).force().use_ours(true);
             repo.checkout_index(None, Some(&mut cb))
                 .map_err(|e| format!("Failed to checkout 'ours': {e}"))?;
         }
         "theirs" => {
             // Checkout their version
             let mut cb = git2::build::CheckoutBuilder::new();
-            cb.path(file_path).force().use_theirs(true);
+            cb.path(crate::git_changes::pathspec_literal(file_path)).force().use_theirs(true);
             repo.checkout_index(None, Some(&mut cb))
                 .map_err(|e| format!("Failed to checkout 'theirs': {e}"))?;
         }
@@ -1409,6 +1410,49 @@ mod tests {
             ["worktree", "add", "--no-checkout", "-b", "b", "--", "/w/.worktrees/b", "HEAD"]
         );
         assert_eq!(worktree_add_args(false, None, "-p", "-x"), ["worktree", "add", "--", "-p", "-x"]);
+    }
+
+    /// fs-relay F2: a file path is one file, never a pathspec: resolving
+    /// `*` (or diffing it) touches no other conflicted or changed file.
+    #[test]
+    fn a_file_path_is_literal_not_a_pathspec() {
+        let dir = crate::test_env::unique_temp_path("git-literal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            out.status.success()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]));
+        std::fs::write(dir.join("a.md"), "base\n").unwrap();
+        std::fs::write(dir.join("b.md"), "base\n").unwrap();
+        assert!(git(&["add", "-A"]) && git(&["commit", "-qm", "base"]));
+        assert!(git(&["checkout", "-qb", "other"]));
+        std::fs::write(dir.join("a.md"), "theirs\n").unwrap();
+        std::fs::write(dir.join("b.md"), "theirs\n").unwrap();
+        assert!(git(&["commit", "-qam", "theirs"]));
+        assert!(git(&["checkout", "-q", "main"]));
+        std::fs::write(dir.join("a.md"), "ours\n").unwrap();
+        std::fs::write(dir.join("b.md"), "ours\n").unwrap();
+        assert!(git(&["commit", "-qam", "ours"]));
+        assert!(!git(&["merge", "-q", "other"]), "a conflict");
+        let repo = dir.to_string_lossy().into_owned();
+        let conflicted = || Repository::open(&dir).unwrap().index().unwrap().conflicts().unwrap().count();
+        assert_eq!(conflicted(), 2);
+        let _ = resolve_conflict(&repo, "*", "theirs");
+        assert_eq!(conflicted(), 2, "`*` resolved nothing");
+        assert!(std::fs::read_to_string(dir.join("b.md")).unwrap().contains("<<<<<<<"), "b.md untouched (its conflict markers)");
+        assert!(diff_file(&repo, "*").unwrap().is_empty(), "`*` diffs no file");
+        // The control: a real name resolves that file only.
+        resolve_conflict(&repo, "a.md", "theirs").unwrap();
+        assert_eq!(conflicted(), 1);
+        assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "theirs\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A branch's folder is one plain name under `.worktrees`.
