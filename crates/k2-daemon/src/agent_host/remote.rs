@@ -1408,6 +1408,7 @@ impl RemoteHost {
                 };
                 if !stale {
                     let mut cut = Vec::new();
+                    let mut at = None;
                     if let Some(p) = inner.placements.remove(&agent_id) {
                         self.forget(&agent_id, p.epoch);
                         self.note_ended(&mut inner, &agent_id);
@@ -1415,13 +1416,14 @@ impl RemoteHost {
                         // The host's counts say how its turn ended, whatever
                         // order its last hooks arrive in.
                         cut = self.take_cut(&mut inner, &agent_id, p.session_id.as_deref(), turn.as_ref());
+                        at = Some((p.host_id.clone(), p.epoch.0));
                     }
                     if let Some(s) = inner.sessions.remove(&agent_id) {
                         s.exited(exit_code);
                     }
                     log_debug!("[hosts] agent {agent_id} gone on host {host_id}");
                     drop(inner);
-                    self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Crashed);
+                    self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Crashed, at);
                 }
             }
             Frame::Refused { code, message } if code == crate::hosts::drain::DRAINING_CODE => {
@@ -1430,10 +1432,11 @@ impl RemoteHost {
                 k2_core::trace::emit(|| k2_core::trace::Event::new(crate::hosts::drain::events::CTL_HOST_DRAINING).attr("host", host_id));
             }
             Frame::Released { req: 0, agent_id, .. } => {
+                let at = inner.placements.get(&agent_id).filter(|p| p.host_id == host_id).map(|p| (p.host_id.clone(), p.epoch.0));
                 let cut = self.released_by_drain(&mut inner, host_id, &agent_id);
                 drop(inner);
                 // K2-f: released at the drain's deadline mid-turn.
-                self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Closed);
+                self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Closed, at);
             }
             Frame::Released { agent_id, epoch, .. } => {
                 log_debug!("[hosts] host {host_id} released agent {agent_id} at epoch {epoch}");
@@ -1698,7 +1701,7 @@ impl RemoteHost {
                         cut = self.take_cut(&mut inner, &agent_id, None, None);
                     }
                     drop(inner);
-                    self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Closed);
+                    self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Closed, Some((host_id.clone(), epoch.0)));
                 }
                 (status, body)
             }
@@ -2523,12 +2526,15 @@ impl RemoteHost {
 
     /// Fail `cut` (from [`Self::take_cut`]) loudly. Call with `inner`
     /// released: the outbox takes its own lock.
-    fn report_cut(&self, agent_id: &str, cut: &[String], how: crate::delivery_drain::Cut) {
+    /// `at`: the cut placement's host and epoch (K2-f.3 review #4: only the
+    /// messages that placement had fail; one resent elsewhere meanwhile
+    /// stays as it is).
+    fn report_cut(&self, agent_id: &str, cut: &[String], how: crate::delivery_drain::Cut, at: Option<(String, u64)>) {
         if cut.is_empty() {
             return;
         }
         log_debug!("[hosts] {agent_id}'s turn was cut ({how:?}): {} message(s) delivered to it never answered", cut.len());
-        crate::delivery_drain::turn_cut(self, agent_id, cut, how);
+        crate::delivery_drain::turn_cut(self, agent_id, cut, how, at.as_ref().map(|(h, e)| (h.as_str(), *e)));
     }
 
     /// `agent_id`'s session ended now: its CLI is gone and nothing holds a
@@ -2667,7 +2673,7 @@ impl RemoteHost {
             self.forget(&p.agent_id, p.epoch);
             // K2-f: its turn there is lost with its host; the copy that
             // resumes elsewhere starts a new one.
-            cuts.push((p.agent_id.clone(), self.take_cut(&mut inner, &p.agent_id, p.session_id.as_deref(), None)));
+            cuts.push((p.agent_id.clone(), self.take_cut(&mut inner, &p.agent_id, p.session_id.as_deref(), None), (p.host_id.clone(), p.epoch.0)));
             let Some(s) = inner.sessions.remove(&p.agent_id) else {
                 // Reserved, but its spawn never answered: nothing to resume.
                 continue;
@@ -2699,8 +2705,8 @@ impl RemoteHost {
             moved.push(p.agent_id);
         }
         drop(inner);
-        for (agent, cut) in &cuts {
-            self.report_cut(agent, cut, crate::delivery_drain::Cut::HostLost);
+        for (agent, cut, at) in cuts {
+            self.report_cut(&agent, &cut, crate::delivery_drain::Cut::HostLost, Some(at));
         }
         moved.sort();
         moved
@@ -2861,7 +2867,7 @@ impl RemoteHost {
                     }
                     _ => self.take_cut(&mut inner, &agent, pane.as_deref(), host),
                 };
-                cuts.push((agent.clone(), cut, how));
+                cuts.push((agent.clone(), cut, how, (host_id.to_string(), epoch.0)));
                 out.push((agent, AdoptDecision::Gone));
             }
             // Reach the host after the table is settled.
@@ -2876,8 +2882,8 @@ impl RemoteHost {
                 }
             }
         }
-        for (agent, cut, how) in &cuts {
-            self.report_cut(agent, cut, *how);
+        for (agent, cut, how, at) in cuts {
+            self.report_cut(&agent, &cut, how, Some(at));
         }
         for (agent, d) in &out {
             if matches!(d, AdoptDecision::Adopted) {
@@ -3271,7 +3277,8 @@ impl AgentHost for RemoteHost {
         };
         // K2-d: closed mid-turn, its messages since the last turn end are
         // not answered: they fail loudly instead of reading as delivered.
-        self.report_cut(agent_id, &cut, crate::delivery_drain::Cut::Closed);
+        let at = placement.as_ref().map(|p| (p.host_id.clone(), p.epoch.0));
+        self.report_cut(agent_id, &cut, crate::delivery_drain::Cut::Closed, at);
         let placement = placement?;
         self.forget(agent_id, placement.epoch);
         let body = json!({"agent_name": agent_id, "force": true});

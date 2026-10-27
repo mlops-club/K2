@@ -230,3 +230,68 @@ fn an_interrupted_message_ends_failed_and_a_late_ack_changes_nothing() {
     }
     assert_eq!(outbox::get(&c, Hop::Down, "m_queued").unwrap().unwrap().state, State::Queued);
 }
+
+/// K2-f.3 review #4: a cut fails only what the cut placement had. A row
+/// resent to host-2 (and acked there) stays delivered when host-1's cut
+/// comes in late; a row host-1's placement had fails; an older placement
+/// on the same host is not this one; a row with no host kept (from before,
+/// or the controller's own) fails as before.
+#[test]
+fn a_cut_fails_only_the_rows_its_own_placement_had() {
+    let c = db();
+    let p = POLICY;
+    for id in ["moved", "own", "old-epoch", "legacy"] {
+        outbox::enqueue(&c, Hop::Down, &msg(id, "agent:a", "bob"), 1).unwrap();
+    }
+    // Sent to host-1 (epoch 3), then resent to host-2 (epoch 9), acked there.
+    outbox::mark_sent_to(&c, Hop::Down, "moved", 2, &p, "host-1", 3).unwrap();
+    outbox::mark_sent_to(&c, Hop::Down, "moved", 3, &p, "host-2", 9).unwrap();
+    assert!(outbox::mark_delivered_by(&c, Hop::Down, "moved", 4, "host-2").unwrap());
+    // Sent to and acked by host-1's placement 3.
+    outbox::mark_sent_to(&c, Hop::Down, "own", 2, &p, "host-1", 3).unwrap();
+    assert!(outbox::mark_delivered_by(&c, Hop::Down, "own", 3, "host-1").unwrap());
+    // host-1, an older placement (epoch 2).
+    outbox::mark_sent_to(&c, Hop::Down, "old-epoch", 2, &p, "host-1", 2).unwrap();
+    assert!(outbox::mark_delivered_by(&c, Hop::Down, "old-epoch", 3, "host-1").unwrap());
+    // No host kept.
+    outbox::mark_sent(&c, Hop::Down, "legacy", 2, &p).unwrap();
+    assert!(outbox::mark_delivered(&c, Hop::Down, "legacy", 3).unwrap());
+    let row = |id: &str| outbox::get(&c, Hop::Down, id).unwrap().unwrap();
+    assert_eq!((row("moved").host.as_deref(), row("moved").epoch), (Some("host-2"), Some(9)));
+    let cut = |id: &str| outbox::mark_interrupted_at(&c, Hop::Down, id, "interrupted", 5, Some(("host-1", 3))).unwrap();
+    assert!(!cut("moved"), "resent to host-2 and acked there: not host-1's");
+    assert!(!cut("old-epoch"), "an older placement on host-1: not this one");
+    assert!(cut("own"), "host-1's placement had it: failed");
+    assert!(cut("legacy"), "no host kept: as before");
+    assert_eq!(row("moved").state, State::Delivered);
+    assert_eq!(row("old-epoch").state, State::Delivered);
+    assert_eq!((row("own").state, row("legacy").state), (State::Failed, State::Failed));
+    // A cut with no placement named: any, as before.
+    assert!(outbox::mark_interrupted(&c, Hop::Down, "moved", "interrupted", 6).unwrap());
+    // K2-f.3: a still `sent` row, sent to the cut placement, fails too.
+    outbox::enqueue(&c, Hop::Down, &msg("inflight", "agent:a", "bob"), 7).unwrap();
+    outbox::mark_sent_to(&c, Hop::Down, "inflight", 7, &p, "host-1", 3).unwrap();
+    assert!(cut("inflight"));
+}
+
+/// K2-f.3 review #4: an outbox from before keeps its rows: the host and
+/// epoch columns are added, empty (as before for those rows).
+#[test]
+fn an_older_outbox_gets_the_host_and_epoch_columns() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE delivery_outbox (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, hop TEXT NOT NULL, msg_id TEXT NOT NULL, sender TEXT NOT NULL,
+            recipient TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            next_at_ms INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, reason TEXT,
+            UNIQUE (hop, msg_id));
+         INSERT INTO delivery_outbox (hop, msg_id, sender, recipient, body, state, created_ms, updated_ms)
+            VALUES ('down', 'old', 'agent:a', 'bob', '{}', 'delivered', 1, 1);",
+    )
+    .unwrap();
+    ensure_schema(&c).unwrap();
+    ensure_schema(&c).unwrap();
+    let r = outbox::get(&c, Hop::Down, "old").unwrap().unwrap();
+    assert_eq!((r.state, r.host, r.epoch), (State::Delivered, None, None));
+    assert!(outbox::mark_interrupted_at(&c, Hop::Down, "old", "interrupted", 2, Some(("host-1", 3))).unwrap(), "no host kept: as before");
+}
