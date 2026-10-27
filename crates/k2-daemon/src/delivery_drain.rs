@@ -1526,8 +1526,10 @@ fn host_side() -> &'static Arc<HostSide> {
 /// `link::serve_once`'s hook: the link to the controller is up.
 pub fn host_linked(tx: mpsc::UnboundedSender<Frame>) {
     static STARTED: OnceLock<()> = OnceLock::new();
-    // P3 T2: and each turn's end saves the agent's home.
+    // P3 T2: and each turn's end saves the agent's home; a save that
+    // failed while the controller was away is retried now.
     crate::hosts::turn_save::start();
+    crate::hosts::turn_save::relinked();
     let h = host_side();
     let report = Arc::clone(h);
     tokio::task::spawn_blocking(move || report.linked(tx));
