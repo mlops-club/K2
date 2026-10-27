@@ -258,7 +258,7 @@ PY
         "PENDING the fs/git relay (dist-link, after rc1): /cli/fs, /cli/git, project create/add and App deploy-from-folder use the controller's own disk; home-move-check.sh shows the gap (docs/prd/progress/kind-p4.md on k2-dist/kind-p4)"
     if [ "$LAB_KIND_DRAIN_MOVE" = 1 ]; then
         kind_check K6 "The pool scales a host down and its agents continue on the others" "$RUN/topology/K6-pool-accept.log" \
-            env K2_P4_NS="$LAB_KIND_POOL_NS" KUBECONFIG=/dev/null "$LAB_KIND_DAEMON_SRC/scripts/lab/topology/kind-pool-accept.sh" \
+            env K2_P4_NS="$LAB_KIND_POOL_NS" K2_P4_PORT="${LAB_KIND_POOL_PORT:-17462}" KUBECONFIG=/dev/null "$LAB_KIND_DAEMON_SRC/scripts/lab/topology/kind-pool-accept.sh" \
             "$LAB_KIND_DAEMON_IMAGE" "$LAB_KIND_FAKE_AGENTS"
     else
         kind_result K6 "The pool scales a host down and its agents continue on the others" not_run \
