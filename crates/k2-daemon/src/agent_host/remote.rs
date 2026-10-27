@@ -194,6 +194,9 @@ struct Inner {
     /// else when it unlinked (an away host is forgotten after `away_forget`
     /// unless something else still names it).
     seen_hosts: HashMap<String, Option<Instant>>,
+    /// P3 T3: why and since when (Unix ms, last heard) each host that
+    /// linked to this process is away; removed when it links again.
+    away: HashMap<String, Away>,
     /// The host that last ran each agent: where its home and conversation
     /// are (each host has its own). A new placement goes there while it is
     /// linked (the provisioner's last host, `reserve_for`). Kept after the agent's
@@ -834,6 +837,9 @@ pub struct RemoteHost {
     enrolled: Mutex<BTreeSet<String>>,
     /// P3: how long a host seen only on a link stays away after unlinking.
     away_forget: Duration,
+    /// P3 T3: how long a linked host may be silent before it is away
+    /// (`K2_HOST_AWAY_AFTER`; the hub's read deadline).
+    away_after: Duration,
     /// P4: bumped on every host hello; a need that got `Wait` (a scale-up)
     /// waits on it, then retries.
     hellos: (std::sync::Mutex<u64>, std::sync::Condvar),
@@ -863,6 +869,43 @@ pub struct RemoteHost {
     /// Each: (host, last touched in Unix ms, the agent).
     relay_spaces: Mutex<HashMap<PathBuf, (String, i64, String)>>,
     relay_ttl: Duration,
+}
+
+/// P3 T3: a host this process saw go away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Away {
+    /// When it was last heard from, in Unix ms.
+    pub since_ms: i64,
+    pub why: crate::hosts::presence::Why,
+}
+
+/// P3 T3: a message's recipient is placed (or waits to resume) on a host
+/// that is away: the outbox holds it until that host is back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Held {
+    /// The placement id the message waits for.
+    pub agent: String,
+    pub host: String,
+    /// When the host was last heard from (Unix ms), if this process saw it go.
+    #[serde(rename = "awaySinceMs", default, skip_serializing_if = "Option::is_none")]
+    pub away_since_ms: Option<i64>,
+    /// Why it is away (`silent for 92 s`, `its link closed`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is paused on host {}, which is away", self.agent, self.host)?;
+        if let Some(why) = &self.why {
+            write!(f, " ({why})")?;
+        }
+        if let Some(ms) = self.away_since_ms {
+            let since = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string());
+            write!(f, " since {}", since.unwrap_or_else(|| ms.to_string()))?;
+        }
+        f.write_str("; the message is delivered when it is back")
+    }
 }
 
 /// A scale-down release whose home save hasn't been seen in the store.
@@ -919,6 +962,7 @@ impl RemoteHost {
             policy: Arc::new(PolicyStore::in_memory()),
             enrolled: Mutex::default(),
             away_forget: AWAY_FORGET,
+            away_after: crate::hosts::presence::DEFAULT_AWAY_AFTER,
             hellos: Default::default(),
             hello_waiters: Default::default(),
             host_wait: HOST_WAIT,
@@ -961,6 +1005,16 @@ impl RemoteHost {
 
     pub fn with_link_grace(self, link_grace: Duration) -> Self {
         Self { link_grace, ..self }
+    }
+
+    /// How long a linked host may be silent before the hub closes its link
+    /// and it is away.
+    pub fn with_away_after(self, away_after: Duration) -> Self {
+        Self { away_after, ..self }
+    }
+
+    pub fn away_after(&self) -> Duration {
+        self.away_after
     }
 
     /// How long a host that only linked to this process stays away after it
@@ -1152,6 +1206,7 @@ impl RemoteHost {
         let old = {
             let mut inner = self.inner.lock();
             inner.seen_hosts.insert(host_id.clone(), None);
+            inner.away.remove(&host_id);
             inner.links.insert(
                 host_id.clone(),
                 Link { conn, host_name: host_name.to_string(), protocol, tx, pending: HashMap::new(), streams: HashMap::new() },
@@ -1182,13 +1237,34 @@ impl RemoteHost {
     /// placements (the agents may still run on the host; re-adopting them
     /// is S9). A stale `conn` (already replaced) changes nothing.
     pub fn disconnect(&self, host_id: &str, conn: u64) {
+        self.disconnect_away(host_id, conn, Instant::now(), crate::hosts::presence::Why::Unlinked);
+    }
+
+    /// [`Self::disconnect`] for a host last heard from at `since`, away for
+    /// `why` (P3 T3: the hub's read deadline closes a silent link). Its
+    /// away time, and so `K2_HOST_MOVE_AFTER`, counts from `since`.
+    pub fn disconnect_away(&self, host_id: &str, conn: u64, since: Instant, why: crate::hosts::presence::Why) {
         let link = {
             let mut inner = self.inner.lock();
             if inner.links.get(host_id).map(|l| l.conn) != Some(conn) {
                 return;
             }
             let protocol = inner.links.get(host_id).map(|l| l.protocol).unwrap_or(1);
-            inner.seen_hosts.insert(host_id.to_string(), Some(Instant::now()));
+            inner.seen_hosts.insert(host_id.to_string(), Some(since));
+            let since_ms = k2_core::delivery::now_ms() - Instant::now().saturating_duration_since(since).as_millis() as i64;
+            inner.away.insert(host_id.to_string(), Away { since_ms, why: why.clone() });
+            let paused = inner.placements.values().filter(|p| p.host_id == host_id).count();
+            log_debug!("[hosts] host {host_id} is away ({why}); {paused} agent(s) paused");
+            k2_core::trace::emit(|| {
+                k2_core::trace::Event::new(crate::hosts::presence::events::CTL_HOST_AWAY)
+                    .attr("host", host_id)
+                    .attr("why", why.kind())
+                    .attr("silent_ms", match &why {
+                        crate::hosts::presence::Why::Silent(d) => d.as_millis() as u64,
+                        crate::hosts::presence::Why::Unlinked => 0,
+                    })
+                    .attr("paused", paused)
+            });
             if protocol >= 2 {
                 // W3: the host's agents may still run. Keep every placement,
                 // marked lost, until the host links again and resumes them
@@ -2484,6 +2560,40 @@ impl RemoteHost {
 
     /// True while `agent_id` was drained and is not placed again yet: its
     /// messages wait in the outbox.
+    /// P3 T3: is the first of `ids` that is placed (or waits to resume on
+    /// its own host, or sleeps pinned to a host) on a host that is away?
+    /// Then its messages are held for that host, a `--wake` included. A
+    /// moved agent's row (any host) is not: it resumes on the next one.
+    pub fn held_on(&self, ids: &[String]) -> Option<Held> {
+        let found = {
+            let inner = self.inner.lock();
+            ids.iter().find_map(|a| {
+                if let Some(p) = inner.placements.get(a) {
+                    return Some((p.agent_id.clone(), p.host_id.clone()));
+                }
+                let r = inner.resume.get(a)?;
+                (r.host_id != crate::hosts::drain::ANY_HOST).then(|| (r.agent_id.clone(), r.host_id.clone()))
+            })
+        };
+        // Asleep: only a pinned agent waits for its host (agent_placement
+        // has its own connection; never read under `inner`).
+        let (agent, host) = found.or_else(|| self.pinned_to(ids))?;
+        let inner = self.inner.lock();
+        if inner.links.contains_key(&host) {
+            return None;
+        }
+        let a = inner.away.get(&host);
+        Some(Held { agent, host, away_since_ms: a.map(|a| a.since_ms), why: a.map(|a| a.why.to_string()) })
+    }
+
+    /// The first of `ids` pinned to a host, and that host (`agent_placement`).
+    pub fn pinned_to(&self, ids: &[String]) -> Option<(String, String)> {
+        ids.iter().find_map(|a| match self.policy.get(a)?.mode {
+            crate::provisioner::Mode::Pinned { host } => Some((a.clone(), host)),
+            crate::provisioner::Mode::Portable => None,
+        })
+    }
+
     pub fn awaiting_resume(&self, agent_id: &str) -> bool {
         self.inner.lock().resume.contains_key(agent_id)
     }
@@ -2878,9 +2988,34 @@ impl RemoteHost {
         lost.dedup();
         // P3: known hosts whose link is down (placement skips them).
         let away: Vec<String> = self.host_views(&inner).into_iter().filter(|v| v.away).map(|v| v.host_id).collect();
+        // P3 T3: since when and why, for those this process saw go.
+        let away_hosts: Vec<Value> = away
+            .iter()
+            .map(|h| {
+                let a = inner.away.get(h);
+                json!({"host_id": h, "since_ms": a.map(|a| a.since_ms), "why": a.map(|a| a.why.to_string())})
+            })
+            .collect();
+        // The agents of an away host: kept, waiting for it (W3).
+        let mut paused: Vec<Value> = inner
+            .placements
+            .values()
+            .filter(|p| !inner.links.contains_key(&p.host_id))
+            .map(|p| json!({"agent": p.agent_id, "host": p.host_id, "epoch": p.epoch.0}))
+            .collect();
+        paused.sort_by(|a, b| a["agent"].as_str().cmp(&b["agent"].as_str()));
         let mut resuming: Vec<&String> = inner.resume.keys().collect();
         resuming.sort();
-        json!({"role": "controller", "provisioner": self.provisioner.kind(), "hosts": hosts, "lost": lost, "away": away, "resuming": resuming})
+        json!({
+            "role": "controller",
+            "provisioner": self.provisioner.kind(),
+            "hosts": hosts,
+            "lost": lost,
+            "away": away,
+            "away_hosts": away_hosts,
+            "paused": paused,
+            "resuming": resuming,
+        })
     }
 }
 
@@ -3345,7 +3480,12 @@ pub fn global() -> &'static RemoteHost {
                 HOST_WAIT
             }),
         };
-        host.with_placement(provisioner, Arc::new(policy)).with_away_forget(forget).with_host_wait(wait).with_link_grace(grace)
+        let away_after = crate::hosts::presence::away_after(|k| std::env::var(k).ok());
+        host.with_placement(provisioner, Arc::new(policy))
+            .with_away_forget(forget)
+            .with_away_after(away_after)
+            .with_host_wait(wait)
+            .with_link_grace(grace)
     });
     RESTORED.call_once(|| {
         r.restore();

@@ -315,6 +315,38 @@ fn the_receiving_side_dedupes_retries_and_rejects_and_remembers_across_a_restart
     std::fs::remove_file(&path).unwrap();
 }
 
+/// P3 T3: the controller accepts a message for an agent whose host is
+/// away and says so in its ack; the waiting `k2 msg` hears `held`. A
+/// reason it can't read on `delivered` is just accepted (older controllers).
+#[test]
+fn a_held_ack_reaches_the_waiting_sender() {
+    let (h, _) = counting_host(mem_db());
+    let held = crate::agent_host::remote::Held {
+        agent: "notes".into(),
+        host: "eric-mbp".into(),
+        away_since_ms: Some(1_000),
+        why: Some("silent for 92 s".into()),
+    };
+    let id = h.enqueue_up("agent:alice", "notes", json!({"kind": "msg", "text": "1"}), 0).unwrap();
+    let waiter = h.watch(&id);
+    h.on_ack(&id, DeliverStatus::Delivered, Some(&serde_json::to_string(&held).unwrap()), 1);
+    assert_eq!(waiter.recv().unwrap(), Accepted::Held(held.clone()));
+    assert_eq!(outbox::get(&h.db.lock(), Hop::Up, &id).unwrap().unwrap().state, State::Delivered, "the up hop is done");
+
+    let id = h.enqueue_up("agent:alice", "notes", json!({"kind": "msg", "text": "2"}), 2).unwrap();
+    let waiter = h.watch(&id);
+    h.on_ack(&id, DeliverStatus::Delivered, Some("something newer"), 3);
+    assert_eq!(waiter.recv().unwrap(), Accepted::Accepted);
+
+    // What `k2 msg` prints.
+    let r = crate::workspace_msg::MsgResponse::from_outbox(Ok(Sent { msg_id: "m_1".into(), state: "accepted", reason: None, held: Some(held) }));
+    assert!(r.success);
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["held"], json!({"agent": "notes", "host": "eric-mbp", "awaySinceMs": 1000, "why": "silent for 92 s"}));
+    let hint = v["hint"].as_str().unwrap();
+    assert!(hint.starts_with("held: notes is paused on host eric-mbp, which is away (silent for 92 s) since 1970-01-01T00:00:01Z"), "{hint}");
+}
+
 #[test]
 fn the_up_hop_resends_until_acked_and_survives_a_link_drop() {
     let (h, _) = counting_host(mem_db());
