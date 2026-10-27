@@ -320,6 +320,8 @@ impl Ptyd {
     }
 
     /// A live owner connection, connecting (and launching ptyd) if needed.
+    /// In sidecar mode ([`sidecar`]) ptyd is another container's: only
+    /// connect, never launch.
     pub fn owner(&self) -> Result<Arc<Owner>, String> {
         let mut g = lock(&self.owner);
         if let Some(o) = g.as_ref() {
@@ -329,6 +331,7 @@ impl Ptyd {
         }
         let o = match Owner::connect(&self.paths, client_version()) {
             Ok(o) => o,
+            Err(first) if sidecar() => return Err(format!("sidecar:{first}")),
             Err(first) => {
                 let exe = run_location(&self.paths.home)?;
                 k2_ptyd::launch::spawn_detached(&exe, &self.paths.home, &[]).map_err(|e| {
@@ -353,7 +356,11 @@ impl Ptyd {
         if !self.swept.swap(true, Ordering::AcqRel) {
             sweep_leftovers(&o);
             // P3: prune old versioned copies, keeping the current one and
-            // the running ptyd's image.
+            // the running ptyd's image. A sidecar's ptyd runs its image's
+            // binary: there are none.
+            if sidecar() {
+                return Ok(o);
+            }
             let mut keep = Vec::new();
             if let Ok(cur) = run_location(&self.paths.home) {
                 keep.push(cur);
@@ -380,6 +387,18 @@ impl Ptyd {
     pub fn ptyd_pid(&self) -> Option<i32> {
         std::fs::read_to_string(&self.paths.lock).ok()?.trim().parse().ok()
     }
+}
+
+/// `K2_PTYD_SIDECAR=1|on|true`: ptyd runs beside the daemon as its own
+/// process, outside the daemon's lifetime (a Kubernetes sidecar container
+/// sharing the K2 home), so a restarted daemon container finds its agents
+/// still running and adopts them (S3). The daemon then only connects to
+/// it: it never launches or places a copy of ptyd.
+pub fn sidecar() -> bool {
+    matches!(
+        std::env::var("K2_PTYD_SIDECAR").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
 }
 
 /// File name of the ptyd binary beside the daemon. Pinned against

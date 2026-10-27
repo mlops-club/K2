@@ -83,8 +83,38 @@ pub fn install(rt: tokio::runtime::Handle) {
         return;
     }
     // The first owner connection runs the adopter (and ends the rest).
-    if let Err(e) = client::global().owner() {
-        log_debug!("[hosts/adopt] ptyd unavailable at boot ({e}): nothing to adopt");
+    // A sidecar ptyd (`K2_PTYD_SIDECAR`) may start after this container:
+    // wait for it, so the first hello resumes what it kept instead of the
+    // controller cutting those turns as gone.
+    let wait = if client::sidecar() { sidecar_wait(|k| std::env::var(k).ok()) } else { std::time::Duration::ZERO };
+    let start = std::time::Instant::now();
+    loop {
+        match client::global().owner() {
+            Ok(_) => return,
+            Err(e) if start.elapsed() >= wait => {
+                log_debug!("[hosts/adopt] ptyd unavailable at boot ({e}): nothing to adopt");
+                return;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(250)),
+        }
+    }
+}
+
+/// How long a host waits at boot for its sidecar ptyd: `K2_PTYD_SIDECAR_WAIT`
+/// seconds, default 60.
+pub const SIDECAR_WAIT_VAR: &str = "K2_PTYD_SIDECAR_WAIT";
+pub const DEFAULT_SIDECAR_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub fn sidecar_wait(get: impl Fn(&str) -> Option<String>) -> std::time::Duration {
+    match get(SIDECAR_WAIT_VAR).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        None => DEFAULT_SIDECAR_WAIT,
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => std::time::Duration::from_secs(n),
+            Err(_) => {
+                k2_core::log_debug!("[hosts/adopt] {SIDECAR_WAIT_VAR}={v:?} is not a number of seconds; using {}", DEFAULT_SIDECAR_WAIT.as_secs());
+                DEFAULT_SIDECAR_WAIT
+            }
+        },
     }
 }
 
@@ -168,6 +198,14 @@ mod tests {
     /// S3: only a running session a controller placed is adopted; an
     /// exited one, one with no placement (an old daemon's, a non-host
     /// role's), or a malformed one is ended as before.
+    #[test]
+    fn the_sidecar_wait_comes_from_the_env() {
+        let env = |v: Option<&str>| sidecar_wait(move |_| v.map(str::to_string));
+        assert_eq!(env(None), DEFAULT_SIDECAR_WAIT);
+        assert_eq!(env(Some("5")), std::time::Duration::from_secs(5));
+        assert_eq!(env(Some("soon")), DEFAULT_SIDECAR_WAIT);
+    }
+
     #[test]
     fn only_placed_running_sessions_are_adopted() {
         let placed = json!({ "k2_host": { "agent_id": "bob", "epoch": 7 } });
