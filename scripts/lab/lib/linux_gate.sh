@@ -81,7 +81,9 @@ fi
 
 mkdir -p "$HOME/.cache"
 until mkdir "$lock" 2>/dev/null; do sleep 20; done
-trap 'rmdir "$lock"' EXIT
+# The owner file says who holds the lock (an ownerless lock looks stale).
+echo "$name (lab-g2 Linux gate on ${sha:0:12}, pid $$, from $(date -u +%H:%M:%SZ))" > "$lock/owner"
+trap 'rm -f "$lock/owner"; rmdir "$lock"' EXIT
 trap 'exit 143' INT TERM
 echo "lab: holding the shared Docker lock ($lock) from $(date -u +%H:%M:%SZ)"
 
