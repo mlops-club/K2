@@ -1027,7 +1027,7 @@ fn resumed(agent: &str, session: &str, epoch: u64, turn: Option<super::proto::Tu
 }
 
 fn ended(agent: &str, session: &str, epoch: u64, turn: Option<super::proto::TurnCounts>) -> super::proto::EndedPlacement {
-    super::proto::EndedPlacement { agent_id: agent.into(), session_id: session.into(), epoch, turn }
+    super::proto::EndedPlacement { agent_id: agent.into(), session_id: session.into(), epoch, hooked: turn.is_some(), turn: turn.unwrap_or_default() }
 }
 
 async fn back(url: &str, host: &str, resume: Vec<super::proto::ResumePlacement>, ended: Vec<super::proto::EndedPlacement>) -> Ws {
@@ -1402,11 +1402,12 @@ async fn a_turn_survives_a_controller_restart_and_a_crash_after_it_fails_the_mes
     std::fs::remove_file(&outbox_db).unwrap();
 }
 
-/// K2-f.3 #6: a turn row written by K2-f.1 (`current_json`) or K2-f.2
-/// (`notes_json`) is read into this one: its messages in the running turn
-/// are the turn's, the rest are dropped.
+/// K2-f.4 #3: a turn row written by K2-f.1 (`current_json`) or K2-f.2
+/// (`notes_json`) keeps its counts and running state; its lists were the
+/// controller's estimates, not its host's evidence, and are dropped: a
+/// crash after the upgrade fails none of those messages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn older_turn_rows_are_migrated() {
+async fn older_turn_rows_keep_their_counts_and_drop_their_lists() {
     let placements = k2_core::test_env::unique_temp_path("k2f3-migrate.db");
     {
         let _store = PlacementStore::open_file(&placements).unwrap();
@@ -1439,12 +1440,10 @@ async fn older_turn_rows_are_migrated() {
     }
     let url = serve(remote).await;
     let mut a = back(&url, "host-a", vec![resumed("ari", &sid(1), 41, None), resumed("bev", &sid(2), 42, None)], vec![]).await;
+    until("both adopted", || remote.in_turn("ari") && remote.in_turn("bev")).await;
     gone(&mut a, remote, "ari").await;
     gone(&mut a, remote, "bev").await;
-    for id in ["m_current", "m_in_turn"] {
-        assert!(interrupted(&outbox, id).await.starts_with("interrupted: "), "{id}");
-    }
-    for id in ["m_pending", "m_next", "m_old"] {
+    for id in ["m_pending", "m_current", "m_in_turn", "m_next", "m_old"] {
         stays_delivered(&outbox, id).await;
     }
     std::fs::remove_file(&placements).unwrap();
@@ -1634,4 +1633,66 @@ async fn a_cut_before_the_ack_keeps_its_result_when_the_ack_comes_late() {
     }
     let row = outbox.get(&m).unwrap();
     assert_eq!((row.state, row.reason.as_deref(), row.attempts), (State::Failed, Some(why), 1), "the cut's result stands; not resent");
+}
+
+/// A host lost hard mid-turn (PRD: the turn in progress is lost). The
+/// message whose prompt that turn had (tied by the host) ends `outcome
+/// unknown` at the move and isn't delivered again. Every other message
+/// reaches the agent's new placement exactly once: one sent but never
+/// acked nor tied (it died in flight), and one queued while the host was
+/// away. One acked but never tied (folded) stays delivered: it is not sent
+/// again either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_a_hard_loss_only_untyped_messages_reach_the_new_placement_once() {
+    use k2_core::delivery::State;
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-1").await;
+    spawn_on(remote, &mut a, "nia", "/w/nia", &sid(1)).await;
+    let m = delivered(&outbox, &mut a, "nia", "tied to the turn").await;
+    let n = delivered(&outbox, &mut a, "nia", "acked, folded").await;
+    prompt_with(remote, &mut a, "nia", &sid(1), running(1, 0, &[&m])).await;
+    // u: sent, and host-1 dies before acking (nor did a prompt carry it).
+    let u = outbox.send("agent:alice", "nia", json!({"kind": "msg", "text": "in flight"})).unwrap();
+    assert!(matches!(recv(&mut a).await, Frame::Deliver { msg_id, .. } if msg_id == u));
+    drop(a); // SIGKILL
+    wait_lost(remote, "host-1").await;
+    // q: sent while host-1 is gone.
+    let q = outbox.send("agent:alice", "nia", json!({"kind": "msg", "text": "during the outage"})).unwrap();
+    assert_eq!(remote.move_lost(std::time::Instant::now(), Duration::ZERO), vec!["nia"]);
+    assert_eq!(interrupted(&outbox, &m).await, "outcome unknown: host lost mid-turn (nia had not answered when its host was lost)");
+
+    let mut b = fake_host(&url, "host-2").await;
+    wait_hosts(remote, 1).await;
+    spawn_on(remote, &mut b, "nia", "/w/nia", &sid(2)).await;
+    let mut got: Vec<String> = Vec::new();
+    within("u and q on host-2", async {
+        while !(got.contains(&u) && got.contains(&q)) {
+            if let Frame::Deliver { msg_id, .. } = recv(&mut b).await {
+                send(&mut b, &Frame::DeliverAck { msg_id: msg_id.clone(), status: crate::hosts::proto::DeliverStatus::Delivered, reason: None }).await;
+                got.push(msg_id);
+            }
+        }
+    })
+    .await;
+    for id in [&u, &q] {
+        assert_eq!(wait_final(&outbox, id).await.state, State::Delivered, "{id}");
+    }
+    // Nothing more comes to host-2: no second copy, and neither m nor n.
+    for _ in 0..3 {
+        outbox.pass(k2_core::delivery::now_ms());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(50), b.next()).await {
+        if let Ok(Frame::Deliver { msg_id, .. }) = Frame::decode(&t) {
+            got.push(msg_id);
+        }
+    }
+    got.sort();
+    let mut want = vec![u.clone(), q.clone()];
+    want.sort();
+    assert_eq!(got, want, "u and q once each; m and n not again");
+    assert_eq!(outbox.get(&n).unwrap().state, State::Delivered);
+    assert_eq!(outbox.get(&m).unwrap().state, State::Failed);
 }

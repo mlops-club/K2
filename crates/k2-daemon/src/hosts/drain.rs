@@ -131,8 +131,20 @@ struct PaneTurns {
     gone: bool,
     heard: u64,
     /// K2-f.3: messages this host typed into the pane and whose prompt
-    /// hasn't been submitted yet: (message id, [`prompt_digest`] of the text).
-    typed: Vec<(String, String)>,
+    /// hasn't been submitted yet.
+    typed: Vec<Typed>,
+}
+
+#[derive(Debug, Clone)]
+struct Typed {
+    msg_id: String,
+    /// [`prompt_digest`] of the text.
+    digest: String,
+    /// K2-f.4: the pane's prompt count when it was typed. Two prompts on
+    /// and still here, it was folded into a turn (or never submitted): no
+    /// later prompt is its own. (One prompt on it may still be: the second
+    /// of two messages typed back to back.)
+    gen: u64,
 }
 
 /// Typed messages kept per pane, at most (the oldest go first).
@@ -183,11 +195,25 @@ impl Turns {
         let t = m.entry(pane.to_string()).or_default();
         t.heard = heard;
         if prompt {
+            // K2-f.4: what two prompts have passed is no prompt's own any
+            // more; this prompt takes the one message whose text it is. Two
+            // or more with that text (one folded, one its own): which one
+            // this is can't be told, so none is tied.
+            let previous = t.counts.prompts;
+            t.typed.retain(|e| e.gen + 1 >= previous);
+            let matching: Vec<usize> =
+                t.typed.iter().enumerate().filter(|(_, e)| Some(e.digest.as_str()) == digest).map(|(i, _)| i).collect();
+            t.counts.msgs = match matching.as_slice() {
+                [i] => vec![t.typed.remove(*i).msg_id],
+                [] => Vec::new(),
+                _ => {
+                    log_debug!("[hosts/drain] {} typed messages match one prompt in {pane}: none is tied to it", matching.len());
+                    t.typed.retain(|e| Some(e.digest.as_str()) != digest);
+                    Vec::new()
+                }
+            };
             t.counts.prompts += 1;
             t.counts.running = true;
-            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut t.typed).into_iter().partition(|(_, d)| Some(d.as_str()) == digest);
-            t.typed = rest;
-            t.counts.msgs = mine.into_iter().map(|(id, _)| id).collect();
         }
         if stop {
             t.counts.stops += 1;
@@ -199,12 +225,17 @@ impl Turns {
     /// K2-f.3: this host typed message `msg_id` (`text`) into `pane`; the
     /// prompt that submits exactly that text takes it into its turn.
     pub fn typed(&self, pane: &str, msg_id: &str, text: &str) {
+        // Nothing typed (an inject with no text): no prompt can be its own.
+        if text.trim().is_empty() {
+            return;
+        }
         let mut m = self.panes.lock();
         let heard = self.touch(&mut m, pane);
         let t = m.entry(pane.to_string()).or_default();
         t.heard = heard;
-        t.typed.retain(|(id, _)| id != msg_id);
-        t.typed.push((msg_id.to_string(), k2_core::agent_hooks::envelope::prompt_digest(text)));
+        t.typed.retain(|e| e.msg_id != msg_id);
+        let gen = t.counts.prompts;
+        t.typed.push(Typed { msg_id: msg_id.to_string(), digest: k2_core::agent_hooks::envelope::prompt_digest(text), gen });
         if t.typed.len() > KEEP_TYPED {
             t.typed.remove(0);
         }
@@ -617,6 +648,52 @@ mod tests {
         t.note("p1", "Stop", false, None);
         t.note("p1", "UserPromptSubmit", false, d("[from alice] something else").as_deref());
         assert_eq!(t.counts("p1").unwrap().msgs, Vec::<String>::new());
+    }
+
+    /// K2-f.4 #1: a message folded into a turn (and answered there) is
+    /// never tied to a later prompt with the same text: two prompts on it
+    /// is dropped, and before that a prompt matching two typed messages
+    /// ties neither. Two messages typed back to back still each get their
+    /// own prompt. Nothing is registered for empty text.
+    #[test]
+    fn a_folded_message_is_never_tied_to_a_later_identical_prompt() {
+        use k2_core::agent_hooks::envelope::prompt_digest;
+        let d = |s: &str| Some(prompt_digest(s));
+        let same = "[from ci] tests passed";
+        // M1 folded into turn 1; M2, the same text, as its own prompt 2.
+        let t = Turns::default();
+        t.note("p1", "UserPromptSubmit", false, d("the user's own").as_deref());
+        t.typed("p1", "m1", same);
+        t.note("p1", "Stop", false, None);
+        t.typed("p1", "m2", same);
+        t.note("p1", "UserPromptSubmit", false, d(same).as_deref());
+        assert_eq!(t.counts("p1").unwrap().msgs, Vec::<String>::new(), "two match: neither is tied");
+        // M2 several prompts later: M1 is gone; M2 is tied.
+        let t = Turns::default();
+        t.note("p2", "UserPromptSubmit", false, d("the user's own").as_deref());
+        t.typed("p2", "m1", same);
+        t.note("p2", "Stop", false, None);
+        for n in 2..=3 {
+            t.note("p2", "UserPromptSubmit", false, d(&format!("other {n}")).as_deref());
+            t.note("p2", "Stop", false, None);
+        }
+        t.typed("p2", "m2", same);
+        t.note("p2", "UserPromptSubmit", false, d(same).as_deref());
+        assert_eq!(t.counts("p2").unwrap().msgs, vec!["m2".to_string()]);
+        // A and B typed back to back: each its own prompt.
+        let t = Turns::default();
+        t.typed("p3", "a", "A");
+        t.typed("p3", "b", "B");
+        t.note("p3", "UserPromptSubmit", false, d("A").as_deref());
+        assert_eq!(t.counts("p3").unwrap().msgs, vec!["a".to_string()]);
+        t.note("p3", "Stop", false, None);
+        t.note("p3", "UserPromptSubmit", false, d("B").as_deref());
+        assert_eq!(t.counts("p3").unwrap().msgs, vec!["b".to_string()]);
+        // An inject with no text registers nothing: an empty prompt ties nothing.
+        let t = Turns::default();
+        t.typed("p4", "m_empty", "  \r");
+        t.note("p4", "UserPromptSubmit", false, d("").as_deref());
+        assert_eq!(t.counts("p4").unwrap().msgs, Vec::<String>::new());
     }
 
     /// K2-f.2 #8: past `keep` panes, the least recently heard go first,

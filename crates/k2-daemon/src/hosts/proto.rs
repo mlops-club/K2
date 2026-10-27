@@ -99,9 +99,18 @@ pub struct EndedPlacement {
     pub agent_id: String,
     pub session_id: String,
     pub epoch: u64,
-    /// `None`: the host never saw a hook from it (a provider without hooks).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn: Option<TurnCounts>,
+    /// Always sent (K2-f.4): a K2-f.2 controller requires it.
+    #[serde(default)]
+    pub turn: TurnCounts,
+    /// False: the host never saw a hook from it (a provider without hooks),
+    /// so `turn` says nothing. A K2-f.2 host sends no such field, and only
+    /// ever reported agents it had counts for.
+    #[serde(default = "yes")]
+    pub hooked: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// K2-f: a pane's turn as the host's hook stream saw it: how many prompts
@@ -860,5 +869,72 @@ mod tests {
         assert_eq!(negotiate(2), Some(2));
         assert_eq!(negotiate(0), None);
         assert_eq!(negotiate(3), None);
+    }
+
+    /// K2-f.4 #2: a K2-f.4 host's hello decodes on a K2-f.2 controller
+    /// (whose `EndedPlacement.turn` is required, its `TurnCounts` without
+    /// `msgs`), an agent that never hooked included; and a K2-f.2 host's
+    /// ended entry (no `hooked`) reads as hooked here.
+    #[test]
+    fn a_new_hosts_hello_decodes_on_a_k2_f2_controller() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct OldTurnCounts {
+            prompts: u64,
+            stops: u64,
+            running: bool,
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct OldEnded {
+            agent_id: String,
+            session_id: String,
+            epoch: u64,
+            turn: OldTurnCounts,
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct OldResume {
+            agent_id: String,
+            session_id: String,
+            epoch: u64,
+            #[serde(default)]
+            turn: Option<OldTurnCounts>,
+        }
+        let hello = Frame::Hello {
+            protocol: PROTOCOL,
+            host_name: "h".into(),
+            token: "t".into(),
+            labels: vec![],
+            resume: vec![ResumePlacement {
+                agent_id: "live".into(),
+                session_id: "p0".into(),
+                epoch: 3,
+                child_alive: true,
+                turn: Some(TurnCounts { prompts: 2, stops: 1, running: true, msgs: vec!["m_1".into()] }),
+                ..Default::default()
+            }],
+            ended: vec![
+                EndedPlacement { agent_id: "no-hooks".into(), session_id: "p1".into(), epoch: 4, turn: TurnCounts::default(), hooked: false },
+                EndedPlacement {
+                    agent_id: "hooked".into(),
+                    session_id: "p2".into(),
+                    epoch: 5,
+                    turn: TurnCounts { prompts: 1, stops: 0, running: true, msgs: vec!["m_2".into()] },
+                    hooked: true,
+                },
+            ],
+        };
+        let v: serde_json::Value = serde_json::from_str(&hello.encode()).unwrap();
+        let old_ended: Vec<OldEnded> = serde_json::from_value(v["ended"].clone()).expect("a K2-f.2 controller reads hello.ended");
+        assert_eq!(old_ended.len(), 2);
+        assert!(!old_ended[0].turn.running);
+        let old_resume: Vec<OldResume> = serde_json::from_value(v["resume"].clone()).expect("and hello.resume");
+        assert_eq!(old_resume[0].turn.as_ref().map(|t| t.prompts), Some(2));
+
+        let from_f2 = json!({"agent_id": "a", "session_id": "p", "epoch": 1, "turn": {"prompts": 1, "stops": 0, "running": true}});
+        let e: EndedPlacement = serde_json::from_value(from_f2).unwrap();
+        assert!(e.hooked, "a K2-f.2 host only reported agents it had counts for");
+        assert_eq!(e.turn, TurnCounts { prompts: 1, stops: 0, running: true, msgs: vec![] });
     }
 }

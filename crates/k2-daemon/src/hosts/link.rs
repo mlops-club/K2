@@ -205,9 +205,9 @@ fn resume_list() -> (Vec<super::proto::ResumePlacement>, Vec<super::proto::Ended
     for (agent, epoch) in dead {
         let pane = p.sessions.iter().find(|(_, a)| **a == agent).map(|(pane, _)| pane.clone());
         if let Some(pane) = pane {
-            // `turn: None`: it never sent a hook (nothing of its turn is known).
+            // `hooked: false`: it never sent a hook (nothing of its turn is known).
             let turn = super::drain::take_turn_counts(&pane);
-            p.ended.push(super::proto::EndedPlacement { agent_id: agent.clone(), session_id: pane, epoch, turn });
+            p.ended.push(ended_record(&agent, pane, epoch, turn));
         }
         p.epochs.remove(&agent);
         p.sessions.retain(|_, a| a != &agent);
@@ -216,6 +216,19 @@ fn resume_list() -> (Vec<super::proto::ResumePlacement>, Vec<super::proto::Ended
     ended.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     (out, ended)
+}
+
+/// K2-f.3: `agent`'s CLI ended, with its turn if it ever sent a hook. The
+/// turn is always sent (K2-f.4: a K2-f.2 controller requires it); `hooked`
+/// says whether it means anything.
+fn ended_record(agent: &str, session_id: String, epoch: u64, turn: Option<super::proto::TurnCounts>) -> super::proto::EndedPlacement {
+    super::proto::EndedPlacement {
+        agent_id: agent.to_string(),
+        session_id,
+        epoch,
+        hooked: turn.is_some(),
+        turn: turn.unwrap_or_default(),
+    }
 }
 
 /// K2-f.3: drop the ended records a welcomed `hello` carried (others, ended
@@ -363,12 +376,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                         // K2-f.3: kept until a hello carries it, in case this
                         // frame dies with the link before it is written.
                         if let Some(pane) = pane {
-                            p.ended.push(super::proto::EndedPlacement {
-                                agent_id: agent_name.clone(),
-                                session_id: pane,
-                                epoch,
-                                turn: turn.clone(),
-                            });
+                            p.ended.push(ended_record(&agent_name, pane, epoch, turn.clone()));
                         }
                         let _ = tx.send(Frame::SessionGone { agent_id: agent_name, epoch: Some(epoch), exit_code: None, turn });
                     }
@@ -876,7 +884,8 @@ mod ended_tests {
             agent_id: id.into(),
             session_id: format!("pane-{id}"),
             epoch: 9,
-            turn: Some(super::super::proto::TurnCounts { prompts: 1, stops: 0, running: true, msgs: vec!["m_x".into()] }),
+            turn: super::super::proto::TurnCounts { prompts: 1, stops: 0, running: true, msgs: vec!["m_x".into()] },
+            hooked: true,
         };
         let a = mine("k2f3-ended-a");
         let b = mine("k2f3-ended-b");
