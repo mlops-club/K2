@@ -963,10 +963,10 @@ pub(crate) fn deliver_live_with_receipt(
         "kind": "msg", "text": text, "command": command, "label": stamp_from,
         "wake": wake, "wake_timeout_ms": wake_timeout.as_millis() as u64,
     });
-    if let Some(sent) = crate::delivery_drain::send(from, workspace_token, body) {
+    if let Some(sent) = crate::delivery_drain::send(from, workspace_token, body.clone()) {
         return MsgResponse::from_outbox(sent);
     }
-    deliver_live_inner(
+    let mut r = deliver_live_inner(
         workspace_token,
         text,
         stamp_from,
@@ -975,7 +975,13 @@ pub(crate) fn deliver_live_with_receipt(
         wake_timeout,
         via,
         Some(Receipt { from, delivery_id, summary }),
-    )
+    );
+    // K2-f: on a controller, what the cascade delivered (a wake included)
+    // gets an outbox row whose turn is followed: a crash mid-turn fails it.
+    if r.success && r.msg_id.is_none() {
+        r.msg_id = crate::delivery_drain::direct_delivered(from, workspace_token, body);
+    }
+    r
 }
 
 /// `receipt`: `(chatter from, delivery id)` when the send has a

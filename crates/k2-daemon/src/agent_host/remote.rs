@@ -1041,14 +1041,19 @@ impl RemoteHost {
                     None => true,
                 };
                 if !stale {
+                    let mut cut = Vec::new();
                     if let Some(p) = inner.placements.remove(&agent_id) {
                         self.forget(&agent_id, p.epoch);
                         self.note_ended(&mut inner, &agent_id);
+                        // K2-f: its CLI exited mid-turn (SIGKILL, a crash).
+                        cut = Self::take_cut(&mut inner, &agent_id, p.session_id.as_deref());
                     }
                     if let Some(s) = inner.sessions.remove(&agent_id) {
                         s.exited(exit_code);
                     }
                     log_debug!("[hosts] agent {agent_id} gone on host {host_id}");
+                    drop(inner);
+                    self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Crashed);
                 }
             }
             Frame::Refused { code, message } if code == crate::hosts::drain::DRAINING_CODE => {
@@ -1918,6 +1923,26 @@ impl RemoteHost {
         });
     }
 
+    /// K2-d, K2-f: `agent_id`'s session (pane `pane`) is over: forget its
+    /// turn. If the turn was running, the messages delivered to it since
+    /// the last turn ended were never answered: those, for [`Self::report_cut`].
+    fn take_cut(inner: &mut Inner, agent_id: &str, pane: Option<&str>) -> Vec<String> {
+        match inner.turns.remove(agent_id) {
+            Some(t) if t.running && pane.is_none_or(|p| p == t.pane) => t.delivered,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Fail `cut` (from [`Self::take_cut`]) loudly. Call with `inner`
+    /// released: the outbox takes its own lock.
+    fn report_cut(&self, agent_id: &str, cut: &[String], how: crate::delivery_drain::Cut) {
+        if cut.is_empty() {
+            return;
+        }
+        log_debug!("[hosts] {agent_id}'s turn was cut ({how:?}): {} message(s) delivered to it never answered", cut.len());
+        crate::delivery_drain::turn_cut(self, agent_id, cut, how);
+    }
+
     /// `agent_id`'s session ended now: its CLI is gone and nothing holds a
     /// placement for it (not a lost host, not a drain).
     fn note_ended(&self, inner: &mut Inner, agent_id: &str) {
@@ -2010,6 +2035,7 @@ impl RemoteHost {
             .collect();
         let candidates: Vec<RemotePlacement> =
             inner.placements.values().filter(|p| lost.contains_key(&p.host_id)).cloned().collect();
+        let mut cuts = Vec::new();
         for p in candidates {
             if let crate::provisioner::Mode::Pinned { host } = self.policy.need(&p.agent_id).mode {
                 log_debug!("[hosts] agent {} is pinned to {host}, lost: it waits for it", p.agent_id);
@@ -2017,6 +2043,9 @@ impl RemoteHost {
             }
             inner.placements.remove(&p.agent_id);
             self.forget(&p.agent_id, p.epoch);
+            // K2-f: its turn there is lost with its host; the copy that
+            // resumes elsewhere starts a new one.
+            cuts.push((p.agent_id.clone(), Self::take_cut(&mut inner, &p.agent_id, p.session_id.as_deref())));
             let Some(s) = inner.sessions.remove(&p.agent_id) else {
                 // Reserved, but its spawn never answered: nothing to resume.
                 continue;
@@ -2046,6 +2075,10 @@ impl RemoteHost {
                     .attr("lost_ms", lost_for.as_millis() as u64)
             });
             moved.push(p.agent_id);
+        }
+        drop(inner);
+        for (agent, cut) in &cuts {
+            self.report_cut(agent, cut, crate::delivery_drain::Cut::Crashed);
         }
         moved.sort();
         moved
@@ -2112,6 +2145,7 @@ impl RemoteHost {
     pub fn adopt(&'static self, host_id: &str, resume: &[ResumePlacement]) -> Vec<(String, AdoptDecision)> {
         let mut out = Vec::new();
         let mut releases = Vec::new();
+        let mut cuts = Vec::new();
         {
             let mut inner = self.inner.lock();
             for r in resume {
@@ -2158,19 +2192,21 @@ impl RemoteHost {
                 out.push((r.agent_id.clone(), decision));
             }
             // Placed here but not resumed: gone while the host was away.
-            let gone: Vec<(String, PlacementEpoch)> = inner
+            let gone: Vec<(String, PlacementEpoch, Option<String>)> = inner
                 .placements
                 .values()
                 .filter(|p| p.host_id == host_id && p.session_id.is_some() && !resume.iter().any(|r| r.agent_id == p.agent_id))
-                .map(|p| (p.agent_id.clone(), p.epoch))
+                .map(|p| (p.agent_id.clone(), p.epoch, p.session_id.clone()))
                 .collect();
-            for (agent, epoch) in gone {
+            for (agent, epoch, pane) in gone {
                 inner.placements.remove(&agent);
                 self.forget(&agent, epoch);
                 self.note_ended(&mut inner, &agent);
                 if let Some(s) = inner.sessions.remove(&agent) {
                     s.exited(None);
                 }
+                // K2-f: it died with its host mid-turn.
+                cuts.push((agent.clone(), Self::take_cut(&mut inner, &agent, pane.as_deref())));
                 out.push((agent, AdoptDecision::Gone));
             }
             // Reach the host after the table is settled.
@@ -2184,6 +2220,9 @@ impl RemoteHost {
                     });
                 }
             }
+        }
+        for (agent, cut) in &cuts {
+            self.report_cut(agent, cut, crate::delivery_drain::Cut::Crashed);
         }
         for (agent, d) in &out {
             log_debug!("[hosts] host {host_id}: agent {agent} {d:?}");
@@ -2554,16 +2593,12 @@ impl AgentHost for RemoteHost {
             if placed.0.is_some() {
                 self.note_ended(&mut inner, agent_id);
             }
-            let turn = inner.turns.remove(agent_id).unwrap_or_default();
-            let cut = if turn.running { turn.delivered } else { Vec::new() };
+            let cut = Self::take_cut(&mut inner, agent_id, None);
             (placed.0, placed.1, cut)
         };
         // K2-d: closed mid-turn, its messages since the last turn end are
         // not answered: they fail loudly instead of reading as delivered.
-        if !cut.is_empty() {
-            log_debug!("[hosts] {agent_id} closed mid-turn: {} message(s) delivered to it never answered", cut.len());
-            crate::delivery_drain::turn_cut(self, agent_id, &cut);
-        }
+        self.report_cut(agent_id, &cut, crate::delivery_drain::Cut::Closed);
         let placement = placement?;
         self.forget(agent_id, placement.epoch);
         let body = json!({"agent_name": agent_id, "force": true});
