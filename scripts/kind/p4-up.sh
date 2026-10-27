@@ -67,8 +67,14 @@ nodes=$(for h in $hosts; do kn get pod "$h" -o jsonpath='{.spec.nodeName}'; echo
     && ok "hosts on different nodes: $(for h in $hosts; do printf '%s on %s; ' "$h" "$(kn get pod "$h" -o jsonpath='{.spec.nodeName}')"; done)" \
     || bad "two hosts share a node: $(echo $nodes)"
 for h in $hosts; do
-    kn exec "$h" -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7420/cli/hosts/status | grep -q "\"linked\":true"' \
-        && ok "$h linked" || bad "$h not linked"
+    # A controller that just rolled takes a few seconds to be relinked.
+    linked=""
+    for _ in $(seq 1 30); do
+        kn exec "$h" -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7420/cli/hosts/status | grep -q "\"linked\":true"' \
+            && { linked=1; break; }
+        sleep 2
+    done
+    [ -n "$linked" ] && ok "$h linked" || bad "$h not linked (60 s)"
     [ "$(kn exec "$h" -c k2-host -- stat -c %a /var/lib/k2-host/.k2/host-key.pem 2>/dev/null)" = 600 ] \
         && ok "$h: its key, 0600" || bad "$h: no key (0600)"
     for c in data work; do
@@ -76,6 +82,9 @@ for h in $hosts; do
     done
 done
 kn get pvc k2-work >/dev/null 2>&1 && bad "a shared k2-work exists" || ok "no shared k2-work"
-[ "$(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}')" = 1 ] && ok "PDB k2-host allows one disruption" || bad "PDB k2-host: $(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}') allowed"
+# Hosts are Ready only when linked: right after a controller roll the PDB
+# allows 0 until they relink.
+for _ in $(seq 1 30); do [ "$(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}')" = 1 ] && break; sleep 2; done
+[ "$(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}')" = 1 ] && ok "PDB k2-host allows one disruption" || bad "PDB k2-host: $(kn get pdb k2-host -o jsonpath='{.status.disruptionsAllowed}') allowed (60 s)"
 echo
 [ "$fails" = 0 ] && echo "PASS p4-up: k2-kind-p4 on 127.0.0.1:$KIND_PORT" || { echo "FAIL p4-up: $fails check(s)"; exit 1; }
