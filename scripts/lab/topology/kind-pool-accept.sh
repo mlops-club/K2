@@ -66,6 +66,7 @@ cleanup() {
     rm -rf "$PRIV"
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM   # an interrupted run cleans up too (EXIT runs on exit)
 
 say "namespace $NS (fresh), images $DAEMON_IMAGE / $AGENTS_IMAGE, idle window ${IDLE_AFTER}s"
 kc delete namespace "$NS" --ignore-not-found --wait=true >/dev/null
@@ -226,7 +227,10 @@ kn rollout status statefulset/k2-controller --timeout=300s >/dev/null || { kn de
 
 # The controller's API on a local port; its owner token into a 0600 file.
 PORT=${K2_P4_PORT:-17460}
-kn port-forward svc/k2-controller "$PORT:7420" > "$RUN/port-forward.log" 2>&1 &
+# kubectl itself in the background, not through kn: a backgrounded function
+# is a subshell, $! would be its pid, and killing it left kubectl running
+# (forwards outlived their runs on 17460-17462).
+kubectl --kubeconfig "$KCFG" -n "$NS" port-forward svc/k2-controller "$PORT:7420" > "$RUN/port-forward.log" 2>&1 &
 PF_PID=$!
 for i in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$PORT/boot-status" && break; sleep 0.3; done
 kn exec k2-controller-0 -- cat /var/lib/k2/.k2/daemon.token > "$PRIV/token" 2>/dev/null; chmod 600 "$PRIV/token"
