@@ -372,6 +372,21 @@ if [ "$host_auth" = enroll ]; then
     for h in $(host_names); do
         case "$have" in *"\"$h\""*) ;; *) first_hosts=0 ;; esac
     done
+    # An entry there is no proof the controller knows the host: after a fresh
+    # controller volume (fleet-g2's fresh step, an interrupted run) it holds
+    # spent tokens, and the rollout below would wait forever for a host
+    # that can't enroll. When the running controller answers, a host with
+    # no live key on it also waits for a new token.
+    if [ "$first_hosts" = "$hosts" ] && [ -z "$render_to" ]; then
+        live=$(kc -n "$KIND_NS" exec "$KIND_POD" -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token 2>/dev/null \
+            | python3 -I "$KIND_REPO/scripts/kind/enroll.py" keys --url "http://127.0.0.1:$KIND_PORT" 2>/dev/null || true)
+        if [ -n "$live" ]; then
+            for h in $(host_names); do
+                printf '%s\n' "$live" | grep "^$h " | grep -vq REVOKED || first_hosts=0
+            done
+            [ "$first_hosts" = 0 ] && say "a host in k2-host-enroll has no live key on the controller: hosts start after new tokens"
+        fi
+    fi
 fi
 if [ -n "$render_to" ]; then
     write_overlay "$hosts"
