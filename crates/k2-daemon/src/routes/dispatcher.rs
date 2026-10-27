@@ -5980,6 +5980,11 @@ async fn handle_one_request(
                 return DispatchOutcome::Done;
             }
             let body_bytes = super::http::read_post_body(&mut *stream, &mut buf).await;
+            // fs-relay: a new workspace is made on the agent host that will hold it.
+            if let Some(a) = crate::hosts::fs_relay::relay_post(p, &query, state.token.as_str(), &body_bytes).await {
+                super::http::send_response(&mut *stream, &a.status, &a.content_type, &a.body).await;
+                return DispatchOutcome::Done;
+            }
             let result = crate::db_routes::dispatch_unit4_post(p, &body_bytes);
             super::http::send_response(&mut *stream, result.status, result.content_type, &result.body)
                 .await;

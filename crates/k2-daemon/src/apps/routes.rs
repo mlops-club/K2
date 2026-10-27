@@ -306,6 +306,22 @@ pub(crate) fn target_ws(who: &Who, requested: Option<&str>) -> R<Ws> {
     ws_by_token(req).ok_or_else(|| no(codes::BAD_REQUEST, 404, format!("no workspace '{req}'")))
 }
 
+/// A folder on an agent host (fs-relay): an agent's must be inside its own
+/// workspace, by the path it names (the workspace's, as registered here).
+fn resolve_agent_folder(who: &Who, p: &Path) -> R<()> {
+    if let Some(ws) = agent_ws(who) {
+        let w = ws_by_id(ws).ok_or_else(|| no(codes::FORBIDDEN, 404, "your workspace is not registered"))?;
+        if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) || !p.starts_with(&w.path) {
+            return Err(no(
+                codes::FOLDER_OUTSIDE_WORKSPACE,
+                403,
+                format!("an agent builds Apps only from folders inside its workspace ({})", w.path),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A folder an agent names must be inside its own workspace.
 pub(crate) fn resolve_folder(who: &Who, raw: &str) -> R<PathBuf> {
     let p = Path::new(raw.trim());
@@ -815,7 +831,16 @@ fn install_isolation(who: &Who, v: &J) -> R<Result<&'static str, J>> {
 /// scripts only on the open path).
 fn seed_for_deploy(who: &Who, app: &AppRow, v: &J) -> R<String> {
     if let Some(f) = s(v, "folder") {
-        let folder = resolve_folder(who, f)?;
+        // fs-relay: a folder in a workspace on an agent host is brought here
+        // (a mirror, removed after the build) and built as today.
+        let mirror = crate::hosts::fs_relay::folder_from_host(f).map_err(|e| no(codes::BAD_REQUEST, 400, e))?;
+        let folder = match &mirror {
+            Some(m) => {
+                resolve_agent_folder(who, Path::new(f.trim()))?;
+                m.path.clone()
+            }
+            None => resolve_folder(who, f)?,
+        };
         let scripts = app.path == "open";
         let slot = if k2_root_proto::apps::AppId::parse(&app.app_id).is_some() { app.app_id.as_str() } else { super::wall_build::BUILD_SLOT };
         return build_seed(who, &folder, v, slot, scripts).map(|(b, _)| b.seed.hash).map_err(|r| {

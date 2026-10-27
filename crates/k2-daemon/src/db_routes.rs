@@ -864,7 +864,7 @@ struct ProjectsCreateBody {
 /// Presentation changes (color, order, name, pin, icon, agent mode, …)
 /// intentionally use this same event too — clients already treat
 /// `ProjectsChanged` as a full-list refetch signal.
-fn emit_projects_changed() {
+pub(crate) fn emit_projects_changed() {
     let _ = crate::session_events::emit(
         crate::session_events::SessionEvent::ProjectsChanged {},
     );

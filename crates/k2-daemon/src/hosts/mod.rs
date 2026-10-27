@@ -167,8 +167,12 @@ pub fn start(port: u16, token: &str) {
                 // fs-relay: a relayed request runs through this daemon's own route.
                 fs_relay::set_local_daemon(port, token);
                 // fs-relay (N7): K2's own git commands run no repository hooks here.
-                if home::work_root(env).is_some() {
+                if let Some(root) = home::work_root(env) {
                     k2_core::git::set_no_hooks(true);
+                    // fs-relay (F3): the Trash stays inside the work root.
+                    k2_core::safe_delete::set_host_trash(Some(root.join(fs_relay::HOST_TRASH)));
+                    // F4: a listing tells a link's own size and time.
+                    k2_core::fs_commands::set_list_without_following(true);
                 }
                 k2_core::log_debug!("[hosts] K2_ROLE=host: linking to {} as {}", cfg.attach_url, cfg.host_name);
                 byte_ring::set(Some(host_ptyd_ring));

@@ -41,10 +41,7 @@ fn no_config_hooks(dir: &Path) -> Result<(), String> {
     if !hardened() {
         return Ok(());
     }
-    let out = git_cli()
-        .args(["config", "--list", "--name-only"])
-        .current_dir(dir)
-        .output()
+    let out = run(git_cli().args(["config", "--list", "--name-only"]).current_dir(dir))
         .map_err(|e| format!("read the git config in {}: {e}", dir.display()))?;
     if !out.status.success() {
         return Err(format!("read the git config in {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
@@ -61,10 +58,7 @@ fn no_config_hooks(dir: &Path) -> Result<(), String> {
 /// filter drivers), then checked out by libgit2, which runs none.
 fn worktree_add(project_path: &str, new_branch: Option<&str>, worktree_path: &str, commitish: &str) -> Result<std::process::Output, String> {
     let args = worktree_add_args(hardened(), new_branch, worktree_path, commitish);
-    let output = git_in(Path::new(project_path))?
-        .args(&args)
-        .output()
-        .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
+    let output = run(git_in(Path::new(project_path))?.args(&args)).map_err(|e| format!("Failed to run git worktree add: {}", e))?;
     if output.status.success() && hardened() {
         let repo = Repository::open(worktree_path).map_err(|e| format!("open the new worktree: {e}"))?;
         let mut co = git2::build::CheckoutBuilder::new();
@@ -72,6 +66,51 @@ fn worktree_add(project_path: &str, new_branch: Option<&str>, worktree_path: &st
         repo.checkout_head(Some(&mut co)).map_err(|e| format!("check out the new worktree: {e}"))?;
     }
     Ok(output)
+}
+
+/// fs-relay (round 13, L3): how long one git command K2 runs on an agent
+/// host may take (a config `include` naming a FIFO would otherwise hang
+/// it). Past it the command is killed and its caller refuses.
+pub const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `cmd`'s output, as `Command::output`; on an agent host (hardened),
+/// within [`GIT_TIMEOUT`].
+pub fn run(cmd: &mut Command) -> Result<std::process::Output, String> {
+    if hardened() {
+        output_within(cmd, GIT_TIMEOUT)
+    } else {
+        cmd.output().map_err(|e| e.to_string())
+    }
+}
+
+/// `cmd`'s output if it exits within `limit`; else it is killed and this
+/// is an error. Its output is read as it comes (no pipe fills up).
+pub fn output_within(cmd: &mut Command, limit: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let read = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = read(Box::new(child.stdout.take().expect("piped")));
+    let err = read(Box::new(child.stderr.take().expect("piped")));
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(st) => break st,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git took longer than {} s", limit.as_secs()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
 /// `worktree add`'s arguments: options, then `--`, then the path and the
@@ -95,15 +134,85 @@ fn worktree_add_args<'a>(no_checkout: bool, new_branch: Option<&'a str>, worktre
 pub fn repo_dirs(path: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Option<std::path::PathBuf>), String> {
     let repo = Repository::discover(path).map_err(|e| format!("no git repository for {path}: {}", e.message()))?;
     let git_dir = repo.path().to_path_buf();
-    // A linked worktree's git dir names its common dir in `commondir`.
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(c) => {
-            let c = Path::new(c.trim());
+    // A linked worktree's git dir names its common dir in `commondir`: one
+    // clean path line, or the repository is refused (fs-relay round 12: a
+    // file that isn't UTF-8 was taken as no commondir while libgit2 read
+    // it).
+    let common = match path_line(&git_dir.join("commondir"))? {
+        Some(c) => {
+            let c = Path::new(&c);
             if c.is_absolute() { c.to_path_buf() } else { git_dir.join(c) }
         }
-        Err(_) => git_dir.clone(),
+        None => git_dir.clone(),
     };
     Ok((git_dir, common, repo.workdir().map(Path::to_path_buf)))
+}
+
+/// fs-relay round 12 (e): the repository's format is one K2 knows: version 0 or 1,
+/// and only the extensions both git and libgit2 read alike (`noop`,
+/// `worktreeConfig`, `relativeWorktrees`, `objectFormat=sha1`). A config
+/// libgit2 can't parse is refused too.
+pub fn known_repo_format(common: &Path) -> Result<(), String> {
+    const KNOWN: &[&str] = &["extensions.noop", "extensions.worktreeconfig", "extensions.relativeworktrees", "extensions.objectformat"];
+    let cfg = git2::Config::open(&common.join("config")).map_err(|_| "its config can't be read".to_string())?;
+    let version = cfg.get_i32("core.repositoryformatversion").unwrap_or(0);
+    if !(0..=1).contains(&version) {
+        return Err(format!("repository format {version} is not one K2 serves"));
+    }
+    let mut entries = cfg.entries(Some("extensions\\..*")).map_err(|_| "its config can't be read".to_string())?;
+    while let Some(e) = entries.next() {
+        let e = e.map_err(|_| "its config can't be read".to_string())?;
+        let name = e.name().unwrap_or("").to_ascii_lowercase();
+        let value = e.value().unwrap_or("").to_ascii_lowercase();
+        if !KNOWN.contains(&name.as_str()) || (name == "extensions.objectformat" && value != "sha1") {
+            return Err(format!("its extension {name} is not one K2 serves"));
+        }
+    }
+    Ok(())
+}
+
+/// fs-relay (round 13, L2): the work-tree folders of the repository at
+/// `path`'s gitlinks (its index's submodule entries, and `.gitmodules`'),
+/// where a submodule's own `.git` would be.
+pub fn gitlink_dirs(path: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let repo = Repository::discover(path).map_err(|e| format!("no git repository for {path}: {}", e.message()))?;
+    let Some(work) = repo.workdir().map(Path::to_path_buf) else { return Ok(Vec::new()) };
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(index) = repo.index() {
+        for e in index.iter().filter(|e| e.mode == 0o160000) {
+            out.push(work.join(String::from_utf8_lossy(&e.path).as_ref()));
+        }
+    }
+    if let Ok(subs) = repo.submodules() {
+        for s in subs {
+            let p = work.join(s.path());
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// fs-relay (round 12): a git pointer file (`commondir`, a `gitdir`
+/// back-link, a `.git` gitfile) read as bytes: `None` when absent, else
+/// its one line, which must be UTF-8 with no NUL or other control
+/// character, not empty, followed by at most one newline. Anything else
+/// is an error: git and libgit2 might read it differently.
+pub fn path_line(file: &Path) -> Result<Option<String>, String> {
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{} can't be read: {e}", file.display())),
+    };
+    let bad = || format!("{} is not one clean path line", file.display());
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad())?;
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if line.is_empty() || line.chars().any(|c| c.is_control()) {
+        return Err(bad());
+    }
+    Ok(Some(line.to_string()))
 }
 
 /// `git`, with `-c core.hooksPath=/dev/null` once [`set_no_hooks`] is on.
@@ -334,7 +443,7 @@ pub fn list_branches(path: &str) -> BranchList {
 pub fn list_worktrees(path: &str) -> Vec<WorktreeInfo> {
     // Use git CLI for worktree list since git2 worktree support is limited
     let Ok(mut git) = git_in(Path::new(path)) else { return Vec::new() };
-    let output = match git.args(["worktree", "list", "--porcelain"]).output() {
+    let output = match run(git.args(["worktree", "list", "--porcelain"])) {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -579,7 +688,7 @@ pub fn remove_worktree(
         if std::fs::rename(wt, &temp_path).is_ok() {
             // Prune git metadata (detach the worktree ref)
             if let Ok(mut git) = git_in(Path::new(project_path)) {
-                let _ = git.args(["worktree", "prune"]).output();
+                let _ = run(git.args(["worktree", "prune"]));
             }
 
             // Move to Trash in background thread (recoverable).
@@ -615,7 +724,7 @@ pub fn remove_worktree(
     // in place and let the user investigate than to permanently
     // destroy their work.
     if let Ok(mut git) = git_in(Path::new(project_path)) {
-        let _ = git.args(["worktree", "prune"]).output();
+        let _ = run(git.args(["worktree", "prune"]));
     }
     if Path::new(worktree_path).exists() {
         crate::safe_delete::trash(worktree_path).map_err(|e| {
@@ -732,7 +841,8 @@ pub fn diff_file(repo_path: &str, file_path: &str) -> Result<Vec<DiffHunk>, Stri
     };
 
     let mut opts = DiffOptions::new();
-    opts.pathspec(&rel_path);
+    // One file, literally (fs-relay F2: `*` is a name here, not a glob).
+    opts.pathspec(crate::git_changes::pathspec_literal(&rel_path));
     opts.context_lines(3);
 
     let head_tree = repo
@@ -1309,14 +1419,14 @@ pub fn resolve_conflict(repo_path: &str, file_path: &str, resolution: &str) -> R
         "ours" => {
             // Checkout our version
             let mut cb = git2::build::CheckoutBuilder::new();
-            cb.path(file_path).force().use_ours(true);
+            cb.path(crate::git_changes::pathspec_literal(file_path)).force().use_ours(true);
             repo.checkout_index(None, Some(&mut cb))
                 .map_err(|e| format!("Failed to checkout 'ours': {e}"))?;
         }
         "theirs" => {
             // Checkout their version
             let mut cb = git2::build::CheckoutBuilder::new();
-            cb.path(file_path).force().use_theirs(true);
+            cb.path(crate::git_changes::pathspec_literal(file_path)).force().use_theirs(true);
             repo.checkout_index(None, Some(&mut cb))
                 .map_err(|e| format!("Failed to checkout 'theirs': {e}"))?;
         }
@@ -1409,6 +1519,96 @@ mod tests {
             ["worktree", "add", "--no-checkout", "-b", "b", "--", "/w/.worktrees/b", "HEAD"]
         );
         assert_eq!(worktree_add_args(false, None, "-p", "-x"), ["worktree", "add", "--", "-p", "-x"]);
+    }
+
+    /// fs-relay F2: a file path is one file, never a pathspec: resolving
+    /// `*` (or diffing it) touches no other conflicted or changed file.
+    #[test]
+    fn a_file_path_is_literal_not_a_pathspec() {
+        let dir = crate::test_env::unique_temp_path("git-literal");
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            out.status.success()
+        };
+        assert!(git(&["init", "-q", "-b", "main"]));
+        std::fs::write(dir.join("a.md"), "base\n").unwrap();
+        std::fs::write(dir.join("b.md"), "base\n").unwrap();
+        assert!(git(&["add", "-A"]) && git(&["commit", "-qm", "base"]));
+        assert!(git(&["checkout", "-qb", "other"]));
+        std::fs::write(dir.join("a.md"), "theirs\n").unwrap();
+        std::fs::write(dir.join("b.md"), "theirs\n").unwrap();
+        assert!(git(&["commit", "-qam", "theirs"]));
+        assert!(git(&["checkout", "-q", "main"]));
+        std::fs::write(dir.join("a.md"), "ours\n").unwrap();
+        std::fs::write(dir.join("b.md"), "ours\n").unwrap();
+        assert!(git(&["commit", "-qam", "ours"]));
+        assert!(!git(&["merge", "-q", "other"]), "a conflict");
+        let repo = dir.to_string_lossy().into_owned();
+        let conflicted = || Repository::open(&dir).unwrap().index().unwrap().conflicts().unwrap().count();
+        assert_eq!(conflicted(), 2);
+        let _ = resolve_conflict(&repo, "*", "theirs");
+        assert_eq!(conflicted(), 2, "`*` resolved nothing");
+        assert!(std::fs::read_to_string(dir.join("b.md")).unwrap().contains("<<<<<<<"), "b.md untouched (its conflict markers)");
+        assert!(diff_file(&repo, "*").unwrap().is_empty(), "`*` diffs no file");
+        // The control: a real name resolves that file only.
+        resolve_conflict(&repo, "a.md", "theirs").unwrap();
+        assert_eq!(conflicted(), 1);
+        assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "theirs\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fs-relay round 12 (b): a pointer file is one clean UTF-8 path line,
+    /// or an error (never read as absent).
+    #[test]
+    fn a_pointer_file_is_one_clean_path_line() {
+        let dir = crate::test_env::unique_temp_path("git-path-line");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("commondir");
+        assert_eq!(path_line(&f).unwrap(), None, "absent");
+        for (bytes, want) in [(&b"../..\n"[..], Some("../..")), (b"/a/b", Some("/a/b")), (b"/a b\r\n", Some("/a b"))] {
+            std::fs::write(&f, bytes).unwrap();
+            assert_eq!(path_line(&f).unwrap().as_deref(), want, "{bytes:?}");
+        }
+        for bytes in [&b"/a\xff\n"[..], b"/a\0\xff\n", b"/a\n/b\n", b"\n", b"", b"/a\tb\n"] {
+            std::fs::write(&f, bytes).unwrap();
+            assert!(path_line(&f).is_err(), "{bytes:?}");
+        }
+        // repo_dirs refuses a repository whose commondir isn't clean,
+        // rather than taking it as no commondir.
+        init_repo(&dir.to_string_lossy()).unwrap();
+        std::fs::write(dir.join(".git/commondir"), b"/elsewhere\0\xff\n").unwrap();
+        assert!(repo_dirs(&dir.to_string_lossy()).is_err());
+        std::fs::remove_file(dir.join(".git/commondir")).unwrap();
+        assert!(repo_dirs(&dir.to_string_lossy()).is_ok(), "the control");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fs-relay round 12 (e): format 0 or 1, the known extensions only.
+    #[test]
+    fn a_repository_format_k2_knows() {
+        let dir = crate::test_env::unique_temp_path("git-format");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config");
+        for (text, ok) in [
+            ("[core]\n\trepositoryformatversion = 0\n", true),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tnoop = true\n\tworktreeConfig = true\n", true),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha1\n", true),
+            ("[core]\n\trepositoryformatversion = 2\n", false),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tpartialclone = origin\n", false),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n", false),
+            ("[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n", false),
+        ] {
+            std::fs::write(&cfg, text).unwrap();
+            assert_eq!(known_repo_format(&dir).is_ok(), ok, "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A branch's folder is one plain name under `.worktrees`.

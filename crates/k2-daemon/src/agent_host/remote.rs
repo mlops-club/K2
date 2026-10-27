@@ -1537,6 +1537,15 @@ impl RemoteHost {
         k2_core::trace::emit(|| {
             k2_core::trace::Event::new("ctl.place").agent(agent_id.as_str()).attr("host", host_id.as_str()).attr("epoch", epoch.0)
         });
+        // fs-relay (5): a workspace under this controller's root runs under
+        // the root it configures for the host (its own disk).
+        let mut parsed = parsed;
+        if let Some(c) = cwd.as_deref() {
+            let mapped = self.host_cwd(&host_id, c);
+            if mapped != c {
+                parsed["cwd"] = Value::String(mapped.to_string_lossy().into_owned());
+            }
+        }
         let meta = SpawnedMeta {
             cwd: parsed.get("cwd").and_then(Value::as_str).map(PathBuf::from),
             program: parsed.get("command").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string),
@@ -1968,6 +1977,11 @@ impl RemoteHost {
             }
         })?;
         let mut request = serde_json::to_value(req).map_err(|e| format!("encode the spawn request: {e}"))?;
+        // fs-relay (5): the host's name of the workspace.
+        let host_cwd = self.host_cwd(&host_id, Path::new(&req.cwd));
+        if host_cwd != Path::new(&req.cwd) {
+            request["cwd"] = Value::String(host_cwd.to_string_lossy().into_owned());
+        }
         // K2-c: a spawn carrying a message the gone rule delivers: the host
         // checks its seen table before the prompt goes on argv.
         if let Some(msg_id) = crate::delivery_drain::direct_delivery_id() {
@@ -2120,8 +2134,9 @@ impl RemoteHost {
 
     /// fs-relay: bind the workspace an agent was asked to run in to its
     /// host: `cwd` as this controller asked for it (strictly under its work
-    /// root), on a host on its own disk. Called at each spawn.
-    fn note_relay_space(&self, host_id: &str, agent_id: &str, cwd: &Path) {
+    /// root), on a host on its own disk. Called at each spawn, and when a
+    /// workspace is made on a host (phase 2: create, add, clone; no agent).
+    pub fn note_relay_space(&self, host_id: &str, agent_id: &str, cwd: &Path) {
         if !self.fs_relay {
             return;
         }
@@ -2189,6 +2204,50 @@ impl RemoteHost {
     /// fs-relay: this controller's work roots.
     pub fn work_roots(&self) -> &[PathBuf] {
         &self.work_roots
+    }
+
+    fn own_disk(inner: &Inner, host_id: &str) -> bool {
+        inner.host_labels.get(host_id).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some())
+    }
+
+    /// fs-relay (phase 2): `p`, a path this controller names (its work root
+    /// itself, or under it), as `host_id` names it: under the root this
+    /// controller configures for the host. `None`: fs-relay off, outside the
+    /// controller's work root, or the host isn't on its own disk.
+    pub fn host_path(&self, host_id: &str, p: &Path) -> Option<PathBuf> {
+        if !self.fs_relay || !Self::own_disk(&self.inner.lock(), host_id) {
+            return None;
+        }
+        let rel = self.work_roots.iter().find_map(|c| p.strip_prefix(c).ok())?;
+        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return None;
+        }
+        let root = self.host_roots.of(host_id);
+        Some(if rel.as_os_str().is_empty() { root.to_path_buf() } else { root.join(rel) })
+    }
+
+    /// fs-relay (phase 2, 5): a spawn's cwd as the host runs it: a
+    /// workspace under this controller's work root runs under the host's
+    /// configured root; anything else (a host on the shared volume, a path
+    /// elsewhere) as asked.
+    pub fn host_cwd(&self, host_id: &str, cwd: &Path) -> PathBuf {
+        match self.host_path(host_id, cwd) {
+            Some(p) if self.work_roots.iter().any(|c| cwd.strip_prefix(c).is_ok_and(|r| !r.as_os_str().is_empty())) => p,
+            _ => cwd.to_path_buf(),
+        }
+    }
+
+    /// fs-relay (phase 2): the linked hosts on their own disk, least placed first.
+    pub fn own_disk_hosts(&self) -> Vec<String> {
+        let inner = self.inner.lock();
+        let mut hosts: Vec<(usize, String)> = inner
+            .links
+            .keys()
+            .filter(|h| Self::own_disk(&inner, h))
+            .map(|h| (inner.placements.values().filter(|p| &p.host_id == h).count(), h.clone()))
+            .collect();
+        hosts.sort();
+        hosts.into_iter().map(|(_, h)| h).collect()
     }
 
     /// fs-relay: where the workspaces `paths` name are. Only a path under

@@ -1005,15 +1005,17 @@ async fn r6_off_by_default_the_controller_serves_every_route_itself() {
 #[test]
 fn r6_every_relayed_route_has_one_schema() {
     use schema::Kind;
-    for (i, s) in schema::SCHEMAS.iter().enumerate() {
-        assert!(
-            !schema::SCHEMAS[..i].iter().any(|t| t.route == s.route),
-            "{} has one schema (and one method)",
-            s.route
-        );
-        assert!(relayed(s.method, s.route));
+    let all: Vec<&schema::Schema> = schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).collect();
+    for (i, s) in all.iter().enumerate() {
+        assert!(!all[..i].iter().any(|t| t.route == s.route), "{} has one schema (and one method)", s.route);
+        // Phase 2's registrations and relay operations: a host serves them
+        // for its controller; the app's routes never relay them.
+        let host_only = i >= schema::SCHEMAS.len();
+        assert_eq!(relayed(s.method, s.route), !host_only, "{}", s.route);
+        assert!(host_allows(s.method, s.route), "{}", s.route);
         for (k, kind) in s.keys {
             match kind {
+                Kind::Transit | Kind::Parent => assert!(s.route.starts_with(OPS), "{} {k}: a relay operation's", s.route),
                 Kind::Abs | Kind::Candidates => assert!(PATH_KEYS.contains(k), "{} {k}: a path key the controller maps", s.route),
                 Kind::RepoRel(base) | Kind::NameIn(base) | Kind::NameBeside(base) => {
                     assert_eq!(s.kind(base), Some(Kind::Abs), "{} {k} joins {base}, one of its paths", s.route)
@@ -1074,12 +1076,18 @@ fn struct_keys(src: &str, name: &str) -> Vec<String> {
     let attrs = &src[src[..at].rfind("\n\n").unwrap_or(0)..at];
     let camel_case = attrs.contains("rename_all = \"camelCase\"");
     let body = &src[at..at + src[at..].find("\n}").unwrap()];
+    // F6: a flattened field hides its keys from this scan.
+    assert!(!body.contains("flatten"), "struct {name}: #[serde(flatten)] can't be scanned");
     let mut keys = Vec::new();
     let mut rename = None;
     for line in body.lines().skip(1) {
         let l = line.trim();
-        if l.starts_with("#[serde(") && l.contains("rename = \"") {
-            rename = quoted_after(l, "rename = \"").into_iter().next();
+        if l.starts_with("#[serde(") {
+            if l.contains("rename = \"") {
+                rename = quoted_after(l, "rename = \"").into_iter().next();
+            }
+            // F6: an alias is a key the handler reads too.
+            keys.extend(quoted_after(l, "alias = \""));
         } else if let Some((f, _)) = l.strip_prefix("pub ").unwrap_or(l).split_once(':').filter(|_| !l.starts_with("//") && !l.starts_with('#')) {
             let f = f.trim();
             keys.push(rename.take().unwrap_or_else(|| if camel_case { camel(f) } else { f.to_string() }));
@@ -1116,6 +1124,7 @@ fn handler_keys(src: &str, handler: &str) -> Vec<String> {
     let used = inner.match_indices("params").filter(|(i, _)| !inner[i + 6..].starts_with(':')).count();
     assert_eq!(used, understood, "{handler}: every use of params is one the scan reads");
     // The body: parsed into a struct, never read any other way.
+    let mut scanned = 0;
     for (i, _) in inner.match_indices(" = match ") {
         let line_start = inner[..i].rfind('\n').unwrap_or(0);
         let decl = &inner[line_start..i];
@@ -1123,6 +1132,7 @@ fn handler_keys(src: &str, handler: &str) -> Vec<String> {
             let rest = &inner[i..i + 60.min(inner.len() - i)];
             if rest.contains("from_slice(body)") || rest.contains("parse_body(body)") {
                 keys.extend(struct_keys(src, ty.trim()));
+                scanned += 1;
             }
         }
     }
@@ -1136,7 +1146,66 @@ fn handler_keys(src: &str, handler: &str) -> Vec<String> {
         .count();
     let parsed = inner.matches("from_slice(body)").count() + inner.matches("parse_body(body)").count();
     assert_eq!(body_uses, parsed, "{handler}: the body is only parsed into its struct");
+    // F6: every parse is one the scan read the struct of.
+    assert_eq!(scanned, parsed, "{handler}: every parse of the body is `let x: T = match …(body)`");
     keys
+}
+
+/// F6: the scan itself: the shapes it reads, and the ones it refuses to
+/// guess at (a parse it can't name the struct of, a flattened struct).
+#[test]
+fn f6_the_handler_scan_reads_what_it_can_and_fails_on_the_rest() {
+    let src = r#"
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Good {
+    file_path: String,
+    #[serde(default, alias = "seedWiki")]
+    seed_wiki: bool,
+    #[serde(rename = "x-y")]
+    xy: String,
+}
+
+fn handle_good(body: &[u8]) -> CliResponse {
+    let b: Good = match parse_body(body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    ok()
+}
+
+fn handle_turbofish(body: &[u8]) -> CliResponse {
+    let b = serde_json::from_slice::<Good>(body).unwrap();
+    ok()
+}
+
+fn handle_inferred(body: &[u8]) -> CliResponse {
+    let b: Good = parse_body(body).unwrap();
+    ok()
+}
+
+#[derive(Deserialize)]
+struct Flat {
+    #[serde(flatten)]
+    rest: HashMap<String, String>,
+}
+
+fn handle_flat(body: &[u8]) -> CliResponse {
+    let b: Flat = match parse_body(body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    ok()
+}
+"#;
+    let mut keys = handler_keys(src, "handle_good");
+    keys.sort();
+    assert_eq!(keys, ["filePath", "seedWiki", "seedWiki", "x-y"]);
+    for h in ["handle_turbofish", "handle_inferred", "handle_flat"] {
+        let src = src.to_string();
+        let h = h.to_string();
+        assert!(std::panic::catch_unwind(move || handler_keys(&src, &h)).is_err(), "the scan refuses a shape it can't read");
+    }
 }
 
 /// The match arm the text at `at` is in: its line and the lines under it
@@ -1166,9 +1235,9 @@ fn match_arm(src: &str, at: usize) -> String {
 fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
     let fs = include_str!("../fs_routes.rs");
     let git = include_str!("../git_routes.rs");
-    let dispatch = [include_str!("../routes/dispatcher.rs"), include_str!("../misc_routes.rs"), git];
+    let db = include_str!("../db_routes.rs");
+    let dispatch = [include_str!("../routes/dispatcher.rs"), include_str!("../misc_routes.rs"), git, db];
     let handlers: &[(&str, &str, &str)] = &[
-        ("/cli/fs/info", "fs", "handle_info"),
         ("/cli/fs/read-dir", "fs", "handle_read_dir"),
         ("/cli/fs/read-file", "fs", "handle_read_file"),
         ("/cli/fs/read-binary", "fs", "handle_read_binary"),
@@ -1210,8 +1279,12 @@ fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
         ("/cli/git/stage", "git", "handle_git_stage"),
         ("/cli/git/stage-all", "git", "handle_git_stage_all"),
         ("/cli/git/unstage", "git", "handle_git_unstage"),
+        // Phase 2: a workspace's registration, made on its host.
+        ("/cli/projects/create", "db", "handle_projects_create"),
+        ("/cli/projects/add-from-path", "db", "handle_projects_add_from_path"),
+        ("/cli/projects/add-without-git", "db", "handle_projects_add_without_git"),
     ];
-    for s in schema::SCHEMAS {
+    for s in schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).filter(|s| !s.route.starts_with(OPS)) {
         assert!(handlers.iter().any(|(r, _, _)| *r == s.route), "{}: its handler is scanned", s.route);
     }
     // The scan reads what the handlers read (it isn't vacuous): query keys,
@@ -1225,9 +1298,30 @@ fn r6_a_relayed_handler_reads_only_its_schemas_keys() {
     has(git, "handle_git_create_worktree", &["projectPath", "branch", "projectId", "existingBranch"]);
     has(git, "handle_git_discard", &["path", "files", "includeStaged"]);
     has(fs, "handle_upload_chunk", &["upload_id", "dir", "filename", "offset", "base64", "is_last", "total_bytes"]);
+    has(db, "handle_projects_add_from_path", &["path", "seed_wiki", "seedWiki", "fanout"]);
+    // The relay operations (in process, `host_op`): each arm's `s("…")` and
+    // `args["…"]` reads.
+    let relay = include_str!("fs_relay.rs");
+    let ops = fn_body(relay, "host_op");
+    for s in schema::HOST_SCHEMAS.iter().filter(|s| s.route.starts_with(OPS)) {
+        let name = &s.route[OPS.len()..];
+        let at = ops.find(&format!("\"{name}\" =>")).unwrap_or_else(|| panic!("host_op runs {name}"));
+        let arm = match_arm(ops, at);
+        let mut keys = quoted_after(&arm, "s(\"");
+        keys.extend(quoted_after(&arm, "args[\""));
+        keys.extend(quoted_after(&arm, "args.get(\""));
+        assert!(!keys.is_empty(), "{name}: the scan reads its arm");
+        for k in keys {
+            assert!(s.kind(&k).is_some(), "{}: host_op reads {k}, which its schema doesn't declare", s.route);
+        }
+    }
     for (route, file, handler) in handlers {
-        let s = schema::SCHEMAS.iter().find(|s| s.route == *route).unwrap_or_else(|| panic!("{route} has a schema"));
-        let src = if *file == "fs" { fs } else { git };
+        let s = schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).find(|s| s.route == *route).unwrap_or_else(|| panic!("{route} has a schema"));
+        let src = match *file {
+            "fs" => fs,
+            "git" => git,
+            _ => db,
+        };
         // The daemon dispatches the route to this handler (or to its
         // `_gated` form, whose owner branch is this handler).
         let gated = format!("{handler}_gated(");
@@ -1439,4 +1533,1632 @@ fn r6_an_uploads_files_and_a_copys_tree_are_confined() {
     assert!(outside_file(schema::confine(&d.root, route_schema("POST", "/cli/fs/duplicate"), &[], &json!({"path": d.ws.join("folder")}))));
     std::fs::remove_file(d.ws.join("folder/deep/s")).unwrap();
     assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy).is_ok(), "the control");
+}
+
+// ── round 7 ────────────────────────────────────────────────────────────
+
+/// A host's workspace `ws` as a repository with one commit (`sub/f`).
+fn committed_repo(ws: &Path) {
+    k2_core::git::init_repo(&ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    std::fs::write(ws.join("sub/f"), "tracked\n").unwrap();
+    host_git(ws, &["add", "-A"]);
+    host_git(ws, &["commit", "-qm", "first"]);
+}
+
+/// R7 F1(a): a symlink anywhere in the git dir (logs, refs, worktrees) or
+/// alternates outside the work root: every git route on that repository is
+/// refused before libgit2 or git writes through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_f1_a_link_in_the_git_dir_is_refused() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let outside = d.root.parent().unwrap().join("outside-git");
+    std::fs::create_dir_all(&outside).unwrap();
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    let git = d.ws.join(".git");
+    let swap = |name: &str| {
+        let real = git.join(name);
+        let kept = git.join(format!("{name}.kept"));
+        std::fs::rename(&real, &kept).unwrap();
+        link(&outside, &real);
+        move || {
+            std::fs::remove_file(&real).unwrap();
+            std::fs::rename(&kept, &real).unwrap();
+        }
+    };
+    for name in ["logs", "refs/heads"] {
+        let back = swap(name);
+        let commit = json!({"path": d.ws, "message": "secret message"});
+        assert!(refused(served("POST", "/cli/git/commit", "", Some(commit)).await), "{name}");
+        assert!(refused(served("GET", "/cli/git/snapshot", &format!("path={}", encode(&d.ws.to_string_lossy())), None).await), "{name}: reads too");
+        back();
+    }
+    std::fs::create_dir_all(git.join("worktrees")).unwrap();
+    let back = swap("worktrees");
+    let wt = json!({"projectPath": d.ws, "branch": "evil", "projectId": "p"});
+    assert!(refused(served("POST", "/cli/git/create-worktree", "", Some(wt)).await));
+    back();
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing written outside");
+    // Objects borrowed from outside the work root.
+    std::fs::create_dir_all(git.join("objects/info")).unwrap();
+    std::fs::write(git.join("objects/info/alternates"), format!("{}\n", outside.display())).unwrap();
+    let commit = json!({"path": d.ws, "message": "m"});
+    assert!(refused(served("POST", "/cli/git/commit", "", Some(commit.clone())).await), "alternates");
+    std::fs::remove_file(git.join("objects/info/alternates")).unwrap();
+    // The control: the same repository, no link, passes the host's checks.
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/commit"), &[], &commit).is_ok());
+}
+
+/// R7 F1(b): a forced checkout (abort-merge, a fast-forward merge,
+/// discard, resolve) through a tracked folder swapped for a link to a
+/// folder outside the work root is refused; nothing outside is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_f1_a_forced_checkout_through_a_folder_link_is_refused() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let outside = d.root.parent().unwrap().join("outside-co");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    link(&outside, &d.ws.join("sub"));
+    // Round 8: refused as a link leaving the work tree (discard's `sub/f`
+    // first, as a repo-relative path outside the work root).
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && (r.1["code"] == "link_outside_worktree" || r.1["code"] == "outside_work_root");
+    let p = json!(d.ws);
+    for (route, body) in [
+        ("/cli/git/abort-merge", json!({"path": p})),
+        ("/cli/git/merge-branch", json!({"path": p, "branch": "main"})),
+        ("/cli/git/discard", json!({"path": p, "files": ["sub/f"]})),
+        ("/cli/git/resolve", json!({"path": p, "filePath": "a.md", "resolution": "ours"})),
+    ] {
+        assert!(refused(served("POST", route, "", Some(body)).await), "{route}");
+    }
+    // From a sub-folder of the repository too: the whole work tree counts.
+    std::fs::create_dir_all(d.ws.join("deeper")).unwrap();
+    assert!(refused(served("POST", "/cli/git/abort-merge", "", Some(json!({"path": d.ws.join("deeper")}))).await));
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+    // A dangling folder link out: refused too.
+    std::fs::remove_file(d.ws.join("sub")).unwrap();
+    link(&outside.join("gone"), &d.ws.join("sub"));
+    assert!(refused(served("POST", "/cli/git/abort-merge", "", Some(json!({"path": p}))).await), "dangling");
+    // The controls: a link to a folder inside the work root, and one to a
+    // file outside (the checkout replaces the link), pass.
+    std::fs::remove_file(d.ws.join("sub")).unwrap();
+    std::fs::create_dir_all(d.ws.join("real-sub")).unwrap();
+    link(&d.ws.join("real-sub"), &d.ws.join("sub"));
+    link(&outside.join("f"), &d.ws.join("file-link"));
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": p})).is_ok());
+}
+
+// ── round 8 ────────────────────────────────────────────────────────────
+
+/// R8 B1: a folder named `.git` that isn't the repository's own git dir is
+/// walked: an untracked `hide/.git/deep` linking out, reached through a
+/// tracked `sub` linked to `hide/.git` (inside the root), is refused, and
+/// nothing outside is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8_b1_only_the_repositorys_own_git_dir_is_skipped() {
+    let d = host_disk();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(d.ws.join("sub/deep")).unwrap();
+    std::fs::write(d.ws.join("sub/deep/f"), "tracked\n").unwrap();
+    host_git(&d.ws, &["add", "-A"]);
+    host_git(&d.ws, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-b1");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::create_dir_all(d.ws.join("hide/.git")).unwrap();
+    link(&outside, &d.ws.join("hide/.git/deep"));
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    link(&d.ws.join("hide/.git"), &d.ws.join("sub"));
+    let (st, v) = served("POST", "/cli/git/abort-merge", "", Some(json!({"path": d.ws}))).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("link_outside_worktree")), "{v}");
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+}
+
+/// R8 B2: a folder link inside the work root whose target is outside the
+/// work tree is refused, not followed: `sub -> ws/elsewhere`, with
+/// `elsewhere/deep` linking out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8_b2_a_folder_link_leaving_the_work_tree_is_refused() {
+    let d = host_disk();
+    let repo = d.ws.join("repo");
+    std::fs::create_dir_all(repo.join("sub/deep")).unwrap();
+    k2_core::git::init_repo(&repo.to_string_lossy()).unwrap();
+    std::fs::write(repo.join("sub/deep/f"), "tracked\n").unwrap();
+    host_git(&repo, &["add", "-A"]);
+    host_git(&repo, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-b2");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::create_dir_all(d.ws.join("elsewhere")).unwrap();
+    link(&outside, &d.ws.join("elsewhere/deep"));
+    std::fs::remove_dir_all(repo.join("sub")).unwrap();
+    link(&d.ws.join("elsewhere"), &repo.join("sub"));
+    for (route, body) in [
+        ("/cli/git/abort-merge", json!({"path": repo})),
+        ("/cli/git/merge-branch", json!({"path": repo, "branch": "main"})),
+    ] {
+        let (st, v) = served("POST", route, "", Some(body)).await;
+        assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("link_outside_worktree")), "{route}: {v}");
+    }
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+    // The control: a folder link that stays in the work tree passes.
+    std::fs::remove_file(repo.join("sub")).unwrap();
+    std::fs::create_dir_all(repo.join("real-sub")).unwrap();
+    link(&repo.join("real-sub"), &repo.join("sub"));
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": repo})).is_ok());
+}
+
+/// R8 C: the checks run within a walk budget: many links, each a long
+/// `a/../` chain, are refused with `walk_budget` past it (a small budget
+/// here); within the default budget the same tree passes.
+#[test]
+fn r8_c_the_checks_stop_at_their_walk_budget() {
+    let d = host_disk();
+    let repo = d.ws.join("repo");
+    std::fs::create_dir_all(repo.join("a")).unwrap();
+    k2_core::git::init_repo(&repo.to_string_lossy()).unwrap();
+    let chain = "a/../".repeat(40);
+    for i in 0..50 {
+        link(Path::new(&format!("{chain}a")), &repo.join(format!("l{i}")));
+    }
+    let abort = route_schema("POST", "/cli/git/abort-merge");
+    let body = json!({"path": repo});
+    let r = schema::confine_within(&d.root, abort, &[], &body, 1_000, Duration::from_secs(60));
+    assert!(matches!(r, Err(schema::Refusal::Coded("walk_budget", _))), "{r:?}");
+    assert!(schema::confine(&d.root, abort, &[], &body).is_ok(), "within the default budget");
+    // The budget is per request: the next check starts afresh.
+    assert!(schema::confine(&d.root, route_schema("GET", "/cli/fs/read-file"), &[("path".into(), repo.join("a").to_string_lossy().into())], &Value::Null).is_ok());
+}
+
+// ── round 9 ────────────────────────────────────────────────────────────
+
+fn mode(p: &Path, m: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+}
+
+/// R9 X1 (the repro): `.git/objects/ab/deep` linking out, reached through
+/// a tracked `sub` linked to `.git/objects/ab`: refused, nothing outside
+/// deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r9_x1_a_checkout_through_the_object_store_is_refused() {
+    let d = host_disk();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(d.ws.join("sub/deep")).unwrap();
+    std::fs::write(d.ws.join("sub/deep/f"), "tracked\n").unwrap();
+    host_git(&d.ws, &["add", "-A"]);
+    host_git(&d.ws, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-x1");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::create_dir_all(d.ws.join(".git/objects/ab")).unwrap();
+    link(&outside, &d.ws.join(".git/objects/ab/deep"));
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    link(&d.ws.join(".git/objects/ab"), &d.ws.join("sub"));
+    let (st, v) = served("POST", "/cli/git/abort-merge", "", Some(json!({"path": d.ws}))).await;
+    assert_eq!(st, "403 Forbidden", "{v}");
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+}
+
+/// R9 X1, each half on its own: (a) a work-tree link into the git dir is
+/// refused even when the git dir itself is clean; (b) the git dir's
+/// fan-out folders and `pack` are listed: a link or a folder in one is
+/// refused, for every git route.
+#[test]
+fn r9_x1_links_into_the_git_dir_and_into_its_object_folders() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let abort = route_schema("POST", "/cli/git/abort-merge");
+    let body = json!({"path": d.ws});
+    link(&d.ws.join(".git/refs"), &d.ws.join("refs-link"));
+    let r = schema::confine(&d.root, abort, &[], &body);
+    assert!(matches!(r, Err(schema::Refusal::Coded("link_into_git_dir", _))), "{r:?}");
+    std::fs::remove_file(d.ws.join("refs-link")).unwrap();
+    assert!(schema::confine(&d.root, abort, &[], &body).is_ok(), "the control");
+    let outside = d.root.parent().unwrap().join("outside-x1b");
+    std::fs::create_dir_all(&outside).unwrap();
+    let snap = route_schema("GET", "/cli/git/snapshot");
+    let q = vec![("path".to_string(), d.ws.to_string_lossy().into_owned())];
+    for (at, what) in [("objects/cd", "a link"), ("objects/pack", "a link")] {
+        std::fs::create_dir_all(d.ws.join(".git").join(at)).unwrap();
+        let l = d.ws.join(".git").join(at).join("x");
+        link(&outside, &l);
+        assert!(matches!(schema::confine(&d.root, snap, &q, &Value::Null), Err(schema::Refusal::Outside(_))), "{at}: {what}");
+        std::fs::remove_file(&l).unwrap();
+        std::fs::create_dir_all(&l).unwrap();
+        assert!(matches!(schema::confine(&d.root, snap, &q, &Value::Null), Err(schema::Refusal::Outside(_))), "{at}: a folder");
+        std::fs::remove_dir(&l).unwrap();
+    }
+    assert!(schema::confine(&d.root, snap, &q, &Value::Null).is_ok(), "the control");
+}
+
+/// R9 X2: a folder a check can't list (mode 0300) fails it, closed, in
+/// all three walks: the checkout's work tree, the git dir, a copy's
+/// source.
+#[test]
+fn r9_x2_a_folder_the_check_cant_list_fails_it() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let hidden = d.ws.join("hidden");
+    std::fs::create_dir_all(&hidden).unwrap();
+    mode(&hidden, 0o300);
+    let abort = route_schema("POST", "/cli/git/abort-merge");
+    let r = schema::confine(&d.root, abort, &[], &json!({"path": d.ws}));
+    mode(&hidden, 0o755);
+    assert!(r.is_err(), "the work tree: {r:?}");
+    let refs = d.ws.join(".git/refs/tags");
+    std::fs::create_dir_all(&refs).unwrap();
+    mode(&refs, 0o300);
+    let q = vec![("path".to_string(), d.ws.to_string_lossy().into_owned())];
+    let r = schema::confine(&d.root, route_schema("GET", "/cli/git/snapshot"), &q, &Value::Null);
+    mode(&refs, 0o755);
+    assert!(r.is_err(), "the git dir: {r:?}");
+    let src = d.ws.join("src-folder");
+    std::fs::create_dir_all(src.join("inner")).unwrap();
+    mode(&src.join("inner"), 0o300);
+    let copy = json!({"sources": [src], "destination": d.ws.join("hidden")});
+    let r = schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy);
+    mode(&src.join("inner"), 0o755);
+    assert!(r.is_err(), "a copy's source: {r:?}");
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/fs/copy"), &[], &copy).is_ok(), "the control");
+}
+
+/// R9 X3: resolve-links' candidates are checked within the request's one
+/// budget (a small one refuses), and past a cap they are answered
+/// unchecked.
+#[test]
+fn r9_x3_resolve_links_candidates_are_in_the_budget_and_capped() {
+    let d = host_disk();
+    std::fs::create_dir_all(d.ws.join("a")).unwrap();
+    // Each candidate a link whose target is a long `a/../` chain.
+    link(Path::new(&format!("{}a", "a/../".repeat(40))), &d.ws.join("lk"));
+    let links = route_schema("POST", "/cli/fs/resolve-links");
+    let body = |n: usize| json!({"workspace": d.ws, "paths": vec!["lk"; n]});
+    let r = check_request(&d.root, links, &[], body(100), 2_000, Duration::from_secs(60));
+    assert!(matches!(r, Err(schema::Refusal::Coded("walk_budget", _))), "a small budget: {:?}", r.err());
+    let (_, refused) = check_request(&d.root, links, &[], body(100), schema::WALK_STEPS, schema::WALK_TIME).unwrap();
+    assert!(refused.is_empty(), "within the default budget, all checked");
+    let (c, refused) = check_request(&d.root, links, &[], body(2_000), schema::WALK_STEPS, schema::WALK_TIME).unwrap();
+    assert_eq!(refused.len(), 1_500, "past the cap: answered unchecked");
+    assert_eq!(c.body["paths"].as_array().unwrap().len(), 500);
+}
+
+// ── F2–F6 (round 7's lows) ─────────────────────────────────────────────
+
+/// The host's Trash folder, for one test at a time (it is process-wide).
+struct HostTrash(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl HostTrash {
+    fn at(dir: &Path) -> HostTrash {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        k2_core::safe_delete::set_host_trash(Some(dir.to_path_buf()));
+        HostTrash(g)
+    }
+}
+
+impl Drop for HostTrash {
+    fn drop(&mut self) {
+        k2_core::safe_delete::set_host_trash(None);
+    }
+}
+
+/// F3: on a host, what a delete (not `permanent`) or a worktree removal
+/// sends to the Trash lands in the work root's `.k2-trash`, never the
+/// host's own Trash outside the root.
+#[test]
+fn f3_the_trash_stays_inside_the_work_root() {
+    let d = host_disk();
+    let trash = d.root.join(HOST_TRASH);
+    std::fs::write(d.ws.join("gone.md"), "x").unwrap();
+    std::fs::create_dir_all(d.ws.join("wt")).unwrap();
+    {
+        let _t = HostTrash::at(&trash);
+        k2_core::fs_commands::delete(&[d.ws.join("gone.md").to_string_lossy().into_owned()], false).unwrap();
+        k2_core::safe_delete::trash(d.ws.join("wt")).unwrap();
+    }
+    assert!(!d.ws.join("gone.md").exists() && !d.ws.join("wt").exists());
+    let names: Vec<String> = std::fs::read_dir(&trash).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.iter().any(|n| n.starts_with("gone.md-")) && names.iter().any(|n| n.starts_with("wt-")), "{names:?}");
+}
+
+/// F4: what a host tells about outside its work root. A listing gives a
+/// link's own size, never its target's; resolve-links' answer carries the
+/// workspace's root only (no `~/…` or canonical spelling); `/cli/fs/info`
+/// (the host's home) is never relayed.
+#[test]
+fn f4_a_host_tells_nothing_about_outside_its_work_root() {
+    let d = host_disk();
+    let outside = d.root.parent().unwrap().join("outside-f4");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("big"), vec![b'x'; 12_345]).unwrap();
+    link(&outside.join("big"), &d.ws.join("big-link"));
+    let size = |follow_off: bool| {
+        k2_core::fs_commands::set_list_without_following(follow_off);
+        let entries = k2_core::fs_commands::read_dir(&d.ws.to_string_lossy(), true).unwrap();
+        k2_core::fs_commands::set_list_without_following(false);
+        entries.into_iter().find(|e| e.name == "big-link").unwrap().size
+    };
+    assert_ne!(size(true), 12_345, "the link's own size on a host");
+    assert_eq!(size(false), 12_345, "the control: a local listing follows it, as before");
+    let answer = json!({"root": "/h1/work/notes", "prefixes": ["/h1/work/notes", "/private/h1/work/notes", "~/work/notes"], "links": []}).to_string();
+    let v: Value = serde_json::from_str(&links_prefixes_root_only(&answer).unwrap()).unwrap();
+    assert_eq!(v["prefixes"], json!(["/h1/work/notes"]));
+    assert!(!relayed("GET", "/cli/fs/info"));
+}
+
+/// F5: a request is confined to the workspace the controller routed it to
+/// (`k2_workspace`), not just the work root: a link from one workspace into
+/// another on the same host is refused, for a path and for resolve-links.
+#[test]
+fn f5_a_request_stays_in_its_routed_workspace() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("secret"), "s").unwrap();
+    link(&other, &d.ws.join("peek"));
+    std::fs::write(d.ws.join("own.md"), "o").unwrap();
+    let read = route_schema("GET", "/cli/fs/read-file");
+    let q = |p: &Path, scoped: bool| {
+        let mut q = vec![("path".to_string(), p.to_string_lossy().into_owned())];
+        if scoped {
+            q.push((SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned()));
+        }
+        q
+    };
+    let check = |q: Vec<(String, String)>| check_request(&d.root, read, &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME);
+    assert!(matches!(check(q(&d.ws.join("peek/secret"), true)), Err(schema::Refusal::Outside(_))), "into another workspace");
+    let ok = check(q(&d.ws.join("own.md"), true)).expect("its own file");
+    assert!(ok.0.query.iter().all(|(k, _)| k != SCOPE_KEY), "the daemon never sees k2_workspace");
+    assert!(check(q(&d.ws.join("peek/secret"), false)).is_ok(), "the control: the work root alone allows it");
+    // A scope that isn't a workspace under the root.
+    let bad = vec![("path".to_string(), d.ws.join("own.md").to_string_lossy().into_owned()), (SCOPE_KEY.to_string(), d.root.to_string_lossy().into_owned())];
+    assert!(check(bad).is_err(), "the root itself is no workspace");
+    // resolve-links: a candidate through the link into the other workspace.
+    let links = route_schema("POST", "/cli/fs/resolve-links");
+    let scoped = vec![(SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned())];
+    let body = json!({"workspace": d.ws, "paths": ["peek/secret", "own.md"]});
+    let (_, refused) = check_request(&d.root, links, &scoped, body, schema::WALK_STEPS, schema::WALK_TIME).unwrap();
+    assert_eq!(refused, vec![(0, "peek/secret".to_string())]);
+}
+
+// ── review round 10b (scratch) ─────────────────────────────────────────
+
+fn rv_refused_code(r: &Result<schema::Confined, schema::Refusal>) -> String {
+    match r {
+        Ok(_) => "ok".into(),
+        Err(schema::Refusal::Coded(c, _)) => c.to_string(),
+        Err(schema::Refusal::Outside(_)) => "outside".into(),
+        Err(schema::Refusal::Undeclared(_)) => "undeclared".into(),
+    }
+}
+
+/// Item 1: a clean git dir; a work-tree link into `.git/objects/ab` (and
+/// into `.git` itself) is refused for abort-merge and merge-branch; a
+/// link in place of `objects/ab` or `objects/pack` is refused.
+#[test]
+fn rv10_item1_links_into_objects_refused_for_abort_and_merge() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/ab")).unwrap();
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    for target in [".git/objects/ab", ".git/objects/pack", ".git", ".git/objects"] {
+        link(&d.ws.join(target), &d.ws.join("sub"));
+        for (route, body) in [
+            ("/cli/git/abort-merge", json!({"path": d.ws})),
+            ("/cli/git/merge-branch", json!({"path": d.ws, "branch": "main"})),
+        ] {
+            let r = schema::confine(&d.root, route_schema("POST", route), &[], &body);
+            assert_eq!(rv_refused_code(&r), "link_into_git_dir", "{route} via {target}");
+        }
+        // Relative target too.
+        std::fs::remove_file(d.ws.join("sub")).unwrap();
+        link(Path::new(target), &d.ws.join("sub"));
+        let r = schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": d.ws}));
+        assert_eq!(rv_refused_code(&r), "link_into_git_dir", "relative {target}");
+        std::fs::remove_file(d.ws.join("sub")).unwrap();
+    }
+    // objects/ab itself a symlink (to a folder inside the work root), and pack.
+    let inside_dir = d.ws.join("elsewhere");
+    std::fs::create_dir_all(&inside_dir).unwrap();
+    let snap = route_schema("GET", "/cli/git/snapshot");
+    let q = vec![("path".to_string(), d.ws.to_string_lossy().into_owned())];
+    for at in ["objects/ab", "objects/pack"] {
+        let p = d.ws.join(".git").join(at);
+        let kept = d.ws.join(".git").join(format!("{}.kept", at.replace('/', "_")));
+        std::fs::rename(&p, &kept).unwrap();
+        link(&inside_dir, &p);
+        assert_eq!(rv_refused_code(&schema::confine(&d.root, snap, &q, &Value::Null)), "outside", "{at} a link");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::rename(&kept, &p).unwrap();
+    }
+    assert_eq!(rv_refused_code(&schema::confine(&d.root, snap, &q, &Value::Null)), "ok", "control");
+    assert_eq!(rv_refused_code(&schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": d.ws}))), "ok", "control");
+}
+
+/// Item 1 on a case-insensitive disk (macOS default): `.GIT` is the git
+/// dir too.
+#[test]
+fn rv10_item1_case_variant_link_into_git_dir() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    if !d.ws.join(".GIT").exists() {
+        eprintln!("case-sensitive disk: skipped");
+        return;
+    }
+    std::fs::create_dir_all(d.ws.join(".git/objects/ab")).unwrap();
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    let mut bypass = Vec::new();
+    for target in [".GIT/objects/ab", ".Git", ".git/OBJECTS/ab"] {
+        link(&d.ws.join(target), &d.ws.join("sub"));
+        let r = schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": d.ws}));
+        if rv_refused_code(&r) != "link_into_git_dir" {
+            bypass.push(format!("{target}: {}", rv_refused_code(&r)));
+        }
+        std::fs::remove_file(d.ws.join("sub")).unwrap();
+    }
+    assert!(bypass.is_empty(), "links into the git dir by another case pass: {bypass:?}");
+}
+
+/// Item 2: an unreadable folder inside the git dir's objects fan-out.
+#[test]
+fn rv10_item2_unreadable_fanout_and_deep_folder() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let ab = d.ws.join(".git/objects/ab");
+    std::fs::create_dir_all(&ab).unwrap();
+    mode(&ab, 0o300);
+    let q = vec![("path".to_string(), d.ws.to_string_lossy().into_owned())];
+    let r = schema::confine(&d.root, route_schema("GET", "/cli/git/snapshot"), &q, &Value::Null);
+    mode(&ab, 0o755);
+    assert!(r.is_err(), "objects/ab unreadable: {r:?}");
+    // a deep work-tree folder for discard
+    let deep = d.ws.join("a/b/c");
+    std::fs::create_dir_all(&deep).unwrap();
+    mode(&deep, 0o000);
+    let r = schema::confine(&d.root, route_schema("POST", "/cli/git/discard"), &[], &json!({"path": d.ws, "files": ["sub/f"]}));
+    mode(&deep, 0o755);
+    assert!(r.is_err(), "deep unreadable work-tree folder: {r:?}");
+}
+
+/// Item 3: the budget and the scope reset when a check panics; a nested
+/// guard shares the outer one.
+#[test]
+fn rv10_item3_budget_and_scope_reset_on_panic() {
+    let root = PathBuf::from("/nonexistent-root");
+    let r = std::panic::catch_unwind(|| {
+        let _g = budget::guard(3, Duration::from_secs(60));
+        let _s = scope::set(Some(PathBuf::from("/nonexistent-root/ws")));
+        assert!(budget::charge());
+        panic!("boom");
+    });
+    assert!(r.is_err());
+    for _ in 0..10 {
+        assert!(budget::charge(), "no budget after a panic: unlimited");
+    }
+    assert_eq!(scope::within(&root), root, "scope reset");
+    // nested guard shares and doesn't reset the outer
+    let outer = budget::guard(2, Duration::from_secs(60));
+    {
+        let _inner = budget::guard(1_000, Duration::from_secs(60));
+        assert!(budget::charge());
+        assert!(budget::charge());
+        assert!(!budget::charge());
+    }
+    assert!(!budget::charge(), "the outer budget still spent after the inner guard drops");
+    assert!(outer.spent());
+    drop(outer);
+    assert!(budget::charge());
+}
+
+/// Item 3: after check_request (refused for budget), nothing remains set.
+#[test]
+fn rv10_item3_check_request_leaves_nothing_behind() {
+    let d = host_disk();
+    std::fs::create_dir_all(d.ws.join("a")).unwrap();
+    link(Path::new(&format!("{}a", "a/../".repeat(40))), &d.ws.join("lk"));
+    let links = route_schema("POST", "/cli/fs/resolve-links");
+    let scoped = vec![(SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned())];
+    let r = check_request(&d.root, links, &scoped, json!({"workspace": d.ws, "paths": vec!["lk"; 100]}), 500, Duration::from_secs(60));
+    assert!(matches!(r, Err(schema::Refusal::Coded("walk_budget", _))));
+    for _ in 0..1000 {
+        assert!(budget::charge());
+    }
+    assert_eq!(scope::within(&d.root), d.root);
+    // non-string candidates are refused, not silently dropped then allowed
+    let r = check_request(&d.root, links, &scoped, json!({"workspace": d.ws, "paths": ["own", 5]}), schema::WALK_STEPS, schema::WALK_TIME);
+    assert!(r.is_err(), "a non-string candidate: {:?}", r.map(|x| x.0.body));
+}
+
+/// F5: sibling workspaces with a shared prefix (`notes` vs `notes2`).
+#[test]
+fn rv10_f5_sibling_prefix() {
+    let d = host_disk();
+    let sib = d.root.join("notes2");
+    std::fs::create_dir_all(&sib).unwrap();
+    std::fs::write(sib.join("secret"), "s").unwrap();
+    link(&sib, &d.ws.join("peek"));
+    let scoped = |p: &Path| vec![("path".to_string(), p.to_string_lossy().into_owned()), (SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned())];
+    let read = route_schema("GET", "/cli/fs/read-file");
+    let check = |q: Vec<(String, String)>| check_request(&d.root, read, &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME);
+    assert!(check(scoped(&sib.join("secret"))).is_err(), "sibling with a shared prefix, direct");
+    assert!(check(scoped(&d.ws.join("peek/secret"))).is_err(), "sibling via link");
+    // A scope spelled with a trailing slash / the sibling as a scope
+    let q = vec![("path".to_string(), sib.join("secret").to_string_lossy().into_owned()), (SCOPE_KEY.to_string(), format!("{}/", d.ws.display()))];
+    assert!(check(q).is_err(), "trailing slash scope");
+    // copy into the sibling
+    let copy = json!({"sources": [d.ws.join("peek")], "destination": d.ws});
+    let r = check_request(&d.root, route_schema("POST", "/cli/fs/copy"), &[(SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned())], copy, schema::WALK_STEPS, schema::WALK_TIME);
+    assert!(r.is_err(), "copying a link into the sibling");
+}
+
+/// F5 via git: a workspace's `.git` gitfile naming another workspace's
+/// git dir on the same host. A request routed to `notes` then writes the
+/// other workspace's index and refs.
+#[test]
+fn rv10_f5_gitfile_into_sibling_workspace() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    host_git(&other, &["config", "user.name", "t"]);
+    host_git(&other, &["config", "user.email", "t@example.invalid"]);
+    let index_before = std::fs::read(other.join(".git/index")).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    std::fs::write(d.ws.join("new-file"), "x").unwrap();
+    let scoped = vec![(SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned())];
+    let r = check_request(&d.root, route_schema("POST", "/cli/git/stage-all"), &scoped, json!({"path": d.ws}), schema::WALK_STEPS, schema::WALK_TIME);
+    let passed = r.is_ok();
+    if passed {
+        // what the daemon's handler then does
+        let wd = k2_core::git::repo_dirs(&d.ws.to_string_lossy());
+        eprintln!("RV10 opened: {wd:?}");
+        let sa = k2_core::git::stage_all(&d.ws.to_string_lossy());
+        let head_before = std::fs::read_to_string(other.join(".git/refs/heads/main")).or_else(|_| std::fs::read_to_string(other.join(".git/refs/heads/master"))).unwrap_or_default();
+        let r2 = check_request(&d.root, route_schema("POST", "/cli/git/commit"), &scoped, json!({"path": d.ws, "message": "x"}), schema::WALK_STEPS, schema::WALK_TIME);
+        let c = k2_core::git::commit(&d.ws.to_string_lossy(), "from notes");
+        let head_after = std::fs::read_to_string(other.join(".git/refs/heads/main")).or_else(|_| std::fs::read_to_string(other.join(".git/refs/heads/master"))).unwrap_or_default();
+        let index_after = std::fs::read(other.join(".git/index")).unwrap();
+        panic!("stage-all routed to notes passed the host's checks: stage_all={sa:?} index_changed={} commit_check_ok={} commit={:?} other_head {head_before:?} -> {head_after:?}", index_before != index_after, r2.is_ok(), c.map(|_| ()));
+    }
+}
+
+/// F4: a repository above the work root (the host's home is a repo):
+/// the refusal names its path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rv10_f4_refusal_names_a_path_outside_the_root() {
+    let d = host_disk();
+    let above = d.root.parent().unwrap().to_path_buf();
+    host_git(&above, &["init", "-q"]);
+    let q = format!("path={}", encode(&d.ws.to_string_lossy()));
+    let (st, v) = served("GET", "/cli/git/info", &q, None).await;
+    let _ = std::fs::remove_dir_all(above.join(".git"));
+    assert_eq!(st, "403 Forbidden", "{v}");
+    let msg = v["error"].as_str().unwrap_or("").to_string();
+    assert!(!msg.contains(&above.join(".git").to_string_lossy().to_string()), "the refusal names a path outside the work root: {msg}");
+}
+
+// ── round 10 ───────────────────────────────────────────────────────────
+
+/// D1's exception: a workspace inside a larger checkout (the repository's
+/// work tree holds it, its git dir that work tree's own `.git`) still
+/// passes, routed to the workspace; a linked worktree's or a gitfile's git
+/// dir elsewhere does not (`rv10_f5_gitfile_into_sibling_workspace`).
+#[test]
+fn r10_d1_a_workspace_inside_a_larger_checkout_passes() {
+    let d = host_disk();
+    let mono = d.root.join("mono");
+    std::fs::create_dir_all(mono.join("team/notes")).unwrap();
+    committed_repo(&mono);
+    let ws = mono.join("team/notes");
+    let scoped = vec![(SCOPE_KEY.to_string(), ws.to_string_lossy().into_owned())];
+    let r = check_request(&d.root, route_schema("POST", "/cli/git/stage-all"), &scoped, json!({"path": ws}), schema::WALK_STEPS, schema::WALK_TIME);
+    assert!(r.is_ok(), "{:?}", r.err());
+}
+
+/// Round 10: the host's trash folder is never a symlink (it would lead
+/// the Trash out of the work root).
+#[test]
+fn r10_the_trash_folder_is_never_a_link() {
+    let d = host_disk();
+    let outside = d.root.parent().unwrap().join("outside-trash");
+    std::fs::create_dir_all(&outside).unwrap();
+    let trash = d.root.join(HOST_TRASH);
+    link(&outside, &trash);
+    std::fs::write(d.ws.join("gone.md"), "x").unwrap();
+    let r = {
+        let _t = HostTrash::at(&trash);
+        k2_core::fs_commands::delete(&[d.ws.join("gone.md").to_string_lossy().into_owned()], false)
+    };
+    assert!(r.is_err(), "{r:?}");
+    assert!(d.ws.join("gone.md").exists(), "not moved");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing outside");
+}
+
+// ── review round 11 (scratch) ──────────────────────────────────────────
+
+fn rv11_check(d: &HostDisk, ws: &Path, route: (&str, &str), body: Value) -> Result<(), String> {
+    let scoped = vec![(SCOPE_KEY.to_string(), ws.to_string_lossy().into_owned())];
+    check_request(&d.root, route_schema(route.0, route.1), &scoped, body, schema::WALK_STEPS, schema::WALK_TIME).map(|_| ()).map_err(|e| format!("{e:?}"))
+}
+
+/// D1 probes: every way to name a sibling's repository is refused.
+#[test]
+fn rv11_d1_probes_all_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let stage = ("POST", "/cli/git/stage-all");
+    let mut passed = Vec::new();
+    let mut probe = |name: &str, d: &HostDisk| {
+        if rv11_check(d, &d.ws, stage, json!({"path": d.ws})).is_ok() {
+            passed.push(name.to_string());
+        }
+    };
+    // a) own repo, commondir -> sibling's .git
+    committed_repo(&d.ws);
+    std::fs::write(d.ws.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    probe("commondir abs", &d);
+    std::fs::write(d.ws.join(".git/commondir"), "../../other/.git\n").unwrap();
+    probe("commondir rel", &d);
+    std::fs::remove_file(d.ws.join(".git/commondir")).unwrap();
+    assert!(rv11_check(&d, &d.ws, stage, json!({"path": d.ws})).is_ok(), "control: own repo passes");
+    // b) core.worktree -> sibling, -> root, -> ancestor (root)
+    host_git(&d.ws, &["config", "core.worktree", &other.to_string_lossy()]);
+    probe("core.worktree sibling", &d);
+    host_git(&d.ws, &["config", "core.worktree", &d.root.to_string_lossy()]);
+    probe("core.worktree root", &d);
+    host_git(&d.ws, &["config", "--unset", "core.worktree"]);
+    // c) .git a symlink to the sibling's git dir
+    std::fs::rename(d.ws.join(".git"), d.ws.join("own.git")).unwrap();
+    link(&other.join(".git"), &d.ws.join(".git"));
+    probe(".git symlink to sibling", &d);
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    // d) gitfile into a sibling's linked worktree git dir
+    let made = k2_core::git::create_worktree(&other.to_string_lossy(), "feat");
+    assert!(made.is_ok(), "{made:?}");
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/feat").display())).unwrap();
+    probe("gitfile into sibling linked worktree", &d);
+    // e) gitfile into own gitdir copy whose commondir -> sibling
+    std::fs::write(d.ws.join("own.git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", d.ws.join("own.git").display())).unwrap();
+    probe("gitfile own + commondir sibling", &d);
+    assert!(passed.is_empty(), "passed: {passed:?}");
+}
+
+/// D1 exception abuse: workspace nested in a larger checkout; the
+/// enclosing checkout's `.git` is a gitfile into a sibling; the work tree
+/// is the root itself; a bare repo above.
+#[test]
+fn rv11_d1_exception_probes() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let mono = d.root.join("mono");
+    let ws = mono.join("team/notes");
+    std::fs::create_dir_all(&ws).unwrap();
+    // mono/.git a gitfile into other's git dir
+    std::fs::write(mono.join(".git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    assert!(rv11_check(&d, &ws, ("POST", "/cli/git/stage-all"), json!({"path": ws})).is_err(), "enclosing gitfile into sibling");
+    std::fs::remove_file(mono.join(".git")).unwrap();
+    // mono/.git a symlink to other/.git
+    link(&other.join(".git"), &mono.join(".git"));
+    assert!(rv11_check(&d, &ws, ("POST", "/cli/git/stage-all"), json!({"path": ws})).is_err(), "enclosing .git symlink into sibling");
+    std::fs::remove_file(mono.join(".git")).unwrap();
+    // root itself a repo: work tree == root
+    host_git(&d.root, &["init", "-q"]);
+    assert!(rv11_check(&d, &d.ws, ("POST", "/cli/git/stage-all"), json!({"path": d.ws})).is_err(), "work tree is the root");
+    host_git(&d.root, &["config", "core.bare", "true"]);
+    assert!(rv11_check(&d, &d.ws, ("POST", "/cli/git/stage-all"), json!({"path": d.ws})).is_err(), "root/.git bare");
+    std::fs::remove_dir_all(d.root.join(".git")).unwrap();
+}
+
+/// Regression probe: an agent's workspace that is a K2 linked worktree
+/// (`<project>/.worktrees/<branch>`), git requests routed to it.
+#[test]
+fn rv11_d1_linked_worktree_workspace() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let made = k2_core::git::create_worktree(&d.ws.to_string_lossy(), "feat");
+    assert!(made.is_ok(), "{made:?}");
+    let wt = d.ws.join(".worktrees/feat");
+    assert!(wt.join(".git").is_file());
+    let mut refused = Vec::new();
+    for (m, r) in [("GET", "/cli/git/info"), ("GET", "/cli/git/changes"), ("POST", "/cli/git/stage-all")] {
+        let scoped = vec![(SCOPE_KEY.to_string(), wt.to_string_lossy().into_owned())];
+        let res = if m == "GET" {
+            let q = vec![("path".to_string(), wt.to_string_lossy().into_owned()), scoped[0].clone()];
+            check_request(&d.root, route_schema(m, r), &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME).map(|_| ())
+        } else {
+            check_request(&d.root, route_schema(m, r), &scoped, json!({"path": wt}), schema::WALK_STEPS, schema::WALK_TIME).map(|_| ())
+        };
+        if let Err(e) = res {
+            refused.push(format!("{r}: {e:?}"));
+        }
+    }
+    // Routed to the project instead: passes.
+    assert!(rv11_check(&d, &d.ws, ("POST", "/cli/git/stage-all"), json!({"path": wt})).is_ok(), "project-scoped");
+    assert!(refused.is_empty(), "a K2 linked-worktree workspace is refused: {refused:?}");
+}
+
+/// F5 via alternates: `notes`' own repo borrows `other`'s objects; a
+/// request routed to `notes` reads `other`'s committed content.
+#[test]
+fn rv11_alternates_into_sibling_reads_its_objects() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    k2_core::git::init_repo(&other.to_string_lossy()).unwrap();
+    std::fs::write(other.join("secret.txt"), "TOP-SECRET\n").unwrap();
+    host_git(&other, &["add", "-A"]);
+    host_git(&other, &["commit", "-qm", "s"]);
+    let out = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap();
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", other.join(".git/objects").display())).unwrap();
+    let q = vec![
+        ("path".to_string(), d.ws.to_string_lossy().into_owned()),
+        ("file_path".to_string(), "secret.txt".to_string()),
+        ("git_ref".to_string(), sha.clone()),
+        (SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned()),
+    ];
+    let r = check_request(&d.root, route_schema("GET", "/cli/git/file-at-ref"), &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME);
+    if r.is_ok() {
+        let got = k2_core::git::file_content_at_ref(&d.ws.to_string_lossy(), "secret.txt", &sha);
+        panic!("file-at-ref routed to notes passed with alternates into other: {got:?}");
+    }
+}
+
+/// The exception's reach: routed to `mono/team/notes`, stage-all stages a
+/// sibling workspace's (`mono/team/other`) changes and abort-merge's
+/// checkout walks the whole enclosing checkout.
+#[test]
+fn rv11_exception_reaches_sibling_in_same_checkout() {
+    let d = host_disk();
+    let mono = d.root.join("mono");
+    std::fs::create_dir_all(mono.join("team/notes")).unwrap();
+    std::fs::create_dir_all(mono.join("team/other")).unwrap();
+    std::fs::write(mono.join("team/other/x"), "1").unwrap();
+    committed_repo(&mono);
+    std::fs::write(mono.join("team/other/x"), "2").unwrap();
+    let ws = mono.join("team/notes");
+    let ok = rv11_check(&d, &ws, ("POST", "/cli/git/stage-all"), json!({"path": ws}));
+    let staged = ok.is_ok() && k2_core::git::stage_all(&ws.to_string_lossy()).is_ok();
+    let st = std::process::Command::new("git").args(["diff", "--cached", "--name-only"]).current_dir(&mono).output().unwrap();
+    eprintln!("RV11 exception: check={ok:?} staged={staged} cached={}", String::from_utf8_lossy(&st.stdout));
+}
+
+
+// ── review round 12 (scratch) ──────────────────────────────────────────
+
+fn rv12_scoped(d: &HostDisk, ws: &Path, m: &str, r: &str, extra: &[(&str, String)], body: Value) -> Result<(), String> {
+    let mut q: Vec<(String, String)> = extra.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+    q.push((SCOPE_KEY.to_string(), ws.to_string_lossy().into_owned()));
+    check_request(&d.root, route_schema(m, r), &q, body, schema::WALK_STEPS, schema::WALK_TIME).map(|_| ()).map_err(|e| format!("{e:?}"))
+}
+
+/// `other` with a committed secret; returns its HEAD sha.
+fn rv12_secret_repo(other: &Path) -> String {
+    std::fs::create_dir_all(other).unwrap();
+    k2_core::git::init_repo(&other.to_string_lossy()).unwrap();
+    std::fs::write(other.join("secret.txt"), "TOP-SECRET\n").unwrap();
+    host_git(other, &["add", "-A"]);
+    host_git(other, &["commit", "-qm", "s"]);
+    let out = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(other).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// file-at-ref routed to `ws` for `sha`: Err(refusal) or Ok(what libgit2 read).
+fn rv12_file_at_ref(d: &HostDisk, ws: &Path, sha: &str) -> Result<Result<String, String>, String> {
+    let extra = [("path", ws.to_string_lossy().into_owned()), ("file_path", "secret.txt".to_string()), ("git_ref", sha.to_string())];
+    rv12_scoped(d, ws, "GET", "/cli/git/file-at-ref", &extra, Value::Null)?;
+    Ok(k2_core::git::file_content_at_ref(&ws.to_string_lossy(), "secret.txt", sha))
+}
+
+fn rv12_assert_no_leak(what: &str, r: Result<Result<String, String>, String>) {
+    if let Ok(Ok(s)) = &r {
+        assert!(!s.contains("TOP-SECRET"), "{what}: check passed and libgit2 read the sibling's secret: {s:?}");
+    }
+    eprintln!("RV12 {what}: {r:?}");
+}
+
+/// N1 control: direct alternates (absolute and relative) into a sibling are refused.
+#[test]
+fn rv12_n1_direct_alternates_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    let alt = d.ws.join(".git/objects/info/alternates");
+    std::fs::write(&alt, format!("{}\n", other.join(".git/objects").display())).unwrap();
+    assert!(rv12_file_at_ref(&d, &d.ws, &sha).is_err(), "absolute");
+    std::fs::write(&alt, "../../../other/.git/objects\n").unwrap();
+    assert!(rv12_file_at_ref(&d, &d.ws, &sha).is_err(), "relative");
+    // Policy (a), round 12 (the coordinator's decision): alternates are
+    // refused even when they point inside the workspace.
+    std::fs::create_dir_all(d.ws.join("store/objects")).unwrap();
+    std::fs::write(&alt, format!("{}\n", d.ws.join("store/objects").display())).unwrap();
+    assert!(rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws})).is_err(), "in-ws alternates: refused (policy a)");
+}
+
+/// N1 bypass: alternates of alternates. notes' alternates name an objects
+/// dir inside notes, whose own alternates name other's objects.
+#[test]
+fn rv12_n1_nested_alternates_into_sibling() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::create_dir_all(d.ws.join("store/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", d.ws.join("store/objects").display())).unwrap();
+    std::fs::write(d.ws.join("store/objects/info/alternates"), format!("{}\n", other.join(".git/objects").display())).unwrap();
+    rv12_assert_no_leak("nested alternates", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// N1 bypass: the alternate objects dir is inside notes but its fan-out
+/// folders are symlinks into other's objects.
+#[test]
+fn rv12_n1_alternate_with_linked_fanout() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    let store = d.ws.join("store/objects");
+    std::fs::create_dir_all(&store).unwrap();
+    for e in std::fs::read_dir(other.join(".git/objects")).unwrap() {
+        let e = e.unwrap();
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.len() == 2 {
+            link(&e.path(), &store.join(&n));
+        }
+    }
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", store.display())).unwrap();
+    rv12_assert_no_leak("alternate with symlinked fan-out", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// N1 bypass: an alternates file that isn't UTF-8 is skipped by the check
+/// (read_to_string fails) but git/libgit2 read it as bytes.
+#[test]
+fn rv12_n1_non_utf8_alternates() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    let mut bytes = b"# \xff\xfe\n".to_vec();
+    bytes.extend_from_slice(format!("{}\n", other.join(".git/objects").display()).as_bytes());
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), bytes).unwrap();
+    rv12_assert_no_leak("non-UTF-8 alternates", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// http-alternates: git uses it only for dumb-HTTP fetch; libgit2 ignores it.
+#[test]
+fn rv12_n1_http_alternates_inert() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/http-alternates"), format!("{}\n", other.join(".git/objects").display())).unwrap();
+    rv12_assert_no_leak("http-alternates", rv12_file_at_ref(&d, &d.ws, &sha));
+}
+
+/// Same class as N1 at the common dir: a `commondir` file that isn't UTF-8.
+/// repo_dirs' read_to_string fails, so the check sees common == git dir.
+/// (a) bytes after a NUL (libgit2 reads a C string); (b) a non-UTF-8
+/// symlink name (Linux only; APFS refuses such names).
+#[test]
+fn rv12_non_utf8_commondir_into_sibling() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = host_disk();
+    let other = d.root.join("other");
+    let sha = rv12_secret_repo(&other);
+    committed_repo(&d.ws);
+    let mut bytes = other.join(".git").display().to_string().into_bytes();
+    bytes.extend_from_slice(b"\0\xff\n");
+    std::fs::write(d.ws.join(".git/commondir"), &bytes).unwrap();
+    eprintln!("RV12 commondir-nul repo_dirs={:?}", k2_core::git::repo_dirs(&d.ws.to_string_lossy()));
+    rv12_assert_no_leak("non-UTF-8 commondir (NUL)", rv12_file_at_ref(&d, &d.ws, &sha));
+    let name = std::ffi::OsStr::from_bytes(b"x\xff");
+    if std::os::unix::fs::symlink(other.join(".git"), d.ws.join(name)).is_ok() {
+        std::fs::write(d.ws.join(".git/commondir"), b"../x\xff\n").unwrap();
+        rv12_assert_no_leak("non-UTF-8 commondir (name)", rv12_file_at_ref(&d, &d.ws, &sha));
+    } else {
+        eprintln!("RV12 commondir-name: filesystem refuses non-UTF-8 names (untested here)");
+    }
+}
+
+/// res(): an unresolvable (link loop) git dir fails closed.
+#[test]
+fn rv12_res_fails_closed() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    // .git a gitfile naming a path through a symlink loop
+    link(&d.ws.join("loopb"), &d.ws.join("loopa"));
+    link(&d.ws.join("loopa"), &d.ws.join("loopb"));
+    std::fs::rename(d.ws.join(".git"), d.ws.join("real.git")).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", d.ws.join("real.git").display())).unwrap();
+    assert!(rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws})).is_ok(), "control: gitfile in ws");
+    // commondir through the loop: libgit2 can't open it either, but the check must refuse
+    std::fs::write(d.ws.join("real.git/commondir"), format!("{}\n", d.ws.join("loopa/x").display())).unwrap();
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    let opened = k2_core::git::repo_dirs(&d.ws.to_string_lossy());
+    eprintln!("RV12 res loop commondir: check={r:?} repo_dirs={opened:?}");
+    assert!(r.is_err() || opened.is_err(), "libgit2 opened it and the check passed");
+    let fn_src = include_str!("fs_relay.rs");
+    assert!(!fn_src.contains("unwrap_or_else(|| d.to_path_buf())"), "old res() fallback still present");
+}
+
+/// N2: K2 linked worktree workspace: info, changes, stage-all, commit pass and work.
+#[test]
+fn rv12_n2_linked_worktree_functional() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    host_git(&d.ws, &["config", "user.name", "lab"]);
+    host_git(&d.ws, &["config", "user.email", "lab@example.invalid"]);
+    k2_core::git::create_worktree(&d.ws.to_string_lossy(), "feat").unwrap();
+    let wt = d.ws.join(".worktrees/feat");
+    let p = wt.to_string_lossy().into_owned();
+    std::fs::write(wt.join("new.txt"), "n\n").unwrap();
+    for (m, r) in [("GET", "/cli/git/info"), ("GET", "/cli/git/changes")] {
+        assert!(rv12_scoped(&d, &wt, m, r, &[("path", p.clone())], Value::Null).is_ok(), "{r}");
+    }
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/stage-all", &[], json!({"path": p})).is_ok());
+    k2_core::git::stage_all(&p).unwrap();
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/commit", &[], json!({"path": p, "message": "m"})).is_ok());
+    k2_core::git::commit(&p, "m").unwrap();
+    assert!(k2_core::git::get_changed_files(&p).is_empty());
+    // the project, nested repo-in-checkout still fine
+    assert!(rv12_scoped(&d, &d.ws, "GET", "/cli/git/info", &[("path", d.ws.to_string_lossy().into_owned())], Value::Null).is_ok());
+}
+
+/// N2 for a project nested in a bigger checkout: mono/proj is the K2
+/// project (no own .git, mono's), its linked worktree mono/proj/.worktrees/feat.
+#[test]
+fn rv12_n2_nested_workspace_and_linked_in_checkout() {
+    let d = host_disk();
+    let mono = d.root.join("mono");
+    let ws = mono.join("team/notes");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("a.txt"), "a\n").unwrap();
+    committed_repo(&mono);
+    host_git(&mono, &["config", "user.name", "lab"]);
+    host_git(&mono, &["config", "user.email", "lab@example.invalid"]);
+    std::fs::write(ws.join("a.txt"), "b\n").unwrap();
+    let p = ws.to_string_lossy().into_owned();
+    for (m, r) in [("GET", "/cli/git/info"), ("GET", "/cli/git/changes")] {
+        assert!(rv12_scoped(&d, &ws, m, r, &[("path", p.clone())], Value::Null).is_ok(), "{r}");
+    }
+    assert!(rv12_scoped(&d, &ws, "POST", "/cli/git/stage-all", &[], json!({"path": p})).is_ok());
+    k2_core::git::stage_all(&p).unwrap();
+    assert!(rv12_scoped(&d, &ws, "POST", "/cli/git/commit", &[], json!({"path": p, "message": "m"})).is_ok());
+    k2_core::git::commit(&p, "m").unwrap();
+    // linked worktree of mono placed at mono/.worktrees/feat
+    k2_core::git::create_worktree(&mono.to_string_lossy(), "feat").unwrap();
+    let wt = mono.join(".worktrees/feat");
+    let wp = wt.to_string_lossy().into_owned();
+    std::fs::write(wt.join("w.txt"), "w\n").unwrap();
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/stage-all", &[], json!({"path": wp})).is_ok(), "linked in mono");
+    k2_core::git::stage_all(&wp).unwrap();
+    assert!(rv12_scoped(&d, &wt, "POST", "/cli/git/commit", &[], json!({"path": wp, "message": "m"})).is_ok());
+    k2_core::git::commit(&wp, "m").unwrap();
+}
+
+/// N2 abuse probes: each must be refused.
+#[test]
+fn rv12_n2_abuse_probes() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    k2_core::git::create_worktree(&other.to_string_lossy(), "feat").unwrap();
+    let stage = |d: &HostDisk, ws: &Path| rv12_scoped(d, ws, "POST", "/cli/git/stage-all", &[], json!({"path": ws}));
+    let mut passed = Vec::new();
+    // a) notes/.git gitfile into other's linked worktree git dir (abs and rel)
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/feat").display())).unwrap();
+    if stage(&d, &d.ws).is_ok() { passed.push("gitfile abs into other's worktree"); }
+    std::fs::write(d.ws.join(".git"), "gitdir: ../other/.git/worktrees/feat\n").unwrap();
+    if stage(&d, &d.ws).is_ok() { passed.push("gitfile rel into other's worktree"); }
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    // b) other's linked worktree workspace (other/.worktrees/feat) gitfile -> other/.git/worktrees/<id of another branch>
+    k2_core::git::create_worktree(&other.to_string_lossy(), "two").unwrap();
+    let feat = other.join(".worktrees/feat");
+    let saved = std::fs::read_to_string(feat.join(".git")).unwrap();
+    std::fs::write(feat.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/two").display())).unwrap();
+    if stage(&d, &feat).is_ok() { passed.push("linked ws gitfile into a sibling linked worktree"); }
+    std::fs::write(feat.join(".git"), saved).unwrap();
+    assert!(stage(&d, &feat).is_ok(), "control: linked ws passes");
+    // c) nested ws inside other (other/sub) with gitfile -> other/.git/worktrees/feat (back-link is feat's)
+    let sub = other.join("sub");
+    std::fs::write(sub.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/feat").display())).unwrap();
+    if stage(&d, &sub).is_ok() { passed.push("nested ws gitfile into project's linked worktree"); }
+    std::fs::remove_file(sub.join(".git")).unwrap();
+    // d) forged back-link: notes has its own fake common dir whose worktrees/x gitdir -> notes/.git,
+    //    but commondir points to other/.git
+    let fake = d.ws.join("fake");
+    std::fs::create_dir_all(fake.join("worktrees/x")).unwrap();
+    std::fs::copy(other.join(".git/worktrees/feat/HEAD"), fake.join("worktrees/x/HEAD")).unwrap();
+    std::fs::write(fake.join("worktrees/x/gitdir"), format!("{}\n", d.ws.join(".git").display())).unwrap();
+    std::fs::write(fake.join("worktrees/x/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", fake.join("worktrees/x").display())).unwrap();
+    if stage(&d, &d.ws).is_ok() { passed.push("forged back-link, commondir other"); }
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    // e) common an ancestor-looking .git that isn't an ancestor: mono/.git where ws is monorepo/x (prefix trick)
+    let mono = d.root.join("mono");
+    committed_repo(&mono);
+    k2_core::git::create_worktree(&mono.to_string_lossy(), "m1").unwrap();
+    let ws2 = d.root.join("monox");
+    std::fs::create_dir_all(&ws2).unwrap();
+    std::fs::write(ws2.join(".git"), format!("gitdir: {}\n", mono.join(".git/worktrees/m1").display())).unwrap();
+    std::fs::write(mono.join(".git/worktrees/m1/gitdir"), format!("{}\n", ws2.join(".git").display())).unwrap();
+    if stage(&d, &ws2).is_ok() { passed.push("common mono/.git, ws monox (string prefix)"); }
+    // f) enclosing_checkout with common a .git that's a gitfile/symlink into other
+    let top = d.root.join("top");
+    let inner = top.join("w");
+    std::fs::create_dir_all(&inner).unwrap();
+    link(&other.join(".git"), &top.join(".git"));
+    std::fs::write(inner.join(".git"), format!("gitdir: {}\n", top.join(".git/worktrees/feat").display())).unwrap();
+    if stage(&d, &inner).is_ok() { passed.push("ancestor .git symlink to other"); }
+    eprintln!("RV12 n2 abuse passed: {passed:?}");
+    assert!(passed.is_empty(), "passed: {passed:?}");
+}
+
+/// N2 functional: a worktree made with relative paths (git >= 2.48
+/// `--relative-paths` / worktree.useRelativePaths): gitfile and back-link relative.
+#[test]
+fn rv12_n2_relative_backlink() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".worktrees")).unwrap();
+    let out = std::process::Command::new("git")
+        .args(["worktree", "add", "--relative-paths", "-b", "rel", ".worktrees/rel"])
+        .current_dir(&d.ws).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+    if !out.status.success() {
+        eprintln!("RV12 relative: git lacks --relative-paths: {}", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+    let wt = d.ws.join(".worktrees/rel");
+    eprintln!("RV12 relative gitfile={:?} backlink={:?}", std::fs::read_to_string(wt.join(".git")), std::fs::read_to_string(d.ws.join(".git/worktrees/rel/gitdir")));
+    let r = rv12_scoped(&d, &wt, "POST", "/cli/git/stage-all", &[], json!({"path": wt}));
+    eprintln!("RV12 relative backlink linked ws: {r:?}");
+    // Round 12 (c): libgit2 (1.8) can't open a relative-paths worktree, so
+    // K2's handlers couldn't serve it either; the host refuses it rather
+    // than skip its checks. K2 makes worktrees with absolute paths.
+    if k2_core::git::repo_dirs(&wt.to_string_lossy()).is_err() {
+        assert!(r.is_err(), "unopenable by libgit2, yet passed: {r:?}");
+    } else {
+        assert!(r.is_ok(), "relative-paths linked worktree refused: {r:?}");
+    }
+}
+
+/// Gap: a repository libgit2 can't open (an extension git knows and
+/// libgit2 doesn't) skips git_precheck (`Err(_) => continue`), while routes
+/// that run the git CLI (worktrees list, prune) open it and follow its
+/// commondir into a sibling.
+#[test]
+fn rv12_libgit2_unopenable_skips_check_cli_follows() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    k2_core::git::create_worktree(&other.to_string_lossy(), "feat").unwrap();
+    committed_repo(&d.ws);
+    std::fs::write(d.ws.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    let mut hit = Vec::new();
+    for ext in ["partialclone", "relativeworktrees", "refstorage"] {
+        let cfg = other.join(".git/config");
+        let saved = std::fs::read_to_string(&cfg).unwrap();
+        let val = if ext == "refstorage" { "files" } else if ext == "partialclone" { "origin" } else { "true" };
+        host_git(&d.ws, &["config", "core.repositoryformatversion", "1"]);
+        host_git(&d.ws, &["config", &format!("extensions.{ext}"), val]);
+        let opened = k2_core::git::repo_dirs(&d.ws.to_string_lossy());
+        let p = d.ws.to_string_lossy().into_owned();
+        let r = rv12_scoped(&d, &d.ws, "GET", "/cli/git/worktrees", &[("path", p.clone())], Value::Null);
+        let wts = if r.is_ok() { k2_core::git::list_worktrees(&p).into_iter().map(|w| format!("{w:?}")).collect::<Vec<_>>() } else { vec![] };
+        eprintln!("RV12 ext {ext}: repo_dirs_ok={} check={r:?} worktrees={wts:?}", opened.is_ok());
+        if r.is_ok() && wts.iter().any(|w| w.contains("other")) {
+            hit.push(ext);
+        }
+        std::fs::write(&cfg, saved).unwrap();
+        // (Round 12: this `git config` in notes follows its commondir into
+        // other's config, just restored: the key may be gone already, so
+        // its status is not asserted.)
+        let _ = std::process::Command::new("git")
+            .args(["config", "--unset", &format!("extensions.{ext}")])
+            .current_dir(&d.ws)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output();
+    }
+    assert!(hit.is_empty(), "check skipped, git CLI reached the sibling via: {hit:?}");
+}
+
+/// Same gap, a write: create-worktree routed to notes writes a branch and
+/// worktree metadata into other's repository.
+#[test]
+fn rv12_libgit2_unopenable_create_worktree_writes_sibling() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    std::fs::write(d.ws.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    host_git(&d.ws, &["config", "core.repositoryformatversion", "1"]);
+    host_git(&d.ws, &["config", "extensions.partialclone", "origin"]);
+    let p = d.ws.to_string_lossy().into_owned();
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/create-worktree", &[], json!({"projectPath": p, "branch": "pwned"}));
+    eprintln!("RV12 create-worktree check={r:?}");
+    if r.is_ok() {
+        let made = k2_core::git::create_worktree(&p, "pwned");
+        let refs = std::process::Command::new("git").args(["branch", "--list"]).current_dir(&other).output().unwrap();
+        let b = String::from_utf8_lossy(&refs.stdout).to_string();
+        eprintln!("RV12 create-worktree made={made:?} other branches={b:?} other wt meta={:?}", std::fs::read_dir(other.join(".git/worktrees")).map(|r| r.count()));
+        assert!(!b.contains("pwned"), "branch written into other's repository");
+    }
+}
+
+// ── round 12 ───────────────────────────────────────────────────────────
+
+/// Round 12 (d): the git CLI must name the git dir, common dir and work
+/// tree libgit2 opened; any other answer is refused. (The bypasses the
+/// review found are caught earlier, by (c); this is the cross-check itself.)
+#[test]
+fn r12_d_the_git_cli_must_open_what_libgit2_opened() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let (g, c, w) = k2_core::git::repo_dirs(&d.ws.to_string_lossy()).unwrap();
+    let (g, c, w) = (resolve(&g).unwrap(), resolve(&c).unwrap(), resolve(&w.unwrap()).unwrap());
+    assert!(cli_sees_the_same(&d.ws, &g, &c, Some(&w)).is_ok(), "the same repository");
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let og = resolve(&other.join(".git")).unwrap();
+    assert!(cli_sees_the_same(&d.ws, &og, &c, Some(&w)).is_err(), "another git dir");
+    assert!(cli_sees_the_same(&d.ws, &g, &og, Some(&w)).is_err(), "another common dir");
+    assert!(cli_sees_the_same(&d.ws, &g, &c, Some(&other)).is_err(), "another work tree");
+}
+
+
+// ── review round 13 (scratch) ──────────────────────────────────────────
+
+/// (c) gap probe: a bare-layout folder (HEAD, objects, refs, config) with no
+/// `.git` anywhere: libgit2 can't open it (unknown extension), so the check
+/// skips it; does the git CLI open it and follow its commondir into other?
+#[test]
+fn rv13_c_bare_layout_without_dot_git() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    k2_core::git::create_worktree(&other.to_string_lossy(), "feat").unwrap();
+    let b = d.ws.join("b");
+    for sub in ["objects", "refs/heads"] {
+        std::fs::create_dir_all(b.join(sub)).unwrap();
+    }
+    std::fs::write(b.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(b.join("config"), "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tpartialclone = origin\n").unwrap();
+    std::fs::write(b.join("commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    let p = b.to_string_lossy().into_owned();
+    let opened = k2_core::git::repo_dirs(&p);
+    let r = rv12_scoped(&d, &d.ws, "GET", "/cli/git/worktrees", &[("path", p.clone())], Value::Null);
+    let wts = if r.is_ok() { k2_core::git::list_worktrees(&p).into_iter().map(|w| format!("{w:?}")).collect::<Vec<_>>() } else { vec![] };
+    eprintln!("RV13 bare-layout: repo_dirs={opened:?} check={r:?} worktrees={wts:?}");
+    let cw = rv12_scoped(&d, &d.ws, "POST", "/cli/git/create-worktree", &[], json!({"projectPath": p, "branch": "pwned13"}));
+    if cw.is_ok() {
+        let made = k2_core::git::create_worktree(&p, "pwned13");
+        let refs = std::process::Command::new("git").args(["branch", "--list"]).current_dir(&other).output().unwrap();
+        eprintln!("RV13 bare-layout create-worktree made={made:?} other branches={:?}", String::from_utf8_lossy(&refs.stdout));
+    }
+    eprintln!("RV13 bare-layout create-worktree check={cw:?}");
+    assert!(!(r.is_ok() && wts.iter().any(|w| w.contains("other"))), "check passed and the git CLI listed other's worktrees: {wts:?}");
+}
+
+/// (a) in a linked worktree's common dir, and (b) a gitfile with a NUL.
+#[test]
+fn rv13_a_b_policy_items() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    k2_core::git::create_worktree(&d.ws.to_string_lossy(), "feat").unwrap();
+    let wt = d.ws.join(".worktrees/feat");
+    let stage = |ws: &Path| rv12_scoped(&d, ws, "POST", "/cli/git/stage-all", &[], json!({"path": ws}));
+    assert!(stage(&wt).is_ok(), "control: linked worktree");
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", d.ws.join(".git/objects").display())).unwrap();
+    assert!(stage(&wt).is_err(), "(a) alternates in the common dir");
+    std::fs::remove_file(d.ws.join(".git/objects/info/alternates")).unwrap();
+    let saved = std::fs::read(wt.join(".git")).unwrap();
+    let mut bad = saved.clone();
+    bad.pop();
+    bad.extend_from_slice(b"\0junk\n");
+    std::fs::write(wt.join(".git"), &bad).unwrap();
+    assert!(stage(&wt).is_err(), "(b) gitfile with a NUL");
+    std::fs::write(wt.join(".git"), &saved).unwrap();
+    assert!(stage(&wt).is_ok(), "control restored");
+}
+
+/// (e) format version 2 / unknown extension in an otherwise own repo.
+#[test]
+fn rv13_e_format_refused() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let stage = || rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    assert!(stage().is_ok(), "control");
+    host_git(&d.ws, &["config", "core.repositoryformatversion", "1"]);
+    host_git(&d.ws, &["config", "extensions.preciousObjects", "true"]);
+    assert!(stage().is_err(), "unknown extension");
+}
+
+/// Repo config `include.path` naming a sibling's config: reach probe (read
+/// only; records whether the check refuses it).
+#[test]
+fn rv13_include_path_into_sibling_config() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    host_git(&other, &["config", "remote.origin.url", "https://user:SECRET13@example.invalid/x.git"]);
+    committed_repo(&d.ws);
+    host_git(&d.ws, &["config", "include.path", &other.join(".git/config").to_string_lossy()]);
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    eprintln!("RV13 include.path into sibling config: check={r:?}");
+}
+
+/// A submodule entry whose `.git` gitfile names a sibling's repository:
+/// libgit2 status on the workspace opens it (reach probe).
+#[test]
+fn rv13_submodule_gitfile_into_sibling() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    let head = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap();
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    host_git(&d.ws, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},modx")]);
+    std::fs::write(d.ws.join(".gitmodules"), "[submodule \"modx\"]\n\tpath = modx\n\turl = ./modx\n").unwrap();
+    std::fs::create_dir_all(d.ws.join("modx")).unwrap();
+    std::fs::write(d.ws.join("modx/.git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    let p = d.ws.to_string_lossy().into_owned();
+    let r = rv12_scoped(&d, &d.ws, "GET", "/cli/git/changes", &[("path", p.clone())], Value::Null);
+    let changes = if r.is_ok() { format!("{:?}", k2_core::git::get_changed_files(&p)) } else { String::new() };
+    eprintln!("RV13 submodule gitfile into sibling: check={r:?} changes={changes}");
+}
+
+// ── round 13 ───────────────────────────────────────────────────────────
+
+/// Round 13 (L1): a repository config including another workspace's
+/// config (`include.path`, `includeIf`) is refused; the plain repository
+/// passes.
+#[test]
+fn r13_l1_a_config_include_from_elsewhere_is_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    let stage = || rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    assert!(stage().is_ok(), "the control");
+    host_git(&d.ws, &["config", "include.path", &other.join(".git/config").to_string_lossy()]);
+    assert!(stage().is_err(), "include.path");
+    host_git(&d.ws, &["config", "--unset", "include.path"]);
+    host_git(&d.ws, &["config", &format!("includeIf.gitdir:{}/.path", d.ws.display()), &other.join(".git/config").to_string_lossy()]);
+    assert!(stage().is_err(), "includeIf");
+}
+
+/// Round 13 (L2): a submodule's `.git` naming a git dir outside the
+/// workspace is refused; one inside it passes.
+#[test]
+fn r13_l2_a_submodule_git_dir_outside_the_workspace_is_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    let head = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap();
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    host_git(&d.ws, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},modx")]);
+    std::fs::create_dir_all(d.ws.join("modx")).unwrap();
+    let changes = || rv12_scoped(&d, &d.ws, "GET", "/cli/git/changes", &[("path", d.ws.to_string_lossy().into_owned())], Value::Null);
+    assert!(changes().is_ok(), "a gitlink with no .git yet");
+    std::fs::write(d.ws.join("modx/.git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    assert!(changes().is_err(), "a submodule gitfile into a sibling");
+    // Inside the workspace (the usual `.git/modules/<name>`): passes.
+    let inner = d.ws.join("modsrc");
+    std::fs::create_dir_all(&inner).unwrap();
+    committed_repo(&inner);
+    std::fs::rename(inner.join(".git"), d.ws.join(".git/modules-x")).unwrap();
+    std::fs::write(d.ws.join("modx/.git"), "gitdir: ../.git/modules-x\n").unwrap();
+    let r = changes();
+    assert!(!matches!(&r, Err(e) if e.contains("submodule")), "a submodule git dir inside the workspace: {r:?}");
+}
+
+/// Round 13 (L3): a git command past its time limit is killed and refused
+/// (`output_within`), and a config `include` of a FIFO (which would block
+/// git, and libgit2, forever) is refused instead of hanging.
+#[test]
+fn r13_l3_git_runs_within_a_time_limit() {
+    let mut slow = std::process::Command::new("sh");
+    slow.args(["-c", "sleep 30"]);
+    let r = k2_core::git::output_within(&mut slow, Duration::from_millis(200));
+    assert!(r.as_ref().is_err_and(|e| e.contains("longer than")), "{:?}", r.map(|o| o.status));
+    let mut quick = std::process::Command::new("sh");
+    quick.args(["-c", "echo ok"]);
+    assert_eq!(k2_core::git::output_within(&mut quick, Duration::from_secs(10)).unwrap().stdout, b"ok\n");
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let fifo = d.ws.join("cfg.fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    host_git(&d.ws, &["config", "include.path", &fifo.to_string_lossy()]);
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    assert!(r.as_ref().is_err_and(|e| e.contains("longer than")), "{r:?}");
+}
+
+// ── phase 2: workspaces made on hosts, clones, App folders, uploads, spawns ──
+
+/// A controller (work root `ctl-work`) and host-1 on its own disk (the
+/// `HostDisk`), whose link serves `http.relay` with its own daemon.
+struct Rig {
+    d: HostDisk,
+    ctl_root: PathBuf,
+    remote: &'static RemoteHost,
+    _daemon: crate::test_harness::TestDaemon,
+}
+
+async fn rig() -> Rig {
+    let d = host_disk();
+    let ctl_root = d.root.parent().unwrap().join("ctl-work");
+    std::fs::create_dir_all(&ctl_root).unwrap();
+    let daemon = crate::test_harness::start("host-owner").await;
+    set_local_daemon(daemon.port, "host-owner");
+    let ctl_s = ctl_root.to_string_lossy().into_owned();
+    let (remote, url) = controller_at(&[&ctl_s], &[("h1", &d.root)]).await;
+    let mut h1 = host(&url, "h1", &[&format!("k2.work_root={}", d.root.display())]).await;
+    tokio::spawn(async move {
+        while let Some(Ok(m)) = h1.next().await {
+            if let Message::Text(t) = m {
+                if let Ok(Frame::HttpRelay { req, method, path, query, body_b64 }) = Frame::decode(&t) {
+                    let r = serve(req, &method, &path, &query, &body_b64).await;
+                    let _ = h1.send(Message::Text(r.encode())).await;
+                }
+            }
+        }
+    });
+    within("h1 linked", async {
+        while !remote.any_host_on_own_disk() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    Rig { d, ctl_root, remote, _daemon: daemon }
+}
+
+impl Rig {
+    async fn post(&self, path: &str, body: Value) -> Option<(String, Value)> {
+        relay_post_on(self.remote, path, "token=o", "o", body.to_string().as_bytes())
+            .await
+            .map(|a| (a.status, serde_json::from_str(&a.body).unwrap_or(Value::Null)))
+    }
+}
+
+fn code(a: &Option<(String, Value)>) -> (String, Value) {
+    let (st, v) = a.clone().expect("answered");
+    (st, v["code"].clone())
+}
+
+/// (1) A workspace created through the controller is made on the host
+/// that will hold it, and bound there; refused for `..` or outside the
+/// work root, never made on the controller's disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_workspace_is_made_on_its_host_and_bound_there() {
+    let r = rig().await;
+    let ctl = r.ctl_root.join("fresh");
+    let made = r.post(PROJECTS_CREATE, json!({"name": "fresh", "path": ctl})).await;
+    assert_eq!(made, None, "the controller's own handler registers it after");
+    assert!(r.d.root.join("fresh").is_dir(), "made on the host");
+    assert!(!ctl.exists(), "not on the controller's disk");
+    assert!(
+        matches!(r.remote.workspace_route(&[ctl.join("a").to_string_lossy().into_owned()]), WorkspaceRoute::Relay { host, .. } if host == "h1"),
+        "bound to the host"
+    );
+    // Refusals.
+    let dotdot = format!("{}/x/../../../escape", r.ctl_root.display());
+    assert_eq!(code(&r.post(PROJECTS_CREATE, json!({"name": "x", "path": dotdot})).await), ("400 Bad Request".into(), json!("bad_path")));
+    assert_eq!(
+        code(&r.post(PROJECTS_CREATE, json!({"name": "x", "path": "/etc/elsewhere"})).await),
+        ("400 Bad Request".into(), json!("outside_work_root"))
+    );
+    // The host, asked directly for a path outside its root, refuses too.
+    let (st, v) = served("POST", PROJECTS_CREATE, "", Some(json!({"name": "x", "path": "/etc/elsewhere"}))).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")));
+    assert!(!Path::new("/etc/elsewhere").exists());
+}
+
+/// (1) Adding an existing folder: the host that has it checks and seeds
+/// it; the controller registers it (registry only) under its own name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_existing_folder_is_added_from_its_host_and_registered_on_the_controller() {
+    let r = rig().await;
+    let host_ws = r.d.root.join("repo");
+    std::fs::create_dir_all(&host_ws).unwrap();
+    k2_core::git::init_repo(&host_ws.to_string_lossy()).unwrap();
+    let ctl = r.ctl_root.join("repo");
+    let (st, p) = r.post(PROJECTS_ADD, json!({"path": ctl, "seedWiki": false, "seedAgentsMd": false})).await.expect("answered");
+    assert_eq!(st, "200 OK", "{p}");
+    assert_eq!(p["path"], json!(ctl.to_string_lossy()), "the controller's row, its name");
+    // A folder no host has: refused (the host says so), not added here.
+    let (st, _) = r.post(PROJECTS_ADD, json!({"path": r.ctl_root.join("nowhere")})).await.expect("answered");
+    assert!(!st.starts_with('2'), "{st}");
+}
+
+/// (1) `git init` through the controller: the host registers the
+/// workspace, then makes the repository there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_init_through_the_controller_makes_the_repository_on_the_host() {
+    let r = rig().await;
+    std::fs::create_dir_all(r.d.root.join("plain")).unwrap();
+    let ctl = r.ctl_root.join("plain");
+    r.remote.note_relay_space("h1", "", &ctl);
+    let (st, v) = r.post("/cli/git/init", json!({"path": ctl})).await.expect("answered");
+    assert_eq!(st, "200 OK", "{v}");
+    assert!(r.d.root.join("plain/.git").is_dir());
+    // Refused: a key init doesn't take (R6), a path outside the workspace
+    // in the same request (a copy's destination).
+    let both = json!({"path": ctl, "worktree_path": "/etc"});
+    assert_eq!(code(&r.post("/cli/git/init", both).await), ("400 Bad Request".into(), json!("undeclared_key")));
+    let copy = json!({"sources": [ctl.join("a")], "destination": "/etc"});
+    assert_eq!(code(&r.post("/cli/fs/copy", copy).await), ("400 Bad Request".into(), json!("outside_workspace")));
+}
+
+/// (4) Uploads to a workspace on a host land there; a name can't climb
+/// out, and a body too big to relay is a 413.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_to_a_host_workspace_land_there_and_are_confined() {
+    let r = rig().await;
+    r.remote.note_relay_space("h1", "", &r.ctl_root.join("notes"));
+    let ctl_ws = r.ctl_root.join("notes");
+    let up = json!({"dir": ctl_ws, "filename": "up.txt", "base64": base64::engine::general_purpose::STANDARD.encode("uploaded")});
+    let (st, v) = r.post("/cli/fs/upload-binary", up).await.expect("answered");
+    assert_eq!(st, "200 OK", "{v}");
+    assert_eq!(std::fs::read_to_string(r.d.ws.join("up.txt")).unwrap(), "uploaded");
+    let climb = json!({"dir": ctl_ws, "filename": "../../escape.txt", "base64": "eA=="});
+    assert_eq!(code(&r.post("/cli/fs/upload-binary", climb).await), ("403 Forbidden".into(), json!("outside_work_root")));
+    let big = json!({"dir": ctl_ws, "filename": "big", "base64": "A".repeat(MAX_RELAY_BODY)});
+    assert_eq!(code(&r.post("/cli/fs/upload-binary", big).await), ("413 Payload Too Large".into(), json!("too_large")));
+}
+
+/// (3) App deploy from a folder on a host: brought to a mirror on the
+/// controller, regular files only (a link out is left behind); refused for
+/// `..`, and for a workspace whose host is away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_folder_on_a_host_comes_to_a_mirror_without_links() {
+    let r = rig().await;
+    r.remote.note_relay_space("h1", "", &r.ctl_root.join("notes"));
+    let app = r.d.ws.join("app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(app.join("index.html"), "<h1>hi</h1>").unwrap();
+    std::fs::write(app.join("src/main.js"), "1").unwrap();
+    let secret = r.d.root.parent().unwrap().join("controller-secret");
+    std::fs::write(&secret, "SECRET").unwrap();
+    std::os::unix::fs::symlink(&secret, app.join("leak")).unwrap();
+    let ctl_app = r.ctl_root.join("notes/app");
+    let remote = r.remote;
+    let raw = ctl_app.to_string_lossy().into_owned();
+    let m = tokio::task::spawn_blocking(move || folder_from_host_on(remote, &raw)).await.unwrap().unwrap().expect("from the host");
+    assert_eq!(std::fs::read_to_string(m.path.join("index.html")).unwrap(), "<h1>hi</h1>");
+    assert_eq!(std::fs::read_to_string(m.path.join("src/main.js")).unwrap(), "1");
+    assert!(std::fs::symlink_metadata(m.path.join("leak")).is_err(), "no link in the mirror");
+    let dir = m.path.clone();
+    drop(m);
+    assert!(!dir.exists(), "the mirror goes with its handle");
+    // Refusals.
+    let raw = format!("{}/../../x", ctl_app.display());
+    assert!(tokio::task::spawn_blocking(move || folder_from_host_on(remote, &raw)).await.unwrap().is_err());
+    let (st, v) = served("POST", "/cli/hosts/relay/pack", "", Some(json!({"path": r.d.root.parent().unwrap()}))).await;
+    // The op's schema refuses it, as every confined path (R6).
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "pack outside the work root: {v}");
+}
+
+/// (2) Clone-to: the bundle goes to the host in chunks and is extracted
+/// there (the workspace under its work root); the controller gets the
+/// manifest and binds it. Refused outside the work root; the transit
+/// operations take plain names and whole chunks only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clone_is_unpacked_on_its_host_and_the_transit_is_confined() {
+    let r = rig().await;
+    // A bundle, as the source side makes one.
+    let src = r.d.root.parent().unwrap().join("source/Cloned");
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(src.join("README.md"), "# Cloned\n").unwrap();
+    std::fs::write(src.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let src_home = r.d.root.parent().unwrap().join("src-home");
+    std::fs::create_dir_all(&src_home).unwrap();
+    let opts = k2_core::clone::CloneOptions { home_override: Some(src_home), ..Default::default() };
+    let canon = std::fs::canonicalize(&src).unwrap();
+    let inv = k2_core::clone::inventory(&canon.to_string_lossy(), opts.clone()).unwrap();
+    let bundle = r.d.root.parent().unwrap().join("bundle.tar.gz");
+    k2_core::clone::build_bundle(&inv, &opts, "2026-10-26T00:00:00Z".into(), None, None, vec![], &bundle).unwrap();
+    let (remote, ctl_root, b) = (r.remote, r.ctl_root.clone(), bundle.clone());
+    let hu = tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, &b, &ctl_root.to_string_lossy()))
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("on the host");
+    assert_eq!(hu.host, "h1");
+    assert!(hu.host_dest.starts_with(&r.d.root) && hu.host_dest.join("src/main.rs").is_file(), "{}", hu.host_dest.display());
+    assert!(hu.dest_path.starts_with(&r.ctl_root) && !hu.dest_path.exists(), "the controller's name, not its disk");
+    // Refused: a parent outside the work root.
+    let b = bundle.clone();
+    assert!(tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, &b, "/etc")).await.unwrap().is_err());
+    // The transit operations.
+    for name in ["../escape", "/etc/passwd", ".hidden", "a/b", ""] {
+        let (st, v) = served("POST", "/cli/hosts/relay/put", "", Some(json!({"file": name, "offset": 0, "b64": "eA=="}))).await;
+        assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "{name:?}: the schema's Transit");
+    }
+    let (st, v) = served("POST", "/cli/hosts/relay/put", "", Some(json!({"file": "t.bin", "offset": 5, "b64": "eA=="}))).await;
+    assert_eq!(st, "400 Bad Request", "a put that skips bytes: {v}");
+    let (st, v) = served("POST", "/cli/hosts/relay/clone-extract", "", Some(json!({"bundle": "t.bin", "dest_parent": "/etc"}))).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("outside_work_root")), "extract outside the work root: {v}");
+    let (st, _) = served("POST", "/cli/hosts/relay/exec", "", Some(json!({}))).await;
+    assert_eq!(st, "403 Forbidden", "only the listed operations");
+}
+
+/// (5) A spawn with the controller's path runs under the host's work root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawn_with_the_controllers_path_runs_under_the_hosts_root() {
+    let (remote, url) = controller_at(&["/ctl/work"], &[("h1", &h("/h1/work"))]).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    let mut shared = host(&url, "shared", &[]).await;
+    let cwd_sent = |remote: &'static RemoteHost, host: &'static str, agent: &'static str, cwd: &'static str| {
+        let body = json!({"agent_name": agent, "cwd": cwd, "command": "claude"}).to_string();
+        let _ = host;
+        tokio::spawn(async move { remote.spawn(body.as_bytes()).await })
+    };
+    let spawn = cwd_sent(remote, "h1", "notes", "/ctl/work/notes");
+    match recv(&mut h1).await {
+        Frame::Spawn { req, body, .. } => {
+            assert_eq!(body["cwd"], "/h1/work/notes");
+            let reply = json!({"sessionId": uuid::Uuid::new_v4().to_string(), "reused": false}).to_string();
+            send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body: reply }).await;
+        }
+        other => panic!("{other:?}"),
+    }
+    within("the spawn", spawn).await.unwrap();
+    assert_eq!(remote.host_cwd("h1", Path::new("/elsewhere/x")), pb("/elsewhere/x"), "outside the root: as asked");
+    assert_eq!(remote.host_cwd("shared", Path::new("/ctl/work/notes")), pb("/ctl/work/notes"), "the shared volume: as asked");
+    drop((h1, shared.close(None).await));
+}
+
+/// Phase 2, flag off (`K2_FS_RELAY` unset): a host on its own disk changes
+/// nothing on the controller. A spawn's cwd goes as asked, a registration
+/// is the controller's own, an App folder and a clone stay on its disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phase2_off_by_default_every_entry_point_is_the_controllers_own() {
+    let roots = crate::agent_host::remote::HostRoots { default: pb("/h1/work"), per_host: Default::default() };
+    let remote = RemoteHost::new().with_fs_relay(false).with_relay_roots(vec![pb("/ctl/work")], roots);
+    let (remote, url) = serve_controller(Box::leak(Box::new(remote))).await;
+    let mut h1 = host(&url, "h1", &["k2.work_root=/h1/work"]).await;
+    let body = json!({"agent_name": "notes", "cwd": "/ctl/work/notes", "command": "claude"}).to_string();
+    let spawn = tokio::spawn(async move { remote.spawn(body.as_bytes()).await });
+    match recv(&mut h1).await {
+        Frame::Spawn { req, body, .. } => {
+            assert_eq!(body["cwd"], "/ctl/work/notes", "the cwd as asked");
+            let reply = json!({"sessionId": uuid::Uuid::new_v4().to_string(), "reused": false}).to_string();
+            send(&mut h1, &Frame::Reply { req, status: "200 OK".into(), body: reply }).await;
+        }
+        other => panic!("{other:?}"),
+    }
+    within("the spawn", spawn).await.unwrap();
+    assert_eq!(remote.host_path("h1", Path::new("/ctl/work/notes")), None);
+    for (route, body) in [
+        (PROJECTS_CREATE, json!({"name": "fresh", "path": "/ctl/work/fresh"})),
+        (PROJECTS_ADD, json!({"path": "/ctl/work/notes"})),
+        (PROJECTS_ADD_WITHOUT_GIT, json!({"path": "/ctl/work/notes"})),
+    ] {
+        assert_eq!(relay_post_on(remote, route, "token=o", "o", body.to_string().as_bytes()).await, None, "{route}");
+    }
+    let r = tokio::task::spawn_blocking(move || folder_from_host_on(remote, "/ctl/work/notes/app")).await.unwrap();
+    assert!(matches!(r, Ok(None)), "an App folder: the controller's own");
+    let r = tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, Path::new("/nonexistent.tar.gz"), "/ctl/work")).await.unwrap();
+    assert!(matches!(r, Ok(None)), "a clone: unpacked here, as before");
+    drop(h1);
 }

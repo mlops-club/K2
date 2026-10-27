@@ -27,6 +27,12 @@ pub enum Kind {
     NameBeside(&'static str),
     /// resolve-links' candidates, each checked on its own (`split_links`).
     Candidates,
+    /// A file in transit: one plain name in the host's own transit folder
+    /// (its K2 home, never a workspace), not a symlink.
+    Transit,
+    /// An absolute folder under the work root, or the root itself (where a
+    /// clone lands).
+    Parent,
     /// Not a path: text, a flag, a number, a ref, an id.
     Plain,
 }
@@ -48,6 +54,17 @@ pub enum Derived {
     /// Each copy's target, and every file under each source (followed
     /// the way the copy follows it).
     CopyTree,
+    /// A forced checkout's work tree (abort, a fast-forward merge, discard,
+    /// resolve): no link in it to a folder outside the work root (or a
+    /// dangling one), which the checkout would write or delete through.
+    CheckoutTree,
+    /// A workspace being registered: every file under `path` (registering
+    /// seeds and writes in it).
+    WorkspaceTree,
+    /// A clone's bundle extracted under `dest_parent` (`clone::unpack_bundle`
+    /// keeps its entries there); its CLI memory and sessions go to this
+    /// host's home, by design.
+    CloneUnpack,
 }
 
 #[derive(Debug)]
@@ -77,9 +94,9 @@ const fn post(route: &'static str, keys: &'static [(&'static str, Kind)], derive
 
 /// Every relayed route, exactly. Not the git notes (they live in the
 /// controller's database and are checked by author), not `open-changes`
-/// (an event on the controller's bus).
+/// (an event on the controller's bus), not `/cli/fs/info` (it names no
+/// path, so it is the controller's own: never the host's home, F4).
 pub const SCHEMAS: &[Schema] = &[
-    get("/cli/fs/info", &[], &[]),
     get("/cli/fs/read-dir", &[("path", Abs), ("show_hidden", Plain)], &[]),
     get("/cli/fs/read-file", &[("path", Abs)], &[]),
     get("/cli/fs/read-binary", &[("path", Abs)], &[]),
@@ -131,7 +148,7 @@ pub const SCHEMAS: &[Schema] = &[
     ),
     post("/cli/fs/search-tree", &[("root", Abs), ("query", Plain), ("show_hidden", Plain), ("max_results", Plain)], &[]),
     post("/cli/fs/resolve-links", &[("workspace", Abs), ("paths", Candidates)], &[]),
-    post("/cli/git/abort-merge", &[("path", Abs)], &[D::Repo]),
+    post("/cli/git/abort-merge", &[("path", Abs)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/commit", &[("path", Abs), ("message", Plain)], &[D::Repo]),
     post(
         "/cli/git/create-worktree",
@@ -139,9 +156,9 @@ pub const SCHEMAS: &[Schema] = &[
         &[D::Repo, D::Worktree],
     ),
     post("/cli/git/delete-branch", &[("path", Abs), ("branch", Plain)], &[D::Repo]),
-    post("/cli/git/discard", &[("path", Abs), ("files", RepoRel("path")), ("includeStaged", Plain)], &[D::Repo]),
+    post("/cli/git/discard", &[("path", Abs), ("files", RepoRel("path")), ("includeStaged", Plain)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/init", &[("path", Abs)], &[D::GitDir]),
-    post("/cli/git/merge-branch", &[("path", Abs), ("branch", Plain)], &[D::Repo]),
+    post("/cli/git/merge-branch", &[("path", Abs), ("branch", Plain)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/prune-worktrees", &[("projectPath", Abs), ("projectId", Plain)], &[D::Repo]),
     post(
         "/cli/git/remove-worktree",
@@ -149,15 +166,44 @@ pub const SCHEMAS: &[Schema] = &[
         &[D::Repo],
     ),
     post("/cli/git/reopen-worktree", &[("projectPath", Abs), ("worktreePath", Abs), ("branch", Plain)], &[D::Repo]),
-    post("/cli/git/resolve", &[("path", Abs), ("filePath", RepoRel("path")), ("resolution", Plain)], &[D::Repo]),
+    post("/cli/git/resolve", &[("path", Abs), ("filePath", RepoRel("path")), ("resolution", Plain)], &[D::Repo, D::CheckoutTree]),
     post("/cli/git/stage", &[("path", Abs), ("filePath", RepoRel("path"))], &[D::Repo]),
     post("/cli/git/stage-all", &[("path", Abs)], &[D::Repo]),
     post("/cli/git/unstage", &[("path", Abs), ("filePath", RepoRel("path"))], &[D::Repo]),
 ];
 
-/// The schema of `method path`, when the relay carries it. Exact routes.
+/// What else a host serves its controller (phase 2), never relayed from
+/// the app's routes: a workspace's registration, made on the host that will
+/// hold it, and the relay operations (in process on the host).
+pub const HOST_SCHEMAS: &[Schema] = &[
+    post("/cli/projects/create", &[("name", Plain), ("path", Abs), ("color", Plain)], &[D::Repo, D::WorkspaceTree]),
+    post(
+        "/cli/projects/add-from-path",
+        &[("path", Abs), ("seed_wiki", Plain), ("seedWiki", Plain), ("seed_agents_md", Plain), ("seedAgentsMd", Plain), ("fanout", Plain)],
+        &[D::Repo, D::WorkspaceTree],
+    ),
+    post(
+        "/cli/projects/add-without-git",
+        &[("path", Abs), ("seed_wiki", Plain), ("seedWiki", Plain), ("seed_agents_md", Plain), ("seedAgentsMd", Plain), ("fanout", Plain)],
+        &[D::Repo, D::WorkspaceTree],
+    ),
+    post("/cli/hosts/relay/pack", &[("path", Abs)], &[]),
+    post("/cli/hosts/relay/get", &[("file", Transit), ("offset", Plain), ("len", Plain)], &[]),
+    post("/cli/hosts/relay/put", &[("file", Transit), ("offset", Plain), ("b64", Plain)], &[]),
+    post("/cli/hosts/relay/drop", &[("file", Transit)], &[]),
+    post("/cli/hosts/relay/clone-extract", &[("bundle", Transit), ("dest_parent", Parent)], &[D::CloneUnpack]),
+];
+
+/// The schema of `method path`, when the relay carries it from the app's
+/// routes. Exact routes.
 pub fn schema(method: &str, path: &str) -> Option<&'static Schema> {
     SCHEMAS.iter().find(|s| s.method.eq_ignore_ascii_case(method) && s.route == path)
+}
+
+/// The schema of `method path` when a host serves it for its controller:
+/// a relayed route, a registration, or a relay operation.
+pub fn host_schema(method: &str, path: &str) -> Option<&'static Schema> {
+    schema(method, path).or_else(|| HOST_SCHEMAS.iter().find(|s| s.method.eq_ignore_ascii_case(method) && s.route == path))
 }
 
 // ── host ───────────────────────────────────────────────────────────────
@@ -168,6 +214,10 @@ fn inside(root: &Path, what: &str, p: &Path) -> Result<PathBuf, String> {
     let r = resolve(p).ok_or_else(|| format!("{what} can't be resolved"))?;
     if r == root || !r.starts_with(root) {
         return Err(format!("{what} is not in a workspace under this host's work root"));
+    }
+    // F5: and in the workspace the request was routed to.
+    if !r.starts_with(super::scope::within(root)) {
+        return Err(format!("{what} is not in the workspace this request was routed to"));
     }
     Ok(r)
 }
@@ -248,6 +298,7 @@ fn strings<'a>(key: &str, v: &'a Value) -> Result<Vec<&'a str>, String> {
 }
 
 /// A request as a host's daemon gets it: the query's pairs and the body.
+#[derive(Debug)]
 pub struct Confined {
     pub query: Vec<(String, String)>,
     pub body: Value,
@@ -260,12 +311,43 @@ pub enum Refusal {
     Undeclared(String),
     /// A path, or a path its handler derives, outside the work root.
     Outside(String),
+    /// Refused with its own code: `link_outside_worktree` (a checkout's
+    /// folder link leaving the work tree), `walk_budget` (the checks cost
+    /// more than a request may).
+    Coded(&'static str, String),
 }
+
+/// R8 C: what a request's checks may cost: steps (a link resolved one
+/// component at a time, a folder entry walked) and time.
+pub const WALK_STEPS: usize = 500_000;
+pub const WALK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The request `s` describes, confined to `root`: every declared path (a
 /// path, a repo-relative path, a name in a folder) and every path its
 /// handler derives under the work root, rebuilt from the confined values.
 pub fn confine(root: &Path, s: &Schema, query: &[(String, String)], body: &Value) -> Result<Confined, Refusal> {
+    confine_within(root, s, query, body, WALK_STEPS, WALK_TIME)
+}
+
+/// [`confine`] within a walk budget of `steps` and `time` (R8 C): past
+/// either, `walk_budget`. Blocking: a host runs it off its link's task.
+pub fn confine_within(
+    root: &Path,
+    s: &Schema,
+    query: &[(String, String)],
+    body: &Value,
+    steps: usize,
+    time: std::time::Duration,
+) -> Result<Confined, Refusal> {
+    let guard = super::budget::guard(steps, time);
+    let r = confine_unbudgeted(root, s, query, body);
+    if guard.spent() {
+        return Err(Refusal::Coded("walk_budget", format!("checking {}'s paths took more than a relayed request may", s.route)));
+    }
+    r
+}
+
+fn confine_unbudgeted(root: &Path, s: &Schema, query: &[(String, String)], body: &Value) -> Result<Confined, Refusal> {
     let out = Refusal::Outside;
     // The request's values, by key: the query's and a flat JSON object's.
     let mut values: Vec<(String, Value)> = Vec::new();
@@ -321,6 +403,25 @@ pub fn confine(root: &Path, s: &Schema, query: &[(String, String)], body: &Value
                 inside(root, k, &dir.join(name)).map_err(out)?;
                 v.clone()
             }
+            Transit => {
+                let name = v.as_str().ok_or_else(|| out(format!("{k} is not a name")))?;
+                let f = super::tmp_file(name).map_err(out)?;
+                if std::fs::symlink_metadata(&f).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(out(format!("{k} is a symlink")));
+                }
+                v.clone()
+            }
+            Parent => {
+                let x = v.as_str().ok_or_else(|| out(format!("{k} is not a path")))?;
+                if !x.starts_with('/') || has_dot_dot(x) {
+                    return Err(out(format!("{k}: an absolute path without '..'")));
+                }
+                let r = resolve(Path::new(x)).ok_or_else(|| out(format!("{k} can't be resolved")))?;
+                if !r.starts_with(root) {
+                    return Err(out(format!("{k} is not under this host's work root")));
+                }
+                Value::String(r.to_string_lossy().into_owned())
+            }
             // Checked one by one by `split_links` before this.
             Candidates => {
                 strings(k, v).map_err(out)?;
@@ -339,7 +440,12 @@ pub fn confine(root: &Path, s: &Schema, query: &[(String, String)], body: &Value
         return Err(Refusal::Undeclared(format!("{} doesn't take {k}", s.route)));
     }
     for d in s.derived {
-        derived(root, s, *d, &confined).map_err(out)?;
+        if *d == Derived::CheckoutTree {
+            let p = confined.iter().find(|(k, _)| k == "path").and_then(|(_, v)| v.as_str()).ok_or_else(|| out("a git request names its repository's path".into()))?;
+            checkout_tree_inside(root, Path::new(p))?;
+        } else {
+            derived(root, s, *d, &confined).map_err(out)?;
+        }
     }
     // The daemon gets the confined values, in the request's own shape.
     if s.method == "GET" {
@@ -395,6 +501,8 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
             }
             Ok(())
         }
+        // Its own codes: `confine` runs it ([`checkout_tree_inside`]).
+        Derived::CheckoutTree => Ok(()),
         Derived::CopyTree => {
             let (sources, dest): (Vec<PathBuf>, PathBuf) = if s.route == "/cli/fs/duplicate" {
                 let p = path_of("path").ok_or("duplicate names its path")?;
@@ -411,7 +519,72 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
             }
             Ok(())
         }
+        Derived::WorkspaceTree => tree_inside(root, &path_of("path").ok_or("a registration names its path")?),
+        // `dest_parent` is confined (`Parent`); `unpack_bundle` keeps every
+        // entry under it.
+        Derived::CloneUnpack => Ok(()),
     }
+}
+
+/// F1 (rounds 7, 8): a forced checkout (abort, a fast-forward merge,
+/// discard, resolve) deletes and writes through a folder link in its work
+/// tree. The work tree of the repository at `path` is walked (every
+/// folder but the repository's own git dir, by path: B1) without following
+/// a link; a link to a folder, or a dangling one, whose target is outside
+/// the work tree is refused (`link_outside_worktree`, B2), and so is any
+/// link into the repository's git dir or common dir (`link_into_git_dir`,
+/// X1). A link to a file elsewhere is the checkout's to replace. A folder
+/// the walk can't list fails it (X2).
+fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
+    let out = Refusal::Outside;
+    let (git_dir, common, work) = match k2_core::git::repo_dirs(&path.to_string_lossy()) {
+        Ok((g, c, Some(w))) => (resolve(&g), resolve(&c), w),
+        _ => (None, None, path.to_path_buf()),
+    };
+    let work = resolve(&work).ok_or_else(|| out(format!("{} can't be resolved", work.display())))?;
+    let git_ids: Vec<(u64, u64)> = [&git_dir, &common].iter().filter_map(|g| g.as_deref().and_then(file_id)).collect();
+    if !work.starts_with(root) {
+        return Err(out(format!("{} is not under this host's work root", work.display())));
+    }
+    let mut todo = vec![work.clone()];
+    let mut n = 0usize;
+    while let Some(d) = todo.pop() {
+        for e in super::read_dir_all(&d).map_err(out)? {
+            n += 1;
+            if n > TREE_LIMIT || !super::budget::charge() {
+                return Err(Refusal::Coded("walk_budget", format!("{} is too big to check for a relayed checkout", work.display())));
+            }
+            let (ft, p) = (e.ft, e.path);
+            if ft.is_symlink() {
+                let r = resolve(&p);
+                // X1: never into the repository's own git dir; D2: by the
+                // folder itself (device and inode), so `.GIT` on a
+                // case-insensitive disk is `.git`.
+                let git = r.as_ref().is_some_and(|r| r.ancestors().any(|a| file_id(a).is_some_and(|id| git_ids.contains(&id))));
+                if git {
+                    return Err(Refusal::Coded("link_into_git_dir", format!("{} links into the repository's git dir; a checkout would go through it", p.display())));
+                }
+                let file = r.as_ref().is_some_and(|r| r.is_file());
+                let leaves = r.as_ref().is_none_or(|r| !r.starts_with(&work));
+                if leaves && !file {
+                    return Err(Refusal::Coded(
+                        "link_outside_worktree",
+                        format!("{} links to a folder outside the repository's work tree; a checkout would go through it", p.display()),
+                    ));
+                }
+            } else if ft.is_dir() && git_dir.as_deref() != Some(p.as_path()) {
+                todo.push(p);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A folder's identity on its disk (device, inode), whatever its name's
+/// case or spelling.
+fn file_id(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
 }
 
 /// The most entries a copy's source may hold for the host to check it.
@@ -426,14 +599,12 @@ fn tree_inside(root: &Path, src: &Path) -> Result<(), String> {
     let mut n = 0usize;
     while let Some(p) = todo.pop() {
         n += 1;
-        if n > TREE_LIMIT {
+        if n > TREE_LIMIT || !super::budget::charge() {
             return Err(format!("{} holds over {TREE_LIMIT} entries; too many to check for a relayed copy", src.display()));
         }
         let real = inside(root, &p.display().to_string(), &p)?;
         if real.is_dir() && seen.insert(real.clone()) {
-            if let Ok(rd) = std::fs::read_dir(&real) {
-                todo.extend(rd.filter_map(Result::ok).map(|e| e.path()));
-            }
+            todo.extend(super::read_dir_all(&real)?.into_iter().map(|e| e.path));
         }
     }
     Ok(())

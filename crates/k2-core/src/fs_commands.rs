@@ -238,7 +238,10 @@ pub fn read_dir(path: &str, show_hidden: bool) -> Result<Vec<DirEntryInfo>, Stri
                 .ok()
                 .map(|ft| ft.is_dir())
                 .unwrap_or(false);
-            let (size, modified_at) = match fs::metadata(&full_path) {
+            // fs-relay F4: on a host, an entry's own size and time (a
+            // link's, never its target's).
+            let meta = if list_without_following() { fs::symlink_metadata(&full_path) } else { fs::metadata(&full_path) };
+            let (size, modified_at) = match meta {
                 Ok(meta) => {
                     let size = meta.len();
                     let modified_at = meta
@@ -443,6 +446,19 @@ pub fn read_file_range(path: &str, offset: u64, len: u64) -> Result<(Vec<u8>, u6
     }
     buf.truncate(filled);
     Ok((buf, size))
+}
+
+static LIST_WITHOUT_FOLLOWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// fs-relay (F4): on an agent host serving its controller, `read_dir`
+/// reports each entry's own size and time (`lstat`): a link's, never what
+/// it points at (which may be outside the work root).
+pub fn set_list_without_following(on: bool) {
+    LIST_WITHOUT_FOLLOWING.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn list_without_following() -> bool {
+    LIST_WITHOUT_FOLLOWING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub fn write_file(path: &str, content: &str) -> Result<(), String> {

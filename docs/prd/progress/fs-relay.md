@@ -301,6 +301,479 @@ patch:
 | `file_path` joins the repository's work tree | `r6_a_repo_relative_path_joins_the_work_tree_the_handler_joins` |
 | An upload's files, a copy's tree | `r6_an_uploads_files_and_a_copys_tree_are_confined` (with controls) |
 
+## Round 7 review of e3b044365: F1
+
+Round 7 found it safe to merge with the flag off, and not yet safe to
+enable. F1 (medium) is fixed here; F2–F6 (low) are still open.
+
+- **F1(a): a link inside the git dir.** The `Repo` check confined only the
+  git dir, the common dir and the work tree themselves. A commit wrote its
+  ref and reflog through symlinked `.git/logs` and `refs/heads`, and
+  `worktree add` wrote through a symlinked `.git/worktrees`.
+  - Now `git_precheck` walks the git dir and the common dir and refuses any
+    symlink in them, for every git route, reads included.
+  - A loose-object fan-out folder and `objects/pack` are checked
+    themselves, not each object in them.
+  - `objects/info/alternates` naming objects outside the work root is
+    refused too.
+- **F1(b): a forced checkout through a folder link.** abort-merge, a
+  fast-forward merge, discard and resolve check out with force, and a
+  tracked folder swapped for a symlink let them delete or write outside the
+  root.
+  - A new derived path, `CheckoutTree`, walks the whole work tree of the
+    repository the route opens (not just the request's folder).
+  - It refuses a link to a folder outside the work root, or a dangling one.
+  - A link to a file is allowed, since the checkout replaces the link
+    itself, and so is a link that stays inside the root.
+- **Not closed:** this is still a check before use. A link swapped in
+  after the check races it (N2). Later hardening: `openat2` with
+  `RESOLVE_BENEATH`, or a separate uid for relayed serving.
+
+| Item | Test |
+|---|---|
+| F1(a): `logs`, `refs/heads`, `worktrees` links; alternates out; reads too (with a control) | `r7_f1_a_link_in_the_git_dir_is_refused` |
+| F1(b): abort-merge, merge-branch, discard, resolve; from a sub-folder; a dangling link (with controls: a folder link inside, a file link out) | `r7_f1_a_forced_checkout_through_a_folder_link_is_refused` |
+
+Both tests fail with the two checks taken out (checked by mutation).
+
+## Round 8 review of 02ea61653: F1(b) completed
+
+F1(a) (links inside the git dir) was confirmed fixed. F1(b) was partial.
+
+- **B1 (medium): every `.git` was skipped.** The work-tree walk skipped
+  any folder named `.git`, at any depth. An untracked `hide/.git/deep`
+  linking out, reached through a tracked `sub -> hide/.git`, let
+  abort-merge delete outside the root. Now only the repository's own git
+  dir is skipped, compared by its resolved path.
+- **B2 (medium): an in-root folder link leaving the work tree.** Such a
+  link was allowed but never walked, so a link out beneath its target was
+  never seen. Now any link in the walk to a folder (or a dangling one)
+  whose target is outside the repository's work tree is refused with 403
+  `link_outside_worktree`. The walk never follows a link. A link to a file
+  is still the checkout's to replace.
+- **C (low-medium): unbounded walk cost.** 2000 links with long `a/../`
+  chains took about 20 s for one check, on the link's task.
+  - The host now runs all its checks (`split_links`, `confine`) in
+    `spawn_blocking`.
+  - The checks share one budget per request: 500,000 steps (each step is
+    one link component resolved or one folder entry walked) and 5 s. Past
+    either, the request is refused with 403 `walk_budget`.
+- **Later (lows from the review, not now):**
+  - alternates are read one level deep;
+  - links among the object fan-out files;
+  - the 200k entry cap;
+  - self-loops;
+  - submodules.
+- **Test change:** r7's forced-checkout test also accepts
+  `outside_work_root`. Discard's `sub/f` is now refused as a repo-relative
+  path outside the work root before the walk runs.
+
+| Item | Test |
+|---|---|
+| B1 | `r8_b1_only_the_repositorys_own_git_dir_is_skipped` |
+| B2: abort-merge and a fast-forward merge-branch (with a control) | `r8_b2_a_folder_link_leaving_the_work_tree_is_refused` |
+| C: a small budget refuses; the default budget passes; the next request starts afresh | `r8_c_the_checks_stop_at_their_walk_budget` |
+
+Each of the three tests fails with its fix reverted (checked by mutation).
+
+## Round 9 review of 57002f441: X1, X2, X3
+
+B2 is closed. B1 reopened as X1.
+
+- **X1 (high): a checkout through the object store.** The work-tree walk
+  skipped the repository's git dir, and the git-dir check never listed
+  `objects/xx` or `objects/pack`. So `.git/objects/ab/deep -> outside`,
+  reached through a tracked `sub -> .git/objects/ab`, let abort-merge delete
+  outside the root. Fixed both ways:
+  - any link in the work tree whose target is inside the git dir or common
+    dir is refused (403 `link_into_git_dir`);
+  - the git-dir check lists every fan-out folder and `pack`, and refuses a
+    link or a folder in one.
+- **X2: a folder a check can't read was skipped.** Any read error other
+  than NotFound now fails the check, closed (`read_dir_all`), in all three
+  walks: the checkout's work tree, the git dir, and a copy's source.
+- **X3 (medium): resolve-links' candidates ran outside the budget.** 2000
+  candidates took 17 s.
+  - One budget now covers the whole request (`check_request`), including
+    `split_links`.
+  - Past 500 candidates, the rest are answered `linkable: false` without
+    being checked.
+- **Lows done now:**
+  - the git-dir walk counts against the budget;
+  - the budget is an RAII guard, reset on drop (a panic too). A nested
+    guard shares the request's budget.
+
+| Item | Test |
+|---|---|
+| X1 (the repro) | `r9_x1_a_checkout_through_the_object_store_is_refused` |
+| X1, each half on its own (with controls) | `r9_x1_links_into_the_git_dir_and_into_its_object_folders` |
+| X2: all three walks (mode 0300), with a control | `r9_x2_a_folder_the_check_cant_list_fails_it` |
+| X3: a small budget refuses; the default budget checks all; the cap | `r9_x3_resolve_links_candidates_are_in_the_budget_and_capped` |
+
+Each test fails with its fix reverted (checked by mutation; the repro
+fails only with both halves of X1 reverted).
+
+## Round 7's lows: F2–F6
+
+One commit each, on top of round 9.
+
+- **F2: a repo-relative path is literal.** `diff_file` and
+  `resolve_conflict` match the path as a literal pathspec
+  (`pathspec_literal`, as discard and folder staging already did). So
+  `filePath="*"` resolves or diffs no other file. Test:
+  `git::tests::a_file_path_is_literal_not_a_pathspec`, with a control.
+- **F3: the Trash stays inside the work root.** A host with a work root
+  sends what goes to the Trash to `<root>/.k2-trash`
+  (`safe_delete::set_host_trash`, set at host start). That covers delete
+  without `permanent`, discard and remove-worktree: renamed there, never
+  copied or unlinked. Test: `f3_the_trash_stays_inside_the_work_root`.
+- **F4: no leaks about outside the work root.**
+  - A host's listing gives a link's own size and time (`lstat`). A local
+    listing still follows the link, as before.
+  - resolve-links' answer from a host keeps only the workspace's root in
+    its prefixes.
+  - `/cli/fs/info` names no path, so it was never relayed; it is now out
+    of the schema.
+  - Test: `f4_a_host_tells_nothing_about_outside_its_work_root`, with a
+    control.
+- **F5: a request stays in its routed workspace.** The controller adds
+  `k2_workspace` (the routed workspace's host path) to every relayed
+  request. The app can't send it, because it is undeclared on every route.
+  The host checks it is a workspace under the root, takes it off the query,
+  and confines every path and resolve-links candidate to it.
+  - If it is absent, the host confines to the work root, as before; a
+    controller always sends it.
+  - Git's repository checks stay at the work root, so a workspace inside a
+    larger checkout keeps working.
+  - Test: `f5_a_request_stays_in_its_routed_workspace`, with a control.
+- **F6: the scan's blind spots.**
+  - Now caught: a parse the scan can't name the struct of (a turbofish, a
+    type inferred without `match`) and a `#[serde(flatten)]` both fail the
+    scan; serde `alias` keys are read.
+  - Tested on synthetic handlers:
+    `f6_the_handler_scan_reads_what_it_can_and_fails_on_the_rest`.
+  - **Still not checked (documented):** reads in the dispatcher arms,
+    reads from the database or the environment, and a key's kind (path or
+    plain). The scan detects drift; the host's run-time refusal of
+    undeclared keys is the real control.
+
+## Round 10 review of 28111e3dd: D1, D2, D3
+
+X1, X2, X3, F2, F3 and F6 are confirmed fixed. The reviewer's 8 tests
+are added as they were written (`rv10_*`); 4 of them failed before this
+commit.
+
+- **D1 (medium): a gitfile into a sibling workspace.** `notes/.git`
+  holding `gitdir: <root>/other/.git` let stage-all and commit, routed to
+  `notes`, move `other`'s branch.
+  - Now the repository a git path opens must have its git dir, common dir
+    and work tree inside the routed workspace.
+  - The one exception is a workspace inside a larger checkout: a work tree
+    that holds the workspace, with that work tree's own `.git` folder as
+    its git dir.
+  - Tests: `rv10_f5_gitfile_into_sibling_workspace`, plus
+    `r10_d1_a_workspace_inside_a_larger_checkout_passes` (the exception).
+- **D2 (low): case variants.** The link-into-git-dir check compares
+  folders by device and inode, so `.GIT` and `.Git` on a case-insensitive
+  disk are `.git`. Test: `rv10_item1_case_variant_link_into_git_dir`.
+- **D3 (low): outside paths in refusals.** A refusal never names a path
+  outside the work root: not a git dir, not an alternates line. Test:
+  `rv10_f4_refusal_names_a_path_outside_the_root`.
+- **Nits:**
+  - A non-string resolve-links candidate is refused, not dropped. Test:
+    `rv10_item3_check_request_leaves_nothing_behind`.
+  - A host's `.k2-trash` that is itself a symlink is refused. Test:
+    `r10_the_trash_folder_is_never_a_link`.
+- **Not done (the review's unconfirmed note):** whether a link outside
+  points at a file or a folder can still be told apart from the refusal.
+
+## Round 11 review of bab357829: N1, N2
+
+D1 (the reported attack), D2, D3 and both nits are confirmed fixed; the
+ancestor exception can't reach a sibling's repository. The reviewer's
+tests are added as given (`rv11_*`); 2 of them failed before this
+commit.
+
+- **N1 (medium): alternates were checked against the work root.**
+  `notes/.git/objects/info/alternates` naming `other/.git/objects` let
+  file-at-ref, routed to `notes`, read `other`'s content. Alternates must
+  now resolve inside what the request may touch: the workspace, the
+  enclosing checkout (the exception), or the project a K2 worktree belongs
+  to. Test: `rv11_alternates_into_sibling_reads_its_objects`.
+- **N2 (medium, a regression from D1): K2's own linked worktrees were
+  refused.** A workspace at `<project>/.worktrees/<branch>` has its git dir
+  at `<project>/.git/worktrees/<id>`, which D1 refused. It is accepted when
+  all of these hold:
+  - its work tree is the workspace;
+  - its git dir is `<common>/worktrees/<id>`;
+  - that git dir's `gitdir` back-link resolves to `<work tree>/.git`;
+  - its common dir is in the workspace, or is an enclosing checkout's
+    `.git`.
+
+  A gitfile into another workspace's linked worktree is still refused
+  (`rv11_d1_probes_all_refused`). Test:
+  `rv11_d1_linked_worktree_workspace`.
+- **Fail closed.** A git dir, common dir or work tree that can't be
+  resolved fails the check. Before this, the unresolved path was used.
+- **Accepted limit: the enclosing-checkout exception.** A workspace inside
+  a larger checkout (`mono/team/notes`, with the repository at `mono`) gets
+  git on that whole checkout. stage-all routed to `notes` stages
+  `mono/team/other`'s changes too, and abort-merge's checkout acts on
+  everything under `mono`. That is what git does on a sub-folder of a
+  repository; the relay can't narrow it. A sibling workspace's own
+  repository, or one outside the enclosing checkout, is never reached.
+  Test: `rv11_exception_reaches_sibling_in_same_checkout`; it records the
+  reach and asserts nothing.
+
+## Round 12 review of f2950fe82: the strict git policy
+
+N2 (linked worktrees) and fail-closed resolution are confirmed fixed. The
+review found three more ways to escape through git discovery (nested,
+linked or non-UTF-8 alternates; a non-UTF-8 `commondir`; a repository
+libgit2 can't open, whose check was skipped while the git CLI followed it).
+The coordinator decided to stop chasing git features one at a time and
+apply a strict policy instead. On a host, the repository a relayed git
+request opens must pass all of these:
+
+- **(a) No alternates at all.** An `objects/info/alternates` or
+  `http-alternates` in the git dir or common dir is refused, even one
+  pointing inside the workspace; a K2 workspace never borrows objects.
+  This replaces round 11's alternates walk.
+- **(b) Clean pointer files.** `commondir`, the `gitdir` back-link and a
+  `.git` gitfile are read as bytes (`k2_core::git::path_line`). Each must
+  be one line of UTF-8 with no NUL or control character. `repo_dirs`
+  refuses a `commondir` that isn't, instead of taking it as absent.
+- **(c) Fail closed.** A `.git` at or above the path that libgit2 can't
+  open is refused, not skipped.
+- **(d) The CLI agrees.** `git rev-parse --absolute-git-dir
+  --git-common-dir --show-toplevel`, run as the routes run git, must name
+  the same three folders libgit2 opened.
+- **(e) A known format.** `repositoryformatversion` must be 0 or 1. The
+  only extensions allowed are `noop`, `worktreeConfig`,
+  `relativeWorktrees` and `objectFormat=sha1`
+  (`k2_core::git::known_repo_format`).
+
+K2's linked worktrees keep working, including those of a project inside a
+larger checkout.
+
+**What the tests show (mutation, one item taken out at a time):**
+- Without (a) or (c), the review's tests fail.
+- Without (b), (d) or (e), nothing in the relay suite fails: the bypasses
+  the review found are already caught by (c), because libgit2 can't open
+  those repositories. (b), (d) and (e) are layers behind it, each with its
+  own test:
+  - `git::tests::a_pointer_file_is_one_clean_path_line`
+  - `r12_d_the_git_cli_must_open_what_libgit2_opened`
+  - `git::tests::a_repository_format_k2_knows`
+
+**The reviewer's tests (`rv12_*`) are added; three are changed:**
+- `rv12_n1_direct_alternates_refused` now expects alternates inside the
+  workspace to be refused, as policy (a) says.
+- `rv12_n2_relative_backlink` expects a refusal when libgit2 can't open
+  the worktree. libgit2 1.8 can't open git 2.48's `--relative-paths`
+  worktrees, so K2's handlers couldn't serve one either. K2 makes
+  worktrees with absolute paths.
+- `rv12_libgit2_unopenable_skips_check_cli_follows`: its cleanup
+  `git config --unset`, run in `notes`, follows `notes`' commondir into
+  `other`'s config, which the test had just restored. Its status is no
+  longer asserted. The check refuses all three extensions the test tries.
+
+## Round 13 review of 26daa2318: ready to enable, three lows closed
+
+The review found the strict policy complete: every earlier bypass is
+refused, and the routes run no repository-config commands. The three
+lows it raised are closed here.
+
+- **L1: a config can include another's.** `include.path` and `includeIf`
+  could make git read another workspace's config. Before libgit2 opens
+  anything, the host now runs `git rev-parse` and `git config
+  --show-origin --list -z`, as the routes run git. Every value must come
+  from one of:
+  - the repository's own `config` or `config.worktree`;
+  - the host's global config (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`);
+  - K2's own `-c` flags.
+
+  Anything else is refused. This runs first because libgit2 follows
+  includes too, with no time limit.
+- **L2: a submodule's git dir.** The `.git` of each gitlink in the index
+  and each submodule in `.gitmodules` must resolve inside the workspace,
+  whether it is a gitfile or a folder.
+- **L3: no time limit on git.** Every git command K2 runs on a host
+  (`config --list`, `rev-parse`, `worktree list/add/prune`) runs within
+  10 s (`k2_core::git::GIT_TIMEOUT`, `output_within`); past it the command
+  is killed and the request refused. A config `include` of a FIFO is
+  refused this way instead of hanging.
+- **(c), optional:** a bare-layout folder (`HEAD` plus `objects/`) at or
+  above the path counts as a repository too, for the fail-closed check.
+- **A limit to know about:** a host whose own global config includes
+  another file has all git refused. The K2 host image has none.
+
+| Item | Test |
+|---|---|
+| L1: `include.path`, `includeIf` (with a control) | `r13_l1_a_config_include_from_elsewhere_is_refused` |
+| L2: a submodule gitfile into a sibling; one inside passes | `r13_l2_a_submodule_git_dir_outside_the_workspace_is_refused` |
+| L3: a slow command killed; a FIFO include refused | `r13_l3_git_runs_within_a_time_limit` |
+
+The reviewer's round 13 tests (`rv13_*`) are added as given. Three of
+them only record what happens (include, submodule, bare layout), and all
+three now show a refusal.
+
+## K5: turning fs-relay on, on kind (runbook)
+
+For kind-app, once the review of fs-relay is clean. Everything here is on
+the kind cluster `k2lab`, namespace `k2-kind-p4` (the P4 overlay,
+`deploy/kind/p4`), through an explicit kubeconfig. Never the current
+context, and never the other `k2-kind*` namespaces.
+
+```sh
+kind get kubeconfig --name k2lab > "$TMPDIR/k2lab.kubeconfig"
+kn() { kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind-p4 "$@"; }
+```
+
+### What it needs
+
+- **An image with fs-relay.** Build `k2-daemon` from `k2-dist/fs-relay2`
+  (or wave3 once fs-relay is merged), under the Docker lock, with
+  `scripts/kind/build-daemon.sh`. Then bring P4 up from it with the
+  switch on: `scripts/kind/p4-up.sh --daemon-image=<that image>
+  --fs-relay`. The `--fs-relay` switch is on `k2-dist/kind-p4-fsrelay`
+  until it is merged into kind-p4. The controller and the hosts run the
+  same image; never mix in a host built before fs-relay.
+- **Volumes: nothing new.** The P4 overlay already has what K5 is about:
+  - no shared `k2-work`;
+  - the controller has its own workspaces volume (`k2-work-controller` at
+    `/var/lib/k2/work`);
+  - each host has its own (claim template `work` at `/var/lib/k2/work`).
+- **RBAC: nothing new.** The relay goes over the host link the hosts
+  already hold (`http.relay`/`http.reply` frames). Hosts never call the
+  API server, and the controller's pool rights
+  (`deploy/kind/dist/pool-rbac.yaml`) are unchanged.
+- **The hosts' env: what P4 already sets.** `K2_WORK_ROOT=/var/lib/k2/work`
+  is set by `p4-up.sh` for home sync. With it, each host:
+  - says `k2.work_root=…` in its labels;
+  - runs K2's git hardened (no hooks, filters or fsmonitor; it refuses a
+    config with `hook.*`);
+  - sends what goes to the Trash to `/var/lib/k2/work/.k2-trash`;
+  - lists a symlink's own size.
+
+  Nothing to add.
+- **The controller's env: two variables, both set by `--fs-relay`.**
+  - `K2_FS_RELAY=1`: the switch. Off by default, and off is the
+    controller as it was.
+  - `K2_WORK_ROOT=/var/lib/k2/work`: the controller's own work root. Only
+    paths under it are relayed, mapped to the same relative path under the
+    host's root.
+  - Optional:
+    - `K2_HOST_WORK_ROOT` (default `/var/lib/k2/work`, which the P4 hosts
+      use);
+    - `K2_HOST_WORK_ROOTS=host=path,…` when hosts differ;
+    - `K2_RELAY_SPACE_TTL_SECS` (default 7 days): how long a workspace
+      stays bound to its host after its agent is gone.
+
+  `p4-up.sh --fs-relay` (through `up.sh --fs-relay`) writes both into the
+  controller's env in the manifest it renders and applies. Nothing is set
+  by hand afterwards. To see what it would apply without applying it:
+
+  ```sh
+  scripts/kind/p4-up.sh --fs-relay --render-only="$TMPDIR/p4.yaml"
+  grep -A1 K2_FS_RELAY "$TMPDIR/p4.yaml"   # in the k2-controller StatefulSet
+  ```
+
+  `up.sh --fs-relay` refuses to run unless the hosts have their own work
+  volumes (`--p4` or `--host-work=own`) and `--work-root`.
+
+  To turn it off again, run `p4-up.sh` without `--fs-relay`. The
+  controller's env then loses both variables, and it rolls.
+
+### What the app then shows
+
+A workspace is bound to a host when the controller spawns an agent in it
+(its cwd under `K2_WORK_ROOT`), or when it is created, added or cloned
+through the controller (phase 2). For a bound workspace:
+
+- **The file browser** (read-dir, read-file, stat, search, uploads,
+  create, rename, move, copy, delete, write) shows and changes the host's
+  disk, at the controller's paths. The controller's own copy of that
+  folder is never read or written.
+- **The git panel** (snapshot, diff, stage, commit, discard, branches,
+  worktrees, merge) acts on the host's repository.
+- **Thread file links** (resolve-links) resolve against the host's
+  workspace.
+- **Phase 2:**
+  - New Project and Add Project make or seed the folder on a host;
+  - Clone-to unpacks on a host;
+  - App deploy from a folder builds from a copy of the host's folder (no
+    links).
+
+What it refuses, and how the app sees it:
+
+| Case | Answer |
+|---|---|
+| A workspace whose host is away | `503 host_away`; the controller's copy is never served instead |
+| An App pass (`k2skn_`) on a host workspace | `501 not_relayed` |
+| compress / extract on a host workspace | `501 not_relayed` |
+| A path with `..`, a relative path, or two workspaces in one request | `400 bad_path` / `relative_path` / `cross_host` |
+| A key the route doesn't take | `400 undeclared_key` |
+| On the host: anything outside the routed workspace, after every link | `403 outside_work_root`, `link_outside_worktree`, `link_into_git_dir`, `walk_budget` |
+
+A workspace that isn't bound (no agent has run there, nothing was created
+through the controller) is the controller's own, as without fs-relay.
+
+### End-to-end check
+
+1. **Both sides are set.**
+   - After `p4-up.sh --fs-relay`,
+     `kn exec k2-controller-0 -c k2-daemon -- env | grep -E 'K2_FS_RELAY|K2_WORK_ROOT'`
+     shows `1` and `/var/lib/k2/work`.
+   - `GET /cli/hosts/status` on the controller (port 7444, owner token)
+     lists each host as linked, with `k2.work_root=/var/lib/k2/work` in its
+     labels.
+2. **An agent on a host.**
+   - `scripts/kind/app-check.sh --p4 --password-file=…` spawns in
+     `/var/lib/k2/work/demo` and prints which host the agent ran on (call
+     it `k2-host-N`).
+   - Then write a file there from inside that host's pod:
+     `kn exec k2-host-N -- sh -c 'echo on-host > /var/lib/k2/work/demo/k5.md'`.
+3. **The file browser reads the host.**
+   - With the app's session token,
+     `GET /cli/fs/read-dir?path=/var/lib/k2/work/demo` through the
+     controller lists `k5.md`, and `read-file` returns `on-host`.
+   - `kn exec k2-controller-0 -c k2-daemon -- ls /var/lib/k2/work/demo` does
+     not have it.
+   - The controller's log has `ctl.fs_relay`; the host's has
+     `host.fs_served`.
+4. **Writes land on the host.**
+   - `POST /cli/fs/write-file {path: /var/lib/k2/work/demo/k5b.md}` through
+     the controller.
+   - `kn exec k2-host-N -- cat /var/lib/k2/work/demo/k5b.md` shows it, and
+     the controller's volume still lacks it.
+5. **The git panel works on the host.**
+   - `POST /cli/git/init`, then `stage-all` and `commit {message: "k5"}`
+     on `/var/lib/k2/work/demo`.
+   - `kn exec k2-host-N -- git -C /var/lib/k2/work/demo log --oneline`
+     shows `k5`.
+   - `GET /cli/git/snapshot?path=…` through the controller shows the same
+     HEAD.
+6. **Refusals.**
+   - `read-file?path=/var/lib/k2/work/demo/../../../etc/passwd` → `400 bad_path`.
+   - An extra key (`…&mode=x`) → `400 undeclared_key`.
+   - In the host pod, `ln -s /etc /var/lib/k2/work/demo/etc-link`, then
+     `read-file?path=/var/lib/k2/work/demo/etc-link/passwd` → `403
+     outside_work_root`.
+7. **The host is away.**
+   - `kn delete pod k2-host-N`, then, before it relinks,
+     `read-dir?path=/var/lib/k2/work/demo` → `503 host_away`, never the
+     controller's empty copy.
+   - Once it is back (its `work` volume keeps the files), the same request
+     shows `k5.md` again.
+8. **Off is the old behaviour.**
+   - Run `p4-up.sh` again without `--fs-relay` and wait for the rollout.
+   - `read-dir?path=/var/lib/k2/work/demo` now lists the controller's own
+     volume (no `k5.md`).
+
+The same checks run without kind, on two processes, in
+`scripts/lab/topology/fs-relay.sh` (7 checks; it sets `K2_FS_RELAY=1`).
+
 ## Checks
 
 | Check | Result |

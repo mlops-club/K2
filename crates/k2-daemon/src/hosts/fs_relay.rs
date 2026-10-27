@@ -29,6 +29,7 @@
 //! about the controller's own machine or its database (git notes, open the
 //! changes tab, the worktree setting).
 
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -50,6 +51,10 @@ use crate::routes::http;
 /// host.
 pub const FS_RELAY_VAR: &str = "K2_FS_RELAY";
 
+/// F3: where a host on its own disk keeps what is sent to the Trash: a
+/// folder in its work root (`<root>/.k2-trash`), not the host's own Trash.
+pub const HOST_TRASH: &str = ".k2-trash";
+
 /// A host's label: the work root its workspaces are under (its own disk).
 pub const LABEL_WORK_ROOT: &str = "k2.work_root";
 
@@ -60,6 +65,35 @@ const RELAY_DEADLINE: Duration = Duration::from_secs(120);
 /// carries (the link's frames are capped at 16 MiB). Bigger is a 413: send
 /// smaller upload chunks, or read a file by ranges.
 pub const MAX_RELAY_BODY: usize = 8 << 20;
+
+/// The bytes one relay frame carries when a file moves between machines.
+const CHUNK: usize = 1 << 20;
+
+/// The largest folder (tar.gz) an App deploy brings from a host.
+const PACK_CAP: u64 = 256 << 20;
+
+/// The largest file (a clone's bundle) sent to a host.
+const PUT_CAP: u64 = 4 << 30;
+
+/// A host's relay operations: in process on the host, never an HTTP route
+/// (their schemas: [`schema::HOST_SCHEMAS`]).
+pub const OPS: &str = "/cli/hosts/relay/";
+
+pub const PROJECTS_CREATE: &str = "/cli/projects/create";
+pub const PROJECTS_ADD: &str = "/cli/projects/add-from-path";
+pub const PROJECTS_ADD_WITHOUT_GIT: &str = "/cli/projects/add-without-git";
+
+/// A workspace registration: made on the host that will hold it, then
+/// registered on the controller.
+pub fn registration(path: &str) -> bool {
+    matches!(path, PROJECTS_CREATE | PROJECTS_ADD | PROJECTS_ADD_WITHOUT_GIT)
+}
+
+/// What a host runs for a controller, exactly: a route with a schema (the
+/// relayed routes, the registrations, its relay operations).
+fn host_allows(method: &str, path: &str) -> bool {
+    schema::host_schema(method, path).is_some()
+}
 
 /// POSTs the relay doesn't carry yet that act on a workspace's files: for a
 /// workspace on a host they are refused (501), never run on the
@@ -360,8 +394,29 @@ fn safe_content_type(ct: &str) -> &'static str {
 /// One request relayed to `host` (its paths mapped there, the answer's
 /// back). Blocking.
 fn exchange(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf)], method: &str, path: &str, query: &str, body: &[u8]) -> Answer {
-    let frame_query = map_query(query, maps);
-    let body_b64 = base64::engine::general_purpose::STANDARD.encode(map_body(body, maps));
+    let mut frame_query = map_query(query, maps);
+    // F5: the workspace it is routed to, on the host: the host confines
+    // the request to it (a client's own `k2_workspace` is undeclared and
+    // never gets here).
+    if let Some((_, ws)) = maps.first() {
+        let pair = format!("{SCOPE_KEY}={}", encode(&ws.to_string_lossy()));
+        frame_query = if frame_query.is_empty() { pair } else { format!("{frame_query}&{pair}") };
+    }
+    exchange_raw(remote, host, maps, method, path, frame_query, map_body(body, maps))
+}
+
+/// [`exchange`] of a query and body already in the host's names (`maps`
+/// still maps the answer back).
+fn exchange_raw(
+    remote: &RemoteHost,
+    host: &str,
+    maps: &[(PathBuf, PathBuf)],
+    method: &str,
+    path: &str,
+    frame_query: String,
+    body: Vec<u8>,
+) -> Answer {
+    let body_b64 = base64::engine::general_purpose::STANDARD.encode(body);
     let (m, p) = (method.to_ascii_uppercase(), path.to_string());
     let probe = Frame::HttpRelay { req: u64::MAX, method: m.clone(), path: p.clone(), query: frame_query.clone(), body_b64: body_b64.clone() };
     if probe.encode().len() > MAX_RELAY_FRAME {
@@ -486,7 +541,7 @@ pub async fn relay_post(path: &str, query: &str, owner_token: &str, body: &[u8])
 /// [`relay_post`] over `remote`.
 pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str, owner_token: &str, body: &[u8]) -> Option<Answer> {
     let not_relayed = NOT_RELAYED_POST.contains(&path);
-    if !remote.fs_relay_on() || !(relayed("POST", path) || not_relayed) || !remote.any_host_on_own_disk() {
+    if !remote.fs_relay_on() || !(relayed("POST", path) || not_relayed || registration(path)) || !remote.any_host_on_own_disk() {
         return None;
     }
     if app_pass(query) {
@@ -496,6 +551,12 @@ pub async fn relay_post_on(remote: &'static RemoteHost, path: &str, query: &str,
     }
     if !http::token_ok(query, owner_token) {
         return None;
+    }
+    if registration(path) {
+        let (p, q, b) = (path.to_string(), query.to_string(), body.to_vec());
+        return tokio::task::spawn_blocking(move || register(remote, &p, &q, &b))
+            .await
+            .unwrap_or_else(|e| Some(Answer::json("500 Internal Server Error", json!({"error": format!("relay: {e}")}))));
     }
     let (path, query, body) = (path.to_string(), query.to_string(), body.to_vec());
     tokio::task::spawn_blocking(move || post_blocking(remote, &path, &query, &body, not_relayed))
@@ -589,6 +650,281 @@ fn upload_chunk_split(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf
     answer.expect("at least one piece")
 }
 
+fn bad(status: &str, code: &str, error: String) -> Answer {
+    Answer::json(status, json!({"error": error, "code": code}))
+}
+
+/// The host a workspace at `ctl_path` (the controller's name) lives on, and
+/// its name there: the host it is bound to (or an agent runs it on); else,
+/// for a folder that exists (`existing`), the first own-disk host that has
+/// it; else the least placed one. Never the controller's own disk while
+/// hosts are on theirs: no linked one is a 503.
+fn host_for_workspace(remote: &RemoteHost, ctl_path: &str, existing: bool) -> Result<(String, PathBuf), Answer> {
+    if has_dot_dot(ctl_path) || !ctl_path.starts_with('/') {
+        return Err(bad("400 Bad Request", "bad_path", format!("{ctl_path}: an absolute path without '..'")));
+    }
+    match remote.workspace_route(&[ctl_path.to_string()]) {
+        WorkspaceRoute::Relay { host, maps } => return Ok((host, PathBuf::from(map_any(ctl_path, &maps)))),
+        WorkspaceRoute::Local => {}
+        WorkspaceRoute::Away { host, path } => {
+            return Err(bad("503 Service Unavailable", "host_away", format!("{path} is on agent host {host}, which is not linked")))
+        }
+        WorkspaceRoute::Split(hosts) => return Err(bad("501 Not Implemented", "cross_host", format!("on several hosts: {}", hosts.join(", ")))),
+    }
+    let hosts = remote.own_disk_hosts();
+    let in_scope = |h: &String| remote.host_path(h, Path::new(ctl_path)).map(|p| (h.clone(), p));
+    let candidates: Vec<(String, PathBuf)> = hosts.iter().filter_map(in_scope).collect();
+    if hosts.is_empty() {
+        return Err(bad("503 Service Unavailable", "no_host", "no agent host on its own disk is linked; try again when one is".into()));
+    }
+    if candidates.is_empty() {
+        return Err(bad(
+            "400 Bad Request",
+            "outside_work_root",
+            format!("{ctl_path} is not under the work root (K2_WORK_ROOT) where workspaces live on this controller's agent hosts"),
+        ));
+    }
+    if existing {
+        for (h, hp) in &candidates {
+            let q = format!("path={}", encode(&hp.to_string_lossy()));
+            if exchange_raw(remote, h, &[], "GET", "/cli/fs/stat", q, Vec::new()).status.starts_with('2') {
+                return Ok((h.clone(), hp.clone()));
+            }
+        }
+        // A folder to add that no linked host has: never a fresh one made.
+        return Err(bad("404 Not Found", "not_found", format!("{ctl_path} is not a folder on any linked agent host")));
+    }
+    Ok(candidates.into_iter().next().expect("not empty"))
+}
+
+/// Create or add a workspace on the host that will hold it, then register
+/// it here. Create: the host registers it (and makes its folder, and its
+/// CLI's trust), then the controller's own handler runs (`None`). Add: the
+/// host checks and seeds the folder; the controller registers it here,
+/// registry only. The controller authorised the caller before (the role
+/// gate and the arm's token check); the host acts only in its work root.
+fn register(remote: &RemoteHost, path: &str, query: &str, body: &[u8]) -> Option<Answer> {
+    let v: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Some(bad("400 Bad Request", "bad_body", "a JSON body with a path".into())),
+    };
+    let Some(ctl_path) = v.get("path").and_then(Value::as_str).map(|p| p.trim_end_matches('/').to_string()) else {
+        return Some(bad("400 Bad Request", "bad_body", "a JSON body with a path".into()));
+    };
+    if let Some(e) = undeclared(path, query, body) {
+        return Some(bad("400 Bad Request", "undeclared_key", e));
+    }
+    let (host, host_path) = match host_for_workspace(remote, &ctl_path, path != PROJECTS_CREATE) {
+        Ok(h) => h,
+        Err(a) => return Some(a),
+    };
+    let maps = vec![(PathBuf::from(&ctl_path), host_path.clone())];
+    let a = exchange(remote, &host, &maps, "POST", path, query, body);
+    if !a.status.starts_with('2') {
+        return Some(a);
+    }
+    if path == PROJECTS_CREATE {
+        remote.note_relay_space(&host, "", Path::new(&ctl_path));
+        log_debug!("[hosts/fs-relay] workspace {ctl_path} made on host {host} ({})", host_path.display());
+        return None;
+    }
+    let hv: Value = serde_json::from_str(&a.body).unwrap_or(Value::Null);
+    if hv.get("needsGitInit").and_then(Value::as_bool) == Some(true) {
+        return Some(a);
+    }
+    remote.note_relay_space(&host, "", Path::new(&ctl_path));
+    let name = hv.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+        Path::new(&ctl_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| ctl_path.clone())
+    });
+    let color = hv.get("color").and_then(Value::as_str);
+    log_debug!("[hosts/fs-relay] workspace {ctl_path} added on host {host} ({}); registered here", host_path.display());
+    Some(match k2_core::projects_ops::projects_create(&name, &ctl_path, color) {
+        Ok(p) => {
+            crate::db_routes::emit_projects_changed();
+            Answer::json("200 OK", serde_json::to_value(&p).unwrap_or(Value::Null))
+        }
+        Err(e) => bad("400 Bad Request", "register", e),
+    })
+}
+
+/// A relay operation on `host`: its answer's JSON, or why not.
+fn op(remote: &RemoteHost, host: &str, name: &str, args: Value) -> Result<Value, String> {
+    let a = exchange_raw(remote, host, &[], "POST", &format!("{OPS}{name}"), String::new(), args.to_string().into_bytes());
+    let v: Value = serde_json::from_str(&a.body).unwrap_or_else(|_| json!({"error": a.body}));
+    if a.status.starts_with('2') {
+        Ok(v)
+    } else {
+        Err(format!("{name} on agent host {host}: {}", v.get("error").and_then(Value::as_str).unwrap_or(&a.status)))
+    }
+}
+
+/// Where a controller keeps what it brings from hosts.
+fn relay_tmp() -> PathBuf {
+    k2_core::paths::k2_home().join("relay-tmp")
+}
+
+/// A folder brought from a host, removed when dropped.
+pub struct Mirror {
+    dir: PathBuf,
+    pub path: PathBuf,
+}
+
+impl Drop for Mirror {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// App deploy from a folder in a workspace on a host: the folder, brought
+/// to a mirror on the controller (a tar.gz in chunks, capped), where the
+/// Seed is built as today. `Ok(None)`: the folder is the controller's own.
+/// A workspace on an away host is an error, never the controller's copy.
+/// Blocking.
+pub fn folder_from_host(raw: &str) -> Result<Option<Mirror>, String> {
+    if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
+        return Ok(None);
+    }
+    folder_from_host_on(crate::agent_host::remote::global(), raw)
+}
+
+/// [`folder_from_host`] over `remote`.
+pub fn folder_from_host_on(remote: &RemoteHost, raw: &str) -> Result<Option<Mirror>, String> {
+    if !remote.fs_relay_on() || !remote.any_host_on_own_disk() {
+        return Ok(None);
+    }
+    if has_dot_dot(raw) {
+        return Err(format!("{raw}: a path with '..' is not accepted on a controller with agent hosts"));
+    }
+    let (host, maps) = match remote.workspace_route(&[raw.to_string()]) {
+        WorkspaceRoute::Local => return Ok(None),
+        WorkspaceRoute::Relay { host, maps } => (host, maps),
+        WorkspaceRoute::Away { host, path } => return Err(format!("{path} is on agent host {host}, which is not linked")),
+        WorkspaceRoute::Split(hosts) => return Err(format!("on several hosts: {}", hosts.join(", "))),
+    };
+    let packed = op(remote, &host, "pack", json!({"path": map_any(raw, &maps)}))?;
+    let file = packed["file"].as_str().ok_or("pack: no file")?.to_string();
+    let size = packed["size"].as_u64().unwrap_or(0);
+    let dir = relay_tmp().join(uuid::Uuid::new_v4().simple().to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mirror = Mirror { path: dir.join(Path::new(raw).file_name().unwrap_or_default()), dir };
+    let tgz = mirror.dir.join("folder.tar.gz");
+    let fetched = (|| -> Result<(), String> {
+        if size > PACK_CAP {
+            return Err(format!("{raw} packs to {size} bytes, over {PACK_CAP}"));
+        }
+        let mut out = std::fs::File::create(&tgz).map_err(|e| e.to_string())?;
+        let mut at = 0u64;
+        while at < size {
+            let got = op(remote, &host, "get", json!({"file": file, "offset": at, "len": CHUNK}))?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(got["b64"].as_str().unwrap_or("")).map_err(|e| format!("get: {e}"))?;
+            if bytes.is_empty() || bytes.len() > CHUNK {
+                return Err(format!("get: {file} gave {} bytes at {at} of {size}", bytes.len()));
+            }
+            out.write_all(&bytes).map_err(|e| e.to_string())?;
+            at += bytes.len() as u64;
+        }
+        Ok(())
+    })();
+    let _ = op(remote, &host, "drop", json!({"file": file}));
+    fetched?;
+    std::fs::create_dir_all(&mirror.path).map_err(|e| e.to_string())?;
+    let gz = flate2::read::GzDecoder::new(std::fs::File::open(&tgz).map_err(|e| e.to_string())?);
+    let mut archive = tar::Archive::new(gz);
+    // Regular files and folders only, each inside the mirror (`unpack_in`
+    // refuses `..` and absolute names): a link from the host never points
+    // the Seed's build at the controller's own files.
+    let mut skipped = 0usize;
+    for entry in archive.entries().map_err(|e| format!("unpack {}: {e}", tgz.display()))? {
+        let mut entry = entry.map_err(|e| format!("unpack: {e}"))?;
+        match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Directory => {
+                entry.unpack_in(&mirror.path).map_err(|e| format!("unpack: {e}"))?;
+            }
+            _ => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        log_debug!("[hosts/fs-relay] {raw}: {skipped} link(s) or special file(s) left out of the mirror");
+    }
+    let _ = std::fs::remove_file(&tgz);
+    log_debug!("[hosts/fs-relay] folder {raw} brought from host {host} ({size} bytes packed)");
+    Ok(Some(mirror))
+}
+
+/// A clone unpacked on a host: what the controller registers.
+#[derive(Debug)]
+pub struct HostUnpack {
+    pub host: String,
+    /// Where it landed, the controller's name and the host's.
+    pub dest_path: PathBuf,
+    pub host_dest: PathBuf,
+    pub threads_json: Option<Vec<u8>>,
+    pub manifest: k2_core::clone::CloneManifest,
+}
+
+/// Clone-to on a controller whose workspaces live on hosts: the bundle (on
+/// the controller's disk) goes to the host that will hold the workspace,
+/// in chunks, which extracts it (the workspace under its work root; the
+/// CLI's memory and sessions in its own home). The controller then
+/// registers it (registry only, the Threads and the vault carry: its
+/// database). `Ok(None)`: no host on its own disk, unpack here as today.
+/// The clone gate ran on the controller before. Blocking.
+pub fn clone_unpack_on_host(bundle: &Path, dest_parent: &str) -> Result<Option<HostUnpack>, String> {
+    if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
+        return Ok(None);
+    }
+    clone_unpack_on_host_on(crate::agent_host::remote::global(), bundle, dest_parent)
+}
+
+/// [`clone_unpack_on_host`] over `remote`.
+pub fn clone_unpack_on_host_on(remote: &RemoteHost, bundle: &Path, dest_parent: &str) -> Result<Option<HostUnpack>, String> {
+    if !remote.fs_relay_on() || !remote.any_host_on_own_disk() {
+        return Ok(None);
+    }
+    let dest_parent = dest_parent.trim_end_matches('/');
+    let (host, host_parent) = host_for_workspace(remote, dest_parent, false).map_err(|a| {
+        serde_json::from_str::<Value>(&a.body).ok().and_then(|v| v["error"].as_str().map(str::to_string)).unwrap_or(a.body)
+    })?;
+    let size = std::fs::metadata(bundle).map_err(|e| format!("{}: {e}", bundle.display()))?.len();
+    if size > PUT_CAP {
+        return Err(format!("the bundle is {size} bytes, over {PUT_CAP}"));
+    }
+    let file = format!("{}.tar.gz", uuid::Uuid::new_v4().simple());
+    let sent = (|| -> Result<Value, String> {
+        let mut f = std::fs::File::open(bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+        let mut at = 0u64;
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let n = f.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk[..n]);
+            op(remote, &host, "put", json!({"file": file, "offset": at, "b64": b64}))?;
+            at += n as u64;
+        }
+        op(remote, &host, "clone-extract", json!({"bundle": file, "dest_parent": host_parent}))
+    })();
+    let _ = op(remote, &host, "drop", json!({"file": file}));
+    let out = sent?;
+    let host_dest = PathBuf::from(out["dest_path"].as_str().ok_or("clone-extract: no dest_path")?);
+    let rel = host_dest
+        .strip_prefix(&host_parent)
+        .ok()
+        .filter(|r| !r.as_os_str().is_empty() && !r.components().any(|c| !matches!(c, Component::Normal(_))))
+        .ok_or_else(|| format!("clone-extract: {} is not under {}", host_dest.display(), host_parent.display()))?;
+    let dest_path = Path::new(dest_parent).join(rel);
+    let manifest = serde_json::from_value(out["manifest"].clone()).map_err(|e| format!("clone-extract manifest: {e}"))?;
+    let threads_json = out["threads_b64"]
+        .as_str()
+        .map(|t| base64::engine::general_purpose::STANDARD.decode(t))
+        .transpose()
+        .map_err(|e| format!("clone-extract threads: {e}"))?;
+    remote.note_relay_space(&host, "", &dest_path);
+    log_debug!("[hosts/fs-relay] clone unpacked on host {host} at {} ({size} bytes sent)", host_dest.display());
+    Ok(Some(HostUnpack { host, dest_path, host_dest, threads_json, manifest }))
+}
+
 pub mod events {
     /// The controller relayed a request (attrs: host, path, ok).
     pub const CTL_FS_RELAY: &str = "ctl.fs_relay";
@@ -611,7 +947,211 @@ fn plain_route(method: &str, path: &str) -> bool {
     let plain = path.starts_with('/')
         && !path.contains(['%', '?', '#', '\\'])
         && path[1..].split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..");
-    plain && relayed(method, path)
+    plain && host_allows(method, path)
+}
+
+/// Where a host keeps files in transit (its K2 home, never a workspace).
+fn host_tmp() -> PathBuf {
+    k2_core::paths::k2_home().join("relay-tmp")
+}
+
+/// A transit file: one plain name in [`host_tmp`].
+pub(crate) fn tmp_file(name: &str) -> Result<PathBuf, String> {
+    let plain = !name.is_empty()
+        && name.len() <= 80
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && !name.starts_with('.');
+    if !plain {
+        return Err(format!("{name:?} is not a transit file name"));
+    }
+    Ok(host_tmp().join(name))
+}
+
+/// `p` resolved (symlinks) under this host's work root: strictly (a
+/// workspace), or the root itself when `allow_root` (a clone's parent).
+fn under_work_root(root: &Path, p: &str, allow_root: bool) -> Result<PathBuf, String> {
+    if !p.starts_with('/') || has_dot_dot(p) {
+        return Err(format!("{p}: an absolute path without '..'"));
+    }
+    let r = resolve(Path::new(p)).ok_or_else(|| format!("{p} can't be resolved"))?;
+    if !r.starts_with(root) || (r == root && !allow_root) {
+        return Err(format!("{p} is not in a workspace under this host's work root"));
+    }
+    Ok(r)
+}
+
+/// A relay operation, in process (blocking). Each checks its own
+/// arguments: paths under the work root, names in the transit dir, sizes.
+fn host_op(root: &Path, name: &str, args: &Value) -> Result<Value, String> {
+    let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    std::fs::create_dir_all(host_tmp()).map_err(|e| e.to_string())?;
+    match name {
+        // A folder in a workspace, packed for the controller (symlinks as links).
+        "pack" => {
+            let dir = under_work_root(root, &s("path"), false)?;
+            if !dir.is_dir() {
+                return Err(format!("{} is not a folder on this host", dir.display()));
+            }
+            let file = format!("{}.tar.gz", uuid::Uuid::new_v4().simple());
+            let path = tmp_file(&file)?;
+            let out = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+            let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(out, flate2::Compression::fast()));
+            tar.follow_symlinks(false);
+            let packed = tar.append_dir_all(".", &dir).and_then(|_| tar.into_inner()).and_then(|gz| gz.finish());
+            if let Err(e) = packed {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("pack {}: {e}", dir.display()));
+            }
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if size > PACK_CAP {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("{} packs to {size} bytes, over {PACK_CAP}", dir.display()));
+            }
+            Ok(json!({"file": file, "size": size}))
+        }
+        "get" => {
+            let path = tmp_file(&s("file"))?;
+            let offset = args["offset"].as_u64().unwrap_or(0);
+            let len = args["len"].as_u64().unwrap_or(CHUNK as u64).min(CHUNK as u64) as usize;
+            let mut f = std::fs::File::open(&path).map_err(|e| format!("{name}: {e}"))?;
+            std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; len];
+            let mut n = 0;
+            while n < len {
+                match f.read(&mut buf[n..]).map_err(|e| e.to_string())? {
+                    0 => break,
+                    k => n += k,
+                }
+            }
+            Ok(json!({"b64": base64::engine::general_purpose::STANDARD.encode(&buf[..n])}))
+        }
+        "put" => {
+            let path = tmp_file(&s("file"))?;
+            let offset = args["offset"].as_u64().unwrap_or(0);
+            let have = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if have != offset {
+                return Err(format!("put at {offset}, but the file has {have} bytes"));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD.decode(s("b64")).map_err(|e| format!("put: {e}"))?;
+            if bytes.len() > CHUNK || offset + bytes.len() as u64 > PUT_CAP {
+                return Err(format!("put: over {CHUNK} bytes at once, or {PUT_CAP} in all"));
+            }
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
+            f.write_all(&bytes).map_err(|e| e.to_string())?;
+            Ok(json!({"size": offset + bytes.len() as u64}))
+        }
+        "drop" => {
+            let _ = std::fs::remove_file(tmp_file(&s("file"))?);
+            Ok(json!({}))
+        }
+        // A clone's bundle, extracted here: the workspace under the work
+        // root, the CLI's memory and sessions in this host's home.
+        "clone-extract" => {
+            let bundle = tmp_file(&s("bundle"))?;
+            let parent = under_work_root(root, &s("dest_parent"), true)?;
+            std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+            let home = dirs::home_dir().ok_or("this host has no home directory")?;
+            let (r, manifest) = k2_core::clone::unpack_bundle(&bundle, &parent, &home)?;
+            let _ = std::fs::remove_file(&bundle);
+            if !r.dest_path.starts_with(&parent) {
+                return Err(format!("the clone landed at {}, outside {}", r.dest_path.display(), parent.display()));
+            }
+            Ok(json!({
+                "dest_path": r.dest_path,
+                "threads_b64": r.threads_json.map(|t| base64::engine::general_purpose::STANDARD.encode(t)),
+                "manifest": manifest,
+            }))
+        }
+        other => Err(format!("no relay operation {other:?}")),
+    }
+}
+
+/// Before a relayed request (its paths already confined): a new
+/// workspace's folder is made; `git init` needs the workspace in this
+/// host's registry, so it is registered here first.
+fn prepare_workspace(root: &Path, path: &str, body: &Value) {
+    let Some(p) = body.get("path").and_then(Value::as_str).map(Path::new) else { return };
+    if path == PROJECTS_CREATE || path == PROJECTS_ADD_WITHOUT_GIT {
+        if let Err(e) = std::fs::create_dir_all(p) {
+            log_debug!("[hosts/fs-relay] make {}: {e}", p.display());
+        }
+        return;
+    }
+    if path != "/cli/git/init" {
+        return;
+    }
+    let Some(first) = p.strip_prefix(root).ok().and_then(|rel| rel.components().next()) else { return };
+    let ws = root.join(first);
+    let ws_s = ws.to_string_lossy().into_owned();
+    if ws.is_dir() && crate::git_notes_routes::owning_project(&ws_s).is_none() {
+        let name = first.as_os_str().to_string_lossy().into_owned();
+        match k2_core::projects_ops::projects_create(&name, &ws_s, None) {
+            Ok(_) => log_debug!("[hosts/fs-relay] registered {ws_s} on this host (its controller relays its git)"),
+            Err(e) => log_debug!("[hosts/fs-relay] register {ws_s}: {e}"),
+        }
+    }
+}
+
+/// R8 C: a request's walk budget, on the thread checking it: steps (a
+/// component of a link resolved, a folder entry walked) and a deadline.
+/// No budget started: unlimited.
+pub(crate) mod budget {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static LEFT: Cell<Option<(usize, Instant)>> = const { Cell::new(None) };
+        static SPENT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A request's budget, for as long as the guard lives (reset on
+    /// drop, a panic too). Inside another request's guard: that one's.
+    #[must_use]
+    pub struct Guard {
+        owner: bool,
+    }
+
+    pub fn guard(steps: usize, time: Duration) -> Guard {
+        if LEFT.get().is_some() {
+            return Guard { owner: false };
+        }
+        LEFT.set(Some((steps, Instant::now() + time)));
+        SPENT.set(false);
+        Guard { owner: true }
+    }
+
+    impl Guard {
+        /// Was the budget spent?
+        pub fn spent(&self) -> bool {
+            SPENT.get()
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.owner {
+                LEFT.set(None);
+                SPENT.set(false);
+            }
+        }
+    }
+
+    /// One step: `false` once the budget is spent.
+    pub fn charge() -> bool {
+        match LEFT.get() {
+            None => true,
+            Some((left, deadline)) => {
+                if left == 0 || (left % 256 == 0 && Instant::now() > deadline) {
+                    SPENT.set(true);
+                    LEFT.set(Some((0, deadline)));
+                    false
+                } else {
+                    LEFT.set(Some((left - 1, deadline)));
+                    true
+                }
+            }
+        }
+    }
 }
 
 /// `p` resolved on this host's disk the way the kernel walks it: one
@@ -619,7 +1159,8 @@ fn plain_route(method: &str, path: &str) -> bool {
 /// stands (an absolute one from `/`), `..` popping what is resolved so far
 /// (the parent of where a link really points, never of its name), a
 /// dangling link followed too (a write through it would land there).
-/// `None` past 40 links (a loop).
+/// `None` past 40 links (a loop), or once the request's walk budget is
+/// spent ([`budget`]).
 pub(crate) fn resolve(p: &Path) -> Option<PathBuf> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
@@ -636,6 +1177,9 @@ pub(crate) fn resolve(p: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::from("/");
     let mut hops = 0u32;
     while let Some(part) = todo.pop_front() {
+        if !budget::charge() {
+            return None;
+        }
         if part == ".." {
             out.pop();
             continue;
@@ -673,10 +1217,10 @@ fn stray_relative(route: &str, key: &str, v: &str) -> bool {
     !v.is_empty() && !v.starts_with('/') && PATH_KEYS.contains(&key) && !relative_ok
 }
 
-/// R6: a key `route`'s schema doesn't declare (a relayed route only), or a
+/// R6: a key `route`'s schema doesn't declare (a route with one), or a
 /// body that isn't one JSON object.
 fn undeclared(route: &str, query: &str, body: &[u8]) -> Option<String> {
-    let s = schema::SCHEMAS.iter().find(|s| s.route == route)?;
+    let s = schema::SCHEMAS.iter().chain(schema::HOST_SCHEMAS).find(|s| s.route == route)?;
     if let Some((k, _)) = pairs(query).into_iter().find(|(k, _)| s.kind(k).is_none()) {
         return Some(format!("{route} doesn't take {k}"));
     }
@@ -699,6 +1243,11 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
     let mut kept = Vec::new();
     let mut refused = Vec::new();
     for (i, p) in paths.into_iter().enumerate() {
+        // X3: past the cap, or the budget, unchecked: not linkable.
+        if i >= MAX_LINK_CANDIDATES || !budget::charge() {
+            refused.push((i, p));
+            continue;
+        }
         let candidate = if has_dot_dot(&p) {
             None
         } else if p.starts_with('/') {
@@ -708,7 +1257,8 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
         } else {
             ws.as_ref().map(|w| w.join(&p))
         };
-        let inside = candidate.and_then(|c| resolve(&c)).is_some_and(|r| r.starts_with(root) && r != root);
+        let within = scope::within(root);
+        let inside = candidate.and_then(|c| resolve(&c)).is_some_and(|r| r.starts_with(&within) && r != root);
         if inside {
             kept.push(Value::String(p));
         } else {
@@ -718,6 +1268,16 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
     let mut out = body.clone();
     out["paths"] = Value::Array(kept);
     (out, refused)
+}
+
+/// F4: resolve-links' answer from a host names the workspace's root (the
+/// controller maps it back) and no other spelling of it: never the host's
+/// home (`~/…`) or its own canonical paths.
+fn links_prefixes_root_only(answer: &str) -> Option<String> {
+    let mut v: Value = serde_json::from_str(answer).ok()?;
+    let root = v.get("root")?.clone();
+    v["prefixes"] = json!([root]);
+    Some(v.to_string())
 }
 
 /// resolve-links' answer with the refused candidates back in their places.
@@ -760,20 +1320,355 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
                 break;
             }
         }
+        // Round 13 (L1, L3): first the git CLI, within its time limit: the
+        // config it reads comes only from this repository's own files and
+        // the host's global config (no include.path / includeIf into
+        // another), before libgit2 (which follows includes, with no time
+        // limit) opens anything.
+        cli_config_own(&open_at).map_err(|e| format!("the repository for {p}: {e}"))?;
         let (git_dir, common, work) = match k2_core::git::repo_dirs(&open_at.to_string_lossy()) {
             Ok(d) => d,
             // No repository at all: nothing git can reach; the route answers.
+            // Round 12 (c): but a `.git` at or above it that libgit2 can't
+            // open is refused, never skipped (the git CLI might open it).
+            // (Round 13: a bare-layout folder, HEAD and objects/, counts too.)
+            Err(_) if open_at.ancestors().any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok() || (a.join("HEAD").is_file() && a.join("objects").is_dir())) => {
+                return Err(format!("the repository for {p} can't be opened here"));
+            }
             Err(_) => continue,
         };
-        for (what, dir) in [("git dir", Some(git_dir)), ("common dir", Some(common)), ("work tree", work)] {
+        // (D3: an outside path is never named in a refusal.)
+        for (what, dir) in [("git dir", Some(&git_dir)), ("common dir", Some(&common)), ("work tree", work.as_ref())] {
             if let Some(dir) = dir {
-                if !inside(&dir) {
-                    return Err(format!("the repository for {p} has its {what} {} outside this host's work root", dir.display()));
+                if !inside(dir) {
+                    return Err(format!("the repository for {p} has its {what} outside this host's work root"));
                 }
+            }
+        }
+        // D1 (round 10): and in the workspace the request was routed to
+        // (F5). Two exceptions, each naming exactly what git will touch:
+        // - a workspace inside a larger checkout: a work tree that holds
+        //   the workspace, with its own `.git` folder as its git dir (never
+        //   a gitfile naming another workspace's). Accepted limit: git then
+        //   acts on that whole checkout (fs-relay.md, round 11);
+        // - N2 (round 11): K2's linked worktree as the workspace
+        //   (`<project>/.worktrees/<branch>`): its work tree is the
+        //   workspace, its git dir `<common>/worktrees/<id>` whose `gitdir`
+        //   back-link is `<work tree>/.git`, and its common dir in the
+        //   workspace or an enclosing checkout's `.git`.
+        // A path that can't be resolved fails the check (closed).
+        let within = scope::within(root);
+        let unresolved = || format!("the repository for {p} can't be resolved");
+        let g = resolve(&git_dir).ok_or_else(unresolved)?;
+        let c = resolve(&common).ok_or_else(unresolved)?;
+        let w = match work.as_deref() {
+            Some(w) => Some(resolve(w).ok_or_else(unresolved)?),
+            None => None,
+        };
+        let in_ws = |d: &Path| d.starts_with(&within);
+        let enclosing_checkout = |c: &Path| c.file_name().is_some_and(|n| n == ".git") && c.parent().is_some_and(|top| within.starts_with(top));
+        let enclosing = w.as_ref().is_some_and(|w| within.starts_with(w) && g == w.join(".git") && c == g);
+        // Round 12 (b): the pointer files are one clean path line each.
+        let back_link = k2_core::git::path_line(&g.join("gitdir"))?;
+        if let Some(w) = &w {
+            if std::fs::symlink_metadata(w.join(".git")).is_ok_and(|m| m.is_file()) {
+                let gitfile = k2_core::git::path_line(&w.join(".git"))?;
+                if !gitfile.as_deref().is_some_and(|l| l.starts_with("gitdir: ")) {
+                    return Err(format!("the repository for {p} has a .git file that isn't one gitdir line"));
+                }
+            }
+        }
+        let linked = w.as_ref().is_some_and(|w| {
+            *w == within
+                && g.parent() == Some(c.join("worktrees").as_path())
+                // The back-link may be relative to the git dir (git 2.48's
+                // relative worktrees).
+                && back_link.as_deref().and_then(|l| resolve(&g.join(l))).is_some_and(|back| back == w.join(".git"))
+                && (in_ws(&c) || enclosing_checkout(&c))
+        });
+        let own = in_ws(&g) && in_ws(&c) && w.as_deref().is_none_or(in_ws);
+        if !(own || enclosing || linked) {
+            return Err(format!("the repository for {p} is not this workspace's own"));
+        }
+        // Round 12 (a): no alternates at all (a K2 workspace never needs
+        // to borrow objects); this replaces round 11's alternates walk.
+        for d in [&g, &c] {
+            for f in ["objects/info/alternates", "objects/info/http-alternates"] {
+                if std::fs::symlink_metadata(d.join(f)).is_ok() {
+                    return Err(format!("the repository for {p} borrows objects (alternates): not served here"));
+                }
+            }
+        }
+        // Round 12 (e): a format and extensions K2 knows.
+        k2_core::git::known_repo_format(&c).map_err(|e| format!("the repository for {p}: {e}"))?;
+        // Round 12 (d): the git CLI, run as the routes run it, opens the
+        // same repository libgit2 did.
+        cli_sees_the_same(&open_at, &g, &c, w.as_deref()).map_err(|e| format!("the repository for {p}: {e}"))?;
+        // Round 13 (L2): a submodule's (or any gitlink's) `.git` is this
+        // workspace's too: libgit2's status opens it.
+        for sub in k2_core::git::gitlink_dirs(&open_at.to_string_lossy()).map_err(|e| format!("the repository for {p}: {e}"))? {
+            submodule_inside(&sub, &within).map_err(|e| format!("the repository for {p}: {e}"))?;
+        }
+        // F1 (round 7): what git writes inside them stays there too.
+        git_dir_without_links(&git_dir)?;
+        if common != git_dir {
+            git_dir_without_links(&common)?;
+        }
+    }
+    Ok(())
+}
+
+/// The most entries a git dir may hold for the host to check it.
+const GIT_DIR_LIMIT: usize = 200_000;
+
+/// Round 12 (d): `git rev-parse` from `dir`, run as the routes run git
+/// (K2's hardened command there), names the same git dir, common dir and
+/// work tree libgit2 opened; else the two disagree on what they act on.
+fn cli_sees_the_same(dir: &Path, g: &Path, c: &Path, w: Option<&Path>) -> Result<(), String> {
+    let mut git = k2_core::git::git_command_in(dir)?;
+    git.args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
+    if w.is_some() {
+        git.arg("--show-toplevel");
+    }
+    let out = k2_core::git::output_within(&mut git, k2_core::git::GIT_TIMEOUT).map_err(|e| format!("git rev-parse: {e}"))?;
+    if !out.status.success() {
+        return Err("git can't open it".into());
+    }
+    let text = String::from_utf8(out.stdout).map_err(|_| "git names it in bytes that aren't UTF-8".to_string())?;
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |i: usize| -> Option<PathBuf> {
+        let l = lines.get(i)?;
+        let p = Path::new(l);
+        resolve(&if p.is_absolute() { p.to_path_buf() } else { dir.join(p) })
+    };
+    let same = at(0).as_deref() == Some(g) && at(1).as_deref() == Some(c) && w.is_none_or(|w| at(2).as_deref() == Some(w));
+    if !same {
+        return Err("git and libgit2 open different repositories".into());
+    }
+    Ok(())
+}
+
+/// Round 13 (L1): the config git reads from `dir`, with where each value
+/// comes from (`git config --show-origin --list -z`, as the routes run
+/// git, within [`k2_core::git::GIT_TIMEOUT`]): only the repository's own
+/// `config` (and `config.worktree`), the host's global config, or K2's
+/// own `-c`. A value from any other file (an `include.path` or
+/// `includeIf` naming another workspace's config) is refused. Not a
+/// repository at all: nothing to check here.
+fn cli_config_own(dir: &Path) -> Result<(), String> {
+    let limit = k2_core::git::GIT_TIMEOUT;
+    let mut git = k2_core::git::git_command_in(dir)?;
+    git.env("GIT_CONFIG_NOSYSTEM", "1").args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
+    let out = k2_core::git::output_within(&mut git, limit).map_err(|e| format!("git rev-parse: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("not a git repository") {
+            return Ok(());
+        }
+        return Err("git can't open it".into());
+    }
+    let text = String::from_utf8(out.stdout).map_err(|_| "git names it in bytes that aren't UTF-8".to_string())?;
+    let mut lines = text.lines();
+    let mut dir_of = |what: &str| -> Result<PathBuf, String> {
+        let l = lines.next().ok_or_else(|| format!("git names no {what}"))?;
+        let p = Path::new(l);
+        resolve(&if p.is_absolute() { p.to_path_buf() } else { dir.join(p) }).ok_or_else(|| format!("its {what} can't be resolved"))
+    };
+    let (g, c) = (dir_of("git dir")?, dir_of("common dir")?);
+    let home = dirs::home_dir().unwrap_or_default();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+    let own: Vec<PathBuf> = [c.join("config"), g.join("config.worktree"), home.join(".gitconfig"), xdg.join("git/config")]
+        .iter()
+        .filter_map(|p| resolve(p))
+        .collect();
+    let mut git = k2_core::git::git_command_in(dir)?;
+    git.env("GIT_CONFIG_NOSYSTEM", "1").args(["config", "--show-origin", "--list", "-z"]);
+    let out = k2_core::git::output_within(&mut git, limit).map_err(|e| format!("git config: {e}"))?;
+    if !out.status.success() {
+        return Err("its git config can't be read".into());
+    }
+    // `-z`: origin NUL key LF value NUL, repeated (no quoting).
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).collect();
+    for pair in fields.chunks(2) {
+        let origin = String::from_utf8_lossy(pair[0]);
+        let key = pair.get(1).map(|kv| String::from_utf8_lossy(kv.split(|b| *b == b'\n').next().unwrap_or(b"")).into_owned()).unwrap_or_default();
+        if origin.starts_with("command line:") {
+            continue;
+        }
+        // A relative origin is relative to where git ran: the folder, or
+        // (git moves there first) the work tree's top or the git dir. It
+        // counts only when it resolves to one of the files above exactly.
+        let from_own = origin.strip_prefix("file:").is_some_and(|f| {
+            let f = Path::new(f);
+            let bases = [Some(dir), g.parent(), Some(g.as_path())];
+            if f.is_absolute() {
+                resolve(f).is_some_and(|r| own.contains(&r))
+            } else {
+                bases.iter().flatten().any(|b| resolve(&b.join(f)).is_some_and(|r| own.contains(&r)))
+            }
+        });
+        if !from_own {
+            return Err(format!("its git config reads {key} from a file that isn't this repository's or the host's"));
+        }
+    }
+    Ok(())
+}
+
+/// Round 13 (L2): a gitlink's folder `sub` (a submodule): its `.git`, when
+/// there is one, is in the workspace: a gitfile naming a git dir in it,
+/// or a folder in it.
+fn submodule_inside(sub: &Path, within: &Path) -> Result<(), String> {
+    let dot_git = sub.join(".git");
+    let Ok(md) = std::fs::symlink_metadata(&dot_git) else { return Ok(()) };
+    let target = if md.is_file() {
+        let line = k2_core::git::path_line(&dot_git)?.unwrap_or_default();
+        let to = line.strip_prefix("gitdir: ").ok_or("a submodule's .git file isn't one gitdir line")?;
+        resolve(&sub.join(to))
+    } else {
+        resolve(&dot_git)
+    };
+    if !target.is_some_and(|t| t.starts_with(within)) {
+        return Err("a submodule's git dir is outside this workspace".into());
+    }
+    Ok(())
+}
+
+/// F1 (round 7), X1 (round 9): no symlink anywhere in a repository's git
+/// dir (libgit2 and git write refs, logs, worktrees and objects through
+/// any link there), every entry listed, a loose-object fan-out folder and
+/// `objects/pack` holding files only. Within the request's budget.
+fn git_dir_without_links(dir: &Path) -> Result<(), String> {
+    let objects = dir.join("objects");
+    // (folder, is it a loose-object fan-out folder or `objects/pack`)
+    let mut todo = vec![(dir.to_path_buf(), false)];
+    let mut n = 0usize;
+    while let Some((d, leaf)) = todo.pop() {
+        // X2: a folder the check can't read is refused, not skipped.
+        for e in read_dir_all(&d)? {
+            n += 1;
+            if n > GIT_DIR_LIMIT || !budget::charge() {
+                return Err(format!("{} holds too much to check for a relayed request", dir.display()));
+            }
+            if e.ft.is_symlink() {
+                return Err(format!("{} is a symlink in a repository's git dir", e.path.display()));
+            }
+            if e.ft.is_dir() {
+                // X1: a fan-out folder or `pack` holds files only.
+                if leaf {
+                    return Err(format!("{} is a folder where git keeps objects", e.path.display()));
+                }
+                let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let is_leaf = d == objects && (name == "pack" || (name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())));
+                todo.push((e.path, is_leaf));
             }
         }
     }
     Ok(())
+}
+
+/// A folder entry, its type as `lstat` says.
+pub(crate) struct Entry {
+    pub path: PathBuf,
+    pub ft: std::fs::FileType,
+}
+
+/// X2 (round 9): every entry of `dir`, or why not. A folder that is gone
+/// has none; any other error (no permission to list it, an entry whose
+/// type can't be read) fails the check that walks it, closed.
+pub(crate) fn read_dir_all(dir: &Path) -> Result<Vec<Entry>, String> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{} can't be listed to check it: {e}", dir.display())),
+    };
+    rd.map(|e| {
+        let e = e.map_err(|e| format!("{} can't be listed to check it: {e}", dir.display()))?;
+        let ft = e.file_type().map_err(|err| format!("{} can't be checked: {err}", e.path().display()))?;
+        Ok(Entry { path: e.path(), ft })
+    })
+    .collect()
+}
+
+/// F5: the query key a controller names a relayed request's workspace with
+/// (its path on the host). Never from the app: undeclared on every route.
+pub const SCOPE_KEY: &str = "k2_workspace";
+
+/// F5: the workspace a request is confined to on this thread (its checks),
+/// for as long as the guard lives; none: the work root.
+pub(crate) mod scope {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SCOPE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    #[must_use]
+    pub struct Guard;
+
+    pub fn set(ws: Option<PathBuf>) -> Guard {
+        SCOPE.with(|s| *s.borrow_mut() = ws);
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCOPE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
+    /// The folder a resolved path must be in: the request's workspace, or
+    /// `root`.
+    pub fn within(root: &Path) -> PathBuf {
+        SCOPE.with(|s| s.borrow().clone()).unwrap_or_else(|| root.to_path_buf())
+    }
+}
+
+/// The most resolve-links candidates a host checks one by one; the rest
+/// answer `linkable: false` unchecked (X3).
+const MAX_LINK_CANDIDATES: usize = 500;
+
+/// A relayed request's checks (resolve-links' candidates, the route's
+/// schema), all within one walk budget of `steps` and `time` (X3): the
+/// confined request and resolve-links' refused candidates.
+pub(crate) fn check_request(
+    root: &Path,
+    route: &'static schema::Schema,
+    query: &[(String, String)],
+    body: Value,
+    steps: usize,
+    time: Duration,
+) -> Result<(schema::Confined, Vec<(usize, String)>), schema::Refusal> {
+    let guard = budget::guard(steps, time);
+    // F5: the request's workspace (the controller's `k2_workspace`): under
+    // the work root, strictly; every path the request names is in it.
+    let ws = query.iter().find(|(k, _)| k == SCOPE_KEY).map(|(_, v)| v.clone());
+    let query: Vec<(String, String)> = query.iter().filter(|(k, _)| k != SCOPE_KEY).cloned().collect();
+    let ws = match ws {
+        Some(w) => {
+            let r = resolve(Path::new(&w)).filter(|r| w.starts_with('/') && !has_dot_dot(&w) && r.starts_with(root) && r != root);
+            Some(r.ok_or_else(|| schema::Refusal::Outside(format!("{w} is not a workspace under this host's work root")))?)
+        }
+        None => None,
+    };
+    let _scope = scope::set(ws);
+    let mut refused_links = Vec::new();
+    // Round 10 nit: every candidate is a string (none dropped unchecked).
+    if route.route == "/cli/fs/resolve-links" && body.get("paths").and_then(Value::as_array).is_some_and(|a| a.iter().any(|v| !v.is_string())) {
+        return Err(schema::Refusal::Outside("resolve-links' paths are strings".into()));
+    }
+    let body = if route.route == "/cli/fs/resolve-links" {
+        let (b, refused) = split_links(root, &body);
+        refused_links = refused;
+        b
+    } else {
+        body
+    };
+    let r = schema::confine(root, route, &query, &body);
+    if guard.spent() {
+        return Err(schema::Refusal::Coded("walk_budget", format!("checking {}'s paths took more than a relayed request may", route.route)));
+    }
+    r.map(|c| (c, refused_links))
 }
 
 /// The link's `http.relay`: run the request through this daemon's own
@@ -797,28 +1692,41 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
         Ok(_) => return reply("413 Payload Too Large", json!({"error": "relay body too large"})),
         Err(e) => return reply("400 Bad Request", json!({"error": format!("relay body: {e}")})),
     };
-    let Some(route) = schema::schema(method, path) else {
+    let Some(route) = schema::host_schema(method, path) else {
         return reply("403 Forbidden", json!({"error": format!("{method} {path} is not relayed to hosts")}));
     };
     let body_json = if body.is_empty() { Value::Null } else { serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null) };
     if !body.is_empty() && body_json.is_null() {
         return reply("400 Bad Request", json!({"error": "a relayed body is JSON"}));
     }
-    let mut refused_links = Vec::new();
-    let body_json = if path == "/cli/fs/resolve-links" {
-        let (b, refused) = split_links(&root, &body_json);
-        refused_links = refused;
-        b
-    } else {
-        body_json
-    };
     // R6: the route's schema: undeclared keys refused, every path and
     // derived path confined, and the daemon gets the confined values only.
-    let (query_pairs, body) = match schema::confine(&root, route, &pairs(query), &body_json) {
-        Ok(c) => (c.query, if c.body.is_null() { Vec::new() } else { c.body.to_string().into_bytes() }),
-        Err(schema::Refusal::Outside(e)) => return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"})),
-        Err(schema::Refusal::Undeclared(e)) => return reply("403 Forbidden", json!({"error": e, "code": "undeclared_key"})),
+    // R8 C: off the link's task (the checks walk the disk), in a budget.
+    let checked = {
+        let (root, query) = (root.clone(), pairs(query));
+        tokio::task::spawn_blocking(move || check_request(&root, route, &query, body_json, schema::WALK_STEPS, schema::WALK_TIME)).await
     };
+    let (query_pairs, body, refused_links) = match checked {
+        Ok(Ok((c, refused))) => (c.query, if c.body.is_null() { Vec::new() } else { c.body.to_string().into_bytes() }, refused),
+        Ok(Err(schema::Refusal::Outside(e))) => return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"})),
+        Ok(Err(schema::Refusal::Undeclared(e))) => return reply("403 Forbidden", json!({"error": e, "code": "undeclared_key"})),
+        Ok(Err(schema::Refusal::Coded(code, e))) => return reply("403 Forbidden", json!({"error": e, "code": code})),
+        Err(e) => return reply("500 Internal Server Error", json!({"error": format!("check: {e}")})),
+    };
+    let confined: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap_or(Value::Null) };
+    // A relay operation runs here, in process, on the confined values.
+    if let Some(name) = path.strip_prefix(OPS) {
+        let (name, root) = (name.to_string(), root.clone());
+        let r = tokio::task::spawn_blocking(move || host_op(&root, &name, &confined)).await.unwrap_or_else(|e| Err(e.to_string()));
+        return match r {
+            Ok(v) => reply("200 OK", v),
+            Err(e) => reply("400 Bad Request", json!({"error": e})),
+        };
+    }
+    {
+        let (root, p) = (root.clone(), path.to_string());
+        let _ = tokio::task::spawn_blocking(move || prepare_workspace(&root, &p, &confined)).await;
+    }
     let Some((port, token)) = LOCAL.lock().clone() else {
         return reply("503 Service Unavailable", json!({"error": "this host's daemon address is not known yet"}));
     };
@@ -861,6 +1769,9 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
                     let mut body = String::from_utf8_lossy(&b).into_owned();
                     if !refused_links.is_empty() {
                         body = merge_links(&body, &refused_links).unwrap_or(body);
+                    }
+                    if path == "/cli/fs/resolve-links" {
+                        body = links_prefixes_root_only(&body).unwrap_or(body);
                     }
                     Frame::HttpReply { req, status, content_type: ct, body }
                 }
