@@ -1353,9 +1353,12 @@ def s10(c, sc):
     drain, nothing saved then). Its portable agent moves once the host has
     been lost for K2_HOST_MOVE_AFTER and resumes on the other host with the
     home its last finished turn saved (MEMORY.md, the transcript, the same
-    session) and the conversation; the turn in progress is lost, and its
-    message, never acked, is delivered again there. When the dead host
-    returns, no second CLI appears (I1).
+    session) and the conversation. The turn in progress is lost (PRD
+    section 6, 'Node fails hard'): its message, submitted on the dead host,
+    ends 'outcome unknown: host lost mid-turn' and is not redelivered. A
+    message sent while the host is down, never typed there, is delivered on
+    the new host once. When the dead host returns, no second CLI appears
+    (I1).
 
     The fleet's hosts share one work dir (LAB_HOME_SYNC), so the workspace
     half of the home is outbox's turn-snapshots.sh (a work root per host);
@@ -1440,6 +1443,14 @@ def s10_attempt(c, sc, attempt):
                      killed and wait_until(lambda: not c.fleet.cli_alive(h1, cli_pid), 10)
                      and len(c.turn_events(csid, "cli.turn.end")) == starts,
                      "pid %s on %s" % (cli_pid, h1))
+            # A message sent while h1 is down, never typed there: it waits in
+            # the outbox (the agent stays placed on the lost host) and goes
+            # to the new host after the move.
+            n3b = "s10 while down %s" % uuid.uuid4().hex[:6]
+            st3b, raw3b, resp3b = c.msg(cwd, n3b, wake=True)
+            msg3b = resp3b.get("msgId")
+            sc.check("a message sent while %s is down is queued, with a msg id (I2)" % h1,
+                     st3b == 200 and bool(msg3b), "HTTP %s %s" % (st3b, raw3b[:200]))
             # Not before K2_HOST_MOVE_AFTER: the agent stays placed on the lost host.
             time.sleep(max(0, after / 2))
             early = [e for e in c.fleet.daemon_events("controller", "ctl.move_decision")
@@ -1487,36 +1498,44 @@ def s10_attempt(c, sc, attempt):
                     if h == h2]
             sc.check("the conversation moved: turns one and two are in the transcript on %s" % h2,
                      len(mine) == 2 and all(s_ == csid for _, s_ in mine), "%s" % mine)
-            # The lost turn's message is delivered again there, once, and answered.
+            # Turn three was typed and its turn had started on h1 (its prompt
+            # is in h1's transcript) when h1 failed hard. PRD section 6, 'Node
+            # fails hard': the turn in progress is lost. Its message ends
+            # loud, 'outcome unknown: host lost mid-turn', and is never
+            # redelivered (the lost turn may have had side effects).
             key3 = n3.split(" [[")[0]
-            wait_until(lambda: c.replied(cwd, key3) and [p for p in c.prompts_with(cwd, key3) if p[0] == h2],
-                       gone_wait_s() + (90 if free else 30))
-            on2 = [p for p in c.prompts_with(cwd, key3) if p[0] == h2]
-            state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
+            state = c.wait_final(msg_id, gone_wait_s() + 30) if msg_id else None
             why3 = c.final_reason(msg_id) if msg_id else None
-            ok3 = len(on2) == 1 and c.replied(cwd, key3) and state == "delivered"
-            # Chaos excuses a loud failure only when it hit after the move
-            # (the redelivery) and before the failure: one that S10's own
-            # host kill causes would fail without chaos too.
-            hit3 = []
-            if free and not ok3:
+            sc.check("turn three's message, its turn lost with %s, ends failed 'outcome unknown: host lost mid-turn'" % h1,
+                     state == "failed" and (why3 or "").startswith("outcome unknown: host lost mid-turn"),
+                     "outbox state %s %s" % (state, why3 or ""))
+            # K2-f: a loud failure for a turn that did answer is a false one.
+            sc.check("turn three's loud failure is real: its turn never answered", not c.replied(cwd, key3), why3 or "")
+            at3 = [p[0] for p in c.prompts_with(cwd, key3)]
+            sc.check("turn three's message is not redelivered: its prompt only on %s, once" % h1, at3 == [h1], "%s" % at3)
+            # The message sent while h1 was down, never typed there: delivered
+            # on the new host once and answered. Under chaos it may fail with
+            # a reason, but only after a hit between the move and the
+            # failure (one S10's own host kill causes would fail without
+            # chaos too).
+            wait_until(lambda: c.replied(cwd, n3b), gone_wait_s() + (90 if free else 30))
+            at3b = [p[0] for p in c.prompts_with(cwd, n3b)]
+            state3b = c.wait_final(msg3b, gone_wait_s()) if msg3b else None
+            why3b = c.final_reason(msg3b) if msg3b else None
+            ok3b = at3b == [h2] and c.replied(cwd, n3b) and state3b == "delivered"
+            hit3b = []
+            if free and not ok3b:
                 failed_at = min([e.get("ts") or "" for e in c.fleet.daemon_events("controller", "delivery.failed")
-                                 if e.get("msg_id") == msg_id] or ["~"])
-                hit3 = [e for e in s10_hits(h2, mv.get("ts") or t_kill) if e["ts"] <= failed_at]
-            sc.check("turn three's message, never acked, is delivered again on %s exactly once and answered%s"
-                     % (h2, " (or failed with a reason after --chaos hit)" if free else ""),
-                     ok3 or (bool(hit3) and state == "failed" and bool(why3) and len(on2) <= 1),
-                     "on %s %d time(s); outbox state %s %s; chaos %s"
-                     % (h2, len(on2), state, why3 or "", [(e["ts"], e.get("kind"), e.get("target")) for e in hit3]))
-            # K2-f: 'interrupted' means its turn never answered. A loud
-            # failure for a turn that did answer is a false one.
-            if state == "failed" and (why3 or "").startswith("interrupted"):
-                sc.check("turn three's 'interrupted' failure is real: its turn never answered",
-                         not c.replied(cwd, key3), why3)
-            elsewhere = [p[0] for p in c.prompts_with(cwd, key3) if p[0] not in (h1, h2)]
-            sc.check("turn three's message reached no third place (never doubled)",
-                     not elsewhere and len([p for p in c.prompts_with(cwd, key3) if p[0] == h1]) == 1,
-                     "%s" % [p[0] for p in c.prompts_with(cwd, key3)])
+                                 if e.get("msg_id") == msg3b] or ["~"])
+                hit3b = [e for e in s10_hits(h2, mv.get("ts") or t_kill) if e["ts"] <= failed_at]
+            sc.check("the message sent while %s was down is delivered on %s exactly once and answered%s"
+                     % (h1, h2, " (or failed with a reason after --chaos hit)" if free else ""),
+                     ok3b or (bool(hit3b) and state3b == "failed" and bool(why3b)
+                              and len(at3b) <= 1 and all(h == h2 for h in at3b)),
+                     "prompts %s; outbox state %s %s; chaos %s"
+                     % (at3b, state3b, why3b or "", [(e["ts"], e.get("kind"), e.get("target")) for e in hit3b]))
+            if state3b == "failed" and (why3b or "").startswith(("interrupted", "outcome unknown")):
+                sc.check("its loud failure is real: its turn never answered", not c.replied(cwd, n3b), why3b)
             mem_now = c.memory_file(h2, cwd) if h2 else ""
             mem_bytes = open(mem_now, "rb").read() if os.path.isfile(mem_now) else b""
             sc.check("MEMORY.md on %s holds turns one and two" % h2, all(f.encode() in mem_bytes for f in facts), mem_now)
