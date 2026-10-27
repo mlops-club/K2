@@ -447,7 +447,10 @@ async fn a_sleeping_recipient_is_woken_by_the_controller_once_and_without_wake_i
         [("/ws/sleepy".to_string(), "agent:alice".to_string(), true), ("/ws/sleepy".to_string(), "agent:alice".to_string(), false)]
     );
     // Neither went through the outbox: nothing waits for a placement (I2).
-    assert_eq!(c.drain.get("m_w"), None);
+    // K2-f: the delivered one is recorded, delivered, so a crash mid-turn
+    // can still fail it; the refused one has no row.
+    let row = c.drain.get("m_w").expect("the direct delivery's row");
+    assert_eq!((row.state, row.attempts), (State::Delivered, 0));
     assert_eq!(c.drain.get("m_n"), None);
 }
 

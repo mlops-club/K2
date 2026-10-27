@@ -308,14 +308,33 @@ pub fn spawned(remote: &RemoteHost) {
     }
 }
 
-/// `RemoteHost::unplace`'s hook (K2-d): `agent` was closed mid-turn with
-/// `msg_ids` delivered to it and not answered.
-pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String]) {
+/// How an agent's running turn was cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cut {
+    /// K2-d: closed (a forced dismiss, a drain's deadline).
+    Closed,
+    /// K2-f: its session ended by itself: the CLI exited (SIGKILL, a
+    /// crash), its host came back without it, or it moved off a lost host.
+    Crashed,
+}
+
+impl Cut {
+    fn what(self) -> &'static str {
+        match self {
+            Cut::Closed => "was closed",
+            Cut::Crashed => "crashed",
+        }
+    }
+}
+
+/// `RemoteHost`'s hook when a session ends mid-turn: `agent` had `msg_ids`
+/// delivered to it and not answered.
+pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String], how: Cut) {
     match controller_for(remote) {
         Some(c) => {
-            c.turn_cut(agent, msg_ids, delivery::now_ms());
+            c.turn_cut(agent, msg_ids, how, delivery::now_ms());
         }
-        None => log_debug!("[delivery] {agent} closed mid-turn; no controller drain to fail {} message(s)", msg_ids.len()),
+        None => log_debug!("[delivery] {agent} {} mid-turn; no controller drain to fail {} message(s)", how.what(), msg_ids.len()),
     }
 }
 
@@ -442,10 +461,45 @@ impl Controller {
         Taken::Ack(status, reason)
     }
 
+    /// Tests: is `msg_id` with the direct path now ([`Self::deliver_gone`])?
+    #[cfg(test)]
+    pub fn is_handing(&self, msg_id: &str) -> bool {
+        self.handing.lock().contains(msg_id)
+    }
+
+    /// K2-f: `msg_id` went into `recipient`'s session by the direct path (a
+    /// wake, a live inject): unanswered until its turn ends, as an outbox
+    /// delivery is ([`RemoteHost::note_delivered`]).
+    fn delivered_to(&self, recipient: &str, msg_id: &str) {
+        match self.placed(recipient) {
+            Some(p) => self.remote.note_delivered(&p.agent_id, msg_id),
+            None => log_debug!("[delivery] {msg_id} delivered directly to {recipient}, which is not placed: its turn isn't followed"),
+        }
+    }
+
+    /// K2-f: a message the direct path delivered with no outbox row (a
+    /// host's message the controller handled itself, or the controller's
+    /// own `k2 msg`) gets one, `delivered`, so a crash mid-turn can fail it
+    /// where every message's end is read (`GET /cli/hosts/outbox`).
+    pub fn record_direct(&self, msg_id: &str, from: &str, recipient: &str, body: &Value, now: i64) {
+        let m = NewMessage { msg_id: msg_id.into(), sender: from.into(), recipient: recipient.into(), body: body.to_string() };
+        {
+            let conn = self.db.lock();
+            if let Err(e) = outbox::enqueue(&conn, Hop::Down, &m, now).and_then(|_| outbox::mark_delivered(&conn, Hop::Down, msg_id, now)) {
+                log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
+                return;
+            }
+        }
+        self.delivered_to(recipient, msg_id);
+    }
+
     /// Deliver a host's message through [`Direct::deliver`] and remember
     /// the answer for its resends.
     pub fn deliver_direct(&self, msg_id: &str, from: &str, agent_id: &str, body: &Value, now: i64) -> (DeliverStatus, Option<String>) {
         let r = (self.direct.deliver)(agent_id, from, body);
+        if r.is_ok() {
+            self.record_direct(msg_id, from, agent_id, body, now);
+        }
         let (status, reason, seen_as) = match r {
             Ok(()) => (DeliverStatus::Delivered, None, "delivered".to_string()),
             Err(why) => (DeliverStatus::Rejected, Some(why.clone()), format!("rejected: {why}")),
@@ -512,12 +566,13 @@ impl Controller {
         self.nudge.notify_one();
     }
 
-    /// K2-d: `agent` was closed mid-turn. The messages delivered to it
-    /// since its last turn ended were never answered: each fails, loudly,
-    /// rather than read as delivered. Not resent: the cut turn may already
-    /// have acted on it, so the sender decides.
-    pub fn turn_cut(&self, agent: &str, msg_ids: &[String], now: i64) -> usize {
-        let why = format!("interrupted: {agent} was closed mid-turn before it answered");
+    /// K2-d, K2-f: `agent`'s turn was cut (closed, or its session crashed).
+    /// The messages delivered to it since its last turn ended were never
+    /// answered: each fails, loudly, rather than read as delivered. Not
+    /// resent: the cut turn may already have acted on it, so the sender
+    /// decides.
+    pub fn turn_cut(&self, agent: &str, msg_ids: &[String], how: Cut, now: i64) -> usize {
+        let why = format!("interrupted: {agent} {} mid-turn before it answered", how.what());
         let conn = self.db.lock();
         let mut failed = Vec::new();
         for id in msg_ids {
@@ -623,6 +678,9 @@ impl Controller {
             }
         }
         drop(conn);
+        if res.is_ok() {
+            self.delivered_to(&r.recipient, &r.msg_id);
+        }
         k2_core::trace::emit(|| {
             let e = k2_core::trace::Event::new(events::CTL_MSG_GONE_DIRECT)
                 .msg(r.msg_id.as_str())
@@ -1481,6 +1539,19 @@ pub fn send(from: &str, agent_id: &str, body: Value) -> Option<Result<Sent, Stri
             Some(host_send(host_side(), &sender, agent_id, body, wait))
         }
     }
+}
+
+/// K2-f: on a controller, a `k2 msg` the cascade delivered itself
+/// ([`send`] answered `None`): recorded as a delivered outbox row whose
+/// turn the controller follows. Its id, for the caller's answer.
+pub fn direct_delivered(from: &str, agent_id: &str, body: Value) -> Option<String> {
+    if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
+        return None;
+    }
+    let now = delivery::now_ms();
+    let msg_id = delivery::new_msg_id(now);
+    ensure_controller_drain().record_direct(&msg_id, &sender_address(from), agent_id, &body, now);
+    Some(msg_id)
 }
 
 /// The wake timeout a `kind=msg` body asks for (zero without a wake).
