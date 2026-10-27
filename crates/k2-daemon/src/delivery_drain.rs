@@ -43,7 +43,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
-use crate::agent_host::remote::{RemoteHost, RemotePlacement};
+use crate::agent_host::remote::{RemoteHost, RemotePlacement, TurnMark};
 use crate::hosts::proto::{trace_events, DeliverStatus, Frame};
 
 pub type Db = Arc<ReentrantMutex<Connection>>;
@@ -146,6 +146,12 @@ pub fn outbox_status(query: &str) -> Option<Value> {
         crate::runtime_role::Role::Host => Some(outbox_json(&host_side().db, Hop::Up, query)),
         crate::runtime_role::Role::All => None,
     }
+}
+
+/// A `kind=msg` body (or one with no kind): typed into the agent as a
+/// prompt, so a turn answers it. An inbox item isn't.
+fn is_prompt(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|b| matches!(b.get("kind").and_then(Value::as_str), Some("msg") | None))
 }
 
 /// The deliver frame for an outbox row.
@@ -313,16 +319,22 @@ pub fn spawned(remote: &RemoteHost) {
 pub enum Cut {
     /// K2-d: closed (a forced dismiss, a drain's deadline).
     Closed,
-    /// K2-f: its session ended by itself: the CLI exited (SIGKILL, a
-    /// crash), its host came back without it, or it moved off a lost host.
+    /// K2-f: its CLI exited mid-turn (SIGKILL, a crash), as its host
+    /// reports it (live, or on relink after an outage).
     Crashed,
+    /// K2-f: its host was lost while its turn ran, and nothing says how the
+    /// turn ended: it moved off the lost host, or the host came back
+    /// without it and without its turn (the host daemon restarted).
+    HostLost,
 }
 
 impl Cut {
-    fn what(self) -> &'static str {
+    /// The failed row's reason.
+    fn reason(self, agent: &str) -> String {
         match self {
-            Cut::Closed => "was closed",
-            Cut::Crashed => "crashed",
+            Cut::Closed => format!("interrupted: {agent} was closed mid-turn before it answered"),
+            Cut::Crashed => format!("interrupted: {agent} crashed mid-turn before it answered"),
+            Cut::HostLost => format!("outcome unknown: host lost mid-turn ({agent} had not answered when its host was lost)"),
         }
     }
 }
@@ -334,7 +346,7 @@ pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String], how: Cut) 
         Some(c) => {
             c.turn_cut(agent, msg_ids, how, delivery::now_ms());
         }
-        None => log_debug!("[delivery] {agent} {} mid-turn; no controller drain to fail {} message(s)", how.what(), msg_ids.len()),
+        None => log_debug!("[delivery] {agent}'s turn was cut ({how:?}); no controller drain to fail {} message(s)", msg_ids.len()),
     }
 }
 
@@ -467,38 +479,52 @@ impl Controller {
         self.handing.lock().contains(msg_id)
     }
 
+    /// K2-f: where `recipient`'s turns stand before a direct delivery, so
+    /// its note (made once the delivery answered) lands in the right turn.
+    pub fn turn_mark(&self, recipient: &str) -> TurnMark {
+        self.placed(recipient).map(|p| self.remote.turn_mark(&p.agent_id)).unwrap_or_default()
+    }
+
     /// K2-f: `msg_id` went into `recipient`'s session by the direct path (a
-    /// wake, a live inject): unanswered until its turn ends, as an outbox
-    /// delivery is ([`RemoteHost::note_delivered`]).
-    fn delivered_to(&self, recipient: &str, msg_id: &str) {
+    /// wake, a live inject) after `mark`: unanswered until the turn that
+    /// submits it ends, as an outbox delivery is
+    /// ([`RemoteHost::note_delivered`]).
+    fn delivered_to(&self, recipient: &str, msg_id: &str, mark: &TurnMark) {
         match self.placed(recipient) {
-            Some(p) => self.remote.note_delivered(&p.agent_id, msg_id),
+            Some(p) => self.remote.note_delivered(&p.agent_id, msg_id, Some(mark)),
             None => log_debug!("[delivery] {msg_id} delivered directly to {recipient}, which is not placed: its turn isn't followed"),
         }
     }
 
     /// K2-f: a message the direct path delivered with no outbox row (a
     /// host's message the controller handled itself, or the controller's
-    /// own `k2 msg`) gets one, `delivered`, so a crash mid-turn can fail it
-    /// where every message's end is read (`GET /cli/hosts/outbox`).
-    pub fn record_direct(&self, msg_id: &str, from: &str, recipient: &str, body: &Value, now: i64) {
+    /// own `k2 msg`) gets one, `delivered` (one transaction), so a crash
+    /// mid-turn can fail it where every message's end is read
+    /// (`GET /cli/hosts/outbox`). `mark`: before the delivery.
+    pub fn record_direct(&self, msg_id: &str, from: &str, recipient: &str, body: &Value, mark: &TurnMark, now: i64) -> Result<(), String> {
         let m = NewMessage { msg_id: msg_id.into(), sender: from.into(), recipient: recipient.into(), body: body.to_string() };
         {
             let conn = self.db.lock();
-            if let Err(e) = outbox::enqueue(&conn, Hop::Down, &m, now).and_then(|_| outbox::mark_delivered(&conn, Hop::Down, msg_id, now)) {
-                log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
-                return;
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            outbox::enqueue(&tx, Hop::Down, &m, now).map_err(|e| e.to_string())?;
+            if !outbox::mark_delivered(&tx, Hop::Down, msg_id, now).map_err(|e| e.to_string())? {
+                return Err(format!("{msg_id} is already finished in the outbox"));
             }
+            tx.commit().map_err(|e| e.to_string())?;
         }
-        self.delivered_to(recipient, msg_id);
+        self.delivered_to(recipient, msg_id, mark);
+        Ok(())
     }
 
     /// Deliver a host's message through [`Direct::deliver`] and remember
     /// the answer for its resends.
     pub fn deliver_direct(&self, msg_id: &str, from: &str, agent_id: &str, body: &Value, now: i64) -> (DeliverStatus, Option<String>) {
+        let mark = self.turn_mark(agent_id);
         let r = (self.direct.deliver)(agent_id, from, body);
         if r.is_ok() {
-            self.record_direct(msg_id, from, agent_id, body, now);
+            if let Err(e) = self.record_direct(msg_id, from, agent_id, body, &mark, now) {
+                log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
+            }
         }
         let (status, reason, seen_as) = match r {
             Ok(()) => (DeliverStatus::Delivered, None, "delivered".to_string()),
@@ -554,25 +580,30 @@ impl Controller {
             Err(e) => log_debug!("[delivery] ERROR: ack {msg_id}: {e}"),
         }
         drop(conn);
-        // K2-d: delivered into the agent's session: unanswered until its
-        // turn ends, and activity for the idle reaper.
-        if matches!(status, DeliverStatus::Delivered) && now_delivered {
-            if let Some(p) = recipient.and_then(|r| self.placed(&r)).filter(|p| p.host_id == host_id) {
-                self.remote.note_delivered(&p.agent_id, msg_id);
-                let activity = Arc::clone(&self.activity.read());
-                activity(&p.agent_id);
+        // K2-d: delivered into the agent's session: activity for the idle
+        // reaper. (Its turn was noted before it was sent, K2-f; a refusal
+        // takes that back.)
+        if let Some(p) = recipient.and_then(|r| self.placed(&r)).filter(|p| p.host_id == host_id) {
+            match status {
+                DeliverStatus::Delivered if now_delivered => {
+                    let activity = Arc::clone(&self.activity.read());
+                    activity(&p.agent_id);
+                }
+                DeliverStatus::Rejected => self.remote.unnote_delivered(&p.agent_id, msg_id),
+                _ => {}
             }
         }
         self.nudge.notify_one();
     }
 
-    /// K2-d, K2-f: `agent`'s turn was cut (closed, or its session crashed).
+    /// K2-d, K2-f: `agent`'s turn was cut (closed, its CLI crashed, or its
+    /// host was lost).
     /// The messages delivered to it since its last turn ended were never
     /// answered: each fails, loudly, rather than read as delivered. Not
     /// resent: the cut turn may already have acted on it, so the sender
     /// decides.
     pub fn turn_cut(&self, agent: &str, msg_ids: &[String], how: Cut, now: i64) -> usize {
-        let why = format!("interrupted: {agent} {} mid-turn before it answered", how.what());
+        let why = how.reason(agent);
         let conn = self.db.lock();
         let mut failed = Vec::new();
         for id in msg_ids {
@@ -657,6 +688,7 @@ impl Controller {
         // K2-c: a host may have delivered it before its agent died; the
         // spawn that wakes the agent carries the id, so that host's seen
         // table decides before the prompt goes on argv.
+        let mark = self.turn_mark(&r.recipient);
         let res = {
             let _id = DirectDelivery::during(&r.msg_id);
             (self.direct.deliver)(&r.recipient, &r.sender, &body)
@@ -679,7 +711,7 @@ impl Controller {
         }
         drop(conn);
         if res.is_ok() {
-            self.delivered_to(&r.recipient, &r.msg_id);
+            self.delivered_to(&r.recipient, &r.msg_id, &mark);
         }
         k2_core::trace::emit(|| {
             let e = k2_core::trace::Event::new(events::CTL_MSG_GONE_DIRECT)
@@ -733,6 +765,13 @@ impl Controller {
                 continue;
             }
             let attempt = r.attempts + 1;
+            // K2-f: noted before it can reach the agent, so the turn that
+            // submits it is the one that answers it (a note after its ack
+            // could come after that turn's Stop). The first send only: a
+            // resend may be one the host already delivered and answered.
+            if attempt == 1 && is_prompt(&r.body) {
+                self.remote.note_delivered(&p.agent_id, &r.msg_id, None);
+            }
             let mut frame = deliver_frame(&r, Some(p.epoch.0), attempt);
             if let Frame::Deliver { agent_id, .. } = &mut frame {
                 agent_id.clone_from(&p.agent_id);
@@ -1452,8 +1491,6 @@ fn host_side() -> &'static Arc<HostSide> {
 /// `link::serve_once`'s hook: the link to the controller is up.
 pub fn host_linked(tx: mpsc::UnboundedSender<Frame>) {
     static STARTED: OnceLock<()> = OnceLock::new();
-    // The drain (S8) needs every turn this host runs from here on.
-    crate::hosts::drain::track_turns();
     // P3 T2: and each turn's end saves the agent's home.
     crate::hosts::turn_save::start();
     let h = host_side();
@@ -1544,14 +1581,24 @@ pub fn send(from: &str, agent_id: &str, body: Value) -> Option<Result<Sent, Stri
 /// K2-f: on a controller, a `k2 msg` the cascade delivered itself
 /// ([`send`] answered `None`): recorded as a delivered outbox row whose
 /// turn the controller follows. Its id, for the caller's answer.
-pub fn direct_delivered(from: &str, agent_id: &str, body: Value) -> Option<String> {
-    if crate::runtime_role::current() != crate::runtime_role::Role::Controller {
-        return None;
-    }
+/// `mark`: from [`turn_mark`], before the cascade ran.
+pub fn direct_delivered(from: &str, agent_id: &str, body: Value, mark: Option<TurnMark>) -> Option<String> {
+    let mark = mark?;
     let now = delivery::now_ms();
     let msg_id = delivery::new_msg_id(now);
-    ensure_controller_drain().record_direct(&msg_id, &sender_address(from), agent_id, &body, now);
-    Some(msg_id)
+    match ensure_controller_drain().record_direct(&msg_id, &sender_address(from), agent_id, &body, &mark, now) {
+        Ok(()) => Some(msg_id),
+        Err(e) => {
+            log_debug!("[delivery] ERROR: record the direct delivery {msg_id}: {e}");
+            None
+        }
+    }
+}
+
+/// K2-f: on a controller, where `agent_id`'s turns stand before the
+/// cascade delivers to it ([`direct_delivered`]); `None` elsewhere.
+pub fn turn_mark(agent_id: &str) -> Option<TurnMark> {
+    (crate::runtime_role::current() == crate::runtime_role::Role::Controller).then(|| ensure_controller_drain().turn_mark(agent_id))
 }
 
 /// The wake timeout a `kind=msg` body asks for (zero without a wake).

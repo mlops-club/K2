@@ -170,8 +170,10 @@ pub(crate) fn placed_epoch(agent: &str) -> Option<u64> {
     placed().lock().epochs.get(agent).copied()
 }
 
-/// `hello.resume`: every placement this host still runs (S9). Entries
-/// whose session is gone are dropped from `placed` here.
+/// `hello.resume`: every placement this host still runs (S9), with its
+/// turn (K2-f). One whose CLI ended while the link was down is reported
+/// once with `child_alive: false` and how its turn ended, then dropped
+/// from `placed`.
 fn resume_list() -> Vec<super::proto::ResumePlacement> {
     let placed = placed();
     let mut p = placed.lock();
@@ -191,11 +193,23 @@ fn resume_list() -> Vec<super::proto::ResumePlacement> {
                 program: s.command(),
                 args: s.args(),
                 label: Some(s.label()),
+                turn: super::drain::turn_counts(&s.session_id().to_string()),
             }),
-            _ => dead.push(agent.clone()),
+            _ => dead.push((agent.clone(), *epoch)),
         }
     }
-    for agent in dead {
+    for (agent, epoch) in dead {
+        let pane = p.sessions.iter().find(|(_, a)| **a == agent).map(|(pane, _)| pane.clone());
+        if let Some((pane, turn)) = pane.and_then(|pane| super::drain::take_turn_counts(&pane).map(|t| (pane, t))) {
+            out.push(super::proto::ResumePlacement {
+                agent_id: agent.clone(),
+                session_id: pane,
+                epoch,
+                child_alive: false,
+                turn: Some(turn),
+                ..Default::default()
+            });
+        }
         p.epochs.remove(&agent);
         p.sessions.retain(|_, a| a != &agent);
     }
@@ -308,6 +322,7 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                         agent_pid: envelope.agent_pid,
                         at_ms: received_at_ms,
                         epoch,
+                        subagent: envelope.agent_id.is_some(),
                     });
                 }
                 Ok(_) => {}
@@ -323,8 +338,13 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                 Ok(SessionEvent::SessionRemoved { agent_name, .. }) => {
                     let mut p = placed.lock();
                     if let Some(epoch) = p.epochs.remove(&agent_name) {
+                        // K2-f: how its turn ended, from this host's own
+                        // hook stream (the forwarded hooks are another
+                        // channel: its last Stop may not have gone yet).
+                        let pane = p.sessions.iter().find(|(_, a)| **a == agent_name).map(|(pane, _)| pane.clone());
+                        let turn = pane.as_deref().and_then(super::drain::take_turn_counts);
                         p.sessions.retain(|_, a| a != &agent_name);
-                        let _ = tx.send(Frame::SessionGone { agent_id: agent_name, epoch: Some(epoch), exit_code: None });
+                        let _ = tx.send(Frame::SessionGone { agent_id: agent_name, epoch: Some(epoch), exit_code: None, turn });
                     }
                 }
                 Ok(_) => {}

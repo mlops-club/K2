@@ -247,6 +247,7 @@ async fn fake_host_s1_spawn_attach_type_hook_open_url_close() {
         agent_pid: Some(42),
         at_ms: 1,
         epoch,
+        subagent: false,
     };
     send(&mut host, &hook("not-placed", "Stop", None)).await;
     send(&mut host, &hook("sess-s1", "Stop", Some(epoch + 1000))).await;
@@ -310,9 +311,9 @@ async fn placement_spreads_and_session_gone_drops_it() {
     assert_eq!(c.remote.placement("a2").unwrap().host_id, "h2");
 
     // A stale session.gone (wrong epoch) changes nothing; the right one drops it.
-    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1 + 1), exit_code: None }).await;
-    send(&mut h1, &Frame::SessionGone { agent_id: "a2".into(), epoch: Some(e2), exit_code: None }).await; // not h1's
-    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1), exit_code: None }).await;
+    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1 + 1), exit_code: None, turn: None }).await;
+    send(&mut h1, &Frame::SessionGone { agent_id: "a2".into(), epoch: Some(e2), exit_code: None, turn: None }).await; // not h1's
+    send(&mut h1, &Frame::SessionGone { agent_id: "a1".into(), epoch: Some(e1), exit_code: None, turn: None }).await;
     within("a1 to go", async {
         while c.remote.placement("a1").is_some() {
             tokio::time::sleep(Duration::from_millis(10)).await;

@@ -85,6 +85,22 @@ pub struct ResumePlacement {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// K2-f: the agent's turn as this host followed it, through any link
+    /// outage. With `child_alive: false` the CLI ended while the link was
+    /// down: reported once, so the controller knows how its turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnCounts>,
+}
+
+/// K2-f: a pane's turn as the host's hook stream saw it: how many prompts
+/// (`UserPromptSubmit`) and turn ends (`Stop`, `StopFailure`, `SessionEnd`)
+/// it had, and whether a turn was running at the last hook. The controller
+/// compares them with the hooks it was forwarded to learn what it missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TurnCounts {
+    pub prompts: u64,
+    pub stops: u64,
+    pub running: bool,
 }
 
 /// Offsets into a session's output ring: `start` is the oldest byte the
@@ -330,6 +346,10 @@ pub enum Frame {
         at_ms: i64,
         #[serde(default)]
         epoch: Option<u64>,
+        /// K2-f: from a subagent (its `agent_id` set): it never starts or
+        /// ends the lead's turn.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        subagent: bool,
     },
     #[serde(rename = "open_url")]
     OpenUrl { url: String, source: String },
@@ -343,6 +363,11 @@ pub enum Frame {
         /// Protocol 2: the child's exit code, when the host knows it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
+        /// K2-f: its turn at the end, so the controller doesn't depend on
+        /// the hook stream (a separate channel) having delivered the last
+        /// `Stop` first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<TurnCounts>,
     },
 
     // ── protocol 2: the AgentHost trait, remote (W1) ───────────────────
@@ -751,7 +776,7 @@ mod tests {
             round_trip(&f);
         }
         // An optional field a protocol-1 controller simply ignores.
-        let gone = Frame::SessionGone { agent_id: "a".into(), epoch: Some(41), exit_code: Some(0) };
+        let gone = Frame::SessionGone { agent_id: "a".into(), epoch: Some(41), exit_code: Some(0), turn: None };
         assert_eq!(gone.min_protocol(), 1);
         round_trip(&gone);
         assert_eq!(
