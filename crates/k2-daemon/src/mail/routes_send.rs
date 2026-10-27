@@ -3073,7 +3073,7 @@ mod tests {
         let wire = email.to_string();
         assert!(!wire.contains("boss@shop.example"), "bcc in headers: {wire}");
         assert!(!wire.contains("qa@shop.example"), "bcc in headers: {wire}");
-        assert!(!wire.to_ascii_lowercase().contains("bcc"), "Bcc header present: {wire}");
+        assert!(!send::email_has_bcc(email), "Bcc header present: {wire}");
         drop(seen);
 
         cleanup(&project_id, Some(&domain));
