@@ -304,3 +304,41 @@ path is unchanged.
 3. `scripts/kind/up.sh --dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=1 --work-root=/var/lib/k2/work --login-from=k2-host-0`
    (rc1's flags);
 4. check 7443 and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
+
+## Owner roll #4: k2-kind-dist onto rc3 (2026-10-27, applied)
+
+`k2-dist/wave3` b60a9fd80 (K2-f through K2-f.4; fs-relay merged and OFF):
+`RC_DAEMON=k2-daemon:rc3 RC_COMMIT=b60a9fd80… PREV=rc2 POOL_MAX=2
+scripts/kind/owner-roll-rc1.sh --go`, the same shape as rc2 (MIN 1, MAX 2,
+home sync, the login copy to the second host). Before the go: lab's final
+Linux gate on b60a9fd80 (9413 passed, one test-fixture EINTR fixed in a
+test) and S10 heavy chaos 10/10; `--rehearse` on k2-kind-dist-fake 49/49.
+
+Images: `k2-daemon:rc3` `6bce83207ce9`, `k2-agents:rc3` `7fd3542bd47b`
+(both labelled b60a9fd80). The daemon was built at
+`K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1` with a disk watcher (the
+Docker VM had 3–8 GB free throughout).
+
+Evidence (roll log, steps 1–10: 87 `ok`, no FAIL):
+- dry-run checks (a)–(f), (f) `K2_FS_RELAY` unset everywhere; the
+  rehearsal on k2-kind-dist-fake (enroll-check, app-check, reconnect-check);
+- backup PVC `k2-backup-controller-20261027-165810` (kept);
+- after the roll: PVC uids unchanged; k2-host-0's login unchanged; k2-host
+  at 1 replica; k2-controller runs `6bce83207ce9` and k2-host
+  `7fd3542bd47b`, both labelled b60a9fd80; K2_WORK_ROOT on k2-host-0;
+  app-check --dist and reconnect-check --restart-live PASS;
+- **owner-proof PASS**: Claude Code answered on k2-host-0 (session
+  3d339f5a…); a turn-end home snapshot in the controller's store before any
+  sleep (seq 1, 23 files, 260285 bytes, from k2-host-0); slept, woken,
+  answered again in the same session;
+- the second host: k2-host-1 kept its own login from roll #3 (0600,
+  onboarding done) and linked; back to 1 replica;
+- afterwards: `K2_FS_RELAY` absent from both pods' env and both ConfigMaps;
+  `K2_PROVISIONER_MIN_HOSTS=1`, `MAX_HOSTS=2`; 7443 answers.
+
+**To go back to rc2:**
+1. `docker tag k2-daemon:dist-rc2 k2-daemon:dist && docker tag k2-agents:dist-rc2 k2-agents:dist`;
+2. `scripts/kind/backup-controller.sh --restore=k2-backup-controller-20261027-165810`;
+3. `scripts/kind/up.sh --dist --host-auth=enroll --ptyd=1 --provisioner=kubernetes --max-hosts=2 --work-root=/var/lib/k2/work --login-from=k2-host-0`
+   (rc2's flags);
+4. check 7443 and `app-check.sh --dist --password-file=$HOME/.local/state/k2-kind/dist/owner-password`.
