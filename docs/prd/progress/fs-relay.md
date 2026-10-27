@@ -457,6 +457,36 @@ One commit each, on top of round 9.
     plain). The scan detects drift; the host's run-time refusal of
     undeclared keys is the real control.
 
+## Round 10 review of 28111e3dd: D1, D2, D3
+
+X1, X2, X3, F2, F3 and F6 are confirmed fixed. The reviewer's 8 tests
+are added as they were written (`rv10_*`); 4 of them failed before this
+commit.
+
+- **D1 (medium): a gitfile into a sibling workspace.** `notes/.git`
+  holding `gitdir: <root>/other/.git` let stage-all and commit, routed to
+  `notes`, move `other`'s branch.
+  - Now the repository a git path opens must have its git dir, common dir
+    and work tree inside the routed workspace.
+  - The one exception is a workspace inside a larger checkout: a work tree
+    that holds the workspace, with that work tree's own `.git` folder as
+    its git dir.
+  - Tests: `rv10_f5_gitfile_into_sibling_workspace`, plus
+    `r10_d1_a_workspace_inside_a_larger_checkout_passes` (the exception).
+- **D2 (low): case variants.** The link-into-git-dir check compares
+  folders by device and inode, so `.GIT` and `.Git` on a case-insensitive
+  disk are `.git`. Test: `rv10_item1_case_variant_link_into_git_dir`.
+- **D3 (low): outside paths in refusals.** A refusal never names a path
+  outside the work root: not a git dir, not an alternates line. Test:
+  `rv10_f4_refusal_names_a_path_outside_the_root`.
+- **Nits:**
+  - A non-string resolve-links candidate is refused, not dropped. Test:
+    `rv10_item3_check_request_leaves_nothing_behind`.
+  - A host's `.k2-trash` that is itself a symlink is refused. Test:
+    `r10_the_trash_folder_is_never_a_link`.
+- **Not done (the review's unconfirmed note):** whether a link outside
+  points at a file or a folder can still be told apart from the refusal.
+
 ## Checks
 
 | Check | Result |

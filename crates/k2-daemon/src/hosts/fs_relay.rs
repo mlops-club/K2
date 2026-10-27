@@ -858,12 +858,25 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
             // No repository at all: nothing git can reach; the route answers.
             Err(_) => continue,
         };
+        // (D3: an outside path is never named in a refusal.)
         for (what, dir) in [("git dir", Some(&git_dir)), ("common dir", Some(&common)), ("work tree", work.as_ref())] {
             if let Some(dir) = dir {
                 if !inside(dir) {
-                    return Err(format!("the repository for {p} has its {what} {} outside this host's work root", dir.display()));
+                    return Err(format!("the repository for {p} has its {what} outside this host's work root"));
                 }
             }
+        }
+        // D1 (round 10): and in the workspace the request was routed to
+        // (F5), but for a workspace inside a larger checkout: a work tree
+        // that holds the workspace, with its own `.git` folder as its git
+        // dir (never a gitfile naming another workspace's).
+        let within = scope::within(root);
+        let res = |d: &Path| resolve(d).unwrap_or_else(|| d.to_path_buf());
+        let (g, c, w) = (res(&git_dir), res(&common), work.as_deref().map(res));
+        let in_ws = |d: &Path| d.starts_with(&within);
+        let enclosing = w.as_ref().is_some_and(|w| within.starts_with(w) && g == w.join(".git") && c == g);
+        if !(enclosing || (in_ws(&g) && in_ws(&c) && w.as_deref().is_none_or(in_ws))) {
+            return Err(format!("the repository for {p} is not this workspace's own"));
         }
         // F1 (round 7): what git writes inside them stays there too.
         git_dir_without_links(root, &git_dir)?;
@@ -912,7 +925,7 @@ fn git_dir_without_links(root: &Path, dir: &Path) -> Result<(), String> {
         for line in alt.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             let p = if Path::new(line).is_absolute() { PathBuf::from(line) } else { objects.join(line) };
             if !resolve(&p).is_some_and(|r| r.starts_with(root)) {
-                return Err(format!("the repository's alternates name {line}, outside this host's work root"));
+                return Err("the repository's alternates name objects outside this host's work root".into());
             }
         }
     }
@@ -1006,6 +1019,10 @@ pub(crate) fn check_request(
     };
     let _scope = scope::set(ws);
     let mut refused_links = Vec::new();
+    // Round 10 nit: every candidate is a string (none dropped unchecked).
+    if route.route == "/cli/fs/resolve-links" && body.get("paths").and_then(Value::as_array).is_some_and(|a| a.iter().any(|v| !v.is_string())) {
+        return Err(schema::Refusal::Outside("resolve-links' paths are strings".into()));
+    }
     let body = if route.route == "/cli/fs/resolve-links" {
         let (b, refused) = split_links(root, &body);
         refused_links = refused;

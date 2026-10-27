@@ -477,6 +477,7 @@ fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
         _ => (None, None, path.to_path_buf()),
     };
     let work = resolve(&work).ok_or_else(|| out(format!("{} can't be resolved", work.display())))?;
+    let git_ids: Vec<(u64, u64)> = [&git_dir, &common].iter().filter_map(|g| g.as_deref().and_then(file_id)).collect();
     if !work.starts_with(root) {
         return Err(out(format!("{} is not under this host's work root", work.display())));
     }
@@ -491,8 +492,10 @@ fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
             let (ft, p) = (e.ft, e.path);
             if ft.is_symlink() {
                 let r = resolve(&p);
-                // X1: never into the repository's own git dir.
-                let git = r.as_ref().is_some_and(|r| [&git_dir, &common].iter().any(|g| g.as_ref().is_some_and(|g| r.starts_with(g))));
+                // X1: never into the repository's own git dir; D2: by the
+                // folder itself (device and inode), so `.GIT` on a
+                // case-insensitive disk is `.git`.
+                let git = r.as_ref().is_some_and(|r| r.ancestors().any(|a| file_id(a).is_some_and(|id| git_ids.contains(&id))));
                 if git {
                     return Err(Refusal::Coded("link_into_git_dir", format!("{} links into the repository's git dir; a checkout would go through it", p.display())));
                 }
@@ -510,6 +513,13 @@ fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+/// A folder's identity on its disk (device, inode), whatever its name's
+/// case or spelling.
+fn file_id(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
 }
 
 /// The most entries a copy's source may hold for the host to check it.

@@ -68,6 +68,10 @@ fn host_trash() -> Option<std::path::PathBuf> {
 /// `path` renamed into the host's trash folder under a fresh name (the
 /// same disk: never copied, never unlinked).
 fn host_trash_move(dir: &Path, path: &Path) -> Result<(), String> {
+    // Never through a link (it could lead out of the work root).
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("the trash folder {} is a symlink", dir.display()));
+    }
     std::fs::create_dir_all(dir).map_err(|e| format!("trash dir {}: {e}", dir.display()))?;
     let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
     let dest = dir.join(format!("{name}-{}", uuid::Uuid::new_v4().simple()));
