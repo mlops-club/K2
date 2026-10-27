@@ -634,11 +634,19 @@ kn() { kubectl --kubeconfig "$TMPDIR/k2lab.kubeconfig" -n k2-kind-p4 "$@"; }
 
 - **An image with fs-relay.** Build `k2-daemon` from `k2-dist/fs-relay2`
   (or wave3 once fs-relay is merged), under the Docker lock, with
-  `scripts/kind/build-daemon.sh`. Then bring P4 up from it with the
-  switch on: `scripts/kind/p4-up.sh --daemon-image=<that image>
-  --fs-relay`. The `--fs-relay` switch is on `k2-dist/kind-p4-fsrelay`
-  until it is merged into kind-p4. The controller and the hosts run the
+  `K2_KIND_BUILD_MEMORY=6g CARGO_BUILD_JOBS=1 scripts/kind/build-daemon.sh`
+  (at the default 4g the compile is OOM-killed). Then bring P4 up from it
+  with the switch on: `scripts/kind/p4-up.sh --daemon-image=<that image>
+  --fake-src=<its tree> --fs-relay`. The `--fs-relay` switch is in
+  `k2-dist/wave3` from 454463cd9. The controller and the hosts run the
   same image; never mix in a host built before fs-relay.
+- **A git identity on each host.** A fresh host has no `user.name` or
+  `user.email`, and the git panel's commit then fails with `Failed to get
+  signature`. K2 sets one only when it runs `git init` itself (adding a
+  folder that isn't a repository yet); `up.sh` makes `demo` a repository
+  first, so that never happens. Set one once per host; it lives in the
+  host's `HOME`, on its own data volume:
+  `kn exec k2-host-N -c k2-host -- sh -c 'git config --global user.name "…" && git config --global user.email "…"'`.
 - **Volumes: nothing new.** The P4 overlay already has what K5 is about:
   - no shared `k2-work`;
   - the controller has its own workspaces volume (`k2-work-controller` at
@@ -748,12 +756,25 @@ through the controller) is the controller's own, as without fs-relay.
    - `kn exec k2-host-N -- cat /var/lib/k2/work/demo/k5b.md` shows it, and
      the controller's volume still lacks it.
 5. **The git panel works on the host.**
-   - `POST /cli/git/init`, then `stage-all` and `commit {message: "k5"}`
-     on `/var/lib/k2/work/demo`.
+   - Add the workspace through the controller, as the app's Add Workspace
+     does: `POST /cli/projects/add-from-path {path: /var/lib/k2/work/demo}`
+     (its `id` is the `projectId` a worktree needs). Give the host a git
+     identity (above).
+   - `demo` is already a repository (`up.sh` made it), so no
+     `POST /cli/git/init`. Then `info`, `changes`, `stage {filePath}`,
+     `stage-all` and `commit {message: "k5"}` on `/var/lib/k2/work/demo`.
    - `kn exec k2-host-N -- git -C /var/lib/k2/work/demo log --oneline`
      shows `k5`.
    - `GET /cli/git/snapshot?path=…` through the controller shows the same
      HEAD.
+   - A linked worktree: `POST /cli/git/create-worktree {projectPath,
+     branch, projectId}` makes `.worktrees/<branch>` on the host, and the
+     same steps work in it. **Known defect (2026-10-27, 454463cd9):** the
+     route answers `400 FOREIGN KEY constraint failed`, although git made
+     the worktree. `add-from-path` registers the project twice, on the
+     controller and on the host, with different ids; `create-worktree` is
+     relayed with the controller's id, and the host's database refuses the
+     worktree's record.
 6. **Refusals.**
    - `read-file?path=/var/lib/k2/work/demo/../../../etc/passwd` → `400 bad_path`.
    - An extra key (`…&mode=x`) → `400 undeclared_key`.
@@ -768,8 +789,16 @@ through the controller) is the controller's own, as without fs-relay.
      shows `k5.md` again.
 8. **Off is the old behaviour.**
    - Run `p4-up.sh` again without `--fs-relay` and wait for the rollout.
-   - `read-dir?path=/var/lib/k2/work/demo` now lists the controller's own
-     volume (no `k5.md`).
+   - `read-dir?path=/var/lib/k2/work/demo` now answers from the
+     controller's own volume: its copy (no `k5.md`), or `400 No such file
+     or directory` when the controller never had that folder (the P4
+     controller's `k2-work-controller` starts empty).
+
+`scripts/kind/k5-check.sh [--host-away] [--off-after]` runs steps 1–8 in
+this order, with step 5 in the workspace and in a linked worktree, and the
+refusals of step 6 plus a git path outside the repository (`filePath
+../../../etc/passwd` → `403 outside_work_root`). G4 runs it as K5 with
+`LAB_KIND_FS_RELAY=1` (`scripts/lab/topology/kind.sh`).
 
 The same checks run without kind, on two processes, in
 `scripts/lab/topology/fs-relay.sh` (7 checks; it sets `K2_FS_RELAY=1`).
