@@ -488,7 +488,7 @@ pub fn ensure_downloads_dir(workspace_path: &str) -> Result<PathBuf, String> {
 /// components (`../`, `/`, `\\`, drive prefixes) and NUL bytes, keeping
 /// only the final path segment. Returns a fallback when the result would
 /// be empty or a relative marker (`.` / `..`).
-pub(crate) fn sanitize_filename(filename: &str) -> String {
+pub fn sanitize_filename(filename: &str) -> String {
     // Split on BOTH separators so a Windows-style `..\\x` path supplied
     // to a unix daemon is still reduced to its last segment.
     let last = filename
@@ -507,7 +507,7 @@ pub(crate) fn sanitize_filename(filename: &str) -> String {
 /// Build a non-colliding target path inside `dir` for `filename`. If
 /// `dir/filename` is free it's used as-is; otherwise appends
 /// ` (1)`, ` (2)`, … before the extension: `name (1).ext`.
-fn collision_free_path(dir: &Path, filename: &str) -> PathBuf {
+pub fn collision_free_path(dir: &Path, filename: &str) -> PathBuf {
     let initial = dir.join(filename);
     if !initial.exists() {
         return initial;
@@ -618,7 +618,7 @@ pub fn free_disk_space(path: &Path) -> Option<u64> {
 /// a path separator into — or escape — the `.part` temp name. Keeps ASCII
 /// alphanumerics, `-`, and `_`; drops everything else. Falls back to `anon`
 /// when the result is empty.
-fn sanitize_upload_id(id: &str) -> String {
+pub fn sanitize_upload_id(id: &str) -> String {
     let cleaned: String = id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -759,7 +759,10 @@ pub fn write_upload_chunk(
 
 // ── move / copy / delete / rename / create / duplicate ────────────────
 
-fn disambiguate_path(target: &Path) -> PathBuf {
+/// The free name a copy, move or duplicate lands at: `target`, else
+/// `<stem> copy<ext>`, `<stem> copy 2<ext>`, … (fs-relay's host checks the
+/// same name).
+pub fn disambiguate_path(target: &Path) -> PathBuf {
     if !target.exists() {
         return target.to_path_buf();
     }
@@ -819,7 +822,8 @@ fn copy_dir_inner(
     Ok(())
 }
 
-fn resolve_destination(source: &Path, destination: &Path) -> PathBuf {
+/// Where `source` goes for `destination`: inside it when it is a folder.
+pub fn resolve_destination(source: &Path, destination: &Path) -> PathBuf {
     if destination.is_dir() {
         if let Some(name) = source.file_name() {
             return destination.join(name);

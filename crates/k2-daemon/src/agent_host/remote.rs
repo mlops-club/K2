@@ -228,19 +228,44 @@ struct Turn {
 }
 
 
-/// fs-relay: a workspace `cwd` (as a session or the affinity table has it:
-/// the host's path, or the one the controller asked for) as the controller
-/// names it and as the host does. The same path relative to each work root
-/// (D2); without the controller's root, one name for both.
-fn workspace_forms(cwd: &Path, host_root: &Path, ctl_root: Option<&Path>) -> (PathBuf, PathBuf) {
-    if let Ok(rel) = cwd.strip_prefix(host_root) {
-        return (ctl_root.map(|c| c.join(rel)).unwrap_or_else(|| cwd.to_path_buf()), cwd.to_path_buf());
-    }
-    if let Some(rel) = ctl_root.and_then(|c| cwd.strip_prefix(c).ok()) {
-        return (cwd.to_path_buf(), host_root.join(rel));
-    }
-    (cwd.to_path_buf(), cwd.to_path_buf())
+/// fs-relay (security re-review H4): where agent hosts on their own disks
+/// keep their workspaces, as this controller configures them. A host's own
+/// `k2.work_root` label only says that it has its own disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRoots {
+    /// `K2_HOST_WORK_ROOT` (default [`DEFAULT_HOST_WORK_ROOT`]).
+    pub default: PathBuf,
+    /// `K2_HOST_WORK_ROOTS=host=/root,…`: per host (a lab's side-by-side hosts).
+    pub per_host: HashMap<String, PathBuf>,
 }
+
+pub const DEFAULT_HOST_WORK_ROOT: &str = "/var/lib/k2/work";
+
+impl HostRoots {
+    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> HostRoots {
+        let default = get("K2_HOST_WORK_ROOT")
+            .map(|v| v.trim().to_string())
+            .filter(|v| v.starts_with('/'))
+            .unwrap_or_else(|| DEFAULT_HOST_WORK_ROOT.into());
+        let per_host = get("K2_HOST_WORK_ROOTS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(h, r)| (h.trim().to_string(), r.trim().to_string()))
+            .filter(|(h, r)| !h.is_empty() && r.starts_with('/'))
+            .map(|(h, r)| (h, PathBuf::from(r)))
+            .collect();
+        HostRoots { default: PathBuf::from(default), per_host }
+    }
+
+    pub fn of(&self, host: &str) -> &Path {
+        self.per_host.get(host).unwrap_or(&self.default)
+    }
+}
+
+/// How long a workspace stays bound to the host an agent last ran it on,
+/// without a new spawn there (`K2_RELAY_SPACE_TTL_SECS`).
+pub const RELAY_SPACE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// fs-relay: where an fs/git request goes ([`RemoteHost::workspace_route`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,9 +354,24 @@ impl PlacementStore {
                     host_id TEXT NOT NULL,
                     cwd TEXT,
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE TABLE IF NOT EXISTS relay_space (
+                    rel TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    touched_ms INTEGER NOT NULL,
+                    agent_id TEXT NOT NULL DEFAULT ''
                 );",
             )
             .map_err(|e| format!("host placement tables: {e}"))?;
+            // A database made by 16253180b has relay_space without agent_id.
+            let has_agent = c
+                .prepare("SELECT 1 FROM pragma_table_info('relay_space') WHERE name = 'agent_id'")
+                .and_then(|mut st| st.exists([]))
+                .unwrap_or(true);
+            if !has_agent {
+                c.execute("ALTER TABLE relay_space ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''", [])
+                    .map_err(|e| format!("relay_space agent_id: {e}"))?;
+            }
         }
         Ok(Self { db })
     }
@@ -471,6 +511,24 @@ impl PlacementStore {
     }
 
     /// Every remembered (agent, host, cwd), oldest first.
+    pub fn relay_space(&self, rel: &str, host_id: &str, touched_ms: i64, agent_id: &str) -> Result<(), String> {
+        let c = self.db.lock();
+        c.execute(
+            "INSERT INTO relay_space (rel, host_id, touched_ms, agent_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(rel) DO UPDATE SET host_id = ?2, touched_ms = ?3, agent_id = ?4",
+            rusqlite::params![rel, host_id, touched_ms, agent_id],
+        )
+        .map(drop)
+        .map_err(|e| format!("relay space {rel}: {e}"))
+    }
+
+    pub fn load_relay_spaces(&self) -> Result<Vec<(String, String, i64, String)>, String> {
+        let c = self.db.lock();
+        let mut st = c.prepare("SELECT rel, host_id, touched_ms, agent_id FROM relay_space").map_err(|e| e.to_string())?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
     pub fn load_affinity(&self) -> Result<Vec<(String, String, Option<String>)>, String> {
         let c = self.db.lock();
         let mut st = c
@@ -662,6 +720,21 @@ pub struct RemoteHost {
     saves: Mutex<HashMap<String, PendingSave>>,
     /// The store's newest snapshot of an agent (`hosts::home::latest`).
     home_latest: Box<dyn Fn(&str) -> Option<k2_core::agent_home::Latest> + Send + Sync>,
+    /// fs-relay is on (`K2_FS_RELAY=1` on the controller; R6: off by
+    /// default, and off is the controller as it was without it).
+    fs_relay: bool,
+    /// fs-relay: this controller's work root (`K2_WORK_ROOT`), as given and
+    /// canonical: the only paths it relays are under it.
+    work_roots: Vec<PathBuf>,
+    /// fs-relay: each own-disk host's work root, as configured here.
+    host_roots: HostRoots,
+    /// fs-relay: workspaces (relative to the work root) bound to the host
+    /// this controller last spawned an agent in them on, and when (Unix
+    /// ms). Only from the cwd this controller asked for, never a host's
+    /// report.
+    /// Each: (host, last touched in Unix ms, the agent).
+    relay_spaces: Mutex<HashMap<PathBuf, (String, i64, String)>>,
+    relay_ttl: Duration,
 }
 
 /// A scale-down release whose home save hasn't been seen in the store.
@@ -724,6 +797,15 @@ impl RemoteHost {
             link_grace: LINK_GRACE,
             saves: Mutex::default(),
             home_latest: Box::new(crate::hosts::home::latest),
+            fs_relay: std::env::var(crate::hosts::fs_relay::FS_RELAY_VAR).is_ok_and(|v| v.trim() == "1"),
+            work_roots: crate::hosts::fs_relay::controller_roots(),
+            host_roots: HostRoots::from_env(|k| std::env::var(k).ok()),
+            relay_spaces: Mutex::default(),
+            relay_ttl: std::env::var("K2_RELAY_SPACE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(RELAY_SPACE_TTL),
         }
     }
 
@@ -733,6 +815,22 @@ impl RemoteHost {
     }
 
     /// How long a need waits for a known host to link before "no host".
+    /// fs-relay: this controller's work roots and its hosts' (tests;
+    /// production reads `K2_WORK_ROOT` and `K2_HOST_WORK_ROOT(S)`).
+    pub fn with_relay_roots(self, work_roots: Vec<PathBuf>, host_roots: HostRoots) -> Self {
+        Self { work_roots, host_roots, ..self }
+    }
+
+    /// fs-relay on or off, whatever `K2_FS_RELAY` says (tests).
+    pub fn with_fs_relay(self, fs_relay: bool) -> Self {
+        Self { fs_relay, ..self }
+    }
+
+    /// fs-relay: how long a workspace stays bound without a spawn (tests).
+    pub fn with_relay_ttl(self, relay_ttl: Duration) -> Self {
+        Self { relay_ttl, ..self }
+    }
+
     pub fn with_link_grace(self, link_grace: Duration) -> Self {
         Self { link_grace, ..self }
     }
@@ -787,6 +885,15 @@ impl RemoteHost {
                 }
             }
             Err(e) => log_debug!("[hosts] host affinity unreadable: {e}"),
+        }
+        match store.load_relay_spaces() {
+            Ok(rows) => {
+                let mut spaces = self.relay_spaces.lock();
+                for (rel, host, ms, agent) in rows {
+                    spaces.insert(PathBuf::from(rel), (host, ms, agent));
+                }
+            }
+            Err(e) => log_debug!("[hosts] relay spaces unreadable: {e}"),
         }
         match store.load_ended() {
             Ok(ended) => self.inner.lock().ended.extend(ended),
@@ -1259,6 +1366,10 @@ impl RemoteHost {
                     }
                     self.record_placement(&inner, &agent_id, &host_id);
                 }
+                drop(inner);
+                if let Some(c) = cwd.as_deref() {
+                    self.note_relay_space(&host_id, &agent_id, c);
+                }
                 log_debug!(
                     "[hosts] placed agent {agent_id} on host {host_id} epoch {} session {}",
                     epoch.0,
@@ -1350,6 +1461,7 @@ impl RemoteHost {
         sid: SessionId,
         meta: SpawnedMeta,
     ) -> Arc<RemoteSession> {
+        self.touch_relay_spaces(agent_id);
         if let Some(s) = inner.sessions.get(agent_id).filter(|s| s.session_id == sid) {
             return Arc::clone(s);
         }
@@ -1695,6 +1807,8 @@ impl RemoteHost {
             label: spawned.label.clone(),
             label_source: label_source_from_wire(&spawned.label_source),
         };
+        // fs-relay: the workspace the controller asked for is on this host.
+        self.note_relay_space(&host_id, &agent_id, Path::new(&req.cwd));
         let session = {
             let mut inner = self.inner.lock();
             match inner.placements.get_mut(&agent_id) {
@@ -1800,52 +1914,114 @@ impl RemoteHost {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, format!("agent host {} link is closing", s.host_id)))
     }
 
+    /// fs-relay: bind the workspace an agent was asked to run in to its
+    /// host: `cwd` as this controller asked for it (strictly under its work
+    /// root), on a host on its own disk. Called at each spawn.
+    fn note_relay_space(&self, host_id: &str, agent_id: &str, cwd: &Path) {
+        if !self.fs_relay {
+            return;
+        }
+        let own_disk = self.inner.lock().host_labels.get(host_id).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some());
+        if !own_disk {
+            return;
+        }
+        let Some(rel) = self.work_roots.iter().find_map(|c| cwd.strip_prefix(c).ok().filter(|r| !r.as_os_str().is_empty())) else {
+            // N4: the app's file browser and git panel won't see this
+            // workspace on the host (only paths under the work root route).
+            log_debug!(
+                "[hosts] WARNING: agent {agent_id} runs in {} on host {host_id} (its own disk), outside this controller's work root {:?}: its files are not relayed",
+                cwd.display(),
+                self.work_roots
+            );
+            return;
+        };
+        if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            return;
+        }
+        let now = k2_core::delivery::now_ms();
+        self.relay_spaces.lock().insert(rel.to_path_buf(), (host_id.to_string(), now, agent_id.to_string()));
+        if let Some(store) = &self.store {
+            if let Err(e) = store.relay_space(&rel.to_string_lossy(), host_id, now, agent_id) {
+                log_debug!("[hosts] {e}");
+            }
+        }
+    }
+
+    /// fs-relay (N3): the workspaces `agent_id` was spawned in stay bound
+    /// while it runs: touched when its session is kept (a spawn, a resume)
+    /// and when its host adopts it again.
+    fn touch_relay_spaces(&self, agent_id: &str) {
+        let now = k2_core::delivery::now_ms();
+        let touched: Vec<(PathBuf, String)> = {
+            let mut spaces = self.relay_spaces.lock();
+            spaces
+                .iter_mut()
+                .filter(|(_, (_, _, a))| a == agent_id)
+                .map(|(rel, (h, t, _))| {
+                    *t = now;
+                    (rel.clone(), h.clone())
+                })
+                .collect()
+        };
+        if let Some(store) = &self.store {
+            for (rel, host) in touched {
+                if let Err(e) = store.relay_space(&rel.to_string_lossy(), &host, now, agent_id) {
+                    log_debug!("[hosts] {e}");
+                }
+            }
+        }
+    }
+
+    /// fs-relay: is it on (`K2_FS_RELAY=1`)?
+    pub fn fs_relay_on(&self) -> bool {
+        self.fs_relay
+    }
+
     /// fs-relay: is any host that linked on its own disk (`k2.work_root`)?
     pub fn any_host_on_own_disk(&self) -> bool {
         self.inner.lock().host_labels.values().any(|l| crate::hosts::fs_relay::work_root_label(l).is_some())
     }
 
-    /// fs-relay: where the workspace `paths` name is. A path is in an
-    /// agent's workspace when it is under the cwd the agent runs (or last
-    /// ran) in on a host on its own disk, as the host names it, or as the
-    /// controller does (the same path under `ctl_root` as under the host's
-    /// work root). A placed agent wins over one that ran there before.
-    pub fn workspace_route(&self, paths: &[String], ctl_root: Option<&Path>) -> WorkspaceRoute {
-        let inner = self.inner.lock();
-        let roots: HashMap<&str, PathBuf> = inner
-            .host_labels
-            .iter()
-            .filter_map(|(h, l)| crate::hosts::fs_relay::work_root_label(l).map(|r| (h.as_str(), r)))
-            .collect();
-        if roots.is_empty() || paths.is_empty() {
+    /// fs-relay: this controller's work roots.
+    pub fn work_roots(&self) -> &[PathBuf] {
+        &self.work_roots
+    }
+
+    /// fs-relay: where the workspaces `paths` name are. Only a path under
+    /// this controller's work root, in a workspace bound to a host on its
+    /// own disk (and not expired), goes to that host, mapped to the root
+    /// this controller configures for it; the longest workspace wins.
+    pub fn workspace_route(&self, paths: &[String]) -> WorkspaceRoute {
+        if self.work_roots.is_empty() || paths.is_empty() {
             return WorkspaceRoute::Local;
         }
-        // (host, its cwd, placed now)
-        let mut spaces: Vec<(String, PathBuf, bool)> =
-            inner.sessions.values().filter_map(|s| Some((s.host_id.clone(), s.cwd.clone()?, true))).collect();
-        spaces.extend(inner.last_host_for_cwd.iter().map(|(cwd, h)| (h.clone(), cwd.clone(), false)));
-        spaces.retain(|(h, _, _)| roots.contains_key(h.as_str()));
+        let now = k2_core::delivery::now_ms();
+        let ttl = self.relay_ttl.as_millis() as i64;
+        let spaces: Vec<(PathBuf, String)> = {
+            let inner = self.inner.lock();
+            let mut spaces = self.relay_spaces.lock();
+            // N3: never while its agent is placed there.
+            spaces.retain(|_, (h, t, a)| now - *t <= ttl || inner.placements.get(a.as_str()).is_some_and(|p| &p.host_id == h));
+            spaces
+                .iter()
+                .filter(|(_, (h, _, _))| inner.host_labels.get(h).is_some_and(|l| crate::hosts::fs_relay::work_root_label(l).is_some()))
+                .map(|(rel, (h, _, _))| (rel.clone(), h.clone()))
+                .collect()
+        };
+        let inner = self.inner.lock();
         let mut chosen: Vec<(String, PathBuf, PathBuf)> = Vec::new(); // (host, from, to)
         let mut away: Option<(String, String)> = None;
         for p in paths {
             let p = Path::new(p);
-            let best = spaces
-                .iter()
-                .filter_map(|(h, cwd, live)| {
-                    let (ctl_form, host_form) = workspace_forms(cwd, &roots[h.as_str()], ctl_root);
-                    [ctl_form, host_form.clone()]
-                        .into_iter()
-                        .filter(|from| p.starts_with(from))
-                        .map(|from| (*live, from.components().count(), h.clone(), from, host_form.clone()))
-                        .max_by_key(|(_, n, ..)| *n)
-                })
-                .max_by_key(|(live, n, ..)| (*live, *n));
-            if let Some((_, _, host, from, to)) = best {
-                if !inner.links.contains_key(&host) {
+            let Some((root, rel_p)) = self.work_roots.iter().find_map(|c| p.strip_prefix(c).ok().map(|r| (c, r))) else { continue };
+            let best = spaces.iter().filter(|(rel, _)| rel_p.starts_with(rel)).max_by_key(|(rel, _)| rel.components().count());
+            if let Some((rel, host)) = best {
+                if !inner.links.contains_key(host) {
                     away.get_or_insert((host.clone(), p.to_string_lossy().into_owned()));
                 }
-                if !chosen.iter().any(|(h, f, _)| h == &host && f == &from) {
-                    chosen.push((host, from, to));
+                let (from, to) = (root.join(rel), self.host_roots.of(host).join(rel));
+                if !chosen.iter().any(|(h, f, _)| h == host && f == &from) {
+                    chosen.push((host.clone(), from, to));
                 }
             }
         }
@@ -1856,10 +2032,7 @@ impl RemoteHost {
             0 => WorkspaceRoute::Local,
             1 => match away {
                 Some((host, path)) => WorkspaceRoute::Away { host, path },
-                None => WorkspaceRoute::Relay {
-                    host: hosts.remove(0),
-                    maps: chosen.into_iter().map(|(_, f, t)| (f, t)).collect(),
-                },
+                None => WorkspaceRoute::Relay { host: hosts.remove(0), maps: chosen.into_iter().map(|(_, f, t)| (f, t)).collect() },
             },
             _ => WorkspaceRoute::Split(hosts),
         }
@@ -2283,6 +2456,9 @@ impl RemoteHost {
             }
         }
         for (agent, d) in &out {
+            if matches!(d, AdoptDecision::Adopted) {
+                self.touch_relay_spaces(agent);
+            }
             log_debug!("[hosts] host {host_id}: agent {agent} {d:?}");
             let decision = match d {
                 AdoptDecision::Adopted => "adopted",
