@@ -31,15 +31,19 @@
 #   3. kind checks as scenarios K1 to K6: enroll-check (relink, revoke,
 #      restore), app-check (the app's path), the home move between two
 #      nodes and the drain demo (k2-kind-p4: hosts on different nodes, no
-#      shared volume), the pool's scale-down, and a row PENDING on work
-#      not merged yet: the controller's workspace routes on the agent's
-#      host (fs/git relay).
+#      shared volume), the pool's scale-down, and the app's file browser
+#      and git panel on the agent's host (fs/git relay, K5).
 #
 # LAB_KIND_DRAIN_MOVE=1 says the daemon image has k2-dist/drain-move (rc2
 # and later): K4's checks 5-7 then count (without it they show PENDING),
 # and K6 runs kind-pool-accept.sh from LAB_KIND_DAEMON_SRC (the daemon
 # image's source tree) in its own namespace (LAB_KIND_POOL_NS) with the
 # fake agents image LAB_KIND_FAKE_AGENTS.
+#
+# LAB_KIND_FS_RELAY=1 says the daemon image has fs-relay (wave3 454463cd9
+# and later) and LAB_KIND_REPO has p4-up.sh --fs-relay and k5-check.sh: K5
+# brings k2-kind-p4 up again with fs-relay on and runs k5-check.sh
+# --host-away. Without it K5 shows PENDING.
 
 LAB_KIND_REPO=${LAB_KIND_REPO:-$(cd "$LAB_REPO/.." && pwd)/kind-p4}
 LAB_KIND_DAEMON_IMAGE=${LAB_KIND_DAEMON_IMAGE:-k2-daemon:rc1}
@@ -51,6 +55,7 @@ LAB_KIND_DRAIN_MOVE=${LAB_KIND_DRAIN_MOVE:-0}
 LAB_KIND_DAEMON_SRC=${LAB_KIND_DAEMON_SRC:-}
 LAB_KIND_FAKE_AGENTS=${LAB_KIND_FAKE_AGENTS:-}
 LAB_KIND_POOL_NS=${LAB_KIND_POOL_NS:-k2-p4-pool-g4}
+LAB_KIND_FS_RELAY=${LAB_KIND_FS_RELAY:-0}
 KIND_NS_FLEET=k2-kind-dist-fake
 KIND_NS_P4=k2-kind-p4
 LAB_KIND_KUBECONFIG=""
@@ -73,6 +78,10 @@ kind_preflight() {
             || { echo "kind: LAB_KIND_DRAIN_MOVE=1 needs LAB_KIND_DAEMON_SRC with scripts/lab/topology/kind-pool-accept.sh" >&2; return 1; }
         docker image inspect "$LAB_KIND_FAKE_AGENTS" >/dev/null 2>&1 || { echo "kind: no image LAB_KIND_FAKE_AGENTS=$LAB_KIND_FAKE_AGENTS" >&2; return 1; }
         case "$LAB_KIND_POOL_NS" in k2-kind*|k2-p4-pool) echo "kind: LAB_KIND_POOL_NS can't be $LAB_KIND_POOL_NS" >&2; return 1 ;; esac
+    fi
+    if [ "$LAB_KIND_FS_RELAY" = 1 ]; then
+        [ -x "$LAB_KIND_REPO/scripts/kind/k5-check.sh" ] && grep -q -- '--fs-relay' "$LAB_KIND_REPO/scripts/kind/p4-up.sh" \
+            || { echo "kind: LAB_KIND_FS_RELAY=1 needs LAB_KIND_REPO with k5-check.sh and p4-up.sh --fs-relay" >&2; return 1; }
     fi
 }
 
@@ -254,8 +263,20 @@ PY
         kind_result K3 "An agent's home moves between hosts on two nodes (no shared volume)" fail "p4-up.sh failed (topology/p4-up.log)"
         kind_result K4 "Drain a node mid-conversation: the agent continues on another host" fail "p4-up.sh failed (topology/p4-up.log)"
     fi
-    kind_result K5 "A workspace made through the app is on the agent's host; the app shows the agent's files" not_run \
-        "PENDING the fs/git relay (dist-link, after rc1): /cli/fs, /cli/git, project create/add and App deploy-from-folder use the controller's own disk; home-move-check.sh shows the gap (docs/prd/progress/kind-p4.md on k2-dist/kind-p4)"
+    if [ "$LAB_KIND_FS_RELAY" = 1 ]; then
+        say "kind: K5 the app's files and git on the agent's host ($KIND_NS_P4 again, fs-relay on)"
+        kind_kc delete namespace "$KIND_NS_P4" --ignore-not-found --wait=true >>"$RUN/topology/p4-up-fsrelay.log" 2>&1
+        if "$LAB_KIND_REPO/scripts/kind/p4-up.sh" --daemon-image="$LAB_KIND_DAEMON_IMAGE" --fake-src="$LAB_REPO" \
+                --pool=2:2 --fs-relay >>"$RUN/topology/p4-up-fsrelay.log" 2>&1; then
+            kind_check K5 "A workspace made through the app is on the agent's host; the app shows the agent's files" "$RUN/topology/K5-check.log" \
+                "$LAB_KIND_REPO/scripts/kind/k5-check.sh" --host-away
+        else
+            kind_result K5 "A workspace made through the app is on the agent's host; the app shows the agent's files" fail "p4-up.sh --fs-relay failed (topology/p4-up-fsrelay.log)"
+        fi
+    else
+        kind_result K5 "A workspace made through the app is on the agent's host; the app shows the agent's files" not_run \
+            "PENDING the fs/git relay: /cli/fs, /cli/git, project create/add and App deploy-from-folder use the controller's own disk (LAB_KIND_FS_RELAY=1 with a build that has it runs K5)"
+    fi
     if [ "$LAB_KIND_DRAIN_MOVE" = 1 ]; then
         kind_check K6 "The pool scales a host down and its agents continue on the others" "$RUN/topology/K6-pool-accept.log" \
             env K2_P4_NS="$LAB_KIND_POOL_NS" K2_P4_PORT="${LAB_KIND_POOL_PORT:-17462}" KUBECONFIG=/dev/null "$LAB_KIND_DAEMON_SRC/scripts/lab/topology/kind-pool-accept.sh" \
