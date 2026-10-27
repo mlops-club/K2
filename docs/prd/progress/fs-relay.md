@@ -413,6 +413,50 @@ B2 is closed. B1 reopened as X1.
 Each test fails with its fix reverted (checked by mutation; the repro
 fails only with both halves of X1 reverted).
 
+## Round 7's lows: F2–F6
+
+One commit each, on top of round 9.
+
+- **F2: a repo-relative path is literal.** `diff_file` and
+  `resolve_conflict` match the path as a literal pathspec
+  (`pathspec_literal`, as discard and folder staging already did). So
+  `filePath="*"` resolves or diffs no other file. Test:
+  `git::tests::a_file_path_is_literal_not_a_pathspec`, with a control.
+- **F3: the Trash stays inside the work root.** A host with a work root
+  sends what goes to the Trash to `<root>/.k2-trash`
+  (`safe_delete::set_host_trash`, set at host start). That covers delete
+  without `permanent`, discard and remove-worktree: renamed there, never
+  copied or unlinked. Test: `f3_the_trash_stays_inside_the_work_root`.
+- **F4: no leaks about outside the work root.**
+  - A host's listing gives a link's own size and time (`lstat`). A local
+    listing still follows the link, as before.
+  - resolve-links' answer from a host keeps only the workspace's root in
+    its prefixes.
+  - `/cli/fs/info` names no path, so it was never relayed; it is now out
+    of the schema.
+  - Test: `f4_a_host_tells_nothing_about_outside_its_work_root`, with a
+    control.
+- **F5: a request stays in its routed workspace.** The controller adds
+  `k2_workspace` (the routed workspace's host path) to every relayed
+  request. The app can't send it, because it is undeclared on every route.
+  The host checks it is a workspace under the root, takes it off the query,
+  and confines every path and resolve-links candidate to it.
+  - If it is absent, the host confines to the work root, as before; a
+    controller always sends it.
+  - Git's repository checks stay at the work root, so a workspace inside a
+    larger checkout keeps working.
+  - Test: `f5_a_request_stays_in_its_routed_workspace`, with a control.
+- **F6: the scan's blind spots.**
+  - Now caught: a parse the scan can't name the struct of (a turbofish, a
+    type inferred without `match`) and a `#[serde(flatten)]` both fail the
+    scan; serde `alias` keys are read.
+  - Tested on synthetic handlers:
+    `f6_the_handler_scan_reads_what_it_can_and_fails_on_the_rest`.
+  - **Still not checked (documented):** reads in the dispatcher arms,
+    reads from the database or the environment, and a key's kind (path or
+    plain). The scan detects drift; the host's run-time refusal of
+    undeclared keys is the real control.
+
 ## Checks
 
 | Check | Result |

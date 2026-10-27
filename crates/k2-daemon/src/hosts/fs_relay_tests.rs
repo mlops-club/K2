@@ -1074,12 +1074,18 @@ fn struct_keys(src: &str, name: &str) -> Vec<String> {
     let attrs = &src[src[..at].rfind("\n\n").unwrap_or(0)..at];
     let camel_case = attrs.contains("rename_all = \"camelCase\"");
     let body = &src[at..at + src[at..].find("\n}").unwrap()];
+    // F6: a flattened field hides its keys from this scan.
+    assert!(!body.contains("flatten"), "struct {name}: #[serde(flatten)] can't be scanned");
     let mut keys = Vec::new();
     let mut rename = None;
     for line in body.lines().skip(1) {
         let l = line.trim();
-        if l.starts_with("#[serde(") && l.contains("rename = \"") {
-            rename = quoted_after(l, "rename = \"").into_iter().next();
+        if l.starts_with("#[serde(") {
+            if l.contains("rename = \"") {
+                rename = quoted_after(l, "rename = \"").into_iter().next();
+            }
+            // F6: an alias is a key the handler reads too.
+            keys.extend(quoted_after(l, "alias = \""));
         } else if let Some((f, _)) = l.strip_prefix("pub ").unwrap_or(l).split_once(':').filter(|_| !l.starts_with("//") && !l.starts_with('#')) {
             let f = f.trim();
             keys.push(rename.take().unwrap_or_else(|| if camel_case { camel(f) } else { f.to_string() }));
@@ -1116,6 +1122,7 @@ fn handler_keys(src: &str, handler: &str) -> Vec<String> {
     let used = inner.match_indices("params").filter(|(i, _)| !inner[i + 6..].starts_with(':')).count();
     assert_eq!(used, understood, "{handler}: every use of params is one the scan reads");
     // The body: parsed into a struct, never read any other way.
+    let mut scanned = 0;
     for (i, _) in inner.match_indices(" = match ") {
         let line_start = inner[..i].rfind('\n').unwrap_or(0);
         let decl = &inner[line_start..i];
@@ -1123,6 +1130,7 @@ fn handler_keys(src: &str, handler: &str) -> Vec<String> {
             let rest = &inner[i..i + 60.min(inner.len() - i)];
             if rest.contains("from_slice(body)") || rest.contains("parse_body(body)") {
                 keys.extend(struct_keys(src, ty.trim()));
+                scanned += 1;
             }
         }
     }
@@ -1136,7 +1144,66 @@ fn handler_keys(src: &str, handler: &str) -> Vec<String> {
         .count();
     let parsed = inner.matches("from_slice(body)").count() + inner.matches("parse_body(body)").count();
     assert_eq!(body_uses, parsed, "{handler}: the body is only parsed into its struct");
+    // F6: every parse is one the scan read the struct of.
+    assert_eq!(scanned, parsed, "{handler}: every parse of the body is `let x: T = match …(body)`");
     keys
+}
+
+/// F6: the scan itself: the shapes it reads, and the ones it refuses to
+/// guess at (a parse it can't name the struct of, a flattened struct).
+#[test]
+fn f6_the_handler_scan_reads_what_it_can_and_fails_on_the_rest() {
+    let src = r#"
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Good {
+    file_path: String,
+    #[serde(default, alias = "seedWiki")]
+    seed_wiki: bool,
+    #[serde(rename = "x-y")]
+    xy: String,
+}
+
+fn handle_good(body: &[u8]) -> CliResponse {
+    let b: Good = match parse_body(body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    ok()
+}
+
+fn handle_turbofish(body: &[u8]) -> CliResponse {
+    let b = serde_json::from_slice::<Good>(body).unwrap();
+    ok()
+}
+
+fn handle_inferred(body: &[u8]) -> CliResponse {
+    let b: Good = parse_body(body).unwrap();
+    ok()
+}
+
+#[derive(Deserialize)]
+struct Flat {
+    #[serde(flatten)]
+    rest: HashMap<String, String>,
+}
+
+fn handle_flat(body: &[u8]) -> CliResponse {
+    let b: Flat = match parse_body(body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    ok()
+}
+"#;
+    let mut keys = handler_keys(src, "handle_good");
+    keys.sort();
+    assert_eq!(keys, ["filePath", "seedWiki", "seedWiki", "x-y"]);
+    for h in ["handle_turbofish", "handle_inferred", "handle_flat"] {
+        let src = src.to_string();
+        let h = h.to_string();
+        assert!(std::panic::catch_unwind(move || handler_keys(&src, &h)).is_err(), "the scan refuses a shape it can't read");
+    }
 }
 
 /// The match arm the text at `at` is in: its line and the lines under it
