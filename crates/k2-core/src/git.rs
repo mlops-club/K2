@@ -41,10 +41,7 @@ fn no_config_hooks(dir: &Path) -> Result<(), String> {
     if !hardened() {
         return Ok(());
     }
-    let out = git_cli()
-        .args(["config", "--list", "--name-only"])
-        .current_dir(dir)
-        .output()
+    let out = run(git_cli().args(["config", "--list", "--name-only"]).current_dir(dir))
         .map_err(|e| format!("read the git config in {}: {e}", dir.display()))?;
     if !out.status.success() {
         return Err(format!("read the git config in {}: {}", dir.display(), String::from_utf8_lossy(&out.stderr).trim()));
@@ -61,10 +58,7 @@ fn no_config_hooks(dir: &Path) -> Result<(), String> {
 /// filter drivers), then checked out by libgit2, which runs none.
 fn worktree_add(project_path: &str, new_branch: Option<&str>, worktree_path: &str, commitish: &str) -> Result<std::process::Output, String> {
     let args = worktree_add_args(hardened(), new_branch, worktree_path, commitish);
-    let output = git_in(Path::new(project_path))?
-        .args(&args)
-        .output()
-        .map_err(|e| format!("Failed to run git worktree add: {}", e))?;
+    let output = run(git_in(Path::new(project_path))?.args(&args)).map_err(|e| format!("Failed to run git worktree add: {}", e))?;
     if output.status.success() && hardened() {
         let repo = Repository::open(worktree_path).map_err(|e| format!("open the new worktree: {e}"))?;
         let mut co = git2::build::CheckoutBuilder::new();
@@ -72,6 +66,51 @@ fn worktree_add(project_path: &str, new_branch: Option<&str>, worktree_path: &st
         repo.checkout_head(Some(&mut co)).map_err(|e| format!("check out the new worktree: {e}"))?;
     }
     Ok(output)
+}
+
+/// fs-relay (round 13, L3): how long one git command K2 runs on an agent
+/// host may take (a config `include` naming a FIFO would otherwise hang
+/// it). Past it the command is killed and its caller refuses.
+pub const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `cmd`'s output, as `Command::output`; on an agent host (hardened),
+/// within [`GIT_TIMEOUT`].
+pub fn run(cmd: &mut Command) -> Result<std::process::Output, String> {
+    if hardened() {
+        output_within(cmd, GIT_TIMEOUT)
+    } else {
+        cmd.output().map_err(|e| e.to_string())
+    }
+}
+
+/// `cmd`'s output if it exits within `limit`; else it is killed and this
+/// is an error. Its output is read as it comes (no pipe fills up).
+pub fn output_within(cmd: &mut Command, limit: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let read = |mut r: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = read(Box::new(child.stdout.take().expect("piped")));
+    let err = read(Box::new(child.stderr.take().expect("piped")));
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(st) => break st,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git took longer than {} s", limit.as_secs()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
 /// `worktree add`'s arguments: options, then `--`, then the path and the
@@ -130,6 +169,29 @@ pub fn known_repo_format(common: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// fs-relay (round 13, L2): the work-tree folders of the repository at
+/// `path`'s gitlinks (its index's submodule entries, and `.gitmodules`'),
+/// where a submodule's own `.git` would be.
+pub fn gitlink_dirs(path: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let repo = Repository::discover(path).map_err(|e| format!("no git repository for {path}: {}", e.message()))?;
+    let Some(work) = repo.workdir().map(Path::to_path_buf) else { return Ok(Vec::new()) };
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(index) = repo.index() {
+        for e in index.iter().filter(|e| e.mode == 0o160000) {
+            out.push(work.join(String::from_utf8_lossy(&e.path).as_ref()));
+        }
+    }
+    if let Ok(subs) = repo.submodules() {
+        for s in subs {
+            let p = work.join(s.path());
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// fs-relay (round 12): a git pointer file (`commondir`, a `gitdir`
@@ -381,7 +443,7 @@ pub fn list_branches(path: &str) -> BranchList {
 pub fn list_worktrees(path: &str) -> Vec<WorktreeInfo> {
     // Use git CLI for worktree list since git2 worktree support is limited
     let Ok(mut git) = git_in(Path::new(path)) else { return Vec::new() };
-    let output = match git.args(["worktree", "list", "--porcelain"]).output() {
+    let output = match run(git.args(["worktree", "list", "--porcelain"])) {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };
@@ -626,7 +688,7 @@ pub fn remove_worktree(
         if std::fs::rename(wt, &temp_path).is_ok() {
             // Prune git metadata (detach the worktree ref)
             if let Ok(mut git) = git_in(Path::new(project_path)) {
-                let _ = git.args(["worktree", "prune"]).output();
+                let _ = run(git.args(["worktree", "prune"]));
             }
 
             // Move to Trash in background thread (recoverable).
@@ -662,7 +724,7 @@ pub fn remove_worktree(
     // in place and let the user investigate than to permanently
     // destroy their work.
     if let Ok(mut git) = git_in(Path::new(project_path)) {
-        let _ = git.args(["worktree", "prune"]).output();
+        let _ = run(git.args(["worktree", "prune"]));
     }
     if Path::new(worktree_path).exists() {
         crate::safe_delete::trash(worktree_path).map_err(|e| {

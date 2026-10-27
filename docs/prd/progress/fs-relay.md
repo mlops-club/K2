@@ -578,6 +578,46 @@ larger checkout.
   `other`'s config, which the test had just restored. Its status is no
   longer asserted. The check refuses all three extensions the test tries.
 
+## Round 13 review of 26daa2318: ready to enable, three lows closed
+
+The review found the strict policy complete: every earlier bypass is
+refused, and the routes run no repository-config commands. The three
+lows it raised are closed here.
+
+- **L1: a config can include another's.** `include.path` and `includeIf`
+  could make git read another workspace's config. Before libgit2 opens
+  anything, the host now runs `git rev-parse` and `git config
+  --show-origin --list -z`, as the routes run git. Every value must come
+  from one of:
+  - the repository's own `config` or `config.worktree`;
+  - the host's global config (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`);
+  - K2's own `-c` flags.
+
+  Anything else is refused. This runs first because libgit2 follows
+  includes too, with no time limit.
+- **L2: a submodule's git dir.** The `.git` of each gitlink in the index
+  and each submodule in `.gitmodules` must resolve inside the workspace,
+  whether it is a gitfile or a folder.
+- **L3: no time limit on git.** Every git command K2 runs on a host
+  (`config --list`, `rev-parse`, `worktree list/add/prune`) runs within
+  10 s (`k2_core::git::GIT_TIMEOUT`, `output_within`); past it the command
+  is killed and the request refused. A config `include` of a FIFO is
+  refused this way instead of hanging.
+- **(c), optional:** a bare-layout folder (`HEAD` plus `objects/`) at or
+  above the path counts as a repository too, for the fail-closed check.
+- **A limit to know about:** a host whose own global config includes
+  another file has all git refused. The K2 host image has none.
+
+| Item | Test |
+|---|---|
+| L1: `include.path`, `includeIf` (with a control) | `r13_l1_a_config_include_from_elsewhere_is_refused` |
+| L2: a submodule gitfile into a sibling; one inside passes | `r13_l2_a_submodule_git_dir_outside_the_workspace_is_refused` |
+| L3: a slow command killed; a FIFO include refused | `r13_l3_git_runs_within_a_time_limit` |
+
+The reviewer's round 13 tests (`rv13_*`) are added as given. Three of
+them only record what happens (include, submodule, bare layout), and all
+three now show a refusal.
+
 ## Checks
 
 | Check | Result |

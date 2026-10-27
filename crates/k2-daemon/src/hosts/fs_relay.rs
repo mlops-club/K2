@@ -853,12 +853,19 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
                 break;
             }
         }
+        // Round 13 (L1, L3): first the git CLI, within its time limit: the
+        // config it reads comes only from this repository's own files and
+        // the host's global config (no include.path / includeIf into
+        // another), before libgit2 (which follows includes, with no time
+        // limit) opens anything.
+        cli_config_own(&open_at).map_err(|e| format!("the repository for {p}: {e}"))?;
         let (git_dir, common, work) = match k2_core::git::repo_dirs(&open_at.to_string_lossy()) {
             Ok(d) => d,
             // No repository at all: nothing git can reach; the route answers.
             // Round 12 (c): but a `.git` at or above it that libgit2 can't
             // open is refused, never skipped (the git CLI might open it).
-            Err(_) if open_at.ancestors().any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok()) => {
+            // (Round 13: a bare-layout folder, HEAD and objects/, counts too.)
+            Err(_) if open_at.ancestors().any(|a| std::fs::symlink_metadata(a.join(".git")).is_ok() || (a.join("HEAD").is_file() && a.join("objects").is_dir())) => {
                 return Err(format!("the repository for {p} can't be opened here"));
             }
             Err(_) => continue,
@@ -930,6 +937,11 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
         // Round 12 (d): the git CLI, run as the routes run it, opens the
         // same repository libgit2 did.
         cli_sees_the_same(&open_at, &g, &c, w.as_deref()).map_err(|e| format!("the repository for {p}: {e}"))?;
+        // Round 13 (L2): a submodule's (or any gitlink's) `.git` is this
+        // workspace's too: libgit2's status opens it.
+        for sub in k2_core::git::gitlink_dirs(&open_at.to_string_lossy()).map_err(|e| format!("the repository for {p}: {e}"))? {
+            submodule_inside(&sub, &within).map_err(|e| format!("the repository for {p}: {e}"))?;
+        }
         // F1 (round 7): what git writes inside them stays there too.
         git_dir_without_links(&git_dir)?;
         if common != git_dir {
@@ -951,7 +963,7 @@ fn cli_sees_the_same(dir: &Path, g: &Path, c: &Path, w: Option<&Path>) -> Result
     if w.is_some() {
         git.arg("--show-toplevel");
     }
-    let out = git.output().map_err(|e| format!("git rev-parse: {e}"))?;
+    let out = k2_core::git::output_within(&mut git, k2_core::git::GIT_TIMEOUT).map_err(|e| format!("git rev-parse: {e}"))?;
     if !out.status.success() {
         return Err("git can't open it".into());
     }
@@ -965,6 +977,91 @@ fn cli_sees_the_same(dir: &Path, g: &Path, c: &Path, w: Option<&Path>) -> Result
     let same = at(0).as_deref() == Some(g) && at(1).as_deref() == Some(c) && w.is_none_or(|w| at(2).as_deref() == Some(w));
     if !same {
         return Err("git and libgit2 open different repositories".into());
+    }
+    Ok(())
+}
+
+/// Round 13 (L1): the config git reads from `dir`, with where each value
+/// comes from (`git config --show-origin --list -z`, as the routes run
+/// git, within [`k2_core::git::GIT_TIMEOUT`]): only the repository's own
+/// `config` (and `config.worktree`), the host's global config, or K2's
+/// own `-c`. A value from any other file (an `include.path` or
+/// `includeIf` naming another workspace's config) is refused. Not a
+/// repository at all: nothing to check here.
+fn cli_config_own(dir: &Path) -> Result<(), String> {
+    let limit = k2_core::git::GIT_TIMEOUT;
+    let mut git = k2_core::git::git_command_in(dir)?;
+    git.env("GIT_CONFIG_NOSYSTEM", "1").args(["rev-parse", "--absolute-git-dir", "--git-common-dir"]);
+    let out = k2_core::git::output_within(&mut git, limit).map_err(|e| format!("git rev-parse: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("not a git repository") {
+            return Ok(());
+        }
+        return Err("git can't open it".into());
+    }
+    let text = String::from_utf8(out.stdout).map_err(|_| "git names it in bytes that aren't UTF-8".to_string())?;
+    let mut lines = text.lines();
+    let mut dir_of = |what: &str| -> Result<PathBuf, String> {
+        let l = lines.next().ok_or_else(|| format!("git names no {what}"))?;
+        let p = Path::new(l);
+        resolve(&if p.is_absolute() { p.to_path_buf() } else { dir.join(p) }).ok_or_else(|| format!("its {what} can't be resolved"))
+    };
+    let (g, c) = (dir_of("git dir")?, dir_of("common dir")?);
+    let home = dirs::home_dir().unwrap_or_default();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+    let own: Vec<PathBuf> = [c.join("config"), g.join("config.worktree"), home.join(".gitconfig"), xdg.join("git/config")]
+        .iter()
+        .filter_map(|p| resolve(p))
+        .collect();
+    let mut git = k2_core::git::git_command_in(dir)?;
+    git.env("GIT_CONFIG_NOSYSTEM", "1").args(["config", "--show-origin", "--list", "-z"]);
+    let out = k2_core::git::output_within(&mut git, limit).map_err(|e| format!("git config: {e}"))?;
+    if !out.status.success() {
+        return Err("its git config can't be read".into());
+    }
+    // `-z`: origin NUL key LF value NUL, repeated (no quoting).
+    let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).collect();
+    for pair in fields.chunks(2) {
+        let origin = String::from_utf8_lossy(pair[0]);
+        let key = pair.get(1).map(|kv| String::from_utf8_lossy(kv.split(|b| *b == b'\n').next().unwrap_or(b"")).into_owned()).unwrap_or_default();
+        if origin.starts_with("command line:") {
+            continue;
+        }
+        // A relative origin is relative to where git ran: the folder, or
+        // (git moves there first) the work tree's top or the git dir. It
+        // counts only when it resolves to one of the files above exactly.
+        let from_own = origin.strip_prefix("file:").is_some_and(|f| {
+            let f = Path::new(f);
+            let bases = [Some(dir), g.parent(), Some(g.as_path())];
+            if f.is_absolute() {
+                resolve(f).is_some_and(|r| own.contains(&r))
+            } else {
+                bases.iter().flatten().any(|b| resolve(&b.join(f)).is_some_and(|r| own.contains(&r)))
+            }
+        });
+        if !from_own {
+            return Err(format!("its git config reads {key} from a file that isn't this repository's or the host's"));
+        }
+    }
+    Ok(())
+}
+
+/// Round 13 (L2): a gitlink's folder `sub` (a submodule): its `.git`, when
+/// there is one, is in the workspace: a gitfile naming a git dir in it,
+/// or a folder in it.
+fn submodule_inside(sub: &Path, within: &Path) -> Result<(), String> {
+    let dot_git = sub.join(".git");
+    let Ok(md) = std::fs::symlink_metadata(&dot_git) else { return Ok(()) };
+    let target = if md.is_file() {
+        let line = k2_core::git::path_line(&dot_git)?.unwrap_or_default();
+        let to = line.strip_prefix("gitdir: ").ok_or("a submodule's .git file isn't one gitdir line")?;
+        resolve(&sub.join(to))
+    } else {
+        resolve(&dot_git)
+    };
+    if !target.is_some_and(|t| t.starts_with(within)) {
+        return Err("a submodule's git dir is outside this workspace".into());
     }
     Ok(())
 }

@@ -2694,3 +2694,173 @@ fn r12_d_the_git_cli_must_open_what_libgit2_opened() {
     assert!(cli_sees_the_same(&d.ws, &g, &og, Some(&w)).is_err(), "another common dir");
     assert!(cli_sees_the_same(&d.ws, &g, &c, Some(&other)).is_err(), "another work tree");
 }
+
+
+// ── review round 13 (scratch) ──────────────────────────────────────────
+
+/// (c) gap probe: a bare-layout folder (HEAD, objects, refs, config) with no
+/// `.git` anywhere: libgit2 can't open it (unknown extension), so the check
+/// skips it; does the git CLI open it and follow its commondir into other?
+#[test]
+fn rv13_c_bare_layout_without_dot_git() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    k2_core::git::create_worktree(&other.to_string_lossy(), "feat").unwrap();
+    let b = d.ws.join("b");
+    for sub in ["objects", "refs/heads"] {
+        std::fs::create_dir_all(b.join(sub)).unwrap();
+    }
+    std::fs::write(b.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(b.join("config"), "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tpartialclone = origin\n").unwrap();
+    std::fs::write(b.join("commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    let p = b.to_string_lossy().into_owned();
+    let opened = k2_core::git::repo_dirs(&p);
+    let r = rv12_scoped(&d, &d.ws, "GET", "/cli/git/worktrees", &[("path", p.clone())], Value::Null);
+    let wts = if r.is_ok() { k2_core::git::list_worktrees(&p).into_iter().map(|w| format!("{w:?}")).collect::<Vec<_>>() } else { vec![] };
+    eprintln!("RV13 bare-layout: repo_dirs={opened:?} check={r:?} worktrees={wts:?}");
+    let cw = rv12_scoped(&d, &d.ws, "POST", "/cli/git/create-worktree", &[], json!({"projectPath": p, "branch": "pwned13"}));
+    if cw.is_ok() {
+        let made = k2_core::git::create_worktree(&p, "pwned13");
+        let refs = std::process::Command::new("git").args(["branch", "--list"]).current_dir(&other).output().unwrap();
+        eprintln!("RV13 bare-layout create-worktree made={made:?} other branches={:?}", String::from_utf8_lossy(&refs.stdout));
+    }
+    eprintln!("RV13 bare-layout create-worktree check={cw:?}");
+    assert!(!(r.is_ok() && wts.iter().any(|w| w.contains("other"))), "check passed and the git CLI listed other's worktrees: {wts:?}");
+}
+
+/// (a) in a linked worktree's common dir, and (b) a gitfile with a NUL.
+#[test]
+fn rv13_a_b_policy_items() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    k2_core::git::create_worktree(&d.ws.to_string_lossy(), "feat").unwrap();
+    let wt = d.ws.join(".worktrees/feat");
+    let stage = |ws: &Path| rv12_scoped(&d, ws, "POST", "/cli/git/stage-all", &[], json!({"path": ws}));
+    assert!(stage(&wt).is_ok(), "control: linked worktree");
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", d.ws.join(".git/objects").display())).unwrap();
+    assert!(stage(&wt).is_err(), "(a) alternates in the common dir");
+    std::fs::remove_file(d.ws.join(".git/objects/info/alternates")).unwrap();
+    let saved = std::fs::read(wt.join(".git")).unwrap();
+    let mut bad = saved.clone();
+    bad.pop();
+    bad.extend_from_slice(b"\0junk\n");
+    std::fs::write(wt.join(".git"), &bad).unwrap();
+    assert!(stage(&wt).is_err(), "(b) gitfile with a NUL");
+    std::fs::write(wt.join(".git"), &saved).unwrap();
+    assert!(stage(&wt).is_ok(), "control restored");
+}
+
+/// (e) format version 2 / unknown extension in an otherwise own repo.
+#[test]
+fn rv13_e_format_refused() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let stage = || rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    assert!(stage().is_ok(), "control");
+    host_git(&d.ws, &["config", "core.repositoryformatversion", "1"]);
+    host_git(&d.ws, &["config", "extensions.preciousObjects", "true"]);
+    assert!(stage().is_err(), "unknown extension");
+}
+
+/// Repo config `include.path` naming a sibling's config: reach probe (read
+/// only; records whether the check refuses it).
+#[test]
+fn rv13_include_path_into_sibling_config() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    host_git(&other, &["config", "remote.origin.url", "https://user:SECRET13@example.invalid/x.git"]);
+    committed_repo(&d.ws);
+    host_git(&d.ws, &["config", "include.path", &other.join(".git/config").to_string_lossy()]);
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    eprintln!("RV13 include.path into sibling config: check={r:?}");
+}
+
+/// A submodule entry whose `.git` gitfile names a sibling's repository:
+/// libgit2 status on the workspace opens it (reach probe).
+#[test]
+fn rv13_submodule_gitfile_into_sibling() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    let head = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap();
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    host_git(&d.ws, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},modx")]);
+    std::fs::write(d.ws.join(".gitmodules"), "[submodule \"modx\"]\n\tpath = modx\n\turl = ./modx\n").unwrap();
+    std::fs::create_dir_all(d.ws.join("modx")).unwrap();
+    std::fs::write(d.ws.join("modx/.git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    let p = d.ws.to_string_lossy().into_owned();
+    let r = rv12_scoped(&d, &d.ws, "GET", "/cli/git/changes", &[("path", p.clone())], Value::Null);
+    let changes = if r.is_ok() { format!("{:?}", k2_core::git::get_changed_files(&p)) } else { String::new() };
+    eprintln!("RV13 submodule gitfile into sibling: check={r:?} changes={changes}");
+}
+
+// ── round 13 ───────────────────────────────────────────────────────────
+
+/// Round 13 (L1): a repository config including another workspace's
+/// config (`include.path`, `includeIf`) is refused; the plain repository
+/// passes.
+#[test]
+fn r13_l1_a_config_include_from_elsewhere_is_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    let stage = || rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    assert!(stage().is_ok(), "the control");
+    host_git(&d.ws, &["config", "include.path", &other.join(".git/config").to_string_lossy()]);
+    assert!(stage().is_err(), "include.path");
+    host_git(&d.ws, &["config", "--unset", "include.path"]);
+    host_git(&d.ws, &["config", &format!("includeIf.gitdir:{}/.path", d.ws.display()), &other.join(".git/config").to_string_lossy()]);
+    assert!(stage().is_err(), "includeIf");
+}
+
+/// Round 13 (L2): a submodule's `.git` naming a git dir outside the
+/// workspace is refused; one inside it passes.
+#[test]
+fn r13_l2_a_submodule_git_dir_outside_the_workspace_is_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    committed_repo(&other);
+    committed_repo(&d.ws);
+    let head = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap();
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    host_git(&d.ws, &["update-index", "--add", "--cacheinfo", &format!("160000,{sha},modx")]);
+    std::fs::create_dir_all(d.ws.join("modx")).unwrap();
+    let changes = || rv12_scoped(&d, &d.ws, "GET", "/cli/git/changes", &[("path", d.ws.to_string_lossy().into_owned())], Value::Null);
+    assert!(changes().is_ok(), "a gitlink with no .git yet");
+    std::fs::write(d.ws.join("modx/.git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    assert!(changes().is_err(), "a submodule gitfile into a sibling");
+    // Inside the workspace (the usual `.git/modules/<name>`): passes.
+    let inner = d.ws.join("modsrc");
+    std::fs::create_dir_all(&inner).unwrap();
+    committed_repo(&inner);
+    std::fs::rename(inner.join(".git"), d.ws.join(".git/modules-x")).unwrap();
+    std::fs::write(d.ws.join("modx/.git"), "gitdir: ../.git/modules-x\n").unwrap();
+    let r = changes();
+    assert!(!matches!(&r, Err(e) if e.contains("submodule")), "a submodule git dir inside the workspace: {r:?}");
+}
+
+/// Round 13 (L3): a git command past its time limit is killed and refused
+/// (`output_within`), and a config `include` of a FIFO (which would block
+/// git, and libgit2, forever) is refused instead of hanging.
+#[test]
+fn r13_l3_git_runs_within_a_time_limit() {
+    let mut slow = std::process::Command::new("sh");
+    slow.args(["-c", "sleep 30"]);
+    let r = k2_core::git::output_within(&mut slow, Duration::from_millis(200));
+    assert!(r.as_ref().is_err_and(|e| e.contains("longer than")), "{:?}", r.map(|o| o.status));
+    let mut quick = std::process::Command::new("sh");
+    quick.args(["-c", "echo ok"]);
+    assert_eq!(k2_core::git::output_within(&mut quick, Duration::from_secs(10)).unwrap().stdout, b"ok\n");
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let fifo = d.ws.join("cfg.fifo");
+    assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    host_git(&d.ws, &["config", "include.path", &fifo.to_string_lossy()]);
+    let r = rv12_scoped(&d, &d.ws, "POST", "/cli/git/stage-all", &[], json!({"path": d.ws}));
+    assert!(r.as_ref().is_err_and(|e| e.contains("longer than")), "{r:?}");
+}

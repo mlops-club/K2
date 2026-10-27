@@ -618,7 +618,7 @@ pub fn handle_git_prune_worktrees(body: &[u8]) -> CliResponse {
     };
     // K2's git command (hardened on an agent host: fs-relay R5-2, R6).
     if let Ok(mut git) = k2_core::git::git_command_in(std::path::Path::new(&b.project_path)) {
-        let _ = git.args(["worktree", "prune"]).output();
+        let _ = k2_core::git::run(git.args(["worktree", "prune"]));
     }
 
     let db = db::shared();
