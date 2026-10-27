@@ -2149,3 +2149,159 @@ fn r10_the_trash_folder_is_never_a_link() {
     assert!(d.ws.join("gone.md").exists(), "not moved");
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing outside");
 }
+
+// ── review round 11 (scratch) ──────────────────────────────────────────
+
+fn rv11_check(d: &HostDisk, ws: &Path, route: (&str, &str), body: Value) -> Result<(), String> {
+    let scoped = vec![(SCOPE_KEY.to_string(), ws.to_string_lossy().into_owned())];
+    check_request(&d.root, route_schema(route.0, route.1), &scoped, body, schema::WALK_STEPS, schema::WALK_TIME).map(|_| ()).map_err(|e| format!("{e:?}"))
+}
+
+/// D1 probes: every way to name a sibling's repository is refused.
+#[test]
+fn rv11_d1_probes_all_refused() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let stage = ("POST", "/cli/git/stage-all");
+    let mut passed = Vec::new();
+    let mut probe = |name: &str, d: &HostDisk| {
+        if rv11_check(d, &d.ws, stage, json!({"path": d.ws})).is_ok() {
+            passed.push(name.to_string());
+        }
+    };
+    // a) own repo, commondir -> sibling's .git
+    committed_repo(&d.ws);
+    std::fs::write(d.ws.join(".git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    probe("commondir abs", &d);
+    std::fs::write(d.ws.join(".git/commondir"), "../../other/.git\n").unwrap();
+    probe("commondir rel", &d);
+    std::fs::remove_file(d.ws.join(".git/commondir")).unwrap();
+    assert!(rv11_check(&d, &d.ws, stage, json!({"path": d.ws})).is_ok(), "control: own repo passes");
+    // b) core.worktree -> sibling, -> root, -> ancestor (root)
+    host_git(&d.ws, &["config", "core.worktree", &other.to_string_lossy()]);
+    probe("core.worktree sibling", &d);
+    host_git(&d.ws, &["config", "core.worktree", &d.root.to_string_lossy()]);
+    probe("core.worktree root", &d);
+    host_git(&d.ws, &["config", "--unset", "core.worktree"]);
+    // c) .git a symlink to the sibling's git dir
+    std::fs::rename(d.ws.join(".git"), d.ws.join("own.git")).unwrap();
+    link(&other.join(".git"), &d.ws.join(".git"));
+    probe(".git symlink to sibling", &d);
+    std::fs::remove_file(d.ws.join(".git")).unwrap();
+    // d) gitfile into a sibling's linked worktree git dir
+    let made = k2_core::git::create_worktree(&other.to_string_lossy(), "feat");
+    assert!(made.is_ok(), "{made:?}");
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", other.join(".git/worktrees/feat").display())).unwrap();
+    probe("gitfile into sibling linked worktree", &d);
+    // e) gitfile into own gitdir copy whose commondir -> sibling
+    std::fs::write(d.ws.join("own.git/commondir"), format!("{}\n", other.join(".git").display())).unwrap();
+    std::fs::write(d.ws.join(".git"), format!("gitdir: {}\n", d.ws.join("own.git").display())).unwrap();
+    probe("gitfile own + commondir sibling", &d);
+    assert!(passed.is_empty(), "passed: {passed:?}");
+}
+
+/// D1 exception abuse: workspace nested in a larger checkout; the
+/// enclosing checkout's `.git` is a gitfile into a sibling; the work tree
+/// is the root itself; a bare repo above.
+#[test]
+fn rv11_d1_exception_probes() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let mono = d.root.join("mono");
+    let ws = mono.join("team/notes");
+    std::fs::create_dir_all(&ws).unwrap();
+    // mono/.git a gitfile into other's git dir
+    std::fs::write(mono.join(".git"), format!("gitdir: {}\n", other.join(".git").display())).unwrap();
+    assert!(rv11_check(&d, &ws, ("POST", "/cli/git/stage-all"), json!({"path": ws})).is_err(), "enclosing gitfile into sibling");
+    std::fs::remove_file(mono.join(".git")).unwrap();
+    // mono/.git a symlink to other/.git
+    link(&other.join(".git"), &mono.join(".git"));
+    assert!(rv11_check(&d, &ws, ("POST", "/cli/git/stage-all"), json!({"path": ws})).is_err(), "enclosing .git symlink into sibling");
+    std::fs::remove_file(mono.join(".git")).unwrap();
+    // root itself a repo: work tree == root
+    host_git(&d.root, &["init", "-q"]);
+    assert!(rv11_check(&d, &d.ws, ("POST", "/cli/git/stage-all"), json!({"path": d.ws})).is_err(), "work tree is the root");
+    host_git(&d.root, &["config", "core.bare", "true"]);
+    assert!(rv11_check(&d, &d.ws, ("POST", "/cli/git/stage-all"), json!({"path": d.ws})).is_err(), "root/.git bare");
+    std::fs::remove_dir_all(d.root.join(".git")).unwrap();
+}
+
+/// Regression probe: an agent's workspace that is a K2 linked worktree
+/// (`<project>/.worktrees/<branch>`), git requests routed to it.
+#[test]
+fn rv11_d1_linked_worktree_workspace() {
+    let d = host_disk();
+    committed_repo(&d.ws);
+    let made = k2_core::git::create_worktree(&d.ws.to_string_lossy(), "feat");
+    assert!(made.is_ok(), "{made:?}");
+    let wt = d.ws.join(".worktrees/feat");
+    assert!(wt.join(".git").is_file());
+    let mut refused = Vec::new();
+    for (m, r) in [("GET", "/cli/git/info"), ("GET", "/cli/git/changes"), ("POST", "/cli/git/stage-all")] {
+        let scoped = vec![(SCOPE_KEY.to_string(), wt.to_string_lossy().into_owned())];
+        let res = if m == "GET" {
+            let q = vec![("path".to_string(), wt.to_string_lossy().into_owned()), scoped[0].clone()];
+            check_request(&d.root, route_schema(m, r), &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME).map(|_| ())
+        } else {
+            check_request(&d.root, route_schema(m, r), &scoped, json!({"path": wt}), schema::WALK_STEPS, schema::WALK_TIME).map(|_| ())
+        };
+        if let Err(e) = res {
+            refused.push(format!("{r}: {e:?}"));
+        }
+    }
+    // Routed to the project instead: passes.
+    assert!(rv11_check(&d, &d.ws, ("POST", "/cli/git/stage-all"), json!({"path": wt})).is_ok(), "project-scoped");
+    assert!(refused.is_empty(), "a K2 linked-worktree workspace is refused: {refused:?}");
+}
+
+/// F5 via alternates: `notes`' own repo borrows `other`'s objects; a
+/// request routed to `notes` reads `other`'s committed content.
+#[test]
+fn rv11_alternates_into_sibling_reads_its_objects() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    k2_core::git::init_repo(&other.to_string_lossy()).unwrap();
+    std::fs::write(other.join("secret.txt"), "TOP-SECRET\n").unwrap();
+    host_git(&other, &["add", "-A"]);
+    host_git(&other, &["commit", "-qm", "s"]);
+    let out = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&other).output().unwrap();
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    committed_repo(&d.ws);
+    std::fs::create_dir_all(d.ws.join(".git/objects/info")).unwrap();
+    std::fs::write(d.ws.join(".git/objects/info/alternates"), format!("{}\n", other.join(".git/objects").display())).unwrap();
+    let q = vec![
+        ("path".to_string(), d.ws.to_string_lossy().into_owned()),
+        ("file_path".to_string(), "secret.txt".to_string()),
+        ("git_ref".to_string(), sha.clone()),
+        (SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned()),
+    ];
+    let r = check_request(&d.root, route_schema("GET", "/cli/git/file-at-ref"), &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME);
+    if r.is_ok() {
+        let got = k2_core::git::file_content_at_ref(&d.ws.to_string_lossy(), "secret.txt", &sha);
+        panic!("file-at-ref routed to notes passed with alternates into other: {got:?}");
+    }
+}
+
+/// The exception's reach: routed to `mono/team/notes`, stage-all stages a
+/// sibling workspace's (`mono/team/other`) changes and abort-merge's
+/// checkout walks the whole enclosing checkout.
+#[test]
+fn rv11_exception_reaches_sibling_in_same_checkout() {
+    let d = host_disk();
+    let mono = d.root.join("mono");
+    std::fs::create_dir_all(mono.join("team/notes")).unwrap();
+    std::fs::create_dir_all(mono.join("team/other")).unwrap();
+    std::fs::write(mono.join("team/other/x"), "1").unwrap();
+    committed_repo(&mono);
+    std::fs::write(mono.join("team/other/x"), "2").unwrap();
+    let ws = mono.join("team/notes");
+    let ok = rv11_check(&d, &ws, ("POST", "/cli/git/stage-all"), json!({"path": ws}));
+    let staged = ok.is_ok() && k2_core::git::stage_all(&ws.to_string_lossy()).is_ok();
+    let st = std::process::Command::new("git").args(["diff", "--cached", "--name-only"]).current_dir(&mono).output().unwrap();
+    eprintln!("RV11 exception: check={ok:?} staged={staged} cached={}", String::from_utf8_lossy(&st.stdout));
+}

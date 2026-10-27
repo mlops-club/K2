@@ -487,6 +487,44 @@ commit.
 - **Not done (the review's unconfirmed note):** whether a link outside
   points at a file or a folder can still be told apart from the refusal.
 
+## Round 11 review of bab357829: N1, N2
+
+D1 (the reported attack), D2, D3 and both nits are confirmed fixed; the
+ancestor exception can't reach a sibling's repository. The reviewer's
+tests are added as given (`rv11_*`); 2 of them failed before this
+commit.
+
+- **N1 (medium): alternates were checked against the work root.**
+  `notes/.git/objects/info/alternates` naming `other/.git/objects` let
+  file-at-ref, routed to `notes`, read `other`'s content. Alternates must
+  now resolve inside what the request may touch: the workspace, the
+  enclosing checkout (the exception), or the project a K2 worktree belongs
+  to. Test: `rv11_alternates_into_sibling_reads_its_objects`.
+- **N2 (medium, a regression from D1): K2's own linked worktrees were
+  refused.** A workspace at `<project>/.worktrees/<branch>` has its git dir
+  at `<project>/.git/worktrees/<id>`, which D1 refused. It is accepted when
+  all of these hold:
+  - its work tree is the workspace;
+  - its git dir is `<common>/worktrees/<id>`;
+  - that git dir's `gitdir` back-link resolves to `<work tree>/.git`;
+  - its common dir is in the workspace, or is an enclosing checkout's
+    `.git`.
+
+  A gitfile into another workspace's linked worktree is still refused
+  (`rv11_d1_probes_all_refused`). Test:
+  `rv11_d1_linked_worktree_workspace`.
+- **Fail closed.** A git dir, common dir or work tree that can't be
+  resolved fails the check. Before this, the unresolved path was used.
+- **Accepted limit: the enclosing-checkout exception.** A workspace inside
+  a larger checkout (`mono/team/notes`, with the repository at `mono`) gets
+  git on that whole checkout. stage-all routed to `notes` stages
+  `mono/team/other`'s changes too, and abort-merge's checkout acts on
+  everything under `mono`. That is what git does on a sub-folder of a
+  repository; the relay can't narrow it. A sibling workspace's own
+  repository, or one outside the enclosing checkout, is never reached.
+  Test: `rv11_exception_reaches_sibling_in_same_checkout`; it records the
+  reach and asserts nothing.
+
 ## Checks
 
 | Check | Result |

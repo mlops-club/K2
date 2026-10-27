@@ -867,21 +867,54 @@ pub(crate) fn git_precheck(root: &Path, paths: &[PathBuf]) -> Result<(), String>
             }
         }
         // D1 (round 10): and in the workspace the request was routed to
-        // (F5), but for a workspace inside a larger checkout: a work tree
-        // that holds the workspace, with its own `.git` folder as its git
-        // dir (never a gitfile naming another workspace's).
+        // (F5). Two exceptions, each naming exactly what git will touch:
+        // - a workspace inside a larger checkout: a work tree that holds
+        //   the workspace, with its own `.git` folder as its git dir (never
+        //   a gitfile naming another workspace's). Accepted limit: git then
+        //   acts on that whole checkout (fs-relay.md, round 11);
+        // - N2 (round 11): K2's linked worktree as the workspace
+        //   (`<project>/.worktrees/<branch>`): its work tree is the
+        //   workspace, its git dir `<common>/worktrees/<id>` whose `gitdir`
+        //   back-link is `<work tree>/.git`, and its common dir in the
+        //   workspace or an enclosing checkout's `.git`.
+        // A path that can't be resolved fails the check (closed).
         let within = scope::within(root);
-        let res = |d: &Path| resolve(d).unwrap_or_else(|| d.to_path_buf());
-        let (g, c, w) = (res(&git_dir), res(&common), work.as_deref().map(res));
+        let unresolved = || format!("the repository for {p} can't be resolved");
+        let g = resolve(&git_dir).ok_or_else(unresolved)?;
+        let c = resolve(&common).ok_or_else(unresolved)?;
+        let w = match work.as_deref() {
+            Some(w) => Some(resolve(w).ok_or_else(unresolved)?),
+            None => None,
+        };
         let in_ws = |d: &Path| d.starts_with(&within);
+        let enclosing_checkout = |c: &Path| c.file_name().is_some_and(|n| n == ".git") && c.parent().is_some_and(|top| within.starts_with(top));
         let enclosing = w.as_ref().is_some_and(|w| within.starts_with(w) && g == w.join(".git") && c == g);
-        if !(enclosing || (in_ws(&g) && in_ws(&c) && w.as_deref().is_none_or(in_ws))) {
+        let linked = w.as_ref().is_some_and(|w| {
+            *w == within
+                && g.parent() == Some(c.join("worktrees").as_path())
+                && std::fs::read_to_string(g.join("gitdir"))
+                    .ok()
+                    .and_then(|l| resolve(Path::new(l.trim())))
+                    .is_some_and(|back| back == w.join(".git"))
+                && (in_ws(&c) || enclosing_checkout(&c))
+        });
+        let own = in_ws(&g) && in_ws(&c) && w.as_deref().is_none_or(in_ws);
+        if !(own || enclosing || linked) {
             return Err(format!("the repository for {p} is not this workspace's own"));
         }
+        // N1 (round 11): objects it borrows (alternates) come from the
+        // same place: the workspace, or the checkout git acts on.
+        let allowed = if enclosing {
+            w.clone().unwrap_or_else(|| within.clone())
+        } else if linked && !in_ws(&c) {
+            c.parent().map(Path::to_path_buf).unwrap_or_else(|| within.clone())
+        } else {
+            within.clone()
+        };
         // F1 (round 7): what git writes inside them stays there too.
-        git_dir_without_links(root, &git_dir)?;
+        git_dir_without_links(&allowed, &git_dir)?;
         if common != git_dir {
-            git_dir_without_links(root, &common)?;
+            git_dir_without_links(&allowed, &common)?;
         }
     }
     Ok(())
@@ -895,7 +928,7 @@ const GIT_DIR_LIMIT: usize = 200_000;
 /// any link there), every entry listed, a loose-object fan-out folder and
 /// `objects/pack` holding files only; and no `objects/info/alternates`
 /// naming objects outside the work root. Within the request's budget.
-fn git_dir_without_links(root: &Path, dir: &Path) -> Result<(), String> {
+fn git_dir_without_links(allowed: &Path, dir: &Path) -> Result<(), String> {
     let objects = dir.join("objects");
     // (folder, is it a loose-object fan-out folder or `objects/pack`)
     let mut todo = vec![(dir.to_path_buf(), false)];
@@ -924,8 +957,8 @@ fn git_dir_without_links(root: &Path, dir: &Path) -> Result<(), String> {
     if let Ok(alt) = std::fs::read_to_string(objects.join("info/alternates")) {
         for line in alt.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             let p = if Path::new(line).is_absolute() { PathBuf::from(line) } else { objects.join(line) };
-            if !resolve(&p).is_some_and(|r| r.starts_with(root)) {
-                return Err("the repository's alternates name objects outside this host's work root".into());
+            if !resolve(&p).is_some_and(|r| r.starts_with(allowed)) {
+                return Err("the repository's alternates name objects outside this workspace".into());
             }
         }
     }
