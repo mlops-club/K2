@@ -223,12 +223,16 @@ def cli_alive(st, host, pid):
 
 
 def host_files(st, host, root, needle):
-    """With own work volumes (k2-host's claim template has `work`) each
-    host's workspaces are on its own disk: grep there, in its pod. With the
-    shared k2-work, None: the runner sees the same files."""
-    if not st["kind"].get("own_work"):
-        return None
+    """With own work volumes (the host's pod mounts work-<pod>, up.sh
+    --host-work=own) its workspaces are on its own disk: grep there, in its
+    pod. With the shared k2-work, None: the runner sees the same files.
+    Read from the pod (the runner may get pods, not StatefulSets)."""
     try:
+        pod = st["kind"]["pods"][host]
+        vols = kubectl(st, "get", "pod", pod, "-o",
+                       "jsonpath={.spec.volumes[*].persistentVolumeClaim.claimName}").stdout.split()
+        if "work-%s" % pod not in vols:
+            return None
         r = _exec(st, host, "grep", "-rlF", "--", needle, root)
     except (subprocess.TimeoutExpired, KeyError):
         return []
@@ -300,9 +304,6 @@ def plan(state_path, run_dir, namespace, hosts, kill_mode, pool=None):
           "kind": {"namespace": namespace, "kill": kill_mode, "pods": {}, "containers": {}, "upstream": {},
                    "pod_home": {}, "pool": pool}}
     k = st["kind"]
-    tpl = kubectl(st, "get", "statefulset", "k2-host", "-o",
-                  "jsonpath={.spec.volumeClaimTemplates[*].metadata.name}").stdout.split()
-    k["own_work"] = "work" in tpl
 
     def proc(name, pod, role, container, upstream, pod_home, port):
         home = "/lab/homes/%s" % pod
