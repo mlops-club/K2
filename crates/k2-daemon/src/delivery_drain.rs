@@ -352,10 +352,10 @@ impl Cut {
 
 /// `RemoteHost`'s hook when a session ends mid-turn: `agent` had `msg_ids`
 /// delivered to it and not answered.
-pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String], how: Cut) {
+pub fn turn_cut(remote: &RemoteHost, agent: &str, msg_ids: &[String], how: Cut, at: Option<(&str, u64)>) {
     match controller_for(remote) {
         Some(c) => {
-            c.turn_cut(agent, msg_ids, how, delivery::now_ms());
+            c.turn_cut_at(agent, msg_ids, how, at, delivery::now_ms());
         }
         None => log_debug!("[delivery] {agent}'s turn was cut ({how:?}); no controller drain to fail {} message(s)", msg_ids.len()),
     }
@@ -587,7 +587,7 @@ impl Controller {
         let conn = self.db.lock();
         let recipient = outbox::get(&conn, Hop::Down, msg_id).ok().flatten().map(|r| r.recipient);
         let changed = match status {
-            DeliverStatus::Delivered | DeliverStatus::Duplicate => outbox::mark_delivered(&conn, Hop::Down, msg_id, now),
+            DeliverStatus::Delivered | DeliverStatus::Duplicate => outbox::mark_delivered_by(&conn, Hop::Down, msg_id, now, host_id),
             DeliverStatus::Rejected => {
                 let why = match reason {
                     // The host can't tell whether the agent got it (I2: a
@@ -627,11 +627,19 @@ impl Controller {
     /// resent: the cut turn may already have acted on it, so the sender
     /// decides.
     pub fn turn_cut(&self, agent: &str, msg_ids: &[String], how: Cut, now: i64) -> usize {
+        self.turn_cut_at(agent, msg_ids, how, None, now)
+    }
+
+    /// [`Self::turn_cut`] of the turn `agent` ran on `at` (host, placement
+    /// epoch): K2-f.3 review #4: a message resent to another host (or
+    /// placement) and acked there before this cut is handled is not that
+    /// turn's, and stays delivered. Rows with no host kept: as before.
+    pub fn turn_cut_at(&self, agent: &str, msg_ids: &[String], how: Cut, at: Option<(&str, u64)>, now: i64) -> usize {
         let why = how.reason(agent);
         let conn = self.db.lock();
         let mut failed = Vec::new();
         for id in msg_ids {
-            match outbox::mark_interrupted(&conn, Hop::Down, id, &why, now) {
+            match outbox::mark_interrupted_at(&conn, Hop::Down, id, &why, now, at) {
                 Ok(true) => {
                     if let Ok(Some(row)) = outbox::get(&conn, Hop::Down, id) {
                         failed.push(row);
@@ -801,7 +809,8 @@ impl Controller {
             }
             match self.remote.send_frame(&p.host_id, frame) {
                 Ok(()) => {
-                    if let Err(e) = outbox::mark_sent(&conn, Hop::Down, &r.msg_id, now, &self.policy) {
+                    // K2-f.3 review #4: which host's placement has it.
+                    if let Err(e) = outbox::mark_sent_to(&conn, Hop::Down, &r.msg_id, now, &self.policy, &p.host_id, p.epoch.0) {
                         log_debug!("[delivery] ERROR: mark sent {}: {e}", r.msg_id);
                     }
                     log_debug!(

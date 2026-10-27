@@ -95,6 +95,11 @@ pub struct Row {
     pub created_ms: i64,
     pub updated_ms: i64,
     pub reason: Option<String>,
+    /// `down`: the host this row was last sent to (and acked by), and that
+    /// placement's epoch; `None` for the controller's own deliveries and
+    /// rows from before they were kept.
+    pub host: Option<String>,
+    pub epoch: Option<i64>,
 }
 
 impl Row {
@@ -110,12 +115,14 @@ impl Row {
             "created_ms": self.created_ms,
             "updated_ms": self.updated_ms,
             "reason": self.reason,
+            "host": self.host,
+            "epoch": self.epoch,
         })
     }
 }
 
 const COLUMNS: &str =
-    "seq, hop, msg_id, sender, recipient, body, state, attempts, next_at_ms, created_ms, updated_ms, reason";
+    "seq, hop, msg_id, sender, recipient, body, state, attempts, next_at_ms, created_ms, updated_ms, reason, host, epoch";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let hop: String = r.get(1)?;
@@ -133,6 +140,8 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         created_ms: r.get(9)?,
         updated_ms: r.get(10)?,
         reason: r.get(11)?,
+        host: r.get(12)?,
+        epoch: r.get(13)?,
     })
 }
 
@@ -220,6 +229,30 @@ pub fn mark_sent(conn: &Connection, hop: Hop, msg_id: &str, now_ms: i64, policy:
     Ok(attempt)
 }
 
+/// [`mark_sent`] to `host`'s placement `epoch` (a `down` row): recorded on
+/// the row, so a cut on another host (or an older placement) leaves it
+/// alone ([`mark_interrupted_at`]).
+pub fn mark_sent_to(conn: &Connection, hop: Hop, msg_id: &str, now_ms: i64, policy: &Policy, host: &str, epoch: u64) -> rusqlite::Result<u32> {
+    let attempt = mark_sent(conn, hop, msg_id, now_ms, policy)?;
+    conn.execute(
+        "UPDATE delivery_outbox SET host = ?3, epoch = ?4 WHERE hop = ?1 AND msg_id = ?2 AND state = 'sent'",
+        params![hop.as_str(), msg_id, host, epoch as i64],
+    )?;
+    Ok(attempt)
+}
+
+/// [`mark_delivered`] by `host`'s ack: the row keeps who delivered it (the
+/// epoch it was sent to, when that host is the one it was sent to).
+pub fn mark_delivered_by(conn: &Connection, hop: Hop, msg_id: &str, now_ms: i64, host: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE delivery_outbox SET state = 'delivered', reason = NULL, updated_ms = ?3,
+                epoch = CASE WHEN host = ?4 THEN epoch ELSE NULL END, host = ?4
+         WHERE hop = ?1 AND msg_id = ?2 AND state IN ('queued', 'sent')",
+        params![hop.as_str(), msg_id, now_ms, host],
+    )?;
+    Ok(n == 1)
+}
+
 /// The receiver acked `delivered` or `duplicate`. Returns false if there
 /// was no unfinished row (an ack for a finished or unknown message).
 pub fn mark_delivered(conn: &Connection, hop: Hop, msg_id: &str, now_ms: i64) -> rusqlite::Result<bool> {
@@ -249,10 +282,25 @@ pub fn mark_failed(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_
 /// with the host; the late ack then finds it finished, and it is never
 /// resent. Returns false unless the row was `delivered` or `sent`.
 pub fn mark_interrupted(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_ms: i64) -> rusqlite::Result<bool> {
+    mark_interrupted_at(conn, hop, msg_id, reason, now_ms, None)
+}
+
+/// [`mark_interrupted`] for the turn cut on `at` (host, placement epoch):
+/// only a row that host's placement had (sent there, or acked by it), or
+/// one with no host kept (the controller's own deliveries, and rows from
+/// before hosts were kept: as before). K2-f.3 review #4: a row resent to
+/// another host and acked there before this cut is handled stays
+/// delivered. `at` None: any (as before).
+pub fn mark_interrupted_at(conn: &Connection, hop: Hop, msg_id: &str, reason: &str, now_ms: i64, at: Option<(&str, u64)>) -> rusqlite::Result<bool> {
+    let (host, epoch) = match at {
+        Some((h, e)) => (Some(h), Some(e as i64)),
+        None => (None, None),
+    };
     let n = conn.execute(
         "UPDATE delivery_outbox SET state = 'failed', reason = ?3, updated_ms = ?4
-         WHERE hop = ?1 AND msg_id = ?2 AND state IN ('delivered', 'sent')",
-        params![hop.as_str(), msg_id, reason, now_ms],
+         WHERE hop = ?1 AND msg_id = ?2 AND state IN ('delivered', 'sent')
+           AND (?5 IS NULL OR host IS NULL OR (host = ?5 AND (epoch IS NULL OR epoch = ?6)))",
+        params![hop.as_str(), msg_id, reason, now_ms, host, epoch],
     )?;
     Ok(n == 1)
 }

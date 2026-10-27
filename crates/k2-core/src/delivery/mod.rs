@@ -65,6 +65,24 @@ impl Policy {
 /// Create the tables if they don't exist. Idempotent; every entry point
 /// in the daemon calls it once per connection.
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_tables(conn)?;
+    // K2-f.3 review #4: the host (and its placement epoch) a `down` row was
+    // last sent to and acked by. Rows from before have neither (NULL), and
+    // keep the old behaviour: any cut of their recipient may fail them.
+    for (col, ty) in [("host", "TEXT"), ("epoch", "INTEGER")] {
+        let has: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('delivery_outbox') WHERE name = ?1",
+            [col],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE delivery_outbox ADD COLUMN {col} {ty}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS delivery_outbox (
             seq         INTEGER PRIMARY KEY AUTOINCREMENT,

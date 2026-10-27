@@ -1297,3 +1297,37 @@ async fn k2b_a_real_host_relink_report_reconciles_the_controllers_row() {
     std::fs::remove_file(&path).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// K2-f.3 review #4, the race: a message host-1's turn had is resent to
+/// host-2 (the agent moved) and acked there before host-1's cut is
+/// handled. The controller's turn cut for host-1's placement leaves it
+/// delivered; a message host-1's placement delivered fails; a row with no
+/// host kept fails, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_handled_late_leaves_a_message_another_host_delivered() {
+    let db = mem_db();
+    let c = Ctl::start(db.clone()).await;
+    let moved = c.drain.send("agent:alice", "bob", json!({"kind": "msg", "text": "moved"})).unwrap();
+    let own = c.drain.send("agent:alice", "carol", json!({"kind": "msg", "text": "own"})).unwrap();
+    let legacy = c.drain.send("agent:alice", "dave", json!({"kind": "msg", "text": "legacy"})).unwrap();
+    let now = delivery::now_ms();
+    {
+        let conn = db.lock();
+        // moved: sent to host-1 (epoch 3), then resent to host-2 (epoch 9).
+        outbox::mark_sent_to(&conn, Hop::Down, &moved, now, &FAST, "host-1", 3).unwrap();
+        outbox::mark_sent_to(&conn, Hop::Down, &moved, now, &FAST, "host-2", 9).unwrap();
+        outbox::mark_sent_to(&conn, Hop::Down, &own, now, &FAST, "host-1", 3).unwrap();
+        // legacy: a row with no host (from before hosts were kept).
+        outbox::mark_sent(&conn, Hop::Down, &legacy, now, &FAST).unwrap();
+        outbox::mark_delivered(&conn, Hop::Down, &legacy, now).unwrap();
+    }
+    c.drain.on_ack("host-2", &moved, DeliverStatus::Delivered, None, now);
+    c.drain.on_ack("host-1", &own, DeliverStatus::Delivered, None, now);
+    assert_eq!(c.drain.get(&moved).unwrap().host.as_deref(), Some("host-2"), "the ack records who delivered it");
+    // host-1's cut (its host lost) is handled now, after host-2's ack.
+    let failed = c.drain.turn_cut_at("bob", &[moved.clone(), own.clone(), legacy.clone()], Cut::HostLost, Some(("host-1", 3)), now + 1);
+    assert_eq!(failed, 2);
+    assert_eq!(c.drain.get(&moved).unwrap().state, State::Delivered, "delivered on host-2: NOT failed by host-1's cut");
+    assert_eq!(c.drain.get(&own).unwrap().state, State::Failed, "host-1's placement had it: failed");
+    assert_eq!(c.drain.get(&legacy).unwrap().state, State::Failed, "no host kept: as before");
+}
