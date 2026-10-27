@@ -8,6 +8,11 @@
 #
 #   scripts/kind/owner-roll-rc1.sh [--dry-run]     (the default)
 #   scripts/kind/owner-roll-rc1.sh --go [--skip-rehearsal]
+#   scripts/kind/owner-roll-rc1.sh --rehearse      (steps 1-7, then stops)
+#
+# --rehearse runs the dry run's checks, tags the rollback images (step 6)
+# and rehearses on k2-kind-dist-fake (step 7), then stops: no backup, and
+# nothing in k2-kind-dist changes.
 #
 # --dry-run changes nothing anywhere: no scale, no token, no tag, no apply.
 # It
@@ -83,6 +88,7 @@ for a in "$@"; do
     case "$a" in
         --dry-run) mode=dry-run ;;
         --go) mode=go ;;
+        --rehearse) mode=rehearse ;;
         --skip-rehearsal) rehearse=0 ;;
         -h|--help) sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "owner-roll-rc1.sh: unknown argument $a" >&2; exit 2 ;;
@@ -294,6 +300,15 @@ done
 if [ "$rehearse" = 1 ]; then
     echo "== 7. rehearse on k2-kind-dist-fake"
     docker tag "$RC_DAEMON" k2-daemon:dist-fake
+    # G4's own-disk runs leave k2-host here with a "work" claim template,
+    # and a template can't change on a live StatefulSet: recreate it (its
+    # PVCs stay), as scripts/lab/topology/kind.sh does.
+    tpl=$(kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake get statefulset k2-host \
+        -o jsonpath='{.spec.volumeClaimTemplates[*].metadata.name}' 2>/dev/null || true)
+    if [ -n "$tpl" ] && [ "$tpl" != data ]; then
+        note "k2-kind-dist-fake: k2-host's claim templates are '$tpl', not 'data': recreating the StatefulSet (PVCs stay)"
+        kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake delete statefulset k2-host --wait=true >&2
+    fi
     # The test login's password, if up.sh makes one, goes to FAKE_PW (0600), never the log.
     "$KIND_REPO/scripts/kind/up.sh" --fake "${ROLL_FLAGS[@]}" --password-file="$FAKE_PW" >&2 && ok "rehearsal: rolled" || bad "rehearsal: up.sh"
     # A dummy login on the test host-0 when it has none: not a credential.
@@ -313,13 +328,18 @@ if [ "$rehearse" = 1 ]; then
     kf delete pvc data-k2-host-1 --ignore-not-found --wait=true >&2
     kf exec k2-controller-0 -c k2-daemon -- cat /var/lib/k2/.k2/daemon.token \
         | python3 -I "$KIND_REPO/scripts/kind/enroll.py" revoke --url http://127.0.0.1:7442 --host k2-host-1 \
-            --reason "rc1 rehearsal: a fresh k2-host-1 volume" >&2 || true
+            --reason "roll rehearsal: a fresh k2-host-1 volume" >&2 || true
     second_host k2-kind-dist-fake 7442 keep renew
     "$KIND_REPO/scripts/kind/enroll-check.sh" >&2 && ok "rehearsal: enroll-check (k2-host-1)" || bad "rehearsal: enroll-check"
     kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake scale statefulset k2-host --replicas=1 >&2
+    # As the owner's will be: one host (a leaving k2-host-1 could still be placed on).
+    kubectl --kubeconfig "$KIND_KUBECONFIG" -n k2-kind-dist-fake wait --for=delete pod/k2-host-1 --timeout=180s >&2 2>/dev/null || true
     "$KIND_REPO/scripts/kind/app-check.sh" --dist --fake --password-file="$FAKE_PW" >&2 && ok "rehearsal: app-check" || bad "rehearsal: app-check"
     "$KIND_REPO/scripts/kind/reconnect-check.sh" --dist --fake --password-file="$FAKE_PW" >&2 && ok "rehearsal: reconnect-check" || bad "rehearsal: reconnect-check"
     [ "$fails" = 0 ] || { echo; echo "STOPPED: the rehearsal failed; k2-kind-dist is untouched"; exit 1; }
+fi
+if [ "$mode" = rehearse ]; then
+    echo; echo "REHEARSED: ${RC_DAEMON} on k2-kind-dist-fake; k2-kind-dist is untouched (--go rolls it)"; exit 0
 fi
 
 echo "== 8. back up the controller's volume (inside the cluster)"
