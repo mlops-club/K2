@@ -56,6 +56,20 @@ _G2 = [
 ]
 SCENARIOS[("G2", "fleet")] = [(sid, title, True) for sid, title in _G2]
 SCENARIOS[("G2", "solo")] = [(sid, title, sid not in ("S8", "S9")) for sid, title in _G2]
+# G4 on kind (P4 T4, scripts/lab/topology/kind.sh): S1 to S10 on the host
+# pool, and the kind checks K1 to K6. Rows whose work isn't merged yet are
+# NOT RUN with a "PENDING <branch>" reason, so the gate can't pass without it.
+SCENARIOS[("G4", "kind")] = [(sid, title, True) for sid, title in _G2 if sid != "S12"] + [
+    ("S10", "Host lost mid-session, its agent moves with its last turn's home", True),
+    ("S12", "Postgres, Apps, mail, Sew, front door parity", True),
+    ("K1", "Signed enrollment: relink by key, revoke, restore", True),
+    ("K2", "The desktop app's path: login, spawn, attach with a session token", True),
+    ("K3", "An agent's home moves between hosts on two nodes (no shared volume)", True),
+    ("K4", "Drain a node mid-conversation: the agent continues on another host", True),
+    ("K5", "A workspace made through the app is on the agent's host; the app shows the agent's files", True),
+    ("K6", "The pool scales a host down and its agents continue on the others", True),
+]
+NOT_BUILT_BY_KIND = {"S12": "no S12 client yet; on kind T3's checks cover it (k2-dist/k8s-capabilities: Postgres, Apps, mail PASS; Sew blocked: no image, no TCP mgmt API)"}
 OPT_IN = ("S10",)
 NOT_BUILT = "not implemented in wave 1 (the lab ships S1 only)"
 NOT_BUILT_BY = {"S12": "no S12 client yet (Postgres, Apps, mail, Sew, front door): not built by the lab"}
@@ -156,6 +170,8 @@ def build(run_dir):
         if r is None:
             if gate == "G0":
                 why = NOT_BUILT if sid != "S1" else "no result written"
+            elif gate == "G4" and sid in NOT_BUILT_BY_KIND:
+                why = NOT_BUILT_BY_KIND[sid]
             else:
                 why = NOT_BUILT_BY.get(sid, "no result written")
             r = {"scenario": sid, "title": title, "status": "not_run", "reason": why, "checks": []}

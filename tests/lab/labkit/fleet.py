@@ -590,6 +590,15 @@ def monitor(state_path, out_path, stop=None):
 
 # ── Reading what the topology wrote ─────────────────────────────────────
 
+def host_files(st, host, root, needle):
+    """The files under `root`, as `host` sees its own disk, whose text has
+    `needle`. None here: procs and compose hosts share this machine's view
+    of the workspaces, so the caller reads them itself. An outside backend
+    whose hosts have their own disks (kind with own work volumes) replaces
+    it and reads through the host."""
+    return None
+
+
 class Fleet:
     """A scenario's view of a running topology."""
 
@@ -670,6 +679,9 @@ class Fleet:
 
     def cli_alive(self, host, pid):
         return cli_alive(self.st, host, pid)
+
+    def host_files(self, host, root, needle):
+        return host_files(self.st, host, root, needle)
 
     def control(self, wait=True):
         return control(self.st, wait)

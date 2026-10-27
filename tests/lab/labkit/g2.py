@@ -720,6 +720,22 @@ def inbox_files(cwd, title):
     return sorted(hits)
 
 
+def placed_host(c, agent):
+    """The host holding `agent`'s placement (GET /cli/hosts/placements on
+    the controller: last_host), or None."""
+    st, _, resp = c.http("GET", "/cli/hosts/placements")
+    p = next((x for x in resp.get("agents", []) if x.get("agent") == agent), {}) if st == 200 else {}
+    return p.get("last_host") or p.get("pinned_host")
+
+
+def inbox_on_host(c, host, cwd, title):
+    """bob's inbox item as his host sees it: through the host when the
+    hosts have their own disks (the item is delivered there, not to the
+    controller's or the runner's copy), else read here."""
+    files = c.fleet.host_files(host, os.path.join(cwd, ".k2"), title) if host else None
+    return inbox_files(cwd, title) if files is None else files
+
+
 def compose_inbox(c, host, to, title, sender):
     h = c.fleet.host(host)
     st, raw, resp = c.http("POST", "/cli/inbox/compose", form={
@@ -793,7 +809,10 @@ def s6(c, sc):
         if b:
             agents[bob] = (bob_cwd, agents[bob][1], b, hb)
         state = c.wait_final(msg_id, gone_wait_s()) if msg_id else None
-        files = wait_until(lambda: inbox_files(bob_cwd, title), 30 if state != "failed" else 3)
+        # Read through bob's host (delivery, not the fs relay, is under test).
+        hb_now = placed_host(c, agents[bob][1]) or hb
+        sc.info["bob_inbox_read_on"] = hb_now
+        files = wait_until(lambda: inbox_on_host(c, hb_now, bob_cwd, title), 30 if state != "failed" else 3)
         # PRD failure table: when --chaos killed bob's CLI, or his host with
         # it, before the item landed (the host answers retry while no session
         # is live), the gone rule failing it with a reason is the right end;
