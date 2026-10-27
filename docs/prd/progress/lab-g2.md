@@ -368,6 +368,42 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### S10 heavy chaos on k2-dist/k2-f1-wave3 f76dce00d (K2-f.1): a regression
+
+These runs used the same setup as below, on throwaway branch
+`k2-dist/lab-g2-k2f1-run` (deleted after).
+
+| Seed | `lab-runs/G2/` | Chaos SIGKILLs (host / controller / CLI) | Inside holds | S10 rounds | I1–I4 |
+|---|---|---|---|---|---|
+| 4117 | `2026-10-27T05-50-46Z` | 45 / 29 / 4 | 47 | 0/5 | pass |
+| 7 | `2026-10-27T06-20-09Z` | 72 / 72 / 13 | 34 | 1/5 | pass |
+
+(c) K2-f.1 regression: a crash-cut turn three ends `delivered` and
+unanswered again, in 8 of 10 rounds, even with no controller restart. Not
+one `delivery.failed` was traced on seed 4117.
+
+- K2-f.1 notes a delivery's turn before the send, and only on attempt 1:
+  `delivery_drain.rs:772` at 73fe2eb01, `if attempt == 1 &&
+  is_prompt(..)`, "a resend may be one the host already delivered and
+  answered".
+- S10's turn three is always a resend. Attempt 1 went to host-1, which was
+  SIGKILLed before it acked. Attempt 2 on host-2 is the message's first
+  real delivery, and it is never noted.
+- The host still reports the crash (`ptyd.child_exit`, `host.agent_exit`).
+  K2-f's controller failed the message 3 ms later; K2-f.1's does nothing.
+- K2-f noted at the ack, on any attempt, and caught these.
+- Suggested fix: note a resend too when no earlier attempt was acked
+  (`ctl.deliver_ack`), or when the host's seen table says it was never
+  delivered.
+
+No 'interrupted' failure appeared, so there was nothing for the
+false-positive assertion to flag.
+
+(a) the lab, seed 7 round 4, fixed: three controller restarts in 25 s
+broke the typing of turn two. `ask_chat` reattached and retyped once, the
+retype hit a broken pipe again, and it then waited for a reply to a prompt
+that never arrived. It now reattaches again within its `tries`.
+
 ### Linux pre-gate on wave3 353c69d65: GREEN
 
 `lab-runs/gate-debug/2026-10-27T03-18-03Z`, before K2-f.1:
