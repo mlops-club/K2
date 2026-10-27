@@ -67,8 +67,14 @@ nodes=$(for h in $hosts; do kn get pod "$h" -o jsonpath='{.spec.nodeName}'; echo
     && ok "hosts on different nodes: $(for h in $hosts; do printf '%s on %s; ' "$h" "$(kn get pod "$h" -o jsonpath='{.spec.nodeName}')"; done)" \
     || bad "two hosts share a node: $(echo $nodes)"
 for h in $hosts; do
-    kn exec "$h" -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7420/cli/hosts/status | grep -q "\"linked\":true"' \
-        && ok "$h linked" || bad "$h not linked"
+    # A controller that just rolled takes a few seconds to be relinked.
+    linked=""
+    for _ in $(seq 1 30); do
+        kn exec "$h" -c k2-host -- sh -c 'curl -fsS --max-time 3 http://127.0.0.1:7420/cli/hosts/status | grep -q "\"linked\":true"' \
+            && { linked=1; break; }
+        sleep 2
+    done
+    [ -n "$linked" ] && ok "$h linked" || bad "$h not linked (60 s)"
     [ "$(kn exec "$h" -c k2-host -- stat -c %a /var/lib/k2-host/.k2/host-key.pem 2>/dev/null)" = 600 ] \
         && ok "$h: its key, 0600" || bad "$h: no key (0600)"
     for c in data work; do
