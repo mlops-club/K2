@@ -286,7 +286,9 @@ def check_i4(ev):
                     writes.append((_ts(e), cwd, a.get("host") or proc, "inbox item"))
     for t, cwd, host, what in sorted(writes):
         for c in ev.clis.values():
-            if c["host"] == host or not c["cwd"] or not cwd.startswith(c["cwd"]):
+            # The workspace or a path under it (an inbox item), by whole
+            # components: /work/s10-x-2 is not under /work/s10-x.
+            if c["host"] == host or not c["cwd"] or not (cwd == c["cwd"] or cwd.startswith(c["cwd"].rstrip("/") + "/")):
                 continue
             if c["start"] <= t and (c["end"] is None or t <= c["end"]):
                 diffs.append("%s: %s for %s written by %s while pid %s ran it on %s" % (t, what, c["cwd"], host, c["pid"], c["host"]))

@@ -186,6 +186,17 @@ class Invariants(unittest.TestCase):
         res = self.check()["I4"]
         self.assertEqual(res["status"], "pass", res)
 
+    def test_i4_a_workspace_whose_name_extends_another_is_another_agent(self):
+        # A scenario's redone attempt (s10-x-2) next to its first (s10-x).
+        self.r.cli("host-1", 100, 1.0, end=9.0, cwd="/w/s10-x", turn_at=5.0)
+        self.r.cli("host-2", 200, 2.0, end=3.0, cwd="/w/s10-x-2", turn_at=2.5)
+        self.assertEqual(self.check()["I4"]["status"], "pass")
+        # A path under the workspace is still its own (an inbox item).
+        self.r.daemon("host-2", 6.0, "inbox.write", attrs={"cwd": "/w/s10-x/.k2/inbox"})
+        res = self.check()["I4"]
+        self.assertEqual(res["status"], "fail")
+        self.assertIn("inbox item for /w/s10-x written by host-2 while pid 100 ran it on host-1", res["diffs"][0])
+
 
 class Chaos(unittest.TestCase):
     def test_schedule_is_a_function_of_the_seed(self):
