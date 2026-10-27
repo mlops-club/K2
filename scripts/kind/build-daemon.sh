@@ -23,6 +23,8 @@
 # waits), then a cargo slot for the compile; both are released when it ends.
 # K2_KIND_BUILD_MEMORY, K2_KIND_BUILD_CPUS and CARGO_BUILD_JOBS override the
 # caps (lower them if the compile is OOM-killed; never raise the memory).
+# K2_KIND_BUILD_OPT_LEVEL (test images only) lowers the release opt-level:
+# at 3 (the default) k2-core alone needs more than 3 GiB to compile.
 set -euo pipefail
 # shellcheck source=scripts/kind/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -32,6 +34,8 @@ tag=${2:?tag, e.g. k2-daemon:dist}
 [ -f "$src/crates/k2-daemon/Cargo.toml" ] && [ -f "$src/packaging/oci/entrypoint.sh" ] \
     || { echo "build-daemon.sh: $src is not a K2 tree" >&2; exit 2; }
 mem=${K2_KIND_BUILD_MEMORY:-4g} cpus=${K2_KIND_BUILD_CPUS:-2} jobs=${CARGO_BUILD_JOBS:-2}
+opt=${K2_KIND_BUILD_OPT_LEVEL:-3}
+case "$opt" in 0|1|2|3|s|z) ;; *) echo "build-daemon.sh: K2_KIND_BUILD_OPT_LEVEL must be 0-3, s or z" >&2; exit 2 ;; esac
 toolchain=k2-kind-toolchain:1.99.1
 out="${TMPDIR:-/tmp}/k2-kind/build/${tag//[:\/]/-}"
 
@@ -59,11 +63,12 @@ if ! docker image inspect "$toolchain" >/dev/null 2>&1; then
 fi
 
 rm -rf "$out" && mkdir -p "$out/usr/bin"
-say "compiling k2-ptyd and k2-daemon from $src ($(git -C "$src" rev-parse --short HEAD)) in a capped container: --memory $mem --cpus $cpus, CARGO_BUILD_JOBS=$jobs"
+say "compiling k2-ptyd and k2-daemon from $src ($(git -C "$src" rev-parse --short HEAD)) in a capped container: --memory $mem --cpus $cpus, CARGO_BUILD_JOBS=$jobs, opt-level $opt"
 docker run --rm --name "k2-kind-build-$$" \
     --memory "$mem" --memory-swap "$mem" --cpus "$cpus" \
     -e CARGO_BUILD_JOBS="$jobs" -e CARGO_TARGET_DIR=/target \
     -e CARGO_PROFILE_RELEASE_LTO=false -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 -e CARGO_PROFILE_RELEASE_DEBUG=false \
+    -e CARGO_PROFILE_RELEASE_OPT_LEVEL="$opt" \
     -v "$src:/src:ro" -v "$out/usr/bin:/out" \
     -v k2-kind-cargo-registry:/usr/local/cargo/registry -v k2-kind-cargo-git:/usr/local/cargo/git \
     -v k2-kind-target-dev:/target \
