@@ -3229,3 +3229,20 @@ fn k5_the_controller_records_a_relayed_worktree() {
     assert!(k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), &ws_id).is_err(), "removed here too");
 }
 
+/// K5: a fresh host gets a git identity at start (only the missing fields,
+/// in its global config); one already set is kept.
+#[test]
+fn k5_a_fresh_host_gets_a_git_identity() {
+    let home = crate::test_support::TempHome::new();
+    let get = |k: &str| {
+        let o = std::process::Command::new("git").args(["config", "--global", "--get", k]).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    assert_eq!(get("user.name"), "", "a fresh HOME has none");
+    crate::hosts::host_git_identity();
+    assert!(!get("user.name").is_empty() && !get("user.email").is_empty(), "set at start");
+    // Already set: kept.
+    std::fs::write(home.path().join(".gitconfig"), "[user]\n\tname = Owner\n\temail = owner@example.com\n").unwrap();
+    crate::hosts::host_git_identity();
+    assert_eq!((get("user.name"), get("user.email")), ("Owner".to_string(), "owner@example.com".to_string()));
+}

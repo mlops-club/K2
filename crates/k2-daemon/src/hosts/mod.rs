@@ -158,6 +158,18 @@ pub fn controller() -> Option<&'static ControllerConfig> {
     Some(CONTROLLER.get_or_init(|| c))
 }
 
+/// K5: give this host a git identity when it has none, as K2 does locally
+/// before its first commit (`git_identity::ensure_git_identity`: only the
+/// missing `user.name` / `user.email`, set in this host's global config,
+/// from its OS account). One the host's user already set, globally or in
+/// a repository, is kept: a repository's own `user.*` wins at commit time,
+/// as git does.
+pub fn host_git_identity() {
+    if let Err(e) = k2_core::git_identity::ensure_git_identity() {
+        k2_core::log_debug!("[hosts] git identity: {e}");
+    }
+}
+
 /// Start this role's background half after boot is ready: the host's
 /// link. A controller has nothing to start (hosts dial in).
 pub fn start(port: u16, token: &str) {
@@ -166,6 +178,9 @@ pub fn start(port: u16, token: &str) {
             Ok(cfg) => {
                 // fs-relay: a relayed request runs through this daemon's own route.
                 fs_relay::set_local_daemon(port, token);
+                // K5: commits made here (a relayed commit, a new project's
+                // first) need an author; a fresh host has none.
+                std::thread::spawn(host_git_identity);
                 // fs-relay (N7): K2's own git commands run no repository hooks here.
                 if let Some(root) = home::work_root(env) {
                     k2_core::git::set_no_hooks(true);
