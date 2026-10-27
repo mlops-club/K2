@@ -439,6 +439,7 @@ async fn a_message_for_an_agent_on_a_lost_host_keeps_waiting_and_lands_when_it_i
         args: vec![],
         label: None,
         turn: None,
+        adopted: false,
     };
     send(&mut b, &Frame::Hello { protocol: PROTOCOL, host_name: "host-b".into(), token: TOKEN.into(), labels: vec![], resume: vec![resume], ended: vec![] })
         .await;
@@ -612,6 +613,7 @@ async fn back_with(url: &str, agent: &str, epoch: u64) -> Ws {
         args: vec![],
         label: None,
         turn: None,
+        adopted: false,
     };
     send(&mut ws, &Frame::Hello { protocol: PROTOCOL, host_name: "host-a".into(), token: TOKEN.into(), labels: vec![], resume: vec![resume], ended: vec![] })
         .await;
@@ -1230,6 +1232,59 @@ async fn a_host_daemon_restart_mid_turn_leaves_the_outcome_unknown() {
     assert_eq!(outbox.get(&m).unwrap().attempts, 1, "not resent");
 }
 
+/// ptyd S3: the host's daemon restarts mid-turn and adopts the CLI ptyd
+/// kept: it resumes the agent at its epoch, alive, with its turn
+/// (`adopted`). The controller adopts it: the turn's message is not failed
+/// nor resent, the turn still runs, and the agent's Stop answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_daemon_restart_that_adopts_the_cli_keeps_the_turn_and_its_message() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let outbox = outbox_for(remote);
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "rex", "/w/rex", &sid(1)).await;
+    let epoch = remote.placement("rex").unwrap().epoch.0;
+    let m = delivered(&outbox, &mut a, "rex", "mid-turn").await;
+    prompt_with(remote, &mut a, "rex", &sid(1), running(1, 0, &[&m])).await;
+    drop(a);
+    wait_lost(remote, "host-a").await;
+    let adopted = super::proto::ResumePlacement { adopted: true, ..resumed("rex", &sid(1), epoch, Some(running(1, 0, &[&m]))) };
+    let mut a = back(&url, "host-a", vec![adopted], vec![]).await;
+    assert_eq!(remote.placement("rex").map(|p| p.epoch.0), Some(epoch), "adopted (the hub adopts before it welcomes)");
+    stays_delivered(&outbox, &m).await;
+    assert_eq!(outbox.get(&m).unwrap().attempts, 1, "not resent");
+    assert!(remote.in_turn("rex"), "the turn the restart interrupted still runs");
+    hook_at(&mut a, &sid(1), "Stop", super::proto::TurnCounts { prompts: 1, stops: 1, running: false, msgs: vec![] }).await;
+    until("rex answered", || !remote.in_turn("rex")).await;
+    stays_delivered(&outbox, &m).await;
+}
+
+/// K2-f.3 #5: a host daemon that restarted counts from what ptyd kept,
+/// which can be behind the controller (hooks fired while no daemon
+/// listened). An `adopted` resume's counts are taken even when lower; the
+/// same counts from a host that did not restart are older news, ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adopted_resume_resets_the_controllers_turn() {
+    for adopted in [true, false] {
+        let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+        let url = serve(remote).await;
+        let mut a = fake_host(&url, "host-a").await;
+        spawn_on(remote, &mut a, "ivy", "/w/ivy", &sid(1)).await;
+        let epoch = remote.placement("ivy").unwrap().epoch.0;
+        prompt_with(remote, &mut a, "ivy", &sid(1), running(3, 2, &[])).await;
+        assert!(remote.in_turn("ivy"));
+        drop(a);
+        wait_lost(remote, "host-a").await;
+        // The host's own counts: its third prompt's Stop only, lower in sum.
+        let behind = super::proto::TurnCounts { prompts: 2, stops: 2, running: false, msgs: vec![] };
+        let r = super::proto::ResumePlacement { adopted, ..resumed("ivy", &sid(1), epoch, Some(behind)) };
+        let _a = back(&url, "host-a", vec![r], vec![]).await;
+        // The hub adopts before it welcomes.
+        assert_eq!(remote.placement("ivy").map(|p| p.epoch.0), Some(epoch));
+        assert_eq!(remote.in_turn("ivy"), !adopted, "adopted={adopted}");
+    }
+}
+
 /// K2-f.3 #1: an agent that never sends hooks (a provider without them):
 /// nothing ever ties its messages to a turn, so neither a close, nor a
 /// controller restart then a close, nor its CLI ending while the link was
@@ -1804,6 +1859,7 @@ async fn a_silent_laptop_is_away_its_agent_paused_and_its_message_held_until_it_
             args: vec![],
             label: None,
             turn: None,
+            adopted: false,
         };
         laptop(&url, "eric-mbp", vec![resume]).await
     };

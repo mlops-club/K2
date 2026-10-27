@@ -89,6 +89,13 @@ pub struct ResumePlacement {
     /// outage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<TurnCounts>,
+    /// ptyd S3: this daemon restarted and took the session over from ptyd.
+    /// Its `turn` is the host's own, rebuilt from what ptyd kept, and may
+    /// be behind the controller's (hooks fired while no daemon listened):
+    /// the controller takes it as it is (K2-f.3 #5). An older controller
+    /// ignores the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopted: bool,
 }
 
 /// K2-f: a placement whose CLI ended while the link was down, reported

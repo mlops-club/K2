@@ -13,6 +13,7 @@
 //! The wire protocol is [`proto`]; the env contract and the table of
 //! frames are in `docs/prd/progress/dist-link.md`.
 
+pub mod adopt;
 pub mod byte_ring;
 pub mod drain;
 pub mod enroll;
@@ -192,7 +193,15 @@ pub fn start(port: u16, token: &str) {
                 }
                 k2_core::log_debug!("[hosts] K2_ROLE=host: linking to {} as {}", cfg.attach_url, cfg.host_name);
                 byte_ring::set(Some(host_ptyd_ring));
-                tokio::spawn(link::run(cfg));
+                // ptyd S3: take over what ptyd kept, then link (the first
+                // hello resumes what was adopted).
+                let rt = tokio::runtime::Handle::current();
+                tokio::spawn(async move {
+                    if let Err(e) = tokio::task::spawn_blocking(move || adopt::install(rt)).await {
+                        k2_core::log_debug!("[hosts/adopt] boot adoption: {e}");
+                    }
+                    link::run(cfg).await
+                });
             }
             Err(e) => {
                 // Boot validated this; a token file removed since is fatal.

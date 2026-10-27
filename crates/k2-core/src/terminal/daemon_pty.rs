@@ -447,6 +447,25 @@ struct PtydSession {
     meta: Mutex<serde_json::Value>,
 }
 
+/// What [`DaemonPtySession::from_ptyd`] builds a session from.
+#[cfg(unix)]
+struct PtydParts {
+    session_id: SessionId,
+    cwd: Option<PathBuf>,
+    program: Option<String>,
+    sandbox: SandboxSpec,
+    pid: i32,
+    args: Vec<String>,
+    cols: u16,
+    rows: u16,
+    label: String,
+    label_source: LabelSource,
+    pin: Option<(u16, u16, Option<String>)>,
+    sid: String,
+    owner: Arc<crate::terminal::ptyd::client::Owner>,
+    meta: serde_json::Value,
+}
+
 /// Trailing-debounce window for [`DaemonPtySession::request_resize`].
 /// Sized to swallow a mobile keyboard show/hide or two clients racing
 /// claims (which fire well inside 120ms of each other) without adding
@@ -1208,7 +1227,7 @@ impl DaemonPtySession {
     /// exactly as on the in-process path.
     #[cfg(unix)]
     fn spawn_ptyd(cfg: DaemonPtyConfig, req: SpawnRequest, store_args: Vec<String>) -> Result<Arc<Self>, io::Error> {
-        use crate::terminal::ptyd::{client, env as penv, io as pio};
+        use crate::terminal::ptyd::{client, env as penv};
         use k2_ptyd::proto::{Reply, Request};
 
         let owner = client::global().owner().map_err(io::Error::other)?;
@@ -1279,15 +1298,137 @@ impl DaemonPtySession {
             }
         };
 
+        let parts = PtydParts {
+            session_id: cfg.session_id,
+            cwd: cfg.cwd,
+            program: cfg.program,
+            sandbox: cfg.sandbox,
+            pid,
+            args: store_args,
+            cols: cfg.cols,
+            rows: cfg.rows,
+            label: cfg.label,
+            label_source: cfg.label_source,
+            pin: None,
+            sid,
+            owner,
+            meta,
+        };
+        Self::from_ptyd(parts, stream, events, |_, _| {})
+    }
+
+    /// k2-ptyd S3: take over a session a previous daemon left running in
+    /// ptyd (`info` from ptyd's `list`, its `meta` as [`Self::sync_ptyd_meta`]
+    /// kept it). The ring is replayed into a new Term with query answers
+    /// muted (P75), so the screen and scrollback come back without the
+    /// child seeing old queries answered again; live output follows from
+    /// the first byte the replay did not finish. Same pid, same session id.
+    #[cfg(unix)]
+    pub fn adopt_ptyd(
+        owner: Arc<crate::terminal::ptyd::client::Owner>,
+        info: &k2_ptyd::proto::SessionInfo,
+    ) -> Result<Arc<Self>, io::Error> {
+        let m = &info.meta;
+        let str_of = |k: &str| m.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let session_id = SessionId::parse(&info.sid).ok_or_else(|| io::Error::other(format!("adopt: bad session id {}", info.sid)))?;
+        let label_source = match str_of("label_source").as_deref() {
+            Some("Seed") => LabelSource::Seed,
+            Some("Locked") => LabelSource::Locked,
+            _ => LabelSource::Pty,
+        };
+        let pin = m.get("pin").and_then(|p| {
+            let c = p.get("cols")?.as_u64()? as u16;
+            let r = p.get("rows")?.as_u64()? as u16;
+            Some((c, r, p.get("set_by").and_then(|s| s.as_str()).map(str::to_string)))
+        });
+        let args = m
+            .get("durable_args")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let events = owner.watch(&info.sid);
+        // The ring, up to where it ended when we looked, through a shadow
+        // scanner: live output resumes at the first byte of a sequence the
+        // replay leaves unfinished.
+        let (replayed, from) = {
+            let mut at = info.ring_start;
+            let mut bytes = Vec::new();
+            while at < info.ring_end {
+                let (start, _, chunk) = owner.read_ring(&info.sid, at, k2_ptyd::proto::READ_RING_MAX)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                // The ring dropped bytes we had not read yet: start over
+                // from its new start.
+                if start != at {
+                    bytes.clear();
+                }
+                at = start + chunk.len() as u64;
+                bytes.extend_from_slice(&chunk);
+            }
+            let first = at - bytes.len() as u64;
+            let mut shadow = crate::terminal::ptyd::shadow::Shadow::at(first);
+            shadow.feed(&bytes);
+            let from = shadow.partial_start();
+            bytes.truncate((from - first) as usize);
+            (bytes, from)
+        };
+        let stream = match owner.attach(&info.sid, from) {
+            Ok(s) => s,
+            Err(e) => {
+                owner.unwatch(&info.sid);
+                return Err(e);
+            }
+        };
+        let parts = PtydParts {
+            session_id,
+            cwd: str_of("cwd").map(PathBuf::from),
+            program: str_of("program"),
+            sandbox: SandboxSpec::Passthrough,
+            pid: info.pid,
+            args,
+            cols: info.cols,
+            rows: info.rows,
+            label: str_of("label").unwrap_or_default(),
+            label_source,
+            pin,
+            sid: info.sid.clone(),
+            owner,
+            meta: m.clone(),
+        };
+        Self::from_ptyd(parts, stream, events, move |term, listener| {
+            use alacritty_terminal::vte::ansi::Processor;
+            listener.set_replies_muted(true);
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, &replayed);
+            parser.stop_sync(term);
+            listener.set_replies_muted(false);
+        })
+    }
+
+    /// The rest of a ptyd-hosted session, spawned or adopted: the Term,
+    /// listener, channels and K2's IO loop on `stream`. `prime` runs on the
+    /// Term before the IO loop starts (an adoption's replay).
+    #[cfg(unix)]
+    fn from_ptyd(
+        p: PtydParts,
+        stream: k2_ptyd::client::DataStream,
+        events: std::sync::mpsc::Receiver<crate::terminal::ptyd::client::SessionEvent>,
+        prime: impl FnOnce(&mut Term<DaemonEventListener>, &DaemonEventListener),
+    ) -> Result<Arc<Self>, io::Error> {
+        use crate::terminal::ptyd::io as pio;
         let (events_tx, _initial_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        crate::trace::pty::watch(&cfg.session_id, &events_tx);
+        crate::trace::pty::watch(&p.session_id, &events_tx);
         drop(_initial_rx);
         let query_reply = Arc::new(std::sync::OnceLock::new());
         let listener = DaemonEventListener { tx: events_tx.clone(), reply_tx: Arc::clone(&query_reply), muted: Default::default() };
         let term_config = TermConfig { scrolling_history: SCROLLBACK_CAP, ..TermConfig::default() };
-        let term_size = TermSize { cols: cfg.cols.max(1) as usize, rows: cfg.rows.max(1) as usize };
-        let term = Arc::new(FairMutex::new(Term::new(term_config, &term_size, listener.clone())));
-
+        let term_size = TermSize { cols: p.cols.max(1) as usize, rows: p.rows.max(1) as usize };
+        let mut t = Term::new(term_config, &term_size, listener.clone());
+        prime(&mut t, &listener);
+        let term = Arc::new(FairMutex::new(t));
+        let sid = p.sid;
+        let owner = p.owner;
         let io = pio::start(sid.clone(), stream, Arc::clone(&term), listener, Arc::clone(&owner), events, |sender| {
             assert!(
                 query_reply
@@ -1296,23 +1437,27 @@ impl DaemonPtySession {
                 "query-reply sink is set exactly once, here"
             );
         })?;
-        log_debug!("[daemon_pty] ptyd session={} pid={}", cfg.session_id, pid);
+        log_debug!("[daemon_pty] ptyd session={} pid={}", p.session_id, p.pid);
 
         let (label_tx, _label_rx_drop) = broadcast::channel::<String>(16);
         drop(_label_rx_drop);
         let (pin_tx, _pin_rx_drop) = broadcast::channel::<Option<(u16, u16)>>(16);
         drop(_pin_rx_drop);
+        let (pin_cols, pin_rows, pin_by) = match p.pin {
+            Some((c, r, by)) => (c, r, by),
+            None => (0, 0, None),
+        };
 
         Ok(Arc::new(Self {
-            session_id: cfg.session_id,
-            cwd: cfg.cwd,
-            program: cfg.program,
-            sandbox: cfg.sandbox,
-            pid: Some(pid),
+            session_id: p.session_id,
+            cwd: p.cwd,
+            program: p.program,
+            sandbox: p.sandbox,
+            pid: Some(p.pid),
             killed: std::sync::atomic::AtomicBool::new(false),
-            args: store_args,
+            args: p.args,
             term,
-            pty_io: PtyIo::Ptyd(PtydSession { sid, io, owner, meta: Mutex::new(meta) }),
+            pty_io: PtyIo::Ptyd(PtydSession { sid, io, owner, meta: Mutex::new(p.meta) }),
             events_tx,
             child_exited: std::sync::atomic::AtomicBool::new(false),
             active_subscriber: std::sync::atomic::AtomicU64::new(0),
@@ -1320,9 +1465,9 @@ impl DaemonPtySession {
             viewer_count: std::sync::atomic::AtomicUsize::new(0),
             active_cols: std::sync::atomic::AtomicU16::new(0),
             active_rows: std::sync::atomic::AtomicU16::new(0),
-            pinned_cols: std::sync::atomic::AtomicU16::new(0),
-            pinned_rows: std::sync::atomic::AtomicU16::new(0),
-            pinned_set_by: Mutex::new(None),
+            pinned_cols: std::sync::atomic::AtomicU16::new(pin_cols),
+            pinned_rows: std::sync::atomic::AtomicU16::new(pin_rows),
+            pinned_set_by: Mutex::new(pin_by),
             pin_tx,
             ephemeral_pin_owner: std::sync::atomic::AtomicU64::new(0),
             viewports: Mutex::new(HashMap::new()),
@@ -1335,10 +1480,26 @@ impl DaemonPtySession {
             }),
             resizes_applied: std::sync::atomic::AtomicU64::new(0),
             resize_generation: std::sync::atomic::AtomicU64::new(0),
-            label: std::sync::RwLock::new(cfg.label),
-            label_source: std::sync::RwLock::new(cfg.label_source),
+            label: std::sync::RwLock::new(p.label),
+            label_source: std::sync::RwLock::new(p.label_source),
             label_tx,
         }))
+    }
+
+    /// k2-ptyd S3: set one top-level key of this session's ptyd meta (what
+    /// a restarted daemon reads back to adopt it) and send it to ptyd.
+    /// Fire-and-forget; a no-op for in-process sessions.
+    pub fn set_ptyd_meta(&self, key: &str, value: serde_json::Value) {
+        #[cfg(unix)]
+        if let PtyIo::Ptyd(p) = &self.pty_io {
+            let mut m = p.meta.lock();
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert(key.to_string(), value);
+            }
+            p.owner.send_nowait(k2_ptyd::proto::Request::UpdateMeta { sid: p.sid.clone(), meta: m.clone() });
+        }
+        #[cfg(not(unix))]
+        let _ = (key, value);
     }
 
     /// Subscribe to out-of-band label change events. Receivers see

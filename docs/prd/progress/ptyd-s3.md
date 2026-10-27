@@ -121,11 +121,16 @@ reports are never below what the controller was told.
   - input written after adoption reaches the child;
   - its exit is seen.
 - **`k2-daemon` units.**
-  - `meta_rebuilds_placed_and_turns`: the meta goes to `Placed` and
-    `Turns`;
+  - `a_pane_restored_from_its_meta_goes_on_where_it_was`: `Turns` round
+    trip through the meta; the next prompt takes the message typed before
+    the restart;
   - `only_placed_running_sessions_are_adopted`: running and `k2_host` set,
-    versus exited or no meta;
-  - `an_adopted_resume_resets_the_controllers_turn`: #5, lower counts are
+    versus exited, no meta or malformed;
+  - `a_host_daemon_restart_that_adopts_the_cli_keeps_the_turn_and_its_message`:
+    the controller side. An `adopted` resume at the same epoch keeps the
+    message delivered, sent once, and the turn running; the agent's `Stop`
+    then answers it;
+  - `an_adopted_resume_resets_the_controllers_turn`: #5. Lower counts are
     taken when `adopted`, and ignored otherwise.
 - **Lab `scripts/lab/topology/host-restart-adopt.sh`** (procs: a controller
   and host-1 with `K2_PTYD=1`, `k2-fake-agent` as `claude`):
@@ -143,3 +148,17 @@ reports are never below what the controller was told.
        and the controller sees the `Stop` (bob not in turn);
      - a second message after the restart is delivered once and answered;
      - the grid shows the pre-restart output (replay).
+
+## Results
+
+| Check | Result |
+|---|---|
+| `scripts/lab/topology/host-restart-adopt.sh`, run `20261027T151414Z` | **7/7 PASS**. The host daemon was killed with `kill -9` mid-turn; the CLI kept its pid (77387, a ptyd child) and never exited or was exec'd again. host-1 logged `host.adopt` and the controller decided `adopted` at the same epoch, with no `gone`. The message stayed `delivered` and was sent once. Reply #2 is in the transcript and on the adopted screen, along with the output from before the restart. A third message was delivered once and answered |
+| `cargo test -p k2-core --test ptyd_backend` | **9 passed** (with `a_session_outlives_its_owner_and_is_adopted`) |
+| `cargo test -p k2-daemon --test ptyd_p76_integration` | **1 passed** |
+| `cargo test -p k2-core --lib` | **3724 passed, 0 failed** |
+| `cargo test -p k2-daemon --lib` (throwaway HOME) | **4678 passed, 0 failed** (with the four new tests) |
+
+The old behaviour is pinned by
+`a_host_daemon_restart_mid_turn_leaves_the_outcome_unknown`: a host that
+comes back without the agent still leaves the message's outcome unknown.

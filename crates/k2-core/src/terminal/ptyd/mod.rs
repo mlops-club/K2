@@ -17,6 +17,9 @@
 
 pub mod shadow;
 
+/// ptyd's session listing, for a daemon that adopts what it kept (S3).
+pub use k2_ptyd::proto::{SessionInfo, SessionState};
+
 #[cfg(unix)]
 pub mod client;
 #[cfg(unix)]

@@ -308,3 +308,75 @@ fn ptyd_death_ends_sessions_without_spinning_and_ptyd_relaunches() {
     assert_ne!(ptyd2, ptyd);
     s2.kill();
 }
+
+/// Waits, with no deadline (a hang is the test runner's to report), until
+/// `cond` holds.
+fn wait_until(mut cond: impl FnMut() -> bool) {
+    while !cond() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+static ADOPTED: Mutex<Vec<std::sync::Arc<DaemonPtySession>>> = Mutex::new(Vec::new());
+
+/// ptyd S3: a session outlives its daemon's owner connection and the next
+/// daemon adopts it: the same child (pid), the screen it had (the ring
+/// replayed), its label and pin from the meta, and input and exit working
+/// as on a spawned session. Sessions without this test's marker are ended,
+/// as before.
+#[test]
+fn a_session_outlives_its_owner_and_is_adopted() {
+    let _g = setup();
+    static ADOPTER: Once = Once::new();
+    ADOPTER.call_once(|| {
+        k2_core::terminal::ptyd::client::set_adopter(Box::new(|owner, sessions| {
+            let mut rest = Vec::new();
+            for info in sessions {
+                if info.meta.get("k2_test_adopt").is_some() && matches!(info.state, k2_ptyd::proto::SessionState::Running) {
+                    let s = DaemonPtySession::adopt_ptyd(std::sync::Arc::clone(owner), &info).expect("adopt");
+                    ADOPTED.lock().unwrap().push(s);
+                } else {
+                    rest.push(info);
+                }
+            }
+            rest
+        }));
+    });
+    let s = DaemonPtySession::spawn(cfg("printf 'MARK-%s\\n' before; while read l; do echo \"got:$l\"; done")).expect("spawn");
+    assert_eq!(s.backend_name(), "ptyd");
+    let pid = s.child_pid().expect("pid");
+    let sid = s.session_id.to_string();
+    wait_until(|| s.visible_text_rows().iter().any(|r| r.contains("MARK-before")));
+    s.set_label("Adoptee".into(), true);
+    DaemonPtySession::set_pinned(&s, Some((80, 24)), Some("owner".into()));
+    s.set_ptyd_meta("k2_test_adopt", serde_json::json!(true));
+    // A round trip on the same connection: ptyd has every meta update.
+    let old = k2_core::terminal::ptyd::client::global().owner().unwrap();
+    assert!(matches!(old.request(k2_ptyd::proto::Request::Ping).unwrap(), k2_ptyd::proto::Reply::Pong { .. }));
+    // The daemon dies (no Drop runs, so nothing kills the child) and a new
+    // one connects: ptyd evicts the old owner and keeps the child.
+    std::mem::forget(s);
+    assert!(alive(pid));
+    let fresh = k2_core::terminal::ptyd::client::Ptyd::for_home(&home().join(".k2"));
+    let _owner = fresh.owner().expect("the restarted daemon connects (and adopts)");
+    let a = ADOPTED.lock().unwrap().iter().find(|x| x.session_id.to_string() == sid).cloned().expect("the session was adopted");
+    assert_eq!(a.child_pid(), Some(pid), "the same child, not a new one");
+    assert!(alive(pid));
+    assert_eq!(a.backend_name(), "ptyd");
+    assert!(a.visible_text_rows().iter().any(|r| r.contains("MARK-before")), "the replayed screen: {:?}", a.visible_text_rows());
+    assert_eq!(a.label(), "Adoptee");
+    assert_eq!(a.pinned(), Some((80, 24)));
+    assert_eq!(a.pinned_set_by().as_deref(), Some("owner"));
+    a.write(b"ping\r".to_vec());
+    wait_until(|| a.visible_text_rows().iter().any(|r| r.contains("got:ping")));
+    let mut rx = a.subscribe_events();
+    a.write(b"\x04".to_vec()); // EOF: the read loop ends, the child exits
+    loop {
+        match rx.try_recv() {
+            Ok(AlacEvent::ChildExit(_)) => break,
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("event channel: {e:?}"),
+        }
+    }
+    wait_until(|| !alive(pid));
+}
