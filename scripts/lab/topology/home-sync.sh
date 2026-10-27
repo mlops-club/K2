@@ -11,9 +11,11 @@
 #      MEMORY.md and its transcript under host-1's HOME; its workspace is a
 #      git repo with two commits, a dirty file and an untracked file
 #   2. SIGTERM host-1: it drains, saves notes' home (host.home_saved), says
-#      released, and exits by itself; the controller holds snapshot 1
+#      released, and exits by itself; the drain's save is the store's newest
+#      snapshot (seq numbers vary: T2 also saves at every turn's end, so every
+#      check compares with the store's newest at that step, never a number)
 #   3. notes is woken with --resume while host-1 is down: it lands on host-2,
-#      which restores snapshot 1 first into its own work root, fetching every
+#      which restores the drain's snapshot first into its own work root, fetching every
 #      object (host.home_restored, fetched > 0), and runs it there
 #   4. on host-2: the workspace byte for byte (git HEAD, history, dirty and
 #      untracked state), MEMORY.md and the transcript as host-1 left them;
@@ -22,11 +24,11 @@
 #      (under its work root) and the agent runs
 #   6. one cwd per agent: a second agent spawned in notes' cwd runs, but its
 #      home isn't saved there (the close reply says why; the host warns)
-#   7. notes sleeps (v2 close): host-2 saves snapshot 2 before it closes, and
-#      the close reply says so (home.seq = 2)
+#   7. notes sleeps (v2 close): host-2 saves a newer snapshot before it
+#      closes, the store's newest, and the close reply's home.seq says so
 #   8. host-1 comes back, host-2 goes: notes wakes on host-1, which still
-#      held snapshot 1 and now restores 2 over it (fetching what changed):
-#      host-2's memory line is there
+#      held the drain's snapshot and now restores the sleep's over it
+#      (fetching what changed): host-2's memory line is there
 #
 # Ports: HS_CTL_PORT (default 17480), HS_H1_PORT (17481), HS_H2_PORT (17482);
 # the script stops if one is taken.
@@ -177,6 +179,19 @@ ev=[json.loads(l) for l in open(sys.argv[1]) if "host.home_restored" in l]
 print("%s %s" % (ev[-1]["attrs"]["seq"], ev[-1]["attrs"]["fetched"]) if ev else "none 0")' "$RUN/$1.trace.jsonl" 2>/dev/null || echo "none 0"
 }
 
+# The store's newest snapshot of notes in a /cli/hosts/home/status answer.
+newest_seq() {
+    python3 -I -c 'import json,sys; s=[x for x in json.load(open(sys.argv[1]))["snapshots"] if x["agent"]=="notes"]; print(s[0]["seq"] if s else "")' "$1" 2>/dev/null
+}
+# The seq of a host's last host.home_saved of notes with this trigger (release | turn).
+last_save() {
+    python3 -I -c '
+import json,sys
+ev=[json.loads(l) for l in open(sys.argv[1]) if "host.home_saved" in l]
+ev=[e for e in ev if e.get("agent_id")=="notes" and (e.get("attrs") or {}).get("trigger")==sys.argv[2]]
+print(ev[-1]["attrs"]["seq"] if ev else "")' "$RUN/$1.trace.jsonl" "$2" 2>/dev/null
+}
+
 # The fake agent's files under a host's HOME (the same layout as Claude's).
 memory_of() { find "$ROOT/$1/home/.claude/projects" -path '*-notes/memory/MEMORY.md' 2>/dev/null | head -1; }
 transcript_of() { find "$ROOT/$1/home/.claude/projects" -name "$SESSION.jsonl" 2>/dev/null | head -1; }
@@ -239,18 +254,19 @@ wait_for 90 sh -c "! kill -0 $H1_PID 2>/dev/null"
 gone=$(kill -0 "$H1_PID" 2>/dev/null && echo 0 || echo 1)
 wait "$H1_PID" 2>/dev/null; H1_PID=""
 ctl_get /cli/hosts/home/status > "$RUN/home-status-1.json"
-seq1=$(python3 -I -c 'import json,sys; s=[x for x in json.load(open(sys.argv[1]))["snapshots"] if x["agent"]=="notes"]; print(s[0]["seq"] if s else "")' "$RUN/home-status-1.json")
-check "SIGTERM host-1: it saved notes' home, released it and exited by itself; the controller holds snapshot 1" \
-    "$([ "$gone" = 1 ] && traced "$RUN/host-1.trace.jsonl" host.home_saved && traced "$RUN/host-1.trace.jsonl" host.drain_release && [ "$seq1" = 1 ] && echo 1)" \
-    "exited $gone; status $(cat "$RUN/home-status-1.json")"
+seq1=$(newest_seq "$RUN/home-status-1.json")
+drain_seq=$(last_save host-1 release)
+check "SIGTERM host-1: it saved notes' home, released it and exited by itself; the drain's save is the store's newest snapshot" \
+    "$([ "$gone" = 1 ] && traced "$RUN/host-1.trace.jsonl" host.drain_release && [ -n "$seq1" ] && [ "$drain_seq" = "$seq1" ] && echo 1)" \
+    "exited $gone; the drain saved seq $drain_seq; the store's newest $seq1 (T2 turn saves come before it); status $(cat "$RUN/home-status-1.json")"
 
 # 3. host-2 is another disk: notes wakes with --resume while host-1 is down
 c=$(spawn "[\"--resume\",\"$SESSION\",\"remember after the move\"]")
 wait_for 30 has_line "$(memory_of h2)" "after the move"
 read -r rseq rfetched <<< "$(last_restore host-2)"
-check "notes wakes on host-2 (host-1 down), which restores snapshot 1 into its own work root first, fetching its objects" \
-    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-2 ] && [ "$rseq" = 1 ] && [ "$rfetched" -gt 0 ] && [ -d "$WS2/.git" ] && echo 1)" \
-    "HTTP $c $(head -c 200 "$RUN/post.out"); on $(placed_on); restored seq $rseq fetched $rfetched objects; $WS2/.git $([ -d "$WS2/.git" ] && echo exists || echo MISSING)"
+check "notes wakes on host-2 (host-1 down), which restores the drain's snapshot into its own work root first, fetching its objects" \
+    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-2 ] && [ "$rseq" = "$seq1" ] && [ "$rfetched" -gt 0 ] && [ -d "$WS2/.git" ] && echo 1)" \
+    "HTTP $c $(head -c 200 "$RUN/post.out"); on $(placed_on); restored seq $rseq (the drain's $seq1) fetched $rfetched objects; $WS2/.git $([ -d "$WS2/.git" ] && echo exists || echo MISSING)"
 
 # 4. byte for byte, and the same conversation
 ws_state "$WS2" > "$RUN/workspace-on-host-2.txt"
@@ -284,8 +300,12 @@ check "one cwd per agent: twin, in notes' cwd, runs, but its home is not saved t
 # 7. notes sleeps: host-2 saves before it closes
 c=$(post /cli/sessions/v2/close '{"agent_name":"notes","force":true}')
 home_seq=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("home",{}).get("seq",""))' "$RUN/post.out" 2>/dev/null)
-check "notes sleeps (v2 close): host-2 saved snapshot 2 first, and the close reply says so" \
-    "$([ "$c" = 200 ] && [ "$home_seq" = 2 ] && echo 1)" "HTTP $c $(cat "$RUN/post.out")"
+cp "$RUN/post.out" "$RUN/close-notes.json"
+ctl_get /cli/hosts/home/status > "$RUN/home-status-2.json"
+seq2=$(newest_seq "$RUN/home-status-2.json")
+check "notes sleeps (v2 close): host-2 saved a newer snapshot first, the store's newest, and the close reply says so" \
+    "$([ "$c" = 200 ] && [ -n "$home_seq" ] && [ "$home_seq" = "$seq2" ] && [ "$seq2" -gt "$seq1" ] && echo 1)" \
+    "HTTP $c $(cat "$RUN/close-notes.json"); the store's newest $seq2 (after the drain's $seq1)"
 
 # 8. host-1 back, host-2 gone: notes wakes on host-1, which restores 2 over its 1
 H1_PID=$(start_host host-1 h1 "$H1_PORT")
@@ -294,9 +314,9 @@ kill -TERM "$H2_PID"; wait_for 90 sh -c "! kill -0 $H2_PID 2>/dev/null"; wait "$
 c=$(spawn "[\"--resume\",\"$SESSION\"]")
 wait_for 30 has_line "$(memory_of h1)" "after the move"
 read -r rseq rfetched <<< "$(last_restore host-1)"
-check "notes wakes on host-1 again, with host-2's turn in its memory (snapshot 2 over 1, only what changed fetched)" \
-    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-1 ] && has_line "$(memory_of h1)" "after the move" && [ "$rseq" = 2 ] && [ "$rfetched" -gt 0 ] && echo 1)" \
-    "HTTP $c; on $(placed_on); restored seq $rseq fetched $rfetched; memory $(tr '\n' '|' < "$(memory_of h1)")"
+check "notes wakes on host-1 again, with host-2's turn in its memory (the sleep's snapshot over the drain's, only what changed fetched)" \
+    "$([ "$c" = 200 ] && [ "$(placed_on)" = host-1 ] && has_line "$(memory_of h1)" "after the move" && [ "$rseq" = "$seq2" ] && [ "$rfetched" -gt 0 ] && echo 1)" \
+    "HTTP $c; on $(placed_on); restored seq $rseq (the sleep's $seq2) fetched $rfetched; memory $(tr '\n' '|' < "$(memory_of h1)")"
 
 ctl_get /cli/hosts/home/status > "$RUN/home-status-final.json"
 grep -hE '\[hosts/(home|drain)\]' "$RUN"/host-*.log > "$RUN/home-sync.log" 2>/dev/null || true
