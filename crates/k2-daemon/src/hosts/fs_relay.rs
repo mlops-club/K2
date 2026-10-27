@@ -50,6 +50,10 @@ use crate::routes::http;
 /// host.
 pub const FS_RELAY_VAR: &str = "K2_FS_RELAY";
 
+/// F3: where a host on its own disk keeps what is sent to the Trash: a
+/// folder in its work root (`<root>/.k2-trash`), not the host's own Trash.
+pub const HOST_TRASH: &str = ".k2-trash";
+
 /// A host's label: the work root its workspaces are under (its own disk).
 pub const LABEL_WORK_ROOT: &str = "k2.work_root";
 

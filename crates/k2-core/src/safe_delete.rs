@@ -52,6 +52,28 @@ use std::path::Path;
 /// (`K2_TEST_TRASH_DIR`; `TempHome` sets it to `<home>/.Trash`).
 pub const TEST_TRASH_DIR_ENV: &str = "K2_TEST_TRASH_DIR";
 
+static HOST_TRASH: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+/// fs-relay (F3): on an agent host serving its controller from a work
+/// root, what goes to the Trash goes to `dir` (inside the work root), never
+/// the host's own Trash outside it. `None`: the OS Trash, as always.
+pub fn set_host_trash(dir: Option<std::path::PathBuf>) {
+    *HOST_TRASH.write().unwrap_or_else(|p| p.into_inner()) = dir;
+}
+
+fn host_trash() -> Option<std::path::PathBuf> {
+    HOST_TRASH.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// `path` renamed into the host's trash folder under a fresh name (the
+/// same disk: never copied, never unlinked).
+fn host_trash_move(dir: &Path, path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("trash dir {}: {e}", dir.display()))?;
+    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let dest = dir.join(format!("{name}-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::rename(path, &dest).map_err(|e| format!("move {} to {}: {e}", path.display(), dest.display()))
+}
+
 /// The ONE call into the OS recycle bin (the `trash` crate). Every helper
 /// here and `fs_commands::delete` go through it.
 ///
@@ -64,6 +86,9 @@ pub const TEST_TRASH_DIR_ENV: &str = "K2_TEST_TRASH_DIR";
 /// meaning something. A release build compiles none of this: production is
 /// `trash::delete`, unchanged.
 pub(crate) fn os_trash(path: &Path) -> Result<(), String> {
+    if let Some(dir) = host_trash() {
+        return host_trash_move(&dir, path);
+    }
     #[cfg(any(test, feature = "test-util"))]
     {
         test_trash(path)

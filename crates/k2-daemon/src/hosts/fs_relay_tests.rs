@@ -1731,3 +1731,42 @@ fn r9_x3_resolve_links_candidates_are_in_the_budget_and_capped() {
     assert_eq!(refused.len(), 1_500, "past the cap: answered unchecked");
     assert_eq!(c.body["paths"].as_array().unwrap().len(), 500);
 }
+
+// ── F2–F6 (round 7's lows) ─────────────────────────────────────────────
+
+/// The host's Trash folder, for one test at a time (it is process-wide).
+struct HostTrash(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl HostTrash {
+    fn at(dir: &Path) -> HostTrash {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        k2_core::safe_delete::set_host_trash(Some(dir.to_path_buf()));
+        HostTrash(g)
+    }
+}
+
+impl Drop for HostTrash {
+    fn drop(&mut self) {
+        k2_core::safe_delete::set_host_trash(None);
+    }
+}
+
+/// F3: on a host, what a delete (not `permanent`) or a worktree removal
+/// sends to the Trash lands in the work root's `.k2-trash`, never the
+/// host's own Trash outside the root.
+#[test]
+fn f3_the_trash_stays_inside_the_work_root() {
+    let d = host_disk();
+    let trash = d.root.join(HOST_TRASH);
+    std::fs::write(d.ws.join("gone.md"), "x").unwrap();
+    std::fs::create_dir_all(d.ws.join("wt")).unwrap();
+    {
+        let _t = HostTrash::at(&trash);
+        k2_core::fs_commands::delete(&[d.ws.join("gone.md").to_string_lossy().into_owned()], false).unwrap();
+        k2_core::safe_delete::trash(d.ws.join("wt")).unwrap();
+    }
+    assert!(!d.ws.join("gone.md").exists() && !d.ws.join("wt").exists());
+    let names: Vec<String> = std::fs::read_dir(&trash).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(names.iter().any(|n| n.starts_with("gone.md-")) && names.iter().any(|n| n.starts_with("wt-")), "{names:?}");
+}
