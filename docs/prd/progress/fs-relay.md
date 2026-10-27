@@ -618,6 +618,41 @@ The reviewer's round 13 tests (`rv13_*`) are added as given. Three of
 them only record what happens (include, submodule, bare layout), and all
 three now show a refusal.
 
+## K5 on kind: two fixes
+
+kind-app's K5 passed 49 of 50 checks. Two things are fixed here.
+
+- **create-worktree failed with "FOREIGN KEY constraint failed".** Adding a
+  workspace registered its project twice, once on the host and once on the
+  controller, under different ids. A relayed create-worktree carries the
+  controller's id, which the host's database doesn't have (git had already
+  made the worktree). Now the ids agree end to end:
+  - The controller registers a workspace made or added on a host under the
+    host's project id (`projects_create_as`).
+  - On a host, a project id it doesn't know is its own project for that
+    path, or, with none, is registered under that id. This also covers
+    workspaces registered before this fix.
+  - A worktree made through the relay is recorded in the controller's
+    registry under the host's workspace id, which is where the app lists
+    workspaces from, and it goes when it is removed.
+  - Test: `k5_a_relayed_create_worktree_with_the_controllers_project_id`
+    reproduces the error with the fix taken out. Also
+    `k5_a_project_registered_under_the_hosts_id` and
+    `k5_the_controller_records_a_relayed_worktree`.
+  - **Not covered:** prune-worktrees does not update the controller's
+    registry. The host deletes rows for worktrees whose folder is gone on
+    its disk; the controller keeps its rows.
+- **Commit failed with "Failed to get signature".** A fresh host had no git
+  identity, and K2 set one only when it ran `git init` itself. Now a host
+  sets one at start, as K2 does locally before its first commit
+  (`git_identity::ensure_git_identity`):
+  - only the missing `user.name` and `user.email`, from its OS account, in
+    its own global config, on its own volume;
+  - an identity already set is kept, and a repository's own `user.*` still
+    wins at commit time, as in git.
+  - The manual identity step in `scripts/kind/k5-check.sh` is no longer
+    needed. Test: `k5_a_fresh_host_gets_a_git_identity`.
+
 ## K5: turning fs-relay on, on kind (runbook)
 
 For kind-app, once the review of fs-relay is clean. Everything here is on

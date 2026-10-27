@@ -496,9 +496,24 @@ pub fn projects_create(
     path: &str,
     color: Option<&str>,
 ) -> Result<Project, String> {
+    projects_create_as(None, name, path, color)
+}
+
+/// [`projects_create`] under a given project id (fs-relay: a controller
+/// and the agent host that holds the workspace register it under one id).
+/// An id already taken here gets a fresh one instead.
+pub fn projects_create_as(
+    id: Option<&str>,
+    name: &str,
+    path: &str,
+    color: Option<&str>,
+) -> Result<Project, String> {
     let db = db::shared();
     let conn = db.lock();
-    let project_id = Uuid::new_v4().to_string();
+    let project_id = id
+        .filter(|i| !i.is_empty() && Project::get(&conn, i).is_err())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let workspace_id = Uuid::new_v4().to_string();
     let tab_order = next_tab_order(&conn);
     let color = color.unwrap_or("#3b82f6").to_string();

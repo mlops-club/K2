@@ -2952,8 +2952,11 @@ fn code(a: &Option<(String, Value)>) -> (String, Value) {
 async fn a_new_workspace_is_made_on_its_host_and_bound_there() {
     let r = rig().await;
     let ctl = r.ctl_root.join("fresh");
-    let made = r.post(PROJECTS_CREATE, json!({"name": "fresh", "path": ctl})).await;
-    assert_eq!(made, None, "the controller's own handler registers it after");
+    // K5: the controller registers it from the host's answer, under the
+    // host's project id (its own handler doesn't run).
+    let (st, p) = r.post(PROJECTS_CREATE, json!({"name": "fresh", "path": ctl})).await.expect("answered");
+    assert_eq!(st, "200 OK", "{p}");
+    assert_eq!(p["path"], json!(ctl.to_string_lossy()), "the controller's row, its name");
     assert!(r.d.root.join("fresh").is_dir(), "made on the host");
     assert!(!ctl.exists(), "not on the controller's disk");
     assert!(
@@ -3161,4 +3164,85 @@ async fn phase2_off_by_default_every_entry_point_is_the_controllers_own() {
     let r = tokio::task::spawn_blocking(move || clone_unpack_on_host_on(remote, Path::new("/nonexistent.tar.gz"), "/ctl/work")).await.unwrap();
     assert!(matches!(r, Ok(None)), "a clone: unpacked here, as before");
     drop(h1);
+}
+
+// ── K5 ─────────────────────────────────────────────────────────────────
+
+/// K5 (the defect kind found): a relayed create-worktree names the
+/// controller's project id, which the host's database doesn't have. The
+/// host maps it to its own project for that path (or, with none, registers
+/// it under that id) instead of failing on the foreign key; git's worktree
+/// and the row agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k5_a_relayed_create_worktree_with_the_controllers_project_id() {
+    let d = host_disk();
+    let daemon = crate::test_harness::start("host-owner").await;
+    set_local_daemon(daemon.port, "host-owner");
+    committed_repo(&d.ws);
+    let host_project = k2_core::projects_ops::projects_create("notes", &d.ws.to_string_lossy(), None).unwrap();
+    let controllers_id = format!("controller-{}", uuid::Uuid::new_v4());
+    let body = json!({"projectPath": d.ws, "branch": "k5", "projectId": controllers_id});
+    let (st, v) = served("POST", "/cli/git/create-worktree", "", Some(body)).await;
+    assert_eq!(st, "200 OK", "{v}");
+    assert!(d.ws.join(".worktrees/k5/.git").exists());
+    let ws_id = v["workspaceId"].as_str().unwrap().to_string();
+    let row = k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), &ws_id).unwrap();
+    assert_eq!(row.project_id, host_project.id, "the host's project for that path");
+    // No project for the path on the host: registered under the
+    // controller's id.
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    committed_repo(&other);
+    let id2 = format!("controller-{}", uuid::Uuid::new_v4());
+    let (st, v) = served("POST", "/cli/git/create-worktree", "", Some(json!({"projectPath": other, "branch": "k5b", "projectId": id2}))).await;
+    assert_eq!(st, "200 OK", "{v}");
+    let row = k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), v["workspaceId"].as_str().unwrap()).unwrap();
+    assert_eq!(row.project_id, id2, "the controller's id, end to end");
+}
+
+/// K5: a project registered under a given id (the host's, on the
+/// controller) keeps it; an id already taken here gets a fresh one.
+#[test]
+fn k5_a_project_registered_under_the_hosts_id() {
+    let _home = crate::test_support::TempHome::new();
+    let id = uuid::Uuid::new_v4().to_string();
+    let p = k2_core::projects_ops::projects_create_as(Some(&id), "a", "/ctl/work/a", None).unwrap();
+    assert_eq!(p.id, id);
+    let q = k2_core::projects_ops::projects_create_as(Some(&id), "b", "/ctl/work/b", None).unwrap();
+    assert_ne!(q.id, id, "taken: a fresh one");
+}
+
+/// K5: a worktree made through the relay is in the controller's registry
+/// under the host's workspace id, and goes when it is removed.
+#[test]
+fn k5_the_controller_records_a_relayed_worktree() {
+    let _home = crate::test_support::TempHome::new();
+    let p = k2_core::projects_ops::projects_create("notes", "/ctl/work/notes", None).unwrap();
+    let ws_id = uuid::Uuid::new_v4().to_string();
+    let req = json!({"projectPath": "/ctl/work/notes", "branch": "feat", "projectId": p.id}).to_string();
+    let ans = Answer::json("200 OK", json!({"workspaceId": ws_id, "path": "/ctl/work/notes/.worktrees/feat", "branch": "feat"}));
+    mirror_worktree_rows("/cli/git/create-worktree", req.as_bytes(), &ans);
+    let row = k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), &ws_id).expect("recorded here");
+    assert_eq!((row.project_id.as_str(), row.worktree_path.as_deref()), (p.id.as_str(), Some("/ctl/work/notes/.worktrees/feat")));
+    let rm = json!({"projectPath": "/ctl/work/notes", "worktreePath": "/ctl/work/notes/.worktrees/feat", "workspaceId": ws_id}).to_string();
+    mirror_worktree_rows("/cli/git/remove-worktree", rm.as_bytes(), &Answer::json("200 OK", json!({"success": true})));
+    assert!(k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), &ws_id).is_err(), "removed here too");
+}
+
+/// K5: a fresh host gets a git identity at start (only the missing fields,
+/// in its global config); one already set is kept.
+#[test]
+fn k5_a_fresh_host_gets_a_git_identity() {
+    let home = crate::test_support::TempHome::new();
+    let get = |k: &str| {
+        let o = std::process::Command::new("git").args(["config", "--global", "--get", k]).env("GIT_CONFIG_NOSYSTEM", "1").output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    assert_eq!(get("user.name"), "", "a fresh HOME has none");
+    crate::hosts::host_git_identity();
+    assert!(!get("user.name").is_empty() && !get("user.email").is_empty(), "set at start");
+    // Already set: kept.
+    std::fs::write(home.path().join(".gitconfig"), "[user]\n\tname = Owner\n\temail = owner@example.com\n").unwrap();
+    crate::hosts::host_git_identity();
+    assert_eq!((get("user.name"), get("user.email")), ("Owner".to_string(), "owner@example.com".to_string()));
 }
