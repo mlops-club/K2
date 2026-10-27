@@ -96,6 +96,8 @@ pub fn status_json() -> serde_json::Value {
         "host_name": s.host_name,
         "controller": s.controller,
         "last_error": s.last_error,
+        // D7: the code to confirm on the controller, while it waits.
+        "pairing_code": super::enroll::pairing_code(&s.host_name),
         "attempts": s.attempts,
         "links": s.links,
     })

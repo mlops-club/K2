@@ -28,8 +28,9 @@ fn memory_db() -> Db {
     Arc::new(ReentrantMutex::new(Connection::open_in_memory().unwrap()))
 }
 
+/// A registry with its own pairing key (never the K2 home's).
 fn registry(mode: Mode) -> Arc<Registry> {
-    Registry::new(memory_db(), mode).unwrap()
+    Registry::new(memory_db(), mode).unwrap().with_pair_key(SigningKey::generate().unwrap())
 }
 
 fn request(key: &SigningKey, token: &str, name: &str) -> EnrollRequest {
@@ -253,7 +254,7 @@ fn owner_routes_need_the_owner_token() {
     let reg = registry(Mode::Enroll);
     let remote = crate::agent_host::remote::RemoteHost::new();
     let q = format!("token={OWNER}");
-    for path in [TOKENS_PATH, KEYS_PATH, REVOKE_PATH] {
+    for path in [TOKENS_PATH, KEYS_PATH, REVOKE_PATH, PENDING_PATH, CONFIRM_PATH] {
         let (status, _) = answer(&reg, &remote, path, "token=nope", OWNER, b"{}", 1);
         assert_eq!(status, "403 Forbidden", "{path}");
     }
@@ -509,5 +510,149 @@ async fn the_enroll_client_never_reuses_a_connection_the_controller_closed() {
     for i in 0..50 {
         let r = call(client.get(format!("{base}{CHALLENGE_PATH}")), "challenge").await;
         assert!(r.is_ok(), "request {i}: {r:?}");
+    }
+}
+
+// ── D7: pairing (the owner confirms the code the host shows) ───────────
+
+fn confirm_token(reg: &Registry, laptop: bool) -> String {
+    let opts = MintOptions { confirm: true, labels: if laptop { vec![LAPTOP_LABEL.into()] } else { vec![] } };
+    reg.mint(1_000, TOKEN_TTL_MS, &opts).unwrap().token
+}
+
+fn pending(r: Result<Enrolled, Refusal>) -> Pairing {
+    match r.expect("an answer") {
+        Enrolled::Pending(p) => p,
+        other => panic!("expected a pending pairing, got {other:?}"),
+    }
+}
+
+/// A confirm token's host is recorded, not enrolled: it gets a pairing
+/// (the same on every call), derives the code the controller would, and
+/// can't link. The owner sees it pending, without the code. The code the
+/// host shows enrolls it, with the token's labels; a wrong one refuses and
+/// burns the token. A second key can't take over a token mid-pairing.
+#[test]
+fn a_confirm_token_enrolls_only_when_the_owner_types_the_hosts_code() {
+    let reg = registry(Mode::Enroll);
+    let key = SigningKey::generate().unwrap();
+
+    // A wrong code: refused, and the token is burned.
+    let t1 = confirm_token(&reg, true);
+    assert!(t1.starts_with("k2e_") && t1.rsplit_once('.').is_some_and(|(_, fp)| fp.len() == 16), "{t1}");
+    let p1 = pending(reg.enroll_or_pair(&request(&key, &t1, "laptop"), 1_001));
+    let shown = pairing_code_for(&t1, &key, &p1).unwrap();
+    let wrong = if shown == "000000" { "000001" } else { "000000" };
+    assert_eq!(code(reg.confirm("laptop", wrong, 1_002)), "sas_mismatch");
+    assert_eq!(code(reg.enroll_or_pair(&request(&key, &t1, "laptop"), 1_003)), "token_invalid");
+    assert_eq!(reg.pending(1_003).unwrap(), Vec::<Value>::new());
+    assert_eq!(code(reg.confirm("laptop", &shown, 1_004)), "no_pairing", "the right code is too late");
+
+    // A new token: the same pairing on every call until confirmed.
+    let t2 = confirm_token(&reg, true);
+    let p2 = pending(reg.enroll_or_pair(&request(&key, &t2, "laptop"), 2_001));
+    let again = pending(reg.enroll_or_pair(&request(&key, &t2, "laptop"), 2_002));
+    assert_eq!((&again.nonce, &again.controller_key_pem), (&p2.nonce, &p2.controller_key_pem), "the same pairing");
+    assert_eq!(pairing_code_for(&t2, &key, &again).unwrap(), pairing_code_for(&t2, &key, &p2).unwrap(), "the same code");
+    assert_ne!(p2.nonce, p1.nonce);
+    let other = SigningKey::generate().unwrap();
+    assert_eq!(code(reg.enroll_or_pair(&request(&other, &t2, "laptop"), 2_003)), "token_in_use");
+    assert_eq!(code(hello(&reg, &key, "laptop", 2_004)), "unknown_host_key", "not enrolled before the owner confirms");
+    let list = reg.pending(2_005).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!((list[0]["host_name"].clone(), list[0]["fingerprint"].clone()), (json!("laptop"), json!(key.fingerprint())));
+    assert!(!list[0].to_string().contains(&pairing_code_for(&t2, &key, &p2).unwrap()), "the owner reads the code on the host");
+
+    // The code the host shows (spaces allowed): enrolled, with the laptop label.
+    let shown = k2_core::compute::proto::pairing::display_sas(&pairing_code_for(&t2, &key, &p2).unwrap());
+    let k = reg.confirm("laptop", &shown, 2_006).unwrap();
+    assert_eq!(k.labels, vec!["pool=lab".to_string(), LAPTOP_LABEL.to_string()]);
+    assert!(matches!(reg.enroll_or_pair(&request(&key, &t2, "laptop"), 2_007), Ok(Enrolled::Key(_))));
+    hello(&reg, &key, "laptop", 2_008).unwrap();
+    let nonce = reg.challenge(2_009).unwrap();
+    let presented = signed_hello_token(&key, &nonce, "laptop").unwrap();
+    assert_eq!(merge_labels(&[], &reg.key_labels(&presented)), vec!["pool=lab".to_string(), LAPTOP_LABEL.to_string()]);
+    assert_eq!(merge_labels(&["k2.kind=server".to_string()], &reg.key_labels(&presented)), vec!["k2.kind=server".to_string(), "pool=lab".to_string()], "a hello label wins");
+
+    // A token minted without `confirm` enrolls at once, as before.
+    let plain = reg.mint_token(3_000, TOKEN_TTL_MS).unwrap();
+    assert!(!plain.confirm && !plain.token.contains('.'));
+    assert!(matches!(reg.enroll_or_pair(&request(&SigningKey::generate().unwrap(), &plain.token, "server"), 3_001), Ok(Enrolled::Key(_))));
+}
+
+/// The host refuses to pair with a key its token doesn't name (a man in
+/// the middle answering with his own key and signature), a signature that
+/// doesn't verify, or a token that names no key.
+#[test]
+fn the_host_pairs_only_with_the_controller_its_token_names() {
+    let reg = registry(Mode::Enroll);
+    let key = SigningKey::generate().unwrap();
+    let token = confirm_token(&reg, false);
+    let p = pending(reg.enroll_or_pair(&request(&key, &token, "laptop"), 1_001));
+    pairing_code_for(&token, &key, &p).unwrap();
+
+    let mitm = registry(Mode::Enroll);
+    let theirs = confirm_token(&mitm, false);
+    let forged = pending(mitm.enroll_or_pair(&request(&key, &theirs, "laptop"), 1_001));
+    let err = pairing_code_for(&token, &key, &Pairing { nonce: p.nonce.clone(), ..forged.clone() }).unwrap_err();
+    assert!(err.contains("is not the one the token names"), "{err}");
+    let err = pairing_code_for(&token, &key, &Pairing { sig: forged.sig.clone(), ..p.clone() }).unwrap_err();
+    assert!(err.contains("signature doesn't verify"), "{err}");
+    let err = pairing_code_for(&token, &key, &Pairing { nonce: "other".into(), ..p.clone() }).unwrap_err();
+    assert!(err.contains("signature doesn't verify"), "a nonce it didn't sign");
+    let plain = reg.mint_token(1_000, TOKEN_TTL_MS).unwrap().token;
+    assert!(pairing_code_for(&plain, &key, &p).unwrap_err().contains("names no controller key"));
+}
+
+/// Over HTTP, with the host's own code: it waits, showing the code (its
+/// link status carries it); the owner sees it pending and confirms with
+/// that code; the host links, and its hello labels have `k2.kind=laptop`
+/// from its token although the laptop sent none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_laptop_pairs_over_http_when_the_owner_confirms_its_code() {
+    let c = Controller::start(Mode::Enroll).await;
+    let http = reqwest::Client::new();
+    let post = |path: &str, body: Value| {
+        let (http, url) = (http.clone(), format!("{}{path}?token={OWNER}", c.base));
+        async move {
+            let r = http.post(url).body(body.to_string()).send().await.unwrap();
+            let status = r.status().as_u16();
+            (status, serde_json::from_str::<Value>(&r.text().await.unwrap()).unwrap())
+        }
+    };
+    let (_, minted) = post(TOKENS_PATH, json!({"laptop": true, "ttl_secs": 600})).await;
+    assert_eq!((minted["confirm"].clone(), minted["labels"].clone()), (json!(true), json!([LAPTOP_LABEL])));
+    let token = minted["token"].as_str().unwrap().to_string();
+    let key = SigningKey::generate().unwrap();
+
+    let err = within("first try", signed_hello(&c.host("eric-mbp", &token), &key)).await.unwrap_err();
+    assert!(err.contains("waiting for the owner to confirm the pairing code"), "{err}");
+    let shown = pairing_code("eric-mbp").expect("the code the host shows");
+    assert!(err.contains(&shown), "{err}");
+    let listed = http.get(format!("{}{PENDING_PATH}?token={OWNER}", c.base)).send().await.unwrap().text().await.unwrap();
+    assert!(listed.contains("eric-mbp") && !listed.contains(&shown.replace(' ', "")), "{listed}");
+
+    let (status, out) = post(CONFIRM_PATH, json!({"host_name": "eric-mbp", "code": shown})).await;
+    assert_eq!(status, 200, "{out}");
+    let hello_token = within("after the confirm", signed_hello(&c.host("eric-mbp", &token), &key)).await.unwrap();
+    assert_eq!(pairing_code("eric-mbp"), None, "paired: nothing to show");
+    let (_ws, welcome) = link(&c, "eric-mbp", &hello_token).await;
+    assert!(matches!(&welcome, Frame::Welcome { host_id, .. } if host_id == "eric-mbp"), "{welcome:?}");
+    let status = c.remote.status_json();
+    let host = status["hosts"].as_array().unwrap().iter().find(|h| h["host_id"] == "eric-mbp").unwrap().clone();
+    assert_eq!((host["kind"].clone(), host["labels"].clone()), (json!("laptop"), json!([LAPTOP_LABEL])), "{host}");
+}
+
+/// Every enrollment route is in the dispatcher's route table, for its
+/// method (D7's confirm answered 405 on a real daemon before its row was
+/// added: the unit tests call `answer` directly).
+#[test]
+fn every_enrollment_route_has_a_route_policy_row() {
+    use crate::routes::route_policy::{lookup, post_allowed};
+    for path in [ENROLL_PATH, TOKENS_PATH, REVOKE_PATH, CONFIRM_PATH] {
+        assert!(post_allowed(path), "POST {path} must pass the dispatcher's allowlist");
+    }
+    for path in [CHALLENGE_PATH, KEYS_PATH, PENDING_PATH] {
+        assert!(lookup(path).is_some(), "GET {path} must have a route policy row");
     }
 }

@@ -67,6 +67,8 @@ where
             if host_name.trim().is_empty() {
                 return refuse(&mut ws, "protocol", "host_name is empty").await;
             }
+            // D7: the labels its key was enrolled with (`k2.kind=laptop`).
+            let labels = super::enroll::hello_labels(remote, &presented, labels);
             (host_name, labels, protocol, resume, ended)
         }
         Ok(other) => return refuse(&mut ws, "protocol", &format!("expected hello, got {}", other.kind())).await,

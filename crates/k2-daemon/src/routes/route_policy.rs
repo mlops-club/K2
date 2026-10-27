@@ -707,6 +707,10 @@ pub const ROUTES: &[Route] = &[
     get("/cli/hosts/challenge", Public),
     post("/cli/hosts/enroll", Public),
     post("/cli/hosts/enroll-tokens", NoLogin),
+    // Pairing (P3 D7): the owner lists waiting hosts and confirms one with
+    // the code it shows.
+    post("/cli/hosts/enroll/confirm", NoLogin),
+    get("/cli/hosts/enroll/pending", NoLogin),
     // Home sync (P3 T1): a host's transfer token (from its hello credential
     // on `session`) is the credential; status takes the owner token.
     post("/cli/hosts/home/commit", Public),

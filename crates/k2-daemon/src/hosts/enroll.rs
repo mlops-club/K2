@@ -16,6 +16,15 @@
 //!   the enrolled one, a spent or stale nonce, a bad signature, and in
 //!   enroll mode the bootstrap token itself.
 //!
+//! - P3 D7, pairing (`docs/prd/progress/pairing.md`): a token minted with
+//!   `confirm` (or `laptop`) carries the first 16 hex characters of the
+//!   controller's pairing key, and enrolls only once the owner confirms.
+//!   The host's first enroll call gets a fresh nonce, the controller's key
+//!   and its signature; both ends derive six digits from both keys, the
+//!   nonce and the token ([`pairing_sas`]); the host shows them and the
+//!   owner types them on the controller (`POST /cli/hosts/enroll/confirm`).
+//!   A wrong code refuses and burns the token.
+//!
 //! The sequence, the env names and the routes are in
 //! `docs/prd/progress/host-enroll.md`.
 
@@ -54,9 +63,23 @@ pub const TOKENS_PATH: &str = "/cli/hosts/enroll-tokens";
 pub const KEYS_PATH: &str = "/cli/hosts/keys";
 /// Owner: revoke a key (by host name or fingerprint).
 pub const REVOKE_PATH: &str = "/cli/hosts/keys/revoke";
+/// Owner (D7): the pairings waiting for the owner's confirmation.
+pub const PENDING_PATH: &str = "/cli/hosts/enroll/pending";
+/// Owner (D7): confirm a pairing with the six digits its host shows.
+pub const CONFIRM_PATH: &str = "/cli/hosts/enroll/confirm";
+/// Controller: its pairing key (default `<K2 home>/host-pairing-key.pem`).
+pub const PAIR_KEY_FILE_VAR: &str = "K2_HOST_PAIR_KEY_FILE";
+/// The label a token minted for a laptop gives its key (and so its hello).
+pub const LAPTOP_LABEL: &str = "k2.kind=laptop";
 
 const DOMAIN_ENROLL: &str = "k2-host-enroll-v1";
 const DOMAIN_HELLO: &str = "k2-host-hello-v1";
+/// The controller's signature over a pairing (host key, nonce, token).
+const DOMAIN_PAIR: &str = "k2-host-pair-v1";
+/// The pairing's six digits (k2-node's CN1 construction, its own domain).
+const SAS_DOMAIN: &str = "k2-host-sas-v1";
+/// Hex characters of the pairing key's fingerprint a confirm token carries.
+const FP_PREFIX_LEN: usize = 16;
 /// `hello.token` of a signed hello starts with this.
 pub const SIGNED_PREFIX: &str = "k2host1.";
 
@@ -73,6 +96,12 @@ pub mod events {
     pub const CTL_HOST_ADMITTED: &str = "ctl.host_admitted";
     pub const CTL_HOST_REFUSED: &str = "ctl.host_refused";
     pub const CTL_HOST_REVOKED: &str = "ctl.host_revoked";
+    /// D7: a host asked to pair; the owner must confirm.
+    pub const CTL_HOST_PAIRING: &str = "ctl.host_pairing";
+    /// D7: the owner confirmed (attrs: ok).
+    pub const CTL_HOST_PAIRED: &str = "ctl.host_paired";
+    /// D7: the host shows its pairing code.
+    pub const HOST_PAIRING: &str = "host.pairing";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +163,21 @@ pub fn signed_hello_token(key: &SigningKey, nonce: &str, host_name: &str) -> Res
     Ok(format!("{SIGNED_PREFIX}{fp}.{nonce}.{sig}"))
 }
 
+/// D7: the six digits of a pairing, the same on both ends: both keys, the
+/// nonce the controller picked after the host's key came, and the token.
+pub fn pairing_sas(controller_fp: &str, host_fp: &str, nonce: &str, token: &str) -> String {
+    k2_core::compute::proto::pairing::sas_digits(
+        SAS_DOMAIN,
+        &[controller_fp.as_bytes(), host_fp.as_bytes(), nonce.as_bytes(), token_hash(token).as_bytes()],
+    )
+}
+
+/// The pairing key prefix a confirm token carries (`k2e_<hex>.<fp16>`).
+fn token_fp_prefix(token: &str) -> Option<&str> {
+    let (_, fp) = token.rsplit_once('.')?;
+    (fp.len() == FP_PREFIX_LEN && fp.chars().all(|c| c.is_ascii_hexdigit())).then_some(fp)
+}
+
 /// `(fingerprint, nonce, signature)` of a signed hello token. Base64 and
 /// hex never hold a `.`.
 fn parse_signed(token: &str) -> Option<(&str, &str, &str)> {
@@ -171,6 +215,36 @@ pub struct EnrollRequest {
 pub struct Minted {
     pub token: String,
     pub expires_ms: i64,
+    /// D7: it enrolls only once the owner confirms the pairing code.
+    pub confirm: bool,
+    /// Labels its key gets (`k2.kind=laptop`).
+    pub labels: Vec<String>,
+}
+
+/// How a token is minted (D7).
+#[derive(Debug, Clone, Default)]
+pub struct MintOptions {
+    pub confirm: bool,
+    pub labels: Vec<String>,
+}
+
+/// D7: the controller's answer to a host that asked to pair: what the host
+/// checks (the key against its token's prefix, the signature) and derives
+/// the six digits from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pairing {
+    pub nonce: String,
+    pub controller_key_pem: String,
+    /// The controller's signature over (host key, nonce, token).
+    pub sig: String,
+}
+
+/// What an enroll call came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Enrolled {
+    Key(HostKey),
+    /// D7: recorded; enrolled once the owner confirms the code.
+    Pending(Pairing),
 }
 
 pub fn ensure_schema(c: &Connection) -> rusqlite::Result<()> {
@@ -191,8 +265,27 @@ pub fn ensure_schema(c: &Connection) -> rusqlite::Result<()> {
             revoked_ms INTEGER,
             revoked_reason TEXT
         );
-        CREATE INDEX IF NOT EXISTS host_keys_name ON host_keys(host_name);",
-    )
+        CREATE INDEX IF NOT EXISTS host_keys_name ON host_keys(host_name);
+        CREATE TABLE IF NOT EXISTS host_pairings (
+            token_sha TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            host_name TEXT NOT NULL,
+            public_key_pem TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '[]',
+            nonce TEXT NOT NULL,
+            created_ms INTEGER NOT NULL
+        );",
+    )?;
+    // D7: tokens minted before pairing have neither column.
+    for (col, ty) in [("confirm", "INTEGER NOT NULL DEFAULT 0"), ("labels", "TEXT NOT NULL DEFAULT '[]'")] {
+        let has = c
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('host_enroll_tokens') WHERE name = '{col}'"))
+            .and_then(|mut st| st.exists([]))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE host_enroll_tokens ADD COLUMN {col} {ty};"))?;
+        }
+    }
+    Ok(())
 }
 
 fn row_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<(HostKey, String)> {
@@ -218,6 +311,8 @@ pub struct Registry {
     db: Db,
     mode: Mode,
     nonces: Mutex<HashMap<String, i64>>,
+    /// D7: the key pairings are signed with (made on first use).
+    pair_key: Mutex<Option<Arc<SigningKey>>>,
 }
 
 fn db_err(e: rusqlite::Error) -> String {
@@ -227,7 +322,27 @@ fn db_err(e: rusqlite::Error) -> String {
 impl Registry {
     pub fn new(db: Db, mode: Mode) -> Result<Arc<Self>, String> {
         ensure_schema(&db.lock()).map_err(db_err)?;
-        Ok(Arc::new(Registry { db, mode, nonces: Mutex::default() }))
+        Ok(Arc::new(Registry { db, mode, nonces: Mutex::default(), pair_key: Mutex::default() }))
+    }
+
+    /// D7: pair with `key` (tests; production loads `K2_HOST_PAIR_KEY_FILE`).
+    pub fn with_pair_key(self: Arc<Self>, key: SigningKey) -> Arc<Self> {
+        *self.pair_key.lock() = Some(Arc::new(key));
+        self
+    }
+
+    fn pair_key(&self) -> Result<Arc<SigningKey>, String> {
+        let mut k = self.pair_key.lock();
+        if let Some(k) = &*k {
+            return Ok(Arc::clone(k));
+        }
+        let path = env(PAIR_KEY_FILE_VAR)
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| k2_core::paths::k2_home().join("host-pairing-key.pem"));
+        let key = Arc::new(load_or_create_key(&path)?);
+        *k = Some(Arc::clone(&key));
+        Ok(key)
     }
 
     pub fn mode(&self) -> Mode {
@@ -235,16 +350,27 @@ impl Registry {
     }
 
     pub fn mint_token(&self, now: i64, ttl_ms: i64) -> Result<Minted, String> {
-        let token = format!("k2e_{}", crypto::hex(&crypto::random_bytes(16)?));
+        self.mint(now, ttl_ms, &MintOptions::default())
+    }
+
+    /// A one-time token. D7: with `confirm`, it carries the pairing key's
+    /// fingerprint prefix and enrolls only once the owner confirms.
+    pub fn mint(&self, now: i64, ttl_ms: i64, opts: &MintOptions) -> Result<Minted, String> {
+        let mut token = format!("k2e_{}", crypto::hex(&crypto::random_bytes(16)?));
+        if opts.confirm {
+            let fp = self.pair_key()?.fingerprint();
+            token = format!("{token}.{}", &fp[..FP_PREFIX_LEN]);
+        }
         let expires_ms = now + ttl_ms.clamp(1, TOKEN_TTL_MAX_MS);
+        let labels = serde_json::to_string(&opts.labels).unwrap_or_else(|_| "[]".into());
         self.db
             .lock()
             .execute(
-                "INSERT INTO host_enroll_tokens (token_sha, created_ms, expires_ms) VALUES (?1, ?2, ?3)",
-                params![token_hash(&token), now, expires_ms],
+                "INSERT INTO host_enroll_tokens (token_sha, created_ms, expires_ms, confirm, labels) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![token_hash(&token), now, expires_ms, opts.confirm, labels],
             )
             .map_err(db_err)?;
-        Ok(Minted { token, expires_ms })
+        Ok(Minted { token, expires_ms, confirm: opts.confirm, labels: opts.labels.clone() })
     }
 
     fn key(&self, fingerprint: &str) -> Result<Option<(HostKey, String)>, String> {
@@ -264,8 +390,21 @@ impl Registry {
 
     /// Store `req`'s key and spend its token. A key that is already
     /// enrolled under the same name answers as enrolled without touching
-    /// a token, so a host can call this on every start.
+    /// a token, so a host can call this on every start. A token that needs
+    /// the owner's confirmation (D7) is refused here: see
+    /// [`Self::enroll_or_pair`].
     pub fn enroll(&self, req: &EnrollRequest, now: i64) -> Result<HostKey, Refusal> {
+        match self.enroll_or_pair(req, now)? {
+            Enrolled::Key(k) => Ok(k),
+            Enrolled::Pending(_) => Err(refusal("pairing_pending", "this token enrolls only once the owner confirms the pairing code")),
+        }
+    }
+
+    /// [`Self::enroll`], or for a confirm token (D7) the pairing the host
+    /// shows the code of: recorded on the first call (a fresh nonce, picked
+    /// now that the host's key is in), the same on every call after, until
+    /// the owner confirms ([`Self::confirm`]).
+    pub fn enroll_or_pair(&self, req: &EnrollRequest, now: i64) -> Result<Enrolled, Refusal> {
         let internal = |e: String| refusal("internal", e);
         let name = req.host_name.trim();
         if name.is_empty() || name != req.host_name || name.len() > 128 {
@@ -291,7 +430,7 @@ impl Registry {
                     format!("host key {}… is enrolled as {:?}, not {name:?}", short(&fp), k.host_name),
                 ));
             }
-            return Ok(k);
+            return Ok(Enrolled::Key(k));
         }
         let holder: Option<String> = db
             .query_row(
@@ -310,39 +449,186 @@ impl Registry {
                 ),
             ));
         }
+        let token_invalid = || {
+            refusal(
+                "token_invalid",
+                "the enrollment token is unknown, already used or expired: mint a new one on the controller \
+                 (POST /cli/hosts/enroll-tokens)",
+            )
+        };
+        let th = token_hash(&req.token);
+        let row: Option<(bool, String)> = db
+            .query_row(
+                "SELECT confirm, labels FROM host_enroll_tokens WHERE token_sha = ?1 AND used_ms IS NULL AND expires_ms > ?2",
+                params![th, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| internal(db_err(e)))?;
+        let (confirm, token_labels) = row.ok_or_else(token_invalid)?;
+        let labels = merge_labels(&req.labels, &serde_json::from_str::<Vec<String>>(&token_labels).unwrap_or_default());
+        if confirm {
+            drop(db);
+            return self.pairing(&th, &fp, name, &der, &labels, now).map(Enrolled::Pending);
+        }
         let spent = db
             .execute(
                 "UPDATE host_enroll_tokens SET used_ms = ?2, used_by = ?3
                  WHERE token_sha = ?1 AND used_ms IS NULL AND expires_ms > ?2",
-                params![token_hash(&req.token), now, fp],
+                params![th, now, fp],
             )
             .map_err(|e| internal(db_err(e)))?;
         if spent != 1 {
-            return Err(refusal(
-                "token_invalid",
-                "the enrollment token is unknown, already used or expired: mint a new one on the controller \
-                 (POST /cli/hosts/enroll-tokens)",
-            ));
+            return Err(token_invalid());
         }
-        let labels = serde_json::to_string(&req.labels).unwrap_or_else(|_| "[]".into());
-        db.execute(
-            "INSERT INTO host_keys (fingerprint, host_name, public_key_pem, labels, enrolled_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![fp, name, crypto::pem_encode("PUBLIC KEY", &der), labels, now],
-        )
-        .map_err(|e| internal(db_err(e)))?;
         drop(db);
-        log_debug!("[hosts/enroll] enrolled {name} with key {}…", short(&fp));
-        k2_core::trace::emit(|| {
-            k2_core::trace::Event::new(events::CTL_HOST_ENROLLED).attr("host", name).attr("fp", short(&fp))
-        });
+        self.store_key(&fp, name, &der, &labels, now).map(Enrolled::Key)
+    }
+
+    fn store_key(&self, fp: &str, name: &str, der: &[u8], labels: &[String], now: i64) -> Result<HostKey, Refusal> {
+        let json_labels = serde_json::to_string(labels).unwrap_or_else(|_| "[]".into());
+        self.db
+            .lock()
+            .execute(
+                "INSERT INTO host_keys (fingerprint, host_name, public_key_pem, labels, enrolled_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![fp, name, crypto::pem_encode("PUBLIC KEY", der), json_labels, now],
+            )
+            .map_err(|e| refusal("internal", db_err(e)))?;
+        log_debug!("[hosts/enroll] enrolled {name} with key {}…", short(fp));
+        k2_core::trace::emit(|| k2_core::trace::Event::new(events::CTL_HOST_ENROLLED).attr("host", name).attr("fp", short(fp)));
         Ok(HostKey {
-            fingerprint: fp,
+            fingerprint: fp.to_string(),
             host_name: name.to_string(),
-            labels: req.labels.clone(),
+            labels: labels.to_vec(),
             enrolled_ms: now,
             revoked_ms: None,
             revoked_reason: None,
         })
+    }
+
+    /// D7: the pairing for confirm token `th` and this host key: made on
+    /// the first call, the same after. Another key on the same token is
+    /// refused (only one host pairs with a token).
+    fn pairing(&self, th: &str, fp: &str, name: &str, der: &[u8], labels: &[String], now: i64) -> Result<Pairing, Refusal> {
+        let internal = |e: String| refusal("internal", e);
+        let key = self.pair_key().map_err(internal)?;
+        let db = self.db.lock();
+        let held: Option<(String, String)> = db
+            .query_row("SELECT fingerprint, nonce FROM host_pairings WHERE token_sha = ?1", [th], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(|e| internal(db_err(e)))?;
+        let nonce = match held {
+            Some((other, _)) if other != fp => {
+                return Err(refusal("token_in_use", "this enrollment token is pairing another host key: mint a new one"));
+            }
+            Some((_, nonce)) => nonce,
+            None => {
+                let nonce = crypto::hex(&crypto::random_bytes(16).map_err(internal)?);
+                db.execute(
+                    "INSERT INTO host_pairings (token_sha, fingerprint, host_name, public_key_pem, labels, nonce, created_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        th,
+                        fp,
+                        name,
+                        crypto::pem_encode("PUBLIC KEY", der),
+                        serde_json::to_string(labels).unwrap_or_else(|_| "[]".into()),
+                        nonce,
+                        now
+                    ],
+                )
+                .map_err(|e| internal(db_err(e)))?;
+                log_debug!("[hosts/enroll] {name} ({}…) asks to pair: confirm its code (POST {CONFIRM_PATH})", short(fp));
+                k2_core::trace::emit(|| k2_core::trace::Event::new(events::CTL_HOST_PAIRING).attr("host", name).attr("fp", short(fp)));
+                nonce
+            }
+        };
+        let sig = key.sign_domain(DOMAIN_PAIR, &[fp.as_bytes(), nonce.as_bytes(), th.as_bytes()]).map_err(internal)?;
+        Ok(Pairing { nonce, controller_key_pem: key.spki_pem(), sig })
+    }
+
+    /// D7: the pairings waiting for the owner, without their codes (the
+    /// owner reads the code on the host).
+    pub fn pending(&self, now: i64) -> Result<Vec<Value>, String> {
+        let db = self.db.lock();
+        let mut st = db
+            .prepare(
+                "SELECT p.host_name, p.fingerprint, p.labels, p.created_ms, t.expires_ms FROM host_pairings p
+                 JOIN host_enroll_tokens t ON t.token_sha = p.token_sha
+                 WHERE t.used_ms IS NULL AND t.expires_ms > ?1 ORDER BY p.created_ms",
+            )
+            .map_err(db_err)?;
+        let rows = st
+            .query_map([now], |r| {
+                let labels: String = r.get(2)?;
+                Ok(json!({
+                    "host_name": r.get::<_, String>(0)?,
+                    "fingerprint": r.get::<_, String>(1)?,
+                    "labels": serde_json::from_str::<Value>(&labels).unwrap_or(json!([])),
+                    "created_ms": r.get::<_, i64>(3)?,
+                    "expires_ms": r.get::<_, i64>(4)?,
+                }))
+            })
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    /// D7: the owner typed `code` for `host_name`'s pairing. The code its
+    /// host shows: the key is enrolled and the token spent. Anything else:
+    /// refused, and the token is burned (a new pairing needs a new token).
+    pub fn confirm(&self, host_name: &str, code: &str, now: i64) -> Result<HostKey, Refusal> {
+        let internal = |e: String| refusal("internal", e);
+        let key = self.pair_key().map_err(internal)?;
+        let row: Option<(String, String, String, String, String)> = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT p.token_sha, p.fingerprint, p.public_key_pem, p.labels, p.nonce FROM host_pairings p
+                 JOIN host_enroll_tokens t ON t.token_sha = p.token_sha
+                 WHERE p.host_name = ?1 AND t.used_ms IS NULL AND t.expires_ms > ?2
+                 ORDER BY p.created_ms DESC LIMIT 1",
+                params![host_name, now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(|e| internal(db_err(e)))?;
+        let (th, fp, pem, labels, nonce) =
+            row.ok_or_else(|| refusal("no_pairing", format!("no host named {host_name:?} is waiting to pair (GET {PENDING_PATH})")))?;
+        let expected = k2_core::compute::proto::pairing::sas_digits(
+            SAS_DOMAIN,
+            &[key.fingerprint().as_bytes(), fp.as_bytes(), nonce.as_bytes(), th.as_bytes()],
+        );
+        let ok = k2_core::compute::proto::pairing::sas_matches(&expected, code);
+        {
+            let db = self.db.lock();
+            let used_by = if ok { fp.clone() } else { format!("refused:{fp}") };
+            db.execute(
+                "UPDATE host_enroll_tokens SET used_ms = ?2, used_by = ?3 WHERE token_sha = ?1 AND used_ms IS NULL",
+                params![th, now, used_by],
+            )
+            .map_err(|e| internal(db_err(e)))?;
+            db.execute("DELETE FROM host_pairings WHERE token_sha = ?1", [&th]).map_err(|e| internal(db_err(e)))?;
+        }
+        k2_core::trace::emit(|| k2_core::trace::Event::new(events::CTL_HOST_PAIRED).attr("host", host_name).attr("ok", ok));
+        if !ok {
+            log_debug!("[hosts/enroll] {host_name}'s pairing code didn't match: refused, its token is burned");
+            return Err(refusal(
+                "sas_mismatch",
+                format!("that is not the code {host_name} shows: pairing refused, and its token can't be used again (mint a new one)"),
+            ));
+        }
+        let der = crypto::pem_decode("PUBLIC KEY", &pem).map_err(internal)?;
+        let labels: Vec<String> = serde_json::from_str(&labels).unwrap_or_default();
+        self.store_key(&fp, host_name, &der, &labels, now)
+    }
+
+    /// D7: the labels `presented`'s key was enrolled with (`k2.kind=laptop`
+    /// from its token), for its hello.
+    pub fn key_labels(&self, presented: &str) -> Vec<String> {
+        parse_signed(presented)
+            .and_then(|(fp, _, _)| self.key(fp).ok().flatten())
+            .map(|(k, _)| k.labels)
+            .unwrap_or_default()
     }
 
     /// A fresh single-use nonce.
@@ -452,6 +738,19 @@ impl Registry {
     }
 }
 
+/// `hello`'s labels with `extra` added, a hello label winning over an
+/// extra one for the same key (`k2.kind=…`).
+pub fn merge_labels(hello: &[String], extra: &[String]) -> Vec<String> {
+    let key = |l: &str| l.split_once('=').map(|(k, _)| k.to_string()).unwrap_or_else(|| l.to_string());
+    let mut out = hello.to_vec();
+    for l in extra {
+        if !out.iter().any(|h| key(h) == key(l)) {
+            out.push(l.clone());
+        }
+    }
+    out
+}
+
 fn revoked(k: &HostKey, at: i64) -> Refusal {
     refusal(
         "revoked_host_key",
@@ -519,6 +818,15 @@ fn registry_for(remote: &RemoteHost) -> Option<Arc<Registry>> {
 /// `hub::serve_attach`'s hook: may the host that sent this `hello` link?
 /// A `RemoteHost` with no registry (the hub's own tests) and a token-mode
 /// controller check the bootstrap token as before.
+/// D7: `labels` with the labels `presented`'s key was enrolled with.
+pub fn hello_labels(remote: &RemoteHost, presented: &str, labels: Vec<String>) -> Vec<String> {
+    let reg = if std::ptr::eq(remote, crate::agent_host::remote::global()) { controller_registry().ok() } else { registry_for(remote) };
+    match reg.filter(|r| r.mode() == Mode::Enroll) {
+        Some(reg) => merge_labels(&labels, &reg.key_labels(presented)),
+        None => labels,
+    }
+}
+
 pub fn admit_hello(remote: &RemoteHost, bootstrap: &str, presented: &str, host_name: &str) -> Result<(), Refusal> {
     let reg = if std::ptr::eq(remote, crate::agent_host::remote::global()) {
         Some(controller_registry().map_err(|e| refusal("internal", e))?)
@@ -541,13 +849,14 @@ fn refusal_status(code: &str) -> &'static str {
     match code {
         "bad_request" => "400 Bad Request",
         "internal" => "500 Internal Server Error",
-        "already_enrolled" | "name_taken" => "409 Conflict",
+        "already_enrolled" | "name_taken" | "token_in_use" => "409 Conflict",
+        "no_pairing" => "404 Not Found",
         _ => "403 Forbidden",
     }
 }
 
 fn is_ours(path: &str) -> bool {
-    [CHALLENGE_PATH, ENROLL_PATH, TOKENS_PATH, KEYS_PATH, REVOKE_PATH].contains(&path)
+    [CHALLENGE_PATH, ENROLL_PATH, TOKENS_PATH, KEYS_PATH, REVOKE_PATH, PENDING_PATH, CONFIRM_PATH].contains(&path)
 }
 
 /// `gate::route`'s hook for the enrollment routes. `true` = answered.
@@ -556,7 +865,7 @@ pub async fn route(stream: &mut TcpStream, buf: &mut [u8], path: &str, query: &s
     if !is_ours(path) || crate::runtime_role::current() != crate::runtime_role::Role::Controller {
         return false;
     }
-    let body = if matches!(path, ENROLL_PATH | TOKENS_PATH | REVOKE_PATH) {
+    let body = if matches!(path, ENROLL_PATH | TOKENS_PATH | REVOKE_PATH | CONFIRM_PATH) {
         http::read_post_body(&mut *stream, buf).await
     } else {
         let _ = stream.read(buf).await;
@@ -590,19 +899,45 @@ pub fn answer(
         },
         ENROLL_PATH => match serde_json::from_value::<EnrollRequest>(body) {
             Err(e) => ("400 Bad Request", json!({"error": format!("enroll body: {e}"), "code": "bad_request"})),
-            Ok(req) => match reg.enroll(&req, now) {
-                Ok(k) => {
+            Ok(req) => match reg.enroll_or_pair(&req, now) {
+                Ok(Enrolled::Key(k)) => {
                     sync_enrolled(reg, remote);
                     ("200 OK", json!({"enrolled": k, "mode": format!("{:?}", reg.mode()).to_lowercase()}))
                 }
+                Ok(Enrolled::Pending(p)) => ("202 Accepted", json!({"pending": p})),
                 Err(r) => (refusal_status(r.code), json!({"error": r.message, "code": r.code})),
             },
         },
         TOKENS_PATH if owner() => {
             let ttl = body.get("ttl_secs").and_then(Value::as_i64).map(|s| s.saturating_mul(1000)).unwrap_or(TOKEN_TTL_MS);
-            match reg.mint_token(now, ttl) {
+            // D7: a laptop's token pairs (the owner confirms its code) and
+            // gives its key `k2.kind=laptop`.
+            let laptop = body.get("laptop").and_then(Value::as_bool).unwrap_or(false);
+            let opts = MintOptions {
+                confirm: laptop || body.get("confirm").and_then(Value::as_bool).unwrap_or(false),
+                labels: if laptop { vec![LAPTOP_LABEL.to_string()] } else { Vec::new() },
+            };
+            match reg.mint(now, ttl, &opts) {
                 Ok(m) => ("200 OK", json!(m)),
                 Err(e) => ("500 Internal Server Error", json!({"error": e})),
+            }
+        }
+        PENDING_PATH if owner() => match reg.pending(now) {
+            Ok(p) => ("200 OK", json!({"pending": p})),
+            Err(e) => ("500 Internal Server Error", json!({"error": e})),
+        },
+        CONFIRM_PATH if owner() => {
+            let name = body.get("host_name").and_then(Value::as_str).unwrap_or("");
+            let code = body.get("code").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() || code.is_empty() {
+                return ("400 Bad Request", json!({"error": "say which host and the code it shows: {\"host_name\": …, \"code\": \"482 913\"}"}));
+            }
+            match reg.confirm(name, code, now) {
+                Ok(k) => {
+                    sync_enrolled(reg, remote);
+                    ("200 OK", json!({"enrolled": k}))
+                }
+                Err(r) => (refusal_status(r.code), json!({"error": r.message, "code": r.code})),
             }
         }
         KEYS_PATH if owner() => match reg.keys() {
@@ -734,6 +1069,21 @@ pub async fn signed_hello(cfg: &HostConfig, key: &SigningKey) -> Result<String, 
     };
     let body = serde_json::to_string(&req).map_err(|e| format!("encode enroll: {e}"))?;
     let enrolled = call(client.post(format!("{base}{ENROLL_PATH}")).body(body), "enroll").await?;
+    if let Some(p) = enrolled.get("pending") {
+        let p: Pairing = serde_json::from_value(p.clone()).map_err(|e| format!("enroll: pairing answer: {e}"))?;
+        let code = pairing_code_for(&cfg.token, key, &p)?;
+        let shown = k2_core::compute::proto::pairing::display_sas(&code);
+        if pairings().lock().insert(cfg.host_name.clone(), shown.clone()).as_deref() != Some(shown.as_str()) {
+            log_debug!(
+                "[hosts/enroll] pairing: confirm this host on the controller with the code {shown} \
+                 (POST {CONFIRM_PATH} {{\"host_name\": {:?}, \"code\": \"{shown}\"}})",
+                cfg.host_name
+            );
+            k2_core::trace::emit(|| k2_core::trace::Event::new(events::HOST_PAIRING).attr("host", cfg.host_name.as_str()));
+        }
+        return Err(format!("waiting for the owner to confirm the pairing code {shown} on the controller"));
+    }
+    pairings().lock().remove(&cfg.host_name);
     let at = enrolled.pointer("/enrolled/enrolled_ms").and_then(Value::as_i64).unwrap_or(0);
     k2_core::trace::emit(|| {
         k2_core::trace::Event::new(events::HOST_ENROLLED)
@@ -744,6 +1094,39 @@ pub async fn signed_hello(cfg: &HostConfig, key: &SigningKey) -> Result<String, 
     let ch = call(client.get(format!("{base}{CHALLENGE_PATH}")), "challenge").await?;
     let nonce = ch.get("nonce").and_then(Value::as_str).ok_or("challenge: no nonce in the answer")?;
     signed_hello_token(key, nonce, &cfg.host_name)
+}
+
+/// D7: the code each host name shows while it waits for the owner (the
+/// link's status carries it); gone once paired.
+fn pairings() -> &'static Mutex<HashMap<String, String>> {
+    static P: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    P.get_or_init(Mutex::default)
+}
+
+pub fn pairing_code(host_name: &str) -> Option<String> {
+    pairings().lock().get(host_name).cloned()
+}
+
+/// D7: check the controller's pairing answer and derive the six digits.
+/// The key must be the one `token` names (its fingerprint prefix: a man in
+/// the middle can't answer with his own) and must have signed this host's
+/// key, the nonce and the token.
+pub fn pairing_code_for(token: &str, key: &SigningKey, p: &Pairing) -> Result<String, String> {
+    let prefix = token_fp_prefix(token).ok_or("enroll: the controller asks to pair, but this token names no controller key")?;
+    let der = crypto::pem_decode("PUBLIC KEY", &p.controller_key_pem).map_err(|e| format!("enroll: pairing key: {e}"))?;
+    let controller_fp = crypto::fingerprint_of_spki_der(&der);
+    if !controller_fp.starts_with(&prefix.to_ascii_lowercase()) {
+        return Err(format!(
+            "enroll: the controller's pairing key {}… is not the one the token names ({prefix}…): refusing to pair",
+            short(&controller_fp)
+        ));
+    }
+    let fp = key.fingerprint();
+    let th = token_hash(token);
+    if !crypto::verify_domain(&der, DOMAIN_PAIR, &[fp.as_bytes(), p.nonce.as_bytes(), th.as_bytes()], &p.sig) {
+        return Err("enroll: the controller's pairing signature doesn't verify: refusing to pair".into());
+    }
+    Ok(pairing_sas(&controller_fp, &fp, &p.nonce, token))
 }
 
 /// `link::serve_once`'s hook: the `hello.token` for the next link. The
