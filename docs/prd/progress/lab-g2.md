@@ -368,6 +368,50 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### FINAL Linux gate on the rc3 candidate, wave3 b60a9fd80: one harness failure
+
+`lab-runs/gate-debug/2026-10-27T13-27-28Z`:
+
+- The cargo target was a bind mount from the Mac
+  (`LAB_GATE_TARGET_DIR=lab-runs/.gate-target`, 5c8f63d34; deleted after),
+  because the VM had 7.8G free. The cargo registry stayed in its VM
+  volume.
+- Floor 3G (image and container layer only), low-memory mode, debuginfo 0,
+  Docker lock held.
+- Watchers (VM < 3G, Mac < 20G, target > 40G) never fired. Lowest VM
+  free 6G, lowest Mac free 198G, largest target 5G.
+
+| Package | Test binaries | Passed | Failed | Ignored |
+|---|---|---|---|---|
+| k2-core | 17 | 3890 | 0 | 1 (allowlisted) |
+| k2-daemon | 160 | 5481 | 1 | 9 (allowlisted) |
+| k2-daemon root-only `cell_egress` | 1 | 1 | 0 | 0 |
+| k2-ptyd | 5 | 42 | 0 | 0 |
+
+The one failure:
+`spawn_fail_keeps_pin_integration::failed_wakes_with_a_cli_that_exits_keep_the_pinned_chat`.
+
+- The test fixture's own HTTP client (`crates/k2-daemon/tests/support/app_fixture.rs:94`)
+  panics on `Interrupted system call (os error 4)` while reading the
+  `POST /cli/workspace/msg` answer.
+- Rerun 10× in the gate image (k2gate, the gate's `env -i`, low-memory
+  build): **0/10**, the same EINTR every time. So it is deterministic on
+  Linux, not a flake.
+- The same test passed in the pre-gate on 353c69d65. Neither the test nor
+  the fixture changed since, and no signal code changed.
+- Likely cause: the fixture sets `SO_RCVTIMEO` (120 s), and on Linux a
+  socket read with a timeout is not restarted after a signal handler,
+  even with SA_RESTART (signal(7)). The test's CLI exits (SIGCHLD in the
+  test process) while the POST is in flight. Since 353c69d65 the wake path
+  (`workspace_msg.rs`, the K2-f turn notes) plausibly keeps that POST open
+  longer.
+- With the one-line fix (`Err(e) if e.kind() ==
+  std::io::ErrorKind::Interrupted => continue,` in the read loop), applied
+  only to the rerun's throwaway copy: **10/10 pass**, the test's own
+  assertions included. A harness bug, not a K2 one.
+- The fixture belongs to the apps work, not lab-g2, so the fix went to the
+  coordinator to route.
+
 ### S10 heavy chaos on the rc3 candidate, wave3 b60a9fd80 (K2-f.4)
 
 This used S10 per the PRD's 'node fails hard' (f59b63e94) and the stricter
