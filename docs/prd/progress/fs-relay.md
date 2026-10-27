@@ -944,6 +944,73 @@ kubeconfig. No exec, so the contents of the volumes were not listed.
     - the copy Job, forward and back;
     - a rehearsal of the whole thing on a test namespace first.
 
+### The migration as code, rehearsed (not run on the owner)
+
+The later ON migration, prepared as scripts and rehearsed end to end on a
+test namespace that has the owner's shape. Nothing here has run on
+`k2-kind-dist`.
+
+- **`up.sh --work-size=SIZE`** (and `p4-up.sh --work-size`) sizes each
+  host's own work claim. The default is 2Gi with `--host-work=own`, and the
+  P4 overlay's 1Gi with `--p4`. Set it to `k2-work`'s size (5Gi on the
+  owner) when migrating.
+- **`up.sh --rehearse`** is a TEST-ONLY variant with the owner's shared
+  `k2-work` shape (dist-fake's overlay, the fake agent). It has its own
+  namespace (`k2-p4-rehearse`), port 7445, NodePort 30745 and images
+  (`k2-daemon:rehearse`, `k2-agents:rehearse`), so it never touches
+  another variant's or the owner's.
+- **`scripts/kind/work-copy.sh`** copies one workspaces claim onto another,
+  inside the cluster.
+  - It is a dry run by default. `--go` runs one pod as K2's pods run (uid
+    10000, the `restricted` pod security), copies with `tar` and compares
+    sha256 lists, failing on any difference.
+  - `--backup` copies onto a new claim `k2-backup-work-<UTC>`, and
+    `--mirror` empties the destination first, for the copy back.
+  - It refuses volumes on different nodes, and a pod mounting the
+    destination (unless named with `--allow-mounted`). It refuses
+    `k2-kind-dist` without `--owner`, before touching the cluster.
+- **`scripts/kind/fs-relay-migrate-rehearse.sh`** runs the whole migration
+  on `k2-p4-rehearse`, from a fresh namespace each time:
+  1. the shared shape, with two workspaces seeded (one a git repository);
+  2. a backup of `k2-work`;
+  3. the host stopped and its StatefulSet deleted, then the roll with
+     `--host-work=own --work-size=<k2-work's size> --fs-relay`;
+  4. `k2-work` copied onto `work-k2-host-0`, and the host started;
+  5. checks with the relay ON;
+  6. the rollback: the host's volume copied back over `k2-work`, and the
+     shared shape without the relay.
+
+**The rehearsal: PASS, 23 of 23 checks** (on wave3 `85cf7e2f6`'s daemon):
+- **The backup** of `k2-work`, verified.
+- **The migration:**
+  - the host on its own 5Gi `work-k2-host-0`;
+  - the copy verified, 65 entries;
+  - the controller with `K2_FS_RELAY=1`;
+  - every seeded file on the host's copy, unchanged.
+- **ON:**
+  - an agent spawned in `alpha` binds it;
+  - a file written on the host reads through the controller and is not
+    on the controller's `k2-work`;
+  - a commit through the controller lands in the host's repository;
+  - `beta`'s seeded files read through the relay.
+- **The rollback:**
+  - the host's volume copied back over `k2-work`, verified, 82 entries;
+  - the host mounts `k2-work` again, and the controller has no
+    `K2_FS_RELAY`;
+  - the file and the commit made while ON are on `k2-work`, read with the
+    relay off;
+  - the host's volume and the backup are kept.
+
+**What the owner's run would add** (not rehearsed):
+- **The controller's own volume:** a backup with `backup-controller.sh`
+  (it supports `k2-kind-dist`, not the rehearsal namespace).
+- **The pool and enroll:** the rehearsal uses token auth and the static
+  provisioner. With `K2_PROVISIONER=kubernetes`, the controller scales
+  `k2-host` itself, so stopping the host for the copies means holding the
+  pool (its MIN at 0, or the controller's scaling paused) first.
+- **The second host's volume:** `work-k2-host-1` is made empty when the
+  pool adds that host. A workspace stays on the host it was spawned on.
+
 ### rc3, with the relay OFF
 
 - **The roll's flags stay as kind-app's owner roll has them:**

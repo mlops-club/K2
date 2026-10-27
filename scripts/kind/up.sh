@@ -5,7 +5,8 @@
 #   scripts/kind/up.sh [--dist [--hosts=N] [--ptyd=0|1] [--host-auth=token|enroll]
 #                             [--provisioner=static|kubernetes [--max-hosts=N]]
 #                             [--work-root=PATH] [--login-from=POD] [--max-awake=N]
-#                             [--host-work=shared|own] [--move-after=S] [--idle-after=S] [--fs-relay]] [--fake] [--rebuild-daemon]
+#                             [--host-work=shared|own [--work-size=SIZE]] [--move-after=S] [--idle-after=S] [--fs-relay]]
+#                             [--fake] [--rebuild-daemon] [--rehearse]
 #                      [--reset-password] [--port-forward] [--password-file=PATH] [--render-only=PATH]
 #
 # 1. builds k2-daemon:dev (scripts/kind/build-daemon.sh: a memory-capped
@@ -68,6 +69,15 @@
 # --idle-after=S sets the controller's K2_PROVISIONER_IDLE_AFTER (seconds a
 # host above the pool's minimum stays idle before it is drained and scaled
 # away; the daemon's default is 900).
+# --work-size=SIZE (with --host-work=own or --p4) sizes each host's own
+# workspaces claim (default 2Gi with --host-work=own, the overlay's 1Gi
+# with --p4), e.g. 5Gi to match a k2-work being migrated onto it. A claim
+# template's size can't change on a live StatefulSet either.
+# --rehearse deploys the rehearsal variant (TEST ONLY; implies --dist
+# --fake): dist-fake's shared-k2-work shape, the owner's, in namespace
+# k2-p4-rehearse on port 7445 with its own images (k2-daemon:rehearse,
+# k2-agents:rehearse): scripts/kind/fs-relay-migrate-rehearse.sh rehearses
+# the fs-relay migration there, never on the owner's k2-kind-dist.
 # --fs-relay turns fs-relay on in the controller (K2_FS_RELAY=1, and its
 # own K2_WORK_ROOT=/var/lib/k2/work, where its workspaces volume is): the
 # app's file browser and git panel are served from the disk of the host
@@ -103,11 +113,14 @@ source "$(dirname "$0")/lib.sh"
 
 fake=0 dist=0 rebuild_daemon=0 reset_password=0 door=proxy password_file= hosts=1 ptyd= host_auth=token
 provisioner=static render_to= max_hosts= work_root= login_from= p4=0 max_awake= host_work=shared move_after= idle_after= fs_relay=0
+rehearse=0 work_size=
 for a in "$@"; do
     case "$a" in
         --fake) fake=1 ;;
         --dist) dist=1 ;;
         --p4) p4=1 dist=1 fake=1 ;;
+        --rehearse) rehearse=1 dist=1 fake=1 ;;
+        --work-size=*) work_size=${a#--work-size=} ;;
         --rebuild-daemon) rebuild_daemon=1 ;;
         --reset-password) reset_password=1 ;;
         --port-forward) door=port-forward ;;
@@ -125,7 +138,7 @@ for a in "$@"; do
         --move-after=*) move_after=${a#--move-after=} ;;
         --idle-after=*) idle_after=${a#--idle-after=} ;;
         --fs-relay) fs_relay=1 ;;
-        -h|--help) sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "up.sh: unknown argument $a (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -162,6 +175,9 @@ case "$idle_after" in ''|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]) 
 [ -z "$idle_after" ] || [ "$provisioner" = kubernetes ] || { echo "up.sh: --idle-after needs --provisioner=kubernetes" >&2; exit 2; }
 { [ "$host_work" = shared ] && [ -z "$move_after" ]; } || [ "$dist" = 1 ] || { echo "up.sh: --host-work and --move-after need --dist" >&2; exit 2; }
 [ "$host_work" = shared ] || [ "$p4" = 0 ] || { echo "up.sh: --p4 hosts already have their own work volumes" >&2; exit 2; }
+case "$work_size" in ''|[1-9]Gi|[1-9][0-9]Gi|[1-9][0-9][0-9]Mi|[1-9][0-9][0-9][0-9]Mi) ;; *) echo "up.sh: --work-size takes a size like 5Gi or 512Mi" >&2; exit 2 ;; esac
+[ -z "$work_size" ] || [ "$host_work" = own ] || [ "$p4" = 1 ] || { echo "up.sh: --work-size needs --host-work=own or --p4" >&2; exit 2; }
+[ "$rehearse" = 0 ] || [ "$p4" = 0 ] || { echo "up.sh: --rehearse and --p4 are different variants" >&2; exit 2; }
 if [ "$fs_relay" = 1 ]; then
     [ "$dist" = 1 ] || { echo "up.sh: --fs-relay needs --dist" >&2; exit 2; }
     { [ "$p4" = 1 ] || [ "$host_work" = own ]; } || { echo "up.sh: --fs-relay needs hosts on their own work volumes (--p4 or --host-work=own)" >&2; exit 2; }
@@ -171,7 +187,7 @@ case "$login_from" in ''|k2-host-[0-9]*) ;; *) echo "up.sh: --login-from takes a
 if { [ -n "$work_root" ] || [ -n "$login_from" ]; } && [ "$dist" = 0 ]; then
     echo "up.sh: --work-root and --login-from need --dist" >&2; exit 2
 fi
-if [ "$p4" = 1 ]; then kind_variant p4; else kind_variant_from_flags "$fake" "$dist"; fi
+if [ "$p4" = 1 ]; then kind_variant p4; elif [ "$rehearse" = 1 ]; then kind_variant rehearse; else kind_variant_from_flags "$fake" "$dist"; fi
 ptyd=${ptyd:-${K2_KIND_PTYD:-$KIND_PTYD_DEFAULT}}
 case "$ptyd" in 0|1) ;; *) echo "up.sh: K2_PTYD must be 0 or 1 (got $ptyd)" >&2; exit 2 ;; esac
 user=${K2_KIND_USER:-owner}
@@ -259,8 +275,29 @@ $([ "$provisioner" = kubernetes ] && printf '  - %s\n' "$(python3 -I -c 'import 
 replicas:
   - {name: k2-host, count: $1}
 EOF
+        if [ "$KIND_VARIANT" = rehearse ]; then
+            # Its own images, never dist-fake's (the overlay it reuses).
+            printf 'images:\n  - {name: k2-daemon, newTag: rehearse}\n  - {name: k2-agents, newTag: rehearse}\n'
+        fi
         if [ "$ptyd" = 1 ] || [ "$host_auth" = enroll ] || [ -n "$work_root" ] || [ -n "$login_from" ] || [ -n "$max_awake" ] \
-            || [ "$host_work" = own ] || [ -n "$move_after" ] || [ -n "$idle_after" ] || [ "$fs_relay" = 1 ]; then echo "patches:"; fi
+            || [ "$host_work" = own ] || [ -n "$move_after" ] || [ -n "$idle_after" ] || [ "$fs_relay" = 1 ] \
+            || [ "$KIND_VARIANT" = rehearse ] || [ -n "$work_size" ]; then echo "patches:"; fi
+        if [ "$KIND_VARIANT" = rehearse ]; then
+            # Its own NodePort (dist-fake's 30742 is another variant's).
+            cat <<EOF
+  - target: {kind: Service, name: k2-controller-nodeport}
+    patch: |-
+      - {op: replace, path: /spec/ports/0/nodePort, value: $KIND_NODEPORT}
+EOF
+        fi
+        if [ "$p4" = 1 ] && [ -n "$work_size" ]; then
+            # The P4 overlay's claim templates are data, then work.
+            cat <<EOF
+  - target: {kind: StatefulSet, name: k2-host}
+    patch: |-
+      - {op: replace, path: /spec/volumeClaimTemplates/1/spec/resources/requests/storage, value: $work_size}
+EOF
+        fi
         if [ "$host_work" = own ]; then
             # The host's own workspaces volume; data's template is repeated
             # because a list of claim templates is replaced, not merged.
@@ -285,7 +322,7 @@ EOF
           - metadata: {name: work}
             spec:
               accessModes: [ReadWriteOnce]
-              resources: {requests: {storage: 2Gi}}
+              resources: {requests: {storage: ${work_size:-2Gi}}}
 EOF
         fi
         if [ -n "$move_after" ] || [ -n "$idle_after" ] || [ "$fs_relay" = 1 ]; then
