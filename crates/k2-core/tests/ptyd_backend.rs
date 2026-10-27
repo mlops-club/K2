@@ -357,6 +357,8 @@ fn a_session_outlives_its_owner_and_is_adopted() {
     // one connects: ptyd evicts the old owner and keeps the child.
     std::mem::forget(s);
     assert!(alive(pid));
+    // The restarted daemon is a new process: it created none of ptyd's sessions.
+    k2_core::terminal::ptyd::client::forget_created_for_tests();
     let fresh = k2_core::terminal::ptyd::client::Ptyd::for_home(&home().join(".k2"));
     let _owner = fresh.owner().expect("the restarted daemon connects (and adopts)");
     let a = ADOPTED.lock().unwrap().iter().find(|x| x.session_id.to_string() == sid).cloned().expect("the session was adopted");
@@ -379,4 +381,46 @@ fn a_session_outlives_its_owner_and_is_adopted() {
         }
     }
     wait_until(|| !alive(pid));
+}
+
+/// ptyd S3.1 #6: a session this process created is never a leftover: a
+/// later first owner connection (a restarted owner handle) neither ends
+/// nor adopts it.
+#[test]
+fn a_session_this_process_created_survives_a_later_sweep() {
+    let _g = setup();
+    let s = DaemonPtySession::spawn(cfg("sleep 60")).expect("spawn");
+    let pid = s.child_pid().unwrap();
+    let sid = s.session_id.to_string();
+    let fresh = k2_core::terminal::ptyd::client::Ptyd::for_home(&home().join(".k2"));
+    let owner = fresh.owner().expect("a second owner connects and sweeps");
+    assert!(alive(pid), "the sweep ended a session this process created");
+    let k2_ptyd::proto::Reply::Sessions { sessions } = owner.request(k2_ptyd::proto::Request::List).unwrap() else { panic!() };
+    assert!(sessions.iter().any(|x| x.sid == sid && matches!(x.state, k2_ptyd::proto::SessionState::Running)));
+    assert!(ADOPTED.lock().unwrap().iter().all(|a| a.session_id.to_string() != sid), "nor adopted");
+    let _ = owner.request(k2_ptyd::proto::Request::Kill { sid: sid.clone(), grace_ms: Some(100) });
+    let _ = owner.request(k2_ptyd::proto::Request::AckExit { sid });
+    std::mem::forget(s);
+}
+
+/// ptyd S3.1 #5: a meta over ptyd's limit is not sent (ptyd would refuse
+/// it and the update would be lost unseen): ptyd keeps the last one that
+/// fit, and a later one that fits goes through.
+#[test]
+fn an_oversize_meta_is_not_sent_and_a_later_one_is() {
+    let _g = setup();
+    let s = DaemonPtySession::spawn(cfg("sleep 60")).expect("spawn");
+    let sid = s.session_id.to_string();
+    s.set_ptyd_meta("big", serde_json::json!("x".repeat(k2_ptyd::proto::MAX_META + 1)));
+    s.set_ptyd_meta("small", serde_json::json!(1));
+    let owner = k2_core::terminal::ptyd::client::global().owner().unwrap();
+    let k2_ptyd::proto::Reply::Sessions { sessions } = owner.request(k2_ptyd::proto::Request::List).unwrap() else { panic!() };
+    let m = sessions.into_iter().find(|x| x.sid == sid).expect("listed").meta;
+    assert!(m.get("big").is_none(), "the oversize meta never reached ptyd");
+    s.set_ptyd_meta("big", serde_json::Value::Null);
+    s.set_ptyd_meta("small", serde_json::json!(2));
+    let k2_ptyd::proto::Reply::Sessions { sessions } = owner.request(k2_ptyd::proto::Request::List).unwrap() else { panic!() };
+    let m = sessions.into_iter().find(|x| x.sid == sid).expect("listed").meta;
+    assert_eq!(m["small"], 2, "a meta that fits again is sent");
+    s.kill();
 }

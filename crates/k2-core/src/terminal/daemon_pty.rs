@@ -1253,6 +1253,8 @@ impl DaemonPtySession {
             "spawned_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         });
         let events = owner.watch(&sid);
+        // S3.1: never a previous daemon's leftover to this process's sweep.
+        client::note_created(&sid);
         crate::trace::pty::open_session(&cfg.session_id, req.window_size.num_cols, req.window_size.num_lines, "ptyd");
         let pid = match owner.request(Request::Spawn {
             sid: sid.clone(),
@@ -1489,12 +1491,20 @@ impl DaemonPtySession {
     /// k2-ptyd S3: set one top-level key of this session's ptyd meta (what
     /// a restarted daemon reads back to adopt it) and send it to ptyd.
     /// Fire-and-forget; a no-op for in-process sessions.
+    /// A meta over ptyd's limit (`MAX_META`) would be refused there, and
+    /// the update lost unseen: it is logged (`meta_too_large`) and not sent,
+    /// so ptyd keeps the last one that fit.
     pub fn set_ptyd_meta(&self, key: &str, value: serde_json::Value) {
         #[cfg(unix)]
         if let PtyIo::Ptyd(p) = &self.pty_io {
             let mut m = p.meta.lock();
             if let Some(obj) = m.as_object_mut() {
                 obj.insert(key.to_string(), value);
+            }
+            let size = serde_json::to_vec(&*m).map(|v| v.len()).unwrap_or(usize::MAX);
+            if size > k2_ptyd::proto::MAX_META {
+                log_debug!("[ptyd] meta_too_large session={} key={} bytes={} (max {}): not sent", self.session_id, key, size, k2_ptyd::proto::MAX_META);
+                return;
             }
             p.owner.send_nowait(k2_ptyd::proto::Request::UpdateMeta { sid: p.sid.clone(), meta: m.clone() });
         }

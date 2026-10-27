@@ -266,10 +266,33 @@ pub fn set_adopter(f: Adopter) {
     }
 }
 
-/// The leftover sweep: the adopter's pick, then the rest ended.
+static CREATED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// S3.1 (review #6): `sid` is a session this process asked ptyd to spawn.
+/// The leftover sweep never touches it (a spawn that raced the first owner
+/// connection is not a previous daemon's).
+pub fn note_created(sid: &str) {
+    lock(CREATED.get_or_init(Default::default)).insert(sid.to_string());
+}
+
+/// Tests: forget the sessions this process created, as a restarted daemon
+/// (a new process) would have.
+#[doc(hidden)]
+pub fn forget_created_for_tests() {
+    if let Some(c) = CREATED.get() {
+        lock(c).clear();
+    }
+}
+
+fn created_here(sid: &str) -> bool {
+    CREATED.get().is_some_and(|c| lock(c).contains(sid))
+}
+
+/// The leftover sweep: the adopter's pick, then the rest ended. Sessions
+/// this process created are neither.
 fn sweep_leftovers(owner: &Arc<Owner>) {
     let sessions = match owner.request(Request::List) {
-        Ok(Reply::Sessions { sessions }) => sessions,
+        Ok(Reply::Sessions { sessions }) => sessions.into_iter().filter(|s| !created_here(&s.sid)).collect::<Vec<_>>(),
         _ => return,
     };
     let total = sessions.len();

@@ -2796,10 +2796,13 @@ impl RemoteHost {
                         // all of it: a turn this controller never followed).
                         // ptyd S3 (K2-f.3 #5): a host daemon that restarted
                         // and adopted the session counts from what ptyd kept,
-                        // which may be behind this turn: taken as it is.
+                        // which may be behind this turn (a Stop no daemon
+                        // heard): taken as it is, but never with fewer
+                        // prompts than this turn had (S3.1 #5: a lost meta
+                        // update would drop the running prompt's messages).
                         if let Some(c) = &r.turn {
                             let t = inner.turns.entry(r.agent_id.clone()).or_default();
-                            if t.pane == r.session_id && !r.adopted {
+                            if t.pane == r.session_id && !(r.adopted && c.prompts >= t.prompts) {
                                 t.counts(c);
                             } else {
                                 *t = Turn::from_counts(&r.session_id, c);
@@ -2831,6 +2834,13 @@ impl RemoteHost {
                             r.epoch
                         ))
                     }
+                    // S3.1 #3: a host that restarted and adopted a CLI this
+                    // controller knows ended (closed, unplaced, or gone when
+                    // the host came back without it) is told to release it.
+                    None if r.adopted && inner.ended.contains_key(&r.agent_id) => AdoptDecision::Released(format!(
+                        "agent {}'s session ended here; host {host_id} adopted a stale CLI at epoch {}",
+                        r.agent_id, r.epoch
+                    )),
                     None => {
                         self.adopt_unknown(&mut inner, host_id, r);
                         AdoptDecision::Adopted

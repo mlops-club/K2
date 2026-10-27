@@ -163,8 +163,9 @@ struct Placed {
     /// told again in the next `hello.ended`.
     ended: Vec<super::proto::EndedPlacement>,
     /// ptyd S3: agents this daemon took over from a previous one at boot,
-    /// resumed with `adopted: true` until a welcomed `hello` carried them.
-    adopted: std::collections::HashSet<String>,
+    /// resumed with `adopted: true` until a welcomed `hello` carried them,
+    /// with the host id their meta recorded (S3.1 #3).
+    adopted: HashMap<String, Option<String>>,
 }
 
 fn placed() -> Arc<Mutex<Placed>> {
@@ -179,13 +180,49 @@ pub(crate) fn placed_epoch(agent: &str) -> Option<u64> {
 
 /// ptyd S3: `agent_id`'s session `session_id`, at `epoch`, was adopted
 /// from ptyd at boot: placed again, as the previous daemon had it.
-pub(crate) fn adopted(agent_id: &str, session_id: &str, epoch: u64) {
+pub(crate) fn adopted(agent_id: &str, session_id: &str, epoch: u64, host_id: Option<String>) {
     let placed = placed();
     let mut p = placed.lock();
     p.epochs.insert(agent_id.to_string(), epoch);
     p.sessions.retain(|_, a| a != agent_id);
     p.sessions.insert(session_id.to_string(), agent_id.to_string());
-    p.adopted.insert(agent_id.to_string());
+    p.adopted.insert(agent_id.to_string(), host_id);
+}
+
+/// S3.1 #4: the adopted agents no welcomed `hello` has confirmed (their
+/// sessions are ended by the caller). They stay placed, so the controller
+/// is told they ended: `session_gone`, or the next hello's `ended`.
+pub(crate) fn take_unconfirmed() -> Vec<String> {
+    let placed = placed();
+    let mut out: Vec<String> = placed.lock().adopted.drain().map(|(a, _)| a).collect();
+    out.sort();
+    out
+}
+
+/// S3.1 #3: a welcomed `hello` carried these adopted agents: confirmed.
+/// Returns those whose meta was written for another host id than the one
+/// the controller just gave this host (the volume moved under this name),
+/// for the caller to end; they stay placed, so the controller hears their
+/// `session_gone`.
+pub(crate) fn confirm_adopted(carried: &[String], host_id: &str) -> Vec<String> {
+    let placed = placed();
+    let mut p = placed.lock();
+    let mut wrong = Vec::new();
+    for a in carried {
+        if let Some(meta_host) = p.adopted.remove(a) {
+            if meta_host.as_deref().is_some_and(|h| h != host_id) {
+                wrong.push(a.clone());
+            }
+        }
+    }
+    wrong
+}
+
+/// This host's link identity for `adopt::mark_placed`: the controller's
+/// attach URL, this host's name, and the host id of its last welcome.
+pub(crate) fn identity() -> (String, String, Option<String>) {
+    let s = state().lock();
+    (s.controller.clone(), s.host_name.clone(), s.host_id.clone())
 }
 
 /// `hello.resume`: every placement this host still runs (S9), with its
@@ -212,7 +249,7 @@ fn resume_list() -> (Vec<super::proto::ResumePlacement>, Vec<super::proto::Ended
                 args: s.args(),
                 label: Some(s.label()),
                 turn: super::drain::turn_counts(&s.session_id().to_string()),
-                adopted: p.adopted.contains(agent),
+                adopted: p.adopted.contains_key(agent),
             }),
             _ => dead.push((agent.clone(), *epoch)),
         }
@@ -293,10 +330,10 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
                 if let Frame::Hello { ended, resume, .. } = &hello {
                     forget_ended(ended);
                     // ptyd S3: the controller was told these were adopted.
-                    let placed = placed();
-                    let mut p = placed.lock();
-                    for r in resume.iter().filter(|r| r.adopted) {
-                        p.adopted.remove(&r.agent_id);
+                    let carried: Vec<String> = resume.iter().filter(|r| r.adopted).map(|r| r.agent_id.clone()).collect();
+                    for a in confirm_adopted(&carried, &host_id) {
+                        log_debug!("[hosts/link] agent {a}: adopted from meta written for another host id than {host_id}; ended");
+                        tokio::task::spawn_blocking(move || super::adopt::end_agent(&a));
                     }
                 }
                 host_id
@@ -904,6 +941,26 @@ fn run_op(s: &crate::agent_host::AgentSession, op: super::proto::SessionOp) -> R
 #[cfg(test)]
 mod ended_tests {
     use super::*;
+
+    /// S3.1 #3/#4: a welcomed hello confirms the adopted agents it carried;
+    /// one whose meta names another host id is returned to be ended; the
+    /// ones no hello confirmed are what the fence ends. All stay placed
+    /// until their sessions end (the controller is told).
+    #[test]
+    fn adopted_agents_are_confirmed_by_a_welcome_or_fenced() {
+        adopted("s31-ok", "pane-s31-ok", 4, Some("h-1".into()));
+        adopted("s31-moved", "pane-s31-moved", 4, Some("h-old".into()));
+        adopted("s31-s3meta", "pane-s31-s3meta", 4, None);
+        adopted("s31-unseen", "pane-s31-unseen", 4, Some("h-1".into()));
+        let carried = vec!["s31-ok".to_string(), "s31-moved".to_string(), "s31-s3meta".to_string()];
+        assert_eq!(confirm_adopted(&carried, "h-1"), vec!["s31-moved".to_string()]);
+        let unconfirmed: Vec<String> = take_unconfirmed().into_iter().filter(|a| a.starts_with("s31-")).collect();
+        assert_eq!(unconfirmed, vec!["s31-unseen".to_string()]);
+        assert!(take_unconfirmed().iter().all(|a| !a.starts_with("s31-")), "taken once");
+        for a in ["s31-ok", "s31-moved", "s31-unseen"] {
+            assert_eq!(placed_epoch(a), Some(4), "{a} stays placed until its session ends");
+        }
+    }
 
     /// K2-f.3 #5: an agent whose CLI ended is in every `hello.ended` until
     /// a welcomed hello carried it (its `session_gone` may have died with

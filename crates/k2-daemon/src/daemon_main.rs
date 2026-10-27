@@ -137,6 +137,8 @@ pub fn run() {
 /// `daemon_port`, `capabilities`, `k2_core::trace`).
 fn boot_settings_check() -> Result<(), String> {
     crate::runtime_role::set_current(crate::runtime_role::from_env()?);
+    // ptyd S3.1 #6: the host's adopter, before anything can reach ptyd.
+    crate::hosts::adopt::at_process_start();
     crate::provisioner::select(crate::runtime_role::current(), std::env::var(crate::provisioner::PROVISIONER_VAR).ok().as_deref())?;
     crate::daemon_port::from_env()?;
     crate::capabilities::overrides_from_env()?;

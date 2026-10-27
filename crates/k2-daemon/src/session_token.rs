@@ -376,6 +376,13 @@ impl SessionTokenRegistry {
         })
     }
 
+    /// A record for `session_id` that its per-session and the global epoch
+    /// still accept (what [`Self::validate_hook`] checks before the secret).
+    pub fn has_live_record(&self, session_id: &str) -> bool {
+        let Some(rec) = self.records.get(session_id) else { return false };
+        rec.global_epoch == self.global_epoch && rec.session_epoch == self.session_epochs.get(session_id).copied().unwrap_or(0)
+    }
+
     /// Revoke the token for one session by bumping its per-session epoch
     /// (the durable, restart-surviving signal) AND dropping the live
     /// record (belt-and-suspenders, exactly like
@@ -1135,6 +1142,13 @@ pub fn validate_hook(bearer: &str) -> Option<ValidatedHook> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .validate_hook(bearer)
+}
+
+/// ptyd S3.1 (review #7): does `session_id` hold a live passport here (a
+/// record this daemon minted, not revoked)? A session a restarted host
+/// would adopt must: its exit revokes it, and an agent can't mint one.
+pub fn has_live_passport(session_id: &str) -> bool {
+    registry().lock().unwrap_or_else(|e| e.into_inner()).has_live_record(session_id)
 }
 
 /// Revoke one session's token via the process registry + persist. Phase 1

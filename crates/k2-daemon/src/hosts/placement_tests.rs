@@ -1259,30 +1259,68 @@ async fn a_host_daemon_restart_that_adopts_the_cli_keeps_the_turn_and_its_messag
     stays_delivered(&outbox, &m).await;
 }
 
-/// K2-f.3 #5: a host daemon that restarted counts from what ptyd kept,
-/// which can be behind the controller (hooks fired while no daemon
-/// listened). An `adopted` resume's counts are taken even when lower; the
-/// same counts from a host that did not restart are older news, ignored.
+/// K2-f.3 #5 and S3.1 #5: a host daemon that restarted counts from what
+/// ptyd kept, which can be behind the controller (a Stop no daemon heard).
+/// The controller saw prompt 3 and its Stop. An `adopted` resume with as
+/// many prompts but one Stop fewer (lower in sum) is taken: the turn runs
+/// again as the host has it. The same counts from a host that did not
+/// restart are older news, ignored. An adopted resume with fewer prompts
+/// than the controller saw (a lost meta update) is never taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_adopted_resume_resets_the_controllers_turn() {
-    for adopted in [true, false] {
+async fn an_adopted_resume_resets_the_controllers_turn_but_never_to_fewer_prompts() {
+    let cases = [
+        (true, super::proto::TurnCounts { prompts: 3, stops: 2, running: true, msgs: vec![] }, true),
+        (false, super::proto::TurnCounts { prompts: 3, stops: 2, running: true, msgs: vec![] }, false),
+        (true, super::proto::TurnCounts { prompts: 2, stops: 2, running: false, msgs: vec![] }, false),
+        (true, super::proto::TurnCounts { prompts: 2, stops: 1, running: true, msgs: vec![] }, false),
+    ];
+    for (adopted, host, in_turn) in cases {
         let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
         let url = serve(remote).await;
         let mut a = fake_host(&url, "host-a").await;
         spawn_on(remote, &mut a, "ivy", "/w/ivy", &sid(1)).await;
         let epoch = remote.placement("ivy").unwrap().epoch.0;
         prompt_with(remote, &mut a, "ivy", &sid(1), running(3, 2, &[])).await;
-        assert!(remote.in_turn("ivy"));
+        hook_at(&mut a, &sid(1), "Stop", super::proto::TurnCounts { prompts: 3, stops: 3, running: false, msgs: vec![] }).await;
+        until("the third turn's Stop", || !remote.in_turn("ivy")).await;
         drop(a);
         wait_lost(remote, "host-a").await;
-        // The host's own counts: its third prompt's Stop only, lower in sum.
-        let behind = super::proto::TurnCounts { prompts: 2, stops: 2, running: false, msgs: vec![] };
-        let r = super::proto::ResumePlacement { adopted, ..resumed("ivy", &sid(1), epoch, Some(behind)) };
+        let r = super::proto::ResumePlacement { adopted, ..resumed("ivy", &sid(1), epoch, Some(host.clone())) };
         let _a = back(&url, "host-a", vec![r], vec![]).await;
         // The hub adopts before it welcomes.
         assert_eq!(remote.placement("ivy").map(|p| p.epoch.0), Some(epoch));
-        assert_eq!(remote.in_turn("ivy"), !adopted, "adopted={adopted}");
+        assert_eq!(remote.in_turn("ivy"), in_turn, "adopted={adopted} host={host:?}");
     }
+}
+
+/// S3.1 #3: a host that restarted and adopted a CLI whose session this
+/// controller saw end (closed, unplaced, gone) is told to release it, not
+/// given the agent back as an unknown placement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adopted_cli_whose_session_ended_here_is_released() {
+    let remote: &'static RemoteHost = Box::leak(Box::new(RemoteHost::new()));
+    let url = serve(remote).await;
+    let mut a = fake_host(&url, "host-a").await;
+    spawn_on(remote, &mut a, "zed", "/w/zed", &sid(1)).await;
+    let epoch = remote.placement("zed").unwrap().epoch.0;
+    gone(&mut a, remote, "zed").await;
+    assert!(remote.session_ended_at("zed").is_some());
+    drop(a);
+    // No placement left on it, so it is unlinked rather than lost.
+    until("host-a unlinked", || remote.link_protocol("host-a").is_none()).await;
+    let r = super::proto::ResumePlacement { adopted: true, ..resumed("zed", &sid(1), epoch, None) };
+    let mut a = back(&url, "host-a", vec![r], vec![]).await;
+    assert!(remote.placement("zed").is_none(), "not placed again");
+    let release = within("the release", async {
+        loop {
+            if let Frame::Release { agent_id, reason, .. } = recv(&mut a).await {
+                break (agent_id, reason);
+            }
+        }
+    })
+    .await;
+    assert_eq!(release.0, "zed");
+    assert!(release.1.contains("ended here"), "{}", release.1);
 }
 
 /// K2-f.3 #1: an agent that never sends hooks (a provider without them):

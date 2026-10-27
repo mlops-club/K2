@@ -162,3 +162,45 @@ reports are never below what the controller was told.
 The old behaviour is pinned by
 `a_host_daemon_restart_mid_turn_leaves_the_outcome_unknown`: a host that
 comes back without the agent still leaves the message's outcome unknown.
+
+## S3.1: the independent review of 311c97615
+
+Branch `k2-dist/ptyd-s3.1`, from wave3 `e1769ca8e`. The review found the
+I1 check at hello and the replay sound. It asked for these fixes before
+the ptyd sidecar, which relies on adoption being right.
+
+| # | Finding | As built | Test |
+|---|---|---|---|
+| 1 (high) | Adoption ran on the first successful ptyd connection, whenever it came. A boot without ptyd linked with an empty resume (the controller marked the agent gone), and a later spawn's connection adopted the old CLI over the new placement | Adoption happens only in the boot window. It opens at process start and closes when `install` returns, and the link starts only after that. `install` retries ptyd for `K2_PTYD_ADOPT_WAIT` (default 10 s). A first connection after the window ends every leftover and adopts none | `after_the_boot_window_leftovers_are_ended_not_adopted` |
+| 2 | Two adoptable sessions for one agent: the last one listed won | `adopt::pick` groups by agent. The highest epoch is adopted, whatever the order, and the rest are ended | `one_session_per_agent_the_highest_epoch_wins` |
+| 3 | A CLI of another controller, or of an agent this controller saw end, came back through `adopt_unknown` | `k2_host` also records `controller` (the attach URL), `host_name` and `host_id`. A mismatch with this host's link config is ended before the hello. A `host_id` other than the welcome's is ended after it, and the controller hears its `session_gone`. On the controller, an `adopted` resume of an agent whose session ended there (`host_ended`: closed, unplaced, or gone) is released, not adopted. Meta from an S3 daemon (without these fields) is taken as this host's | `a_session_placed_by_another_controller_or_for_another_host_is_ended`, `adopted_agents_are_confirmed_by_a_welcome_or_fenced`, `an_adopted_cli_whose_session_ended_here_is_released` |
+| 4 | An adopted CLI lived on indefinitely if no hello was ever welcomed | The fence: `K2_HOST_MOVE_AFTER` after boot, adopted agents that no welcomed hello confirmed are ended. They stay placed, so the controller is told (`session_gone`, or the next hello's `ended`) | `adopted_agents_are_confirmed_by_a_welcome_or_fenced` |
+| 5 | The controller reset the turn even when the host's meta was behind (an `update_meta` lost, for example over 64 KiB), dropping the running prompt's messages | An adopted resume's counts are taken only when they have at least as many prompts as the controller saw; otherwise the usual newer-only rule applies. A meta over `MAX_META` is logged (`meta_too_large`) and not sent, so ptyd keeps the last one that fit. Typed messages stay bounded (`KEEP_TYPED` 64) | `an_adopted_resume_resets_the_controllers_turn_but_never_to_fewer_prompts`, `an_oversize_meta_is_not_sent_and_a_later_one_is` |
+| 6 | Boot race: the adopter was set late (after HTTP was up), and the sweep could end a session this process had just created | The host role's adopter is set at process start (`boot_settings_check`). The ptyd client keeps the sids this process created, and the sweep neither ends nor adopts them | `a_session_this_process_created_survives_a_later_sweep` |
+| 7 (low) | An agent CLI has the same uid as ptyd, so it can read ptyd's key and rewrite its meta to name another agent or epoch | The cheap part: a session is adopted only if its hook passport is live in `hook-sessions.json` (minted by this host, not revoked). A forged or ended session is ended | `a_session_without_a_live_passport_is_ended` |
+| 8 (low) | An adopted session lost its exit observer's inputs | `k2_exit` keeps `ephemeral_cwd`, `principal_key` and `quota_workspace` when a spawn has them, and the adopted session's observer gets them back | `the_exit_observers_inputs_come_back_from_the_meta` |
+
+**Written down, not done:**
+- **#7, the rest.** The live passport proves this host minted that session,
+  not which agent it belongs to. A CLI could still swap two live sessions'
+  `agent_id`. The full fix checks the passport's `HookPrincipal` against
+  the agent, which needs the agent → workspace mapping on the host. A
+  different uid for ptyd than for the agents would close it at the root
+  (ADR-0001's isolated cells).
+- **#8, the rest.**
+  - A session's vault state isn't kept across a restart.
+  - Sessions spawned locally on a host (not through the link) get no
+    `k2_host` and are ended at a restart, as before S3.
+  - A terminal query sent while no daemon was attached stays unanswered:
+    the replay is muted (P75). A CLI waiting on one would hang. This is
+    unconfirmed, and the fake agent doesn't send any.
+
+### Results (S3.1)
+
+| Check | Result |
+|---|---|
+| `scripts/lab/topology/host-restart-adopt.sh`, run `20261027T161131Z` | **7/7 PASS** |
+| `cargo test -p k2-core --test ptyd_backend` | **11 passed** (with the #5 and #6 tests) |
+| `cargo test -p k2-daemon --test ptyd_p76_integration` | **1 passed** |
+| `cargo test -p k2-core --lib` | **3724 passed, 0 failed** |
+| `cargo test -p k2-daemon --lib` (throwaway HOME) | **4686 passed, 0 failed** |

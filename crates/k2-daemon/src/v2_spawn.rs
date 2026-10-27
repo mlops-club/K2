@@ -1631,6 +1631,8 @@ fn spawn_session_locked(req: SpawnRequest) -> HandlerResult {
     // eventually, but eventually-consistent stale data is the kind
     // of "feels haunted" UX we'd rather avoid. See
     // `heartbeat-active-session-tracking` PRD.
+    // ptyd S3.1 #8: what the observer gets, for an adopting daemon's.
+    crate::hosts::adopt::mark_exit(session.pty(), req.ephemeral_cwd.as_deref(), req.principal_key.as_deref(), req.quota_workspace.as_deref());
     spawn_child_exit_observer(
         req.agent_name.clone(),
         session.clone(),
