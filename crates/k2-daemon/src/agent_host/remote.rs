@@ -223,98 +223,62 @@ struct Turn {
     /// The session (pane) the hooks came from.
     pane: String,
     running: bool,
-    /// The lead's prompts (`UserPromptSubmit`) and turn ends (`Stop`,
-    /// `StopFailure`, `SessionEnd`) in this pane: the host's absolute counts
-    /// when it sends them ([`TurnCounts`]), else counted here.
+    /// The lead's prompts and turn ends in this pane: the host's absolute
+    /// counts when it sends them ([`TurnCounts`]), else counted here.
     prompts: u64,
     stops: u64,
-    /// Messages delivered to it and not known answered.
-    notes: Vec<Note>,
-    /// Its turns are followed: it has sent a hook, or the host counted
-    /// them. A provider with no hooks never answers by Stop, so a close or a
-    /// crash cuts nothing of it (its outcome is only unknown on a lost host).
-    hooked: bool,
-}
-
-/// A message delivered to an agent (K2-f).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Note {
-    msg_id: String,
-    /// The prompt that submits it: the host's count when it typed it, + 1
-    /// (`deliver.ack`'s `prompt`), else this controller's estimate.
-    prompt: u64,
-    /// Noted on a resend, for a message not noted before: a `duplicate`
-    /// answer means it was typed earlier, so this note is dropped.
-    #[serde(default)]
-    resend: bool,
-}
-
-/// K2-f: where a pane's turns stood when a delivery started, so a note
-/// made after the delivery lands in the right turn ([`RemoteHost::note_delivered`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TurnMark {
-    /// The session it was placed with ("" when not placed yet: a wake).
-    pub pane: String,
-    pub prompts: u64,
+    /// K2-f.3: the messages the running turn's prompt submitted, as its host
+    /// matched them (the prompt is the text it typed). The only messages a
+    /// cut of this turn fails: no evidence, no failure.
+    msgs: Vec<String>,
 }
 
 impl Turn {
-    fn from_counts(pane: &str, c: TurnCounts) -> Self {
-        Turn { pane: pane.to_string(), running: c.running, prompts: c.prompts, stops: c.stops, notes: Vec::new(), hooked: true }
+    fn from_counts(pane: &str, c: &TurnCounts) -> Self {
+        let mut t = Turn { pane: pane.to_string(), ..Turn::default() };
+        t.counts(c);
+        t
     }
 
-    /// A hook forwarded without counts (an older host): counted here.
+    /// A hook forwarded without counts (an older host): counted here. Such
+    /// a host says nothing of which messages a prompt submitted.
     fn hook(&mut self, event: &str) -> bool {
-        self.hooked = true;
         match event {
             "UserPromptSubmit" => {
                 self.prompts += 1;
                 self.running = true;
+                self.msgs.clear();
             }
             "Stop" | "StopFailure" | "SessionEnd" => {
                 self.stops += 1;
                 self.running = false;
+                self.msgs.clear();
             }
             _ => return false,
         }
-        self.prune();
         true
     }
 
-    /// The host's absolute counts. Older (or equal) counts than these
-    /// change nothing: frames from one link arrive in order, but a resume
-    /// or `session_gone` may carry counts a later hook already gave.
-    fn counts(&mut self, c: TurnCounts) {
-        self.hooked = true;
+    /// The host's absolute counts. Older ones than these change nothing:
+    /// frames from one link arrive in order, but a resume or `session_gone`
+    /// may carry counts a later hook already gave.
+    fn counts(&mut self, c: &TurnCounts) {
         if c.prompts + c.stops < self.prompts + self.stops {
             return;
         }
         self.prompts = c.prompts;
         self.stops = c.stops;
         self.running = c.running;
-        self.prune();
+        self.msgs = if c.running { c.msgs.clone() } else { Vec::new() };
     }
 
-    /// Is `n`'s prompt's turn over (answered)?
-    fn answered(&self, n: &Note) -> bool {
-        n.prompt < self.prompts || (n.prompt == self.prompts && !self.running)
-    }
-
-    fn prune(&mut self) {
-        let done: Vec<String> = self.notes.iter().filter(|n| self.answered(n)).map(|n| n.msg_id.clone()).collect();
-        self.notes.retain(|n| !done.contains(&n.msg_id));
-    }
-
-    /// Unanswered if the session ends now: each note whose prompt hasn't
-    /// been submitted yet or whose turn is running. `unknown`: its host was
-    /// lost, so even an agent whose turns aren't followed may not have
-    /// answered.
-    fn cut(self, unknown: bool) -> Vec<String> {
-        if !self.hooked && !unknown {
-            return Vec::new();
+    /// Unanswered if the session ends now: the running turn's messages.
+    fn cut(self) -> Vec<String> {
+        if self.running {
+            self.msgs
+        } else {
+            Vec::new()
         }
-        let t = &self;
-        self.notes.iter().filter(|n| !t.answered(n)).map(|n| n.msg_id.clone()).collect()
     }
 }
 
@@ -461,19 +425,22 @@ impl PlacementStore {
                     pending_json TEXT NOT NULL DEFAULT '[]',
                     current_json TEXT NOT NULL DEFAULT '[]',
                     notes_json TEXT NOT NULL DEFAULT '[]',
+                    msgs_json TEXT NOT NULL DEFAULT '[]',
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
                 );",
             )
             .map_err(|e| format!("host placement tables: {e}"))?;
-            // K2-f.2: a table made by 73fe2eb01 has no notes_json (its
-            // pending/current lists are no longer read).
-            let has_notes = c
-                .prepare("SELECT 1 FROM pragma_table_info('host_turns') WHERE name = 'notes_json'")
-                .and_then(|mut st| st.exists([]))
-                .unwrap_or(true);
-            if !has_notes {
-                c.execute_batch("ALTER TABLE host_turns ADD COLUMN notes_json TEXT NOT NULL DEFAULT '[]';")
-                    .map_err(|e| format!("host_turns.notes_json: {e}"))?;
+            // A table made by K2-f.1 (73fe2eb01) or K2-f.2 (c504e6819) lacks
+            // the later columns; its lists are migrated as it is read.
+            for col in ["notes_json", "msgs_json"] {
+                let has = c
+                    .prepare(&format!("SELECT 1 FROM pragma_table_info('host_turns') WHERE name = '{col}'"))
+                    .and_then(|mut st| st.exists([]))
+                    .unwrap_or(true);
+                if !has {
+                    c.execute_batch(&format!("ALTER TABLE host_turns ADD COLUMN {col} TEXT NOT NULL DEFAULT '[]';"))
+                        .map_err(|e| format!("host_turns.{col}: {e}"))?;
+                }
             }
             // A database made by 16253180b has relay_space without agent_id.
             let has_agent = c
@@ -627,17 +594,17 @@ impl PlacementStore {
         let c = self.db.lock();
         let r = match t {
             Some(t) => c.execute(
-                "INSERT INTO host_turns (agent_id, pane, running, prompts, stops, notes_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())
+                "INSERT INTO host_turns (agent_id, pane, running, prompts, stops, msgs_json, pending_json, current_json, notes_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', '[]', '[]', unixepoch())
                  ON CONFLICT(agent_id) DO UPDATE SET pane = ?2, running = ?3, prompts = ?4, stops = ?5,
-                    notes_json = ?6, updated_at = unixepoch()",
+                    msgs_json = ?6, pending_json = '[]', current_json = '[]', notes_json = '[]', updated_at = unixepoch()",
                 rusqlite::params![
                     agent_id,
                     t.pane,
                     t.running,
                     t.prompts as i64,
                     t.stops as i64,
-                    serde_json::to_string(&t.notes).unwrap_or_else(|_| "[]".into()),
+                    serde_json::to_string(&t.msgs).unwrap_or_else(|_| "[]".into()),
                 ],
             ),
             None => c.execute("DELETE FROM host_turns WHERE agent_id = ?1", [agent_id]),
@@ -648,21 +615,35 @@ impl PlacementStore {
     fn load_turns(&self) -> Result<Vec<(String, Turn)>, String> {
         let c = self.db.lock();
         let mut st = c
-            .prepare("SELECT agent_id, pane, running, prompts, stops, notes_json FROM host_turns")
+            .prepare("SELECT agent_id, pane, running, prompts, stops, msgs_json, current_json, notes_json FROM host_turns")
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    Turn {
-                        pane: r.get(1)?,
-                        running: r.get(2)?,
-                        prompts: r.get::<_, i64>(3)? as u64,
-                        stops: r.get::<_, i64>(4)? as u64,
-                        notes: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
-                        hooked: true,
-                    },
-                ))
+                let mut t = Turn {
+                    pane: r.get(1)?,
+                    running: r.get(2)?,
+                    prompts: r.get::<_, i64>(3)? as u64,
+                    stops: r.get::<_, i64>(4)? as u64,
+                    msgs: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                };
+                // K2-f.3 migration: an older row's messages in the running
+                // turn (K2-f.1 `current`, K2-f.2 notes for the running
+                // prompt) become this turn's; the rest are dropped.
+                if t.msgs.is_empty() && t.running {
+                    let current: Vec<String> = serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default();
+                    let notes: Vec<serde_json::Value> = serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default();
+                    t.msgs = current;
+                    for n in notes {
+                        if n.get("prompt").and_then(serde_json::Value::as_u64) == Some(t.prompts) {
+                            if let Some(id) = n.get("msg_id").and_then(serde_json::Value::as_str) {
+                                if !t.msgs.iter().any(|m| m == id) {
+                                    t.msgs.push(id.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok((r.get::<_, String>(0)?, t))
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
@@ -1337,15 +1318,14 @@ impl RemoteHost {
                     }
                     // K2-f: the host's absolute counts (a hook lost on the
                     // way is in them); an older host's hooks are counted here.
-                    let before = (t.prompts, t.stops, t.running, t.notes.len(), t.hooked);
-                    match turn {
+                    let before = (t.prompts, t.stops, t.running, t.msgs.clone());
+                    match &turn {
                         Some(c) => t.counts(c),
                         None => {
                             t.hook(&event);
                         }
                     }
-                    t.hooked = true;
-                    if before != (t.prompts, t.stops, t.running, t.notes.len(), t.hooked) {
+                    if before != (t.prompts, t.stops, t.running, t.msgs.clone()) {
                         self.save_turn(&inner, &agent);
                     }
                 }
@@ -1369,7 +1349,7 @@ impl RemoteHost {
                         // K2-f: its CLI exited mid-turn (SIGKILL, a crash).
                         // The host's counts say how its turn ended, whatever
                         // order its last hooks arrive in.
-                        cut = self.take_cut(&mut inner, &agent_id, p.session_id.as_deref(), turn, false);
+                        cut = self.take_cut(&mut inner, &agent_id, p.session_id.as_deref(), turn.as_ref());
                     }
                     if let Some(s) = inner.sessions.remove(&agent_id) {
                         s.exited(exit_code);
@@ -1641,7 +1621,7 @@ impl RemoteHost {
                             s.mark_exited();
                         }
                         // K2-f: closed mid-turn, as `unplace` (K2-d).
-                        cut = self.take_cut(&mut inner, &agent_id, None, None, false);
+                        cut = self.take_cut(&mut inner, &agent_id, None, None);
                     }
                     drop(inner);
                     self.report_cut(&agent_id, &cut, crate::delivery_drain::Cut::Closed);
@@ -2371,7 +2351,7 @@ impl RemoteHost {
         };
         inner.placements.remove(agent_id);
         self.forget(agent_id, p.epoch);
-        let cut = self.take_cut(inner, agent_id, p.session_id.as_deref(), None, false);
+        let cut = self.take_cut(inner, agent_id, p.session_id.as_deref(), None);
         let Some(s) = inner.sessions.remove(agent_id) else { return cut };
         let row = Self::stored(&s);
         if let Some(store) = &self.store {
@@ -2401,7 +2381,7 @@ impl RemoteHost {
     /// [`Self::report_cut`]. `host`: the host's own counts at the end, when
     /// it sent them; without them, what this controller last knew (a lost
     /// host: the outcome is unknown, and the caller says so).
-    fn take_cut(&self, inner: &mut Inner, agent_id: &str, pane: Option<&str>, host: Option<TurnCounts>, unknown: bool) -> Vec<String> {
+    fn take_cut(&self, inner: &mut Inner, agent_id: &str, pane: Option<&str>, host: Option<&TurnCounts>) -> Vec<String> {
         let turn = inner.turns.remove(agent_id);
         if turn.is_some() {
             self.save_turn(inner, agent_id);
@@ -2411,7 +2391,7 @@ impl RemoteHost {
                 if let Some(c) = host {
                     t.counts(c);
                 }
-                t.cut(unknown)
+                t.cut()
             }
             _ => Vec::new(),
         }
@@ -2529,7 +2509,7 @@ impl RemoteHost {
             self.forget(&p.agent_id, p.epoch);
             // K2-f: its turn there is lost with its host; the copy that
             // resumes elsewhere starts a new one.
-            cuts.push((p.agent_id.clone(), self.take_cut(&mut inner, &p.agent_id, p.session_id.as_deref(), None, true)));
+            cuts.push((p.agent_id.clone(), self.take_cut(&mut inner, &p.agent_id, p.session_id.as_deref(), None)));
             let Some(s) = inner.sessions.remove(&p.agent_id) else {
                 // Reserved, but its spawn never answered: nothing to resume.
                 continue;
@@ -2650,7 +2630,7 @@ impl RemoteHost {
                         // K2-f: its turn as the host has it (what its
                         // forwarded hooks missed while the link was down, or
                         // all of it: a turn this controller never followed).
-                        if let Some(c) = r.turn {
+                        if let Some(c) = &r.turn {
                             let t = inner.turns.entry(r.agent_id.clone()).or_default();
                             if t.pane == r.session_id {
                                 t.counts(c);
@@ -2709,11 +2689,21 @@ impl RemoteHost {
                     s.exited(None);
                 }
                 // K2-f: the host says how its turn ended (its CLI exited
-                // while the link was down); a host that doesn't know (its
-                // daemon restarted) leaves the outcome unknown.
-                let host = ended.get(agent.as_str()).filter(|e| e.epoch == epoch.0).map(|e| e.turn);
-                let how = if host.is_some() { crate::delivery_drain::Cut::Crashed } else { crate::delivery_drain::Cut::HostLost };
-                cuts.push((agent.clone(), self.take_cut(&mut inner, &agent, pane.as_deref(), host, host.is_none()), how));
+                // while the link was down; no turn: it never sent a hook); a
+                // host that doesn't know (its daemon restarted) leaves the
+                // outcome unknown.
+                let told = ended.get(agent.as_str()).filter(|e| e.epoch == epoch.0);
+                let how = if told.is_some() { crate::delivery_drain::Cut::Crashed } else { crate::delivery_drain::Cut::HostLost };
+                let host = told.and_then(|e| e.turn.as_ref());
+                let cut = match told {
+                    // Told it ended, and nothing of a turn: nothing to fail.
+                    Some(e) if e.turn.is_none() => {
+                        self.take_cut(&mut inner, &agent, pane.as_deref(), None);
+                        Vec::new()
+                    }
+                    _ => self.take_cut(&mut inner, &agent, pane.as_deref(), host),
+                };
+                cuts.push((agent.clone(), cut, how));
                 out.push((agent, AdoptDecision::Gone));
             }
             // Reach the host after the table is settled.
@@ -2772,7 +2762,7 @@ impl RemoteHost {
         let s = self.keep_session(inner, &r.agent_id, host_id, epoch, sid, meta);
         s.cached.lock().alive = r.child_alive;
         // K2-f: its turn as the host has it.
-        if let Some(c) = r.turn {
+        if let Some(c) = &r.turn {
             inner.turns.insert(r.agent_id.clone(), Turn::from_counts(&r.session_id, c));
             self.save_turn(inner, &r.agent_id);
         }
@@ -2792,83 +2782,6 @@ impl RemoteHost {
         let inner = self.inner.lock();
         let Some(t) = inner.turns.get(agent_id) else { return false };
         t.running && inner.placements.get(agent_id).is_some_and(|p| p.session_id.as_deref() == Some(t.pane.as_str()))
-    }
-
-    /// K2-f: where `agent_id`'s turns stand now, taken before a delivery
-    /// whose note can only be made after it ([`Self::note_delivered`]).
-    /// Not placed: from its next session's start (a wake).
-    pub fn turn_mark(&self, agent_id: &str) -> TurnMark {
-        let inner = self.inner.lock();
-        let Some(pane) = inner.placements.get(agent_id).and_then(|p| p.session_id.clone()) else {
-            return TurnMark::default();
-        };
-        let prompts = inner.turns.get(agent_id).filter(|t| t.pane == pane).map(|t| t.prompts).unwrap_or(0);
-        TurnMark { pane, prompts }
-    }
-
-    /// K2-d, K2-f: `msg_id` is (being) delivered to `agent_id` as a prompt:
-    /// unanswered until the turn that submits it ends. Its prompt is
-    /// estimated as the next one after `mark` (`None`: now, the note made
-    /// before the delivery); the host's ack gives the exact one
-    /// ([`Self::set_note_prompt`]). `resend`: noted on a resend. A message
-    /// noted already keeps its note.
-    pub fn note_delivered(&self, agent_id: &str, msg_id: &str, mark: Option<&TurnMark>, resend: bool) {
-        let mut inner = self.inner.lock();
-        let Some(pane) = inner.placements.get(agent_id).and_then(|p| p.session_id.clone()) else { return };
-        let t = inner.turns.entry(agent_id.to_string()).or_default();
-        if t.pane != pane {
-            *t = Turn { pane: pane.clone(), ..Turn::default() };
-        }
-        if t.notes.iter().any(|n| n.msg_id == msg_id) {
-            return;
-        }
-        let base = match mark {
-            None => t.prompts,
-            Some(m) if m.pane == pane => m.prompts,
-            // A new session since (the wake that delivers it): from its start.
-            Some(_) => 0,
-        };
-        let n = Note { msg_id: msg_id.to_string(), prompt: base + 1, resend };
-        if t.answered(&n) {
-            return;
-        }
-        t.notes.push(n);
-        self.save_turn(&inner, agent_id);
-    }
-
-    /// K2-f: the host typed `msg_id` for `agent_id`'s `prompt`th prompt.
-    pub fn set_note_prompt(&self, agent_id: &str, msg_id: &str, prompt: u64) {
-        let mut inner = self.inner.lock();
-        let Some(pane) = inner.placements.get(agent_id).and_then(|p| p.session_id.clone()) else { return };
-        let t = inner.turns.entry(agent_id.to_string()).or_default();
-        if t.pane != pane {
-            *t = Turn { pane, ..Turn::default() };
-        }
-        t.notes.retain(|n| n.msg_id != msg_id);
-        let n = Note { msg_id: msg_id.to_string(), prompt, resend: false };
-        if !t.answered(&n) {
-            t.notes.push(n);
-        }
-        self.save_turn(&inner, agent_id);
-    }
-
-    /// The delivery of `msg_id` to `agent_id` didn't happen after all.
-    pub fn unnote_delivered(&self, agent_id: &str, msg_id: &str) {
-        let mut inner = self.inner.lock();
-        if let Some(t) = inner.turns.get_mut(agent_id) {
-            t.notes.retain(|n| n.msg_id != msg_id);
-            self.save_turn(&inner, agent_id);
-        }
-    }
-
-    /// K2-f: a resend of `msg_id` was a duplicate: it was typed before,
-    /// and its earlier note (if any) is the one that counts.
-    pub fn unnote_resend(&self, agent_id: &str, msg_id: &str) {
-        let mut inner = self.inner.lock();
-        if let Some(t) = inner.turns.get_mut(agent_id) {
-            t.notes.retain(|n| !(n.msg_id == msg_id && n.resend));
-            self.save_turn(&inner, agent_id);
-        }
     }
 
     /// The host that last ran `agent_id` (S7's affinity), placed or not.
@@ -3170,7 +3083,7 @@ impl AgentHost for RemoteHost {
             if placed.0.is_some() {
                 self.note_ended(&mut inner, agent_id);
             }
-            let cut = self.take_cut(&mut inner, agent_id, None, None, false);
+            let cut = self.take_cut(&mut inner, agent_id, None, None);
             (placed.0, placed.1, cut)
         };
         // K2-d: closed mid-turn, its messages since the last turn end are
@@ -3253,7 +3166,8 @@ impl AgentHost for RemoteHost {
         let steps = steps.iter().map(InjectStep::from_action).collect();
         let r = self.request_blocking(
             &s.host_id,
-            |req| Frame::Inject { req, agent_id: s.agent_id.clone(), epoch: s.epoch.0, steps, msg_id: None },
+            // K2-f.3: the message the direct path delivers, if any.
+            |req| Frame::Inject { req, agent_id: s.agent_id.clone(), epoch: s.epoch.0, steps, msg_id: crate::delivery_drain::direct_delivery_id() },
             OP_DEADLINE,
         );
         match r {

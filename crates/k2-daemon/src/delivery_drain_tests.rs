@@ -186,9 +186,9 @@ async fn a_message_from_host_a_reaches_host_b_exactly_once_when_the_link_to_b_dr
 
     // Hop up: the controller accepts once, and a resend (lost ack) is a duplicate.
     send(&mut a, &msg("m_1", "bob", "hello bob")).await;
-    assert_eq!(recv(&mut a).await, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Delivered, reason: None, prompt: None });
+    assert_eq!(recv(&mut a).await, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Delivered, reason: None });
     send(&mut a, &msg("m_1", "bob", "hello bob")).await;
-    assert_eq!(recv(&mut a).await, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Duplicate, reason: None, prompt: None });
+    assert_eq!(recv(&mut a).await, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Duplicate, reason: None });
 
     // Hop down: B gets it, delivers it, and the link drops before the ack.
     let (m, epoch, attempt) = next_deliver(&mut b).await;
@@ -196,7 +196,7 @@ async fn a_message_from_host_a_reaches_host_b_exactly_once_when_the_link_to_b_dr
     assert_eq!((epoch, attempt), (Some(epoch_b), 1));
     assert_eq!(m.body, json!({"kind": "msg", "text": "hello bob"}));
     let lost = host_b.receive(&m, 1).expect("an ack");
-    assert_eq!(lost, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Delivered, reason: None, prompt: None });
+    assert_eq!(lost, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Delivered, reason: None });
     drop(b);
     c.wait_hosts(1).await;
     assert_eq!(c.drain.get("m_1").unwrap().state, State::Sent, "not delivered until acked");
@@ -208,7 +208,7 @@ async fn a_message_from_host_a_reaches_host_b_exactly_once_when_the_link_to_b_dr
     assert_eq!(m.msg_id, "m_1");
     assert!(attempt >= 2, "a resend: attempt {attempt}");
     let ack = host_b.receive(&m, 2).expect("an ack");
-    assert_eq!(ack, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Duplicate, reason: None, prompt: None });
+    assert_eq!(ack, Frame::DeliverAck { msg_id: "m_1".into(), status: DeliverStatus::Duplicate, reason: None });
     send(&mut b, &ack).await;
     let row = c.wait_state("m_1", State::Delivered).await;
     assert_eq!((row.sender.as_str(), row.recipient.as_str()), ("agent:alice", "bob"));
@@ -248,7 +248,7 @@ async fn a_pair_is_delivered_in_order_and_a_rejection_fails_loudly() {
             break d;
         }
     };
-    send(&mut b, &Frame::DeliverAck { msg_id: m.msg_id, status: DeliverStatus::Rejected, reason: Some("no agent bob here".into()), prompt: None }).await;
+    send(&mut b, &Frame::DeliverAck { msg_id: m.msg_id, status: DeliverStatus::Rejected, reason: Some("no agent bob here".into()) }).await;
     let row = c.wait_state("m_4", State::Failed).await;
     assert_eq!(row.reason.as_deref(), Some("rejected by host host-b: no agent bob here"));
     assert_eq!(*got.lock(), ["m_2", "m_3"]);
@@ -297,7 +297,7 @@ fn the_receiving_side_dedupes_retries_and_rejects_and_remembers_across_a_restart
     };
     let m = Incoming { msg_id: "m_1".into(), agent_id: "bob".into(), from: "agent:alice".into(), body: json!({"text": "hi"}) };
     let bad = Incoming { msg_id: "m_bad".into(), agent_id: "bob".into(), from: "agent:alice".into(), body: json!({}) };
-    let ack = |id: &str, status, reason: Option<&str>| Some(Frame::DeliverAck { msg_id: id.into(), status, reason: reason.map(String::from), prompt: None });
+    let ack = |id: &str, status, reason: Option<&str>| Some(Frame::DeliverAck { msg_id: id.into(), status, reason: reason.map(String::from) });
     {
         let h = HostSide::new(open(), FAST, deliverer(Arc::clone(&calls)));
         assert_eq!(h.receive(&m, 1), None, "retryable: no ack");
@@ -420,7 +420,7 @@ fn wake_msg(id: &str, to: &str, wake: bool) -> Frame {
 }
 
 fn ack(id: &str, status: DeliverStatus, reason: Option<&str>) -> Frame {
-    Frame::DeliverAck { msg_id: id.into(), status, reason: reason.map(str::to_string), prompt: None }
+    Frame::DeliverAck { msg_id: id.into(), status, reason: reason.map(str::to_string) }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -688,7 +688,7 @@ fn restarted(db: Db, t: &Arc<TempTranscripts>) -> (HostSide, Arc<Mutex<Vec<Strin
 
 fn reported(rx: &mut mpsc::UnboundedReceiver<Frame>) -> Vec<(String, DeliverStatus, String)> {
     let mut out = Vec::new();
-    while let Ok(Frame::DeliverAck { msg_id, status, reason, prompt: None }) = rx.try_recv() {
+    while let Ok(Frame::DeliverAck { msg_id, status, reason }) = rx.try_recv() {
         out.push((msg_id, status, reason.unwrap_or_default()));
     }
     out

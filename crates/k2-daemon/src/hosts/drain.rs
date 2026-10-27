@@ -124,13 +124,19 @@ pub struct Turns {
     tick: std::sync::atomic::AtomicU64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct PaneTurns {
     counts: TurnCounts,
     /// The pane's owner exited.
     gone: bool,
     heard: u64,
+    /// K2-f.3: messages this host typed into the pane and whose prompt
+    /// hasn't been submitted yet: (message id, [`prompt_digest`] of the text).
+    typed: Vec<(String, String)>,
 }
+
+/// Typed messages kept per pane, at most (the oldest go first).
+const KEEP_TYPED: usize = 64;
 
 /// [`Turns::keep`] in production.
 const KEEP_PANES: usize = 4096;
@@ -160,7 +166,10 @@ impl Turns {
 
     /// One hook from the pane's owner. A subagent's (`agent_id` set) or a
     /// nested CLI's (`from_descendant`) never starts or ends the lead's turn.
-    pub fn note(&self, pane: &str, event: &str, subagent: bool) {
+    /// A prompt whose `digest` is a message this host typed into the pane
+    /// takes that message into its turn (K2-f.3: the only evidence that the
+    /// turn had it); a turn's end lets go of them, answered.
+    pub fn note(&self, pane: &str, event: &str, subagent: bool, digest: Option<&str>) {
         if subagent {
             return;
         }
@@ -176,10 +185,28 @@ impl Turns {
         if prompt {
             t.counts.prompts += 1;
             t.counts.running = true;
+            let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut t.typed).into_iter().partition(|(_, d)| Some(d.as_str()) == digest);
+            t.typed = rest;
+            t.counts.msgs = mine.into_iter().map(|(id, _)| id).collect();
         }
         if stop {
             t.counts.stops += 1;
             t.counts.running = false;
+            t.counts.msgs.clear();
+        }
+    }
+
+    /// K2-f.3: this host typed message `msg_id` (`text`) into `pane`; the
+    /// prompt that submits exactly that text takes it into its turn.
+    pub fn typed(&self, pane: &str, msg_id: &str, text: &str) {
+        let mut m = self.panes.lock();
+        let heard = self.touch(&mut m, pane);
+        let t = m.entry(pane.to_string()).or_default();
+        t.heard = heard;
+        t.typed.retain(|(id, _)| id != msg_id);
+        t.typed.push((msg_id.to_string(), k2_core::agent_hooks::envelope::prompt_digest(text)));
+        if t.typed.len() > KEEP_TYPED {
+            t.typed.remove(0);
         }
     }
 
@@ -198,19 +225,20 @@ impl Turns {
         self.panes.lock().get(pane).is_some_and(|t| t.counts.running && !t.gone)
     }
 
-    /// K2-f: the pane's counts, for the controller.
+    /// K2-f: the pane's counts, for the controller. None until it has a
+    /// prompt or a turn end (a pane with only typed messages has no turns).
     pub fn counts(&self, pane: &str) -> Option<TurnCounts> {
-        self.panes.lock().get(pane).map(|t| t.counts)
+        self.panes.lock().get(pane).filter(|t| t.counts.prompts + t.counts.stops > 0).map(|t| t.counts.clone())
     }
 
     /// K2-f: the counts of a pane whose CLI exited, now reported: forgotten.
     pub fn take(&self, pane: &str) -> Option<TurnCounts> {
         let mut m = self.panes.lock();
-        match m.get(pane) {
-            Some(t) if t.gone => m.remove(pane).map(|t| t.counts),
-            Some(t) => Some(t.counts),
-            None => None,
+        let counts = m.get(pane).filter(|t| t.counts.prompts + t.counts.stops > 0).map(|t| t.counts.clone());
+        if m.get(pane).is_some_and(|t| t.gone) {
+            m.remove(pane);
         }
+        counts
     }
 }
 
@@ -232,7 +260,9 @@ pub fn is_subagent(envelope: &k2_core::agent_hooks::envelope::HookEnvelope) -> b
 pub fn note_ingest(ev: &crate::hook_ingest::IngestEvent) {
     use crate::hook_ingest::IngestEvent;
     match ev {
-        IngestEvent::Envelope { envelope, .. } => turns().note(&envelope.pane, &envelope.event, is_subagent(envelope)),
+        IngestEvent::Envelope { envelope, .. } => {
+            turns().note(&envelope.pane, &envelope.event, is_subagent(envelope), envelope.prompt_digest.as_deref())
+        }
         IngestEvent::OwnerReleased { pane, .. } => turns().gone(pane),
         _ => {}
     }
@@ -242,7 +272,13 @@ pub fn note_ingest(ev: &crate::hook_ingest::IngestEvent) {
 /// would see it.
 #[doc(hidden)]
 pub fn note_turn_hook(pane: &str, event: &str) {
-    turns().note(pane, event, false);
+    turns().note(pane, event, false, None);
+}
+
+/// K2-f.3: this host typed message `msg_id` (`text`) into `pane` (a
+/// delivery, a wake's launch prompt, an inject the controller named).
+pub fn note_typed(pane: &str, msg_id: &str, text: &str) {
+    turns().typed(pane, msg_id, text);
 }
 
 /// K2-f: `pane`'s turn counts on this host (reported in `hello`'s resume).
@@ -521,39 +557,66 @@ mod tests {
     fn a_turn_runs_from_the_prompt_to_its_stop_and_subagents_dont_count() {
         let t = Turns::default();
         assert!(!t.in_turn("p1"));
-        t.note("p1", "SessionStart", false);
+        t.note("p1", "SessionStart", false, None);
         assert!(!t.in_turn("p1"));
-        t.note("p1", "UserPromptSubmit", false);
+        t.note("p1", "UserPromptSubmit", false, None);
         assert!(t.in_turn("p1"));
-        t.note("p1", "Stop", true);
+        t.note("p1", "Stop", true, None);
         assert!(t.in_turn("p1"), "a subagent's Stop doesn't end the lead's turn");
-        t.note("p1", "PreToolUse", false);
+        t.note("p1", "PreToolUse", false, None);
         assert!(t.in_turn("p1"));
-        t.note("p1", "Stop", false);
+        t.note("p1", "Stop", false, None);
         assert!(!t.in_turn("p1"));
-        t.note("p2", "UserPromptSubmit", false);
+        t.note("p2", "UserPromptSubmit", false, None);
         t.gone("p2");
         assert!(!t.in_turn("p2"), "the CLI exited");
-        t.note("p3", "UserPromptSubmit", false);
-        t.note("p3", "StopFailure", false);
+        t.note("p3", "UserPromptSubmit", false, None);
+        t.note("p3", "StopFailure", false, None);
         assert!(!t.in_turn("p3"));
     }
 
     #[test]
     fn turns_are_counted_and_kept_after_the_cli_exits_until_reported() {
         let t = Turns::default();
-        t.note("p1", "UserPromptSubmit", false);
-        t.note("p1", "Stop", false);
-        t.note("p1", "UserPromptSubmit", false);
-        t.note("p1", "Stop", true);
-        assert_eq!(t.counts("p1"), Some(TurnCounts { prompts: 2, stops: 1, running: true }), "a subagent's Stop isn't counted");
+        t.note("p1", "UserPromptSubmit", false, None);
+        t.note("p1", "Stop", false, None);
+        t.note("p1", "UserPromptSubmit", false, None);
+        t.note("p1", "Stop", true, None);
+        assert_eq!(t.counts("p1"), Some(TurnCounts { prompts: 2, stops: 1, running: true, msgs: vec![] }), "a subagent's Stop isn't counted");
         t.gone("p1");
         assert!(!t.in_turn("p1"));
-        assert_eq!(t.take("p1"), Some(TurnCounts { prompts: 2, stops: 1, running: true }), "it died mid-turn");
+        assert_eq!(t.take("p1"), Some(TurnCounts { prompts: 2, stops: 1, running: true, msgs: vec![] }), "it died mid-turn");
         assert_eq!(t.take("p1"), None, "reported once");
-        t.note("p2", "UserPromptSubmit", false);
-        assert_eq!(t.take("p2"), Some(TurnCounts { prompts: 1, stops: 0, running: true }), "a live pane is kept");
+        t.note("p2", "UserPromptSubmit", false, None);
+        assert_eq!(t.take("p2"), Some(TurnCounts { prompts: 1, stops: 0, running: true, msgs: vec![] }), "a live pane is kept");
         assert!(t.in_turn("p2"));
+    }
+
+    /// K2-f.3 #2, #3: a typed message is in the turn whose prompt is its
+    /// text, and only that one. One typed while a turn runs and folded into
+    /// it (no prompt of its own) is in no turn; two typed in a row each get
+    /// their own prompt's turn; a turn's end lets go of its messages.
+    #[test]
+    fn a_message_is_in_the_turn_whose_prompt_is_its_text() {
+        use k2_core::agent_hooks::envelope::prompt_digest;
+        let t = Turns::default();
+        let d = |s: &str| Some(prompt_digest(s));
+        t.note("p1", "UserPromptSubmit", false, d("the user's own").as_deref());
+        t.typed("p1", "m_folded", "[from alice] folded in");
+        t.note("p1", "Stop", false, None);
+        assert_eq!(t.counts("p1").unwrap().msgs, Vec::<String>::new());
+        t.typed("p1", "m_a", "[from alice] A");
+        t.typed("p1", "m_b", "[from alice] B");
+        t.note("p1", "UserPromptSubmit", false, d("\u{1b}[200~[from alice] A\u{1b}[201~\r").as_deref());
+        assert_eq!(t.counts("p1").unwrap().msgs, vec!["m_a".to_string()]);
+        t.note("p1", "Stop", false, None);
+        assert_eq!(t.counts("p1").unwrap().msgs, Vec::<String>::new(), "answered");
+        t.note("p1", "UserPromptSubmit", false, d("[from alice] B").as_deref());
+        assert_eq!(t.counts("p1").unwrap(), TurnCounts { prompts: 3, stops: 2, running: true, msgs: vec!["m_b".into()] });
+        // The folded one never matches a later prompt that isn't its text.
+        t.note("p1", "Stop", false, None);
+        t.note("p1", "UserPromptSubmit", false, d("[from alice] something else").as_deref());
+        assert_eq!(t.counts("p1").unwrap().msgs, Vec::<String>::new());
     }
 
     /// K2-f.2 #8: past `keep` panes, the least recently heard go first,
@@ -561,14 +624,14 @@ mod tests {
     #[test]
     fn panes_are_evicted_oldest_first_exited_ones_before_live_ones() {
         let t = Turns::with_keep(2);
-        t.note("p1", "UserPromptSubmit", false);
-        t.note("p2", "UserPromptSubmit", false);
+        t.note("p1", "UserPromptSubmit", false, None);
+        t.note("p2", "UserPromptSubmit", false, None);
         t.gone("p2");
-        t.note("p3", "UserPromptSubmit", false);
+        t.note("p3", "UserPromptSubmit", false, None);
         assert!(t.counts("p2").is_none(), "the exited one goes first");
         assert!(t.counts("p1").is_some() && t.counts("p3").is_some());
-        t.note("p1", "Stop", false);
-        t.note("p4", "UserPromptSubmit", false);
+        t.note("p1", "Stop", false, None);
+        t.note("p4", "UserPromptSubmit", false, None);
         assert!(t.counts("p3").is_none(), "then the least recently heard");
         assert!(t.counts("p1").is_some() && t.counts("p4").is_some());
     }

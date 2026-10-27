@@ -206,3 +206,27 @@ fn a_restart_mid_queue_keeps_every_message_and_its_state() {
     drop(c);
     std::fs::remove_file(&path).unwrap();
 }
+
+/// K2-d, K2-f.3: a cut turn's message ends `failed`, delivered or still
+/// `sent` (its ack died with the host), and a late ack can't revive it. A
+/// message never sent is not touched.
+#[test]
+fn an_interrupted_message_ends_failed_and_a_late_ack_changes_nothing() {
+    let c = db();
+    for id in ["m_queued", "m_sent", "m_delivered"] {
+        outbox::enqueue(&c, Hop::Down, &msg(id, "agent:a", "b"), 10).unwrap();
+    }
+    outbox::mark_sent(&c, Hop::Down, "m_sent", 11, &POLICY).unwrap();
+    outbox::mark_sent(&c, Hop::Down, "m_delivered", 11, &POLICY).unwrap();
+    outbox::mark_delivered(&c, Hop::Down, "m_delivered", 12).unwrap();
+    let why = "interrupted: b crashed mid-turn before it answered";
+    assert!(!outbox::mark_interrupted(&c, Hop::Down, "m_queued", why, 13).unwrap(), "never sent");
+    assert!(outbox::mark_interrupted(&c, Hop::Down, "m_sent", why, 13).unwrap());
+    assert!(outbox::mark_interrupted(&c, Hop::Down, "m_delivered", why, 13).unwrap());
+    assert!(!outbox::mark_delivered(&c, Hop::Down, "m_sent", 14).unwrap(), "the late ack");
+    for id in ["m_sent", "m_delivered"] {
+        let r = outbox::get(&c, Hop::Down, id).unwrap().unwrap();
+        assert_eq!((r.state, r.reason.as_deref()), (State::Failed, Some(why)), "{id}");
+    }
+    assert_eq!(outbox::get(&c, Hop::Down, "m_queued").unwrap().unwrap().state, State::Queued);
+}

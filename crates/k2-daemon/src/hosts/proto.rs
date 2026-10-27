@@ -99,7 +99,9 @@ pub struct EndedPlacement {
     pub agent_id: String,
     pub session_id: String,
     pub epoch: u64,
-    pub turn: TurnCounts,
+    /// `None`: the host never saw a hook from it (a provider without hooks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<TurnCounts>,
 }
 
 /// K2-f: a pane's turn as the host's hook stream saw it: how many prompts
@@ -107,11 +109,16 @@ pub struct EndedPlacement {
 /// the lead had since its CLI started, and whether a turn was running at
 /// the last hook. Absolute: the controller takes them as they are (a hook
 /// it never got is in the next counts it gets).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TurnCounts {
     pub prompts: u64,
     pub stops: u64,
     pub running: bool,
+    /// K2-f.3: the messages the running turn's prompt submitted, matched by
+    /// the host (the `UserPromptSubmit` prompt is the text it typed): the
+    /// only messages a cut of this turn fails. Empty when no turn runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub msgs: Vec<String>,
 }
 
 /// Offsets into a session's output ring: `start` is the oldest byte the
@@ -475,10 +482,6 @@ pub enum Frame {
         status: DeliverStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
-        /// K2-f: the agent's prompt (its `UserPromptSubmit` count, from 1)
-        /// that submits the injected message: the turn that answers it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt: Option<u64>,
     },
 
     // ── protocol 2: inject (the `AgentHost::inject` flow, remote) ──────
@@ -489,7 +492,8 @@ pub enum Frame {
         agent_id: String,
         epoch: u64,
         steps: Vec<InjectStep>,
-        /// The message this injection delivers, when it is one.
+        /// The message this injection delivers, when it is one (K2-f.3: the
+        /// host matches it to the prompt that submits it).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         msg_id: Option<String>,
     },
@@ -726,11 +730,11 @@ mod tests {
                        "body": {"text": "hi"}, "attempt": 2}),
             ),
             (
-                Frame::DeliverAck { msg_id: "m-1".into(), status: DeliverStatus::Duplicate, reason: None, prompt: None },
+                Frame::DeliverAck { msg_id: "m-1".into(), status: DeliverStatus::Duplicate, reason: None },
                 json!({"t": "deliver.ack", "msg_id": "m-1", "status": "duplicate"}),
             ),
             (
-                Frame::DeliverAck { msg_id: "m-2".into(), status: DeliverStatus::Rejected, reason: Some("stale epoch".into()), prompt: None },
+                Frame::DeliverAck { msg_id: "m-2".into(), status: DeliverStatus::Rejected, reason: Some("stale epoch".into()) },
                 json!({"t": "deliver.ack", "msg_id": "m-2", "status": "rejected", "reason": "stale epoch"}),
             ),
             (
