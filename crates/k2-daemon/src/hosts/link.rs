@@ -162,6 +162,9 @@ struct Placed {
     /// `hello` has carried them: a `session_gone` lost with its link is
     /// told again in the next `hello.ended`.
     ended: Vec<super::proto::EndedPlacement>,
+    /// ptyd S3: agents this daemon took over from a previous one at boot,
+    /// resumed with `adopted: true` until a welcomed `hello` carried them.
+    adopted: std::collections::HashSet<String>,
 }
 
 fn placed() -> Arc<Mutex<Placed>> {
@@ -172,6 +175,17 @@ fn placed() -> Arc<Mutex<Placed>> {
 /// The epoch this host runs `agent` at (the drain's home save).
 pub(crate) fn placed_epoch(agent: &str) -> Option<u64> {
     placed().lock().epochs.get(agent).copied()
+}
+
+/// ptyd S3: `agent_id`'s session `session_id`, at `epoch`, was adopted
+/// from ptyd at boot: placed again, as the previous daemon had it.
+pub(crate) fn adopted(agent_id: &str, session_id: &str, epoch: u64) {
+    let placed = placed();
+    let mut p = placed.lock();
+    p.epochs.insert(agent_id.to_string(), epoch);
+    p.sessions.retain(|_, a| a != agent_id);
+    p.sessions.insert(session_id.to_string(), agent_id.to_string());
+    p.adopted.insert(agent_id.to_string());
 }
 
 /// `hello.resume`: every placement this host still runs (S9), with its
@@ -198,6 +212,7 @@ fn resume_list() -> (Vec<super::proto::ResumePlacement>, Vec<super::proto::Ended
                 args: s.args(),
                 label: Some(s.label()),
                 turn: super::drain::turn_counts(&s.session_id().to_string()),
+                adopted: p.adopted.contains(agent),
             }),
             _ => dead.push((agent.clone(), *epoch)),
         }
@@ -275,8 +290,14 @@ pub(crate) async fn serve_once(cfg: &HostConfig, t: &Timings, linked: impl FnOnc
             Frame::Welcome { host_id, protocol, controller } => {
                 log_debug!("[hosts/link] linked as {host_id} to {controller} (protocol {protocol})");
                 // K2-f.3: the ended agents this hello carried are told.
-                if let Frame::Hello { ended, .. } = &hello {
+                if let Frame::Hello { ended, resume, .. } = &hello {
                     forget_ended(ended);
+                    // ptyd S3: the controller was told these were adopted.
+                    let placed = placed();
+                    let mut p = placed.lock();
+                    for r in resume.iter().filter(|r| r.adopted) {
+                        p.adopted.remove(&r.agent_id);
+                    }
                 }
                 host_id
             }
@@ -427,6 +448,10 @@ fn handle(
                     .and_then(|v| v.get("sessionId").and_then(|s| s.as_str()).map(str::to_string));
                 if let Some(session) = session {
                     log_debug!("[hosts/link] spawned agent {agent_id} session {session} epoch {epoch} (pid {})", std::process::id());
+                    // ptyd S3: what a restarted daemon adopts it by.
+                    if let Some(s) = k2_core::session::SessionId::parse(&session).and_then(|sid| crate::agent_host::host().find_session(&sid)) {
+                        super::adopt::mark_placed(&s, &agent_id, epoch);
+                    }
                     placed.lock().sessions.insert(session, agent_id);
                 }
                 let _ = tx.send(Frame::Reply { req, status, body });
@@ -521,6 +546,11 @@ fn handle(
                             spawned.reused,
                             std::process::id()
                         );
+                        if let Some(s) = k2_core::session::SessionId::parse(&spawned.session_id)
+                            .and_then(|sid| crate::agent_host::host().find_session(&sid))
+                        {
+                            super::adopt::mark_placed(&s, &agent_id, epoch);
+                        }
                         placed.lock().sessions.insert(spawned.session_id.clone(), agent_id);
                         ("200 OK".to_string(), serde_json::to_string(&spawned).unwrap_or_default())
                     }

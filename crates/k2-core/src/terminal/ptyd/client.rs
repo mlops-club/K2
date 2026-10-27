@@ -233,15 +233,12 @@ pub struct Ptyd {
     swept: AtomicBool,
 }
 
-/// 0.46.2 has no adoption (that is S3), so sessions a PREVIOUS daemon left
-/// in ptyd can't be taken over: end them, keeping today's semantics (a
-/// restart ends agents) and avoiding a second `--resume` of the same
-/// conversation. Returns how many were ended.
-pub fn end_leftover_sessions(owner: &Owner) -> usize {
-    let sessions = match owner.request(Request::List) {
-        Ok(Reply::Sessions { sessions }) => sessions,
-        _ => return 0,
-    };
+/// Sessions a PREVIOUS daemon left in ptyd that this one doesn't take over
+/// (no adopter is set, or it declined them): ended, keeping the semantics
+/// of a restart without adoption (it ends agents) and avoiding a second
+/// `--resume` of the same conversation. Exited records are acked. Returns
+/// how many running sessions were ended.
+pub fn end_leftover_sessions(owner: &Owner, sessions: Vec<proto::SessionInfo>) -> usize {
     let mut ended = 0;
     for s in sessions {
         if matches!(s.state, proto::SessionState::Running) {
@@ -251,6 +248,43 @@ pub fn end_leftover_sessions(owner: &Owner) -> usize {
         let _ = owner.request(Request::AckExit { sid: s.sid });
     }
     ended
+}
+
+/// k2-ptyd S3: takes over the sessions a previous daemon left in ptyd, on
+/// this process's first owner connection. Gets every listed session and
+/// returns those it did not take, which are ended.
+pub type Adopter = Box<dyn Fn(&Arc<Owner>, Vec<proto::SessionInfo>) -> Vec<proto::SessionInfo> + Send + Sync>;
+
+static ADOPTER: OnceLock<Adopter> = OnceLock::new();
+
+/// k2-ptyd S3: set this process's [`Adopter`]. Must run before the first
+/// owner connection (the host role sets it at boot); without one, every
+/// leftover session is ended.
+pub fn set_adopter(f: Adopter) {
+    if ADOPTER.set(f).is_err() {
+        crate::log_debug!("[ptyd] an adopter was already set; this one is ignored");
+    }
+}
+
+/// The leftover sweep: the adopter's pick, then the rest ended.
+fn sweep_leftovers(owner: &Arc<Owner>) {
+    let sessions = match owner.request(Request::List) {
+        Ok(Reply::Sessions { sessions }) => sessions,
+        _ => return,
+    };
+    let total = sessions.len();
+    let rest = match ADOPTER.get() {
+        Some(adopt) => adopt(owner, sessions),
+        None => sessions,
+    };
+    let adopted = total - rest.len();
+    let n = end_leftover_sessions(owner, rest);
+    if adopted > 0 {
+        crate::log_debug!("[ptyd] adopted {} session(s) left by a previous daemon", adopted);
+    }
+    if n > 0 {
+        crate::log_debug!("[ptyd] ended {} session(s) left by a previous daemon (not adopted)", n);
+    }
 }
 
 static HOME_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
@@ -312,11 +346,12 @@ impl Ptyd {
             }
         };
         crate::log_debug!("[ptyd] owner connected (ptyd v{}, boot {})", o.ptyd_version, &o.boot_id[..8.min(o.boot_id.len())]);
+        *g = Some(Arc::clone(&o));
+        // The sweep runs without the handle's lock: an adopter's sessions
+        // are wired into the daemon, which may look ptyd up again.
+        drop(g);
         if !self.swept.swap(true, Ordering::AcqRel) {
-            let n = end_leftover_sessions(&o);
-            if n > 0 {
-                crate::log_debug!("[ptyd] ended {} session(s) left by a previous daemon (no adoption before S3)", n);
-            }
+            sweep_leftovers(&o);
             // P3: prune old versioned copies, keeping the current one and
             // the running ptyd's image.
             let mut keep = Vec::new();
@@ -333,7 +368,6 @@ impl Ptyd {
                 }
             }
         }
-        *g = Some(Arc::clone(&o));
         Ok(o)
     }
 

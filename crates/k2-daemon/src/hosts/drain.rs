@@ -135,7 +135,7 @@ struct PaneTurns {
     typed: Vec<Typed>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Typed {
     msg_id: String,
     /// [`prompt_digest`] of the text.
@@ -181,15 +181,16 @@ impl Turns {
     /// A prompt whose `digest` is a message this host typed into the pane
     /// takes that message into its turn (K2-f.3: the only evidence that the
     /// turn had it); a turn's end lets go of them, answered.
-    pub fn note(&self, pane: &str, event: &str, subagent: bool, digest: Option<&str>) {
+    /// Returns whether the pane's turn changed.
+    pub fn note(&self, pane: &str, event: &str, subagent: bool, digest: Option<&str>) -> bool {
         if subagent {
-            return;
+            return false;
         }
         let mut m = self.panes.lock();
         let (prompt, stop) = match event {
             "UserPromptSubmit" => (true, false),
             "Stop" | "StopFailure" | "SessionEnd" => (false, true),
-            _ => return,
+            _ => return false,
         };
         let heard = self.touch(&mut m, pane);
         let t = m.entry(pane.to_string()).or_default();
@@ -220,6 +221,32 @@ impl Turns {
             t.counts.running = false;
             t.counts.msgs.clear();
         }
+        true
+    }
+
+    /// ptyd S3: the pane's counts and typed messages, as ptyd's meta keeps
+    /// them for a restarted daemon (`adopt::turn_meta`).
+    pub fn snapshot(&self, pane: &str) -> Option<serde_json::Value> {
+        let m = self.panes.lock();
+        let t = m.get(pane)?;
+        Some(super::adopt::turn_meta(&t.counts, serde_json::to_value(&t.typed).unwrap_or_default()))
+    }
+
+    /// ptyd S3: a pane adopted from ptyd gets back the counts and typed
+    /// messages its meta kept ([`Self::snapshot`]). Anything unreadable is
+    /// left out: a pane with no counts reports no turn.
+    pub fn restore(&self, pane: &str, v: &serde_json::Value) {
+        let counts: Option<TurnCounts> = v.get("counts").and_then(|c| serde_json::from_value(c.clone()).ok());
+        let typed: Vec<Typed> = v.get("typed").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default();
+        let mut m = self.panes.lock();
+        let heard = self.touch(&mut m, pane);
+        let t = m.entry(pane.to_string()).or_default();
+        t.heard = heard;
+        t.gone = false;
+        if let Some(c) = counts {
+            t.counts = c;
+        }
+        t.typed = typed;
     }
 
     /// K2-f.3: this host typed message `msg_id` (`text`) into `pane`; the
@@ -292,7 +319,9 @@ pub fn note_ingest(ev: &crate::hook_ingest::IngestEvent) {
     use crate::hook_ingest::IngestEvent;
     match ev {
         IngestEvent::Envelope { envelope, .. } => {
-            turns().note(&envelope.pane, &envelope.event, is_subagent(envelope), envelope.prompt_digest.as_deref())
+            if turns().note(&envelope.pane, &envelope.event, is_subagent(envelope), envelope.prompt_digest.as_deref()) {
+                save_turn(&envelope.pane);
+            }
         }
         IngestEvent::OwnerReleased { pane, .. } => turns().gone(pane),
         _ => {}
@@ -310,6 +339,28 @@ pub fn note_turn_hook(pane: &str, event: &str) {
 /// delivery, a wake's launch prompt, an inject the controller named).
 pub fn note_typed(pane: &str, msg_id: &str, text: &str) {
     turns().typed(pane, msg_id, text);
+    save_turn(pane);
+}
+
+/// ptyd S3: `pane`'s turn into its ptyd meta, so a restarted daemon that
+/// adopts it goes on from these counts. Written before the hook is
+/// forwarded (the ingest is synchronous), so what a restarted host reports
+/// is never behind what the controller was told. A no-op for a session
+/// not on ptyd.
+fn save_turn(pane: &str) {
+    let Some(id) = k2_core::session::SessionId::parse(pane) else { return };
+    let Some(pty) = crate::v2_session_map::lookup_by_session_id(&id) else { return };
+    if pty.backend_name() != "ptyd" {
+        return;
+    }
+    if let Some(v) = turns().snapshot(pane) {
+        pty.set_ptyd_meta(super::adopt::META_TURN, v);
+    }
+}
+
+/// ptyd S3: an adopted pane's turn, from its ptyd meta.
+pub fn restore_turn(pane: &str, v: &serde_json::Value) {
+    turns().restore(pane, v);
 }
 
 /// K2-f: `pane`'s turn counts on this host (reported in `hello`'s resume).
@@ -698,6 +749,34 @@ mod tests {
 
     /// K2-f.2 #8: past `keep` panes, the least recently heard go first,
     /// the exited ones before the live ones.
+    /// ptyd S3: what ptyd's meta keeps of a pane (`snapshot`) gives a
+    /// restarted daemon the same counts and typed messages (`restore`):
+    /// its next prompt takes the message typed before the restart, and its
+    /// counts go on from where they were.
+    #[test]
+    fn a_pane_restored_from_its_meta_goes_on_where_it_was() {
+        let before = Turns::default();
+        before.typed("p1", "m_a", "first");
+        before.note("p1", "UserPromptSubmit", false, Some(&k2_core::agent_hooks::envelope::prompt_digest("first")));
+        before.note("p1", "Stop", false, None);
+        before.typed("p1", "m_b", "second");
+        let meta = before.snapshot("p1").expect("a pane with turns");
+
+        let after = Turns::default();
+        after.restore("p1", &meta);
+        assert_eq!(after.snapshot("p1"), Some(meta.clone()), "the same pane, round trip");
+        assert_eq!(after.counts("p1").map(|c| (c.prompts, c.stops, c.running)), Some((1, 1, false)));
+        after.note("p1", "UserPromptSubmit", false, Some(&k2_core::agent_hooks::envelope::prompt_digest("second")));
+        let c = after.counts("p1").unwrap();
+        assert_eq!((c.prompts, c.stops, c.running), (2, 1, true));
+        assert_eq!(c.msgs, vec!["m_b".to_string()], "the message typed before the restart is this prompt's");
+
+        // Unreadable meta: no counts, nothing typed.
+        let empty = Turns::default();
+        empty.restore("p2", &serde_json::json!({ "counts": "x" }));
+        assert_eq!(empty.counts("p2"), None);
+    }
+
     #[test]
     fn panes_are_evicted_oldest_first_exited_ones_before_live_ones() {
         let t = Turns::with_keep(2);

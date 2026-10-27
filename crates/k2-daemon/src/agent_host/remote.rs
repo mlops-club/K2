@@ -2794,9 +2794,12 @@ impl RemoteHost {
                         // K2-f: its turn as the host has it (what its
                         // forwarded hooks missed while the link was down, or
                         // all of it: a turn this controller never followed).
+                        // ptyd S3 (K2-f.3 #5): a host daemon that restarted
+                        // and adopted the session counts from what ptyd kept,
+                        // which may be behind this turn: taken as it is.
                         if let Some(c) = &r.turn {
                             let t = inner.turns.entry(r.agent_id.clone()).or_default();
-                            if t.pane == r.session_id {
+                            if t.pane == r.session_id && !r.adopted {
                                 t.counts(c);
                             } else {
                                 *t = Turn::from_counts(&r.session_id, c);
