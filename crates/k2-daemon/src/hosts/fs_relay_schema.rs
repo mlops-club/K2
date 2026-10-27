@@ -252,6 +252,7 @@ fn strings<'a>(key: &str, v: &'a Value) -> Result<Vec<&'a str>, String> {
 }
 
 /// A request as a host's daemon gets it: the query's pairs and the body.
+#[derive(Debug)]
 pub struct Confined {
     pub query: Vec<(String, String)>,
     pub body: Value,
@@ -264,12 +265,43 @@ pub enum Refusal {
     Undeclared(String),
     /// A path, or a path its handler derives, outside the work root.
     Outside(String),
+    /// Refused with its own code: `link_outside_worktree` (a checkout's
+    /// folder link leaving the work tree), `walk_budget` (the checks cost
+    /// more than a request may).
+    Coded(&'static str, String),
 }
+
+/// R8 C: what a request's checks may cost: steps (a link resolved one
+/// component at a time, a folder entry walked) and time.
+pub const WALK_STEPS: usize = 500_000;
+pub const WALK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The request `s` describes, confined to `root`: every declared path (a
 /// path, a repo-relative path, a name in a folder) and every path its
 /// handler derives under the work root, rebuilt from the confined values.
 pub fn confine(root: &Path, s: &Schema, query: &[(String, String)], body: &Value) -> Result<Confined, Refusal> {
+    confine_within(root, s, query, body, WALK_STEPS, WALK_TIME)
+}
+
+/// [`confine`] within a walk budget of `steps` and `time` (R8 C): past
+/// either, `walk_budget`. Blocking: a host runs it off its link's task.
+pub fn confine_within(
+    root: &Path,
+    s: &Schema,
+    query: &[(String, String)],
+    body: &Value,
+    steps: usize,
+    time: std::time::Duration,
+) -> Result<Confined, Refusal> {
+    super::budget::start(steps, time);
+    let r = confine_unbudgeted(root, s, query, body);
+    if super::budget::end() {
+        return Err(Refusal::Coded("walk_budget", format!("checking {}'s paths took more than a relayed request may", s.route)));
+    }
+    r
+}
+
+fn confine_unbudgeted(root: &Path, s: &Schema, query: &[(String, String)], body: &Value) -> Result<Confined, Refusal> {
     let out = Refusal::Outside;
     // The request's values, by key: the query's and a flat JSON object's.
     let mut values: Vec<(String, Value)> = Vec::new();
@@ -343,7 +375,12 @@ pub fn confine(root: &Path, s: &Schema, query: &[(String, String)], body: &Value
         return Err(Refusal::Undeclared(format!("{} doesn't take {k}", s.route)));
     }
     for d in s.derived {
-        derived(root, s, *d, &confined).map_err(out)?;
+        if *d == Derived::CheckoutTree {
+            let p = confined.iter().find(|(k, _)| k == "path").and_then(|(_, v)| v.as_str()).ok_or_else(|| out("a git request names its repository's path".into()))?;
+            checkout_tree_inside(root, Path::new(p))?;
+        } else {
+            derived(root, s, *d, &confined).map_err(out)?;
+        }
     }
     // The daemon gets the confined values, in the request's own shape.
     if s.method == "GET" {
@@ -399,7 +436,8 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
             }
             Ok(())
         }
-        Derived::CheckoutTree => checkout_tree_inside(root, &path_of("path").ok_or("a git request names its repository's path")?),
+        // Its own codes: `confine` runs it ([`checkout_tree_inside`]).
+        Derived::CheckoutTree => Ok(()),
         Derived::CopyTree => {
             let (sources, dest): (Vec<PathBuf>, PathBuf) = if s.route == "/cli/fs/duplicate" {
                 let p = path_of("path").ok_or("duplicate names its path")?;
@@ -419,33 +457,46 @@ fn derived(root: &Path, s: &Schema, d: Derived, confined: &[(String, Value)]) ->
     }
 }
 
-/// F1 (round 7): the work tree of the repository at `path` holds no link
-/// to a folder outside the work root, nor a dangling one (a forced
-/// checkout deletes and writes through a folder link). Links to files, and
-/// within the root, are the checkout's to replace. `.git` is the git dir's
-/// own check.
-fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), String> {
-    let work = repo_base(&path.to_string_lossy());
+/// F1 (rounds 7, 8): a forced checkout (abort, a fast-forward merge,
+/// discard, resolve) deletes and writes through a folder link in its work
+/// tree. The work tree of the repository at `path` is walked (every
+/// folder but the repository's own git dir, by path: B1) without following
+/// a link; a link to a folder, or a dangling one, whose target is outside
+/// the work tree is refused (`link_outside_worktree`, B2). A link to a file
+/// is the checkout's to replace.
+fn checkout_tree_inside(root: &Path, path: &Path) -> Result<(), Refusal> {
+    let out = Refusal::Outside;
+    let (git_dir, work) = match k2_core::git::repo_dirs(&path.to_string_lossy()) {
+        Ok((g, _, Some(w))) => (resolve(&g), w),
+        _ => (None, path.to_path_buf()),
+    };
+    let work = resolve(&work).ok_or_else(|| out(format!("{} can't be resolved", work.display())))?;
+    if !work.starts_with(root) {
+        return Err(out(format!("{} is not under this host's work root", work.display())));
+    }
     let mut todo = vec![work.clone()];
     let mut n = 0usize;
     while let Some(d) = todo.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.filter_map(Result::ok) {
             n += 1;
-            if n > TREE_LIMIT {
-                return Err(format!("{} holds over {TREE_LIMIT} entries; too many to check for a relayed checkout", work.display()));
+            if n > TREE_LIMIT || !super::budget::charge() {
+                return Err(Refusal::Coded("walk_budget", format!("{} is too big to check for a relayed checkout", work.display())));
             }
             let Ok(ft) = e.file_type() else { continue };
+            let p = e.path();
             if ft.is_symlink() {
-                let p = e.path();
                 let r = resolve(&p);
-                let out = r.as_ref().is_none_or(|r| !r.starts_with(root));
                 let file = r.as_ref().is_some_and(|r| r.is_file());
-                if out && !file {
-                    return Err(format!("{} links to a folder outside this host's work root; a checkout would go through it", p.display()));
+                let leaves = r.as_ref().is_none_or(|r| !r.starts_with(&work));
+                if leaves && !file {
+                    return Err(Refusal::Coded(
+                        "link_outside_worktree",
+                        format!("{} links to a folder outside the repository's work tree; a checkout would go through it", p.display()),
+                    ));
                 }
-            } else if ft.is_dir() && e.file_name() != ".git" {
-                todo.push(e.path());
+            } else if ft.is_dir() && git_dir.as_deref() != Some(p.as_path()) {
+                todo.push(p);
             }
         }
     }
@@ -464,7 +515,7 @@ fn tree_inside(root: &Path, src: &Path) -> Result<(), String> {
     let mut n = 0usize;
     while let Some(p) = todo.pop() {
         n += 1;
-        if n > TREE_LIMIT {
+        if n > TREE_LIMIT || !super::budget::charge() {
             return Err(format!("{} holds over {TREE_LIMIT} entries; too many to check for a relayed copy", src.display()));
         }
         let real = inside(root, &p.display().to_string(), &p)?;

@@ -614,12 +614,54 @@ fn plain_route(method: &str, path: &str) -> bool {
     plain && relayed(method, path)
 }
 
+/// R8 C: a request's walk budget, on the thread checking it: steps (a
+/// component of a link resolved, a folder entry walked) and a deadline.
+/// No budget started: unlimited.
+pub(crate) mod budget {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static LEFT: Cell<Option<(usize, Instant)>> = const { Cell::new(None) };
+        static SPENT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn start(steps: usize, time: Duration) {
+        LEFT.set(Some((steps, Instant::now() + time)));
+        SPENT.set(false);
+    }
+
+    /// Ends it: was it spent?
+    pub fn end() -> bool {
+        LEFT.set(None);
+        SPENT.replace(false)
+    }
+
+    /// One step: `false` once the budget is spent.
+    pub fn charge() -> bool {
+        match LEFT.get() {
+            None => true,
+            Some((left, deadline)) => {
+                if left == 0 || (left % 256 == 0 && Instant::now() > deadline) {
+                    SPENT.set(true);
+                    LEFT.set(Some((0, deadline)));
+                    false
+                } else {
+                    LEFT.set(Some((left - 1, deadline)));
+                    true
+                }
+            }
+        }
+    }
+}
+
 /// `p` resolved on this host's disk the way the kernel walks it: one
 /// component at a time (`lstat`), a symlink's target spliced in where it
 /// stands (an absolute one from `/`), `..` popping what is resolved so far
 /// (the parent of where a link really points, never of its name), a
 /// dangling link followed too (a write through it would land there).
-/// `None` past 40 links (a loop).
+/// `None` past 40 links (a loop), or once the request's walk budget is
+/// spent ([`budget`]).
 pub(crate) fn resolve(p: &Path) -> Option<PathBuf> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
@@ -636,6 +678,9 @@ pub(crate) fn resolve(p: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::from("/");
     let mut hops = 0u32;
     while let Some(part) = todo.pop_front() {
+        if !budget::charge() {
+            return None;
+        }
         if part == ".." {
             out.pop();
             continue;
@@ -851,20 +896,30 @@ pub async fn serve(req: u64, method: &str, path: &str, query: &str, body_b64: &s
     if !body.is_empty() && body_json.is_null() {
         return reply("400 Bad Request", json!({"error": "a relayed body is JSON"}));
     }
-    let mut refused_links = Vec::new();
-    let body_json = if path == "/cli/fs/resolve-links" {
-        let (b, refused) = split_links(&root, &body_json);
-        refused_links = refused;
-        b
-    } else {
-        body_json
-    };
     // R6: the route's schema: undeclared keys refused, every path and
     // derived path confined, and the daemon gets the confined values only.
-    let (query_pairs, body) = match schema::confine(&root, route, &pairs(query), &body_json) {
-        Ok(c) => (c.query, if c.body.is_null() { Vec::new() } else { c.body.to_string().into_bytes() }),
-        Err(schema::Refusal::Outside(e)) => return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"})),
-        Err(schema::Refusal::Undeclared(e)) => return reply("403 Forbidden", json!({"error": e, "code": "undeclared_key"})),
+    // R8 C: off the link's task (the checks walk the disk), in a budget.
+    let checked = {
+        let (root, path, query) = (root.clone(), path.to_string(), pairs(query));
+        tokio::task::spawn_blocking(move || {
+            let mut refused_links = Vec::new();
+            let body_json = if path == "/cli/fs/resolve-links" {
+                let (b, refused) = split_links(&root, &body_json);
+                refused_links = refused;
+                b
+            } else {
+                body_json
+            };
+            schema::confine(&root, route, &query, &body_json).map(|c| (c, refused_links))
+        })
+        .await
+    };
+    let (query_pairs, body, refused_links) = match checked {
+        Ok(Ok((c, refused))) => (c.query, if c.body.is_null() { Vec::new() } else { c.body.to_string().into_bytes() }, refused),
+        Ok(Err(schema::Refusal::Outside(e))) => return reply("403 Forbidden", json!({"error": e, "code": "outside_work_root"})),
+        Ok(Err(schema::Refusal::Undeclared(e))) => return reply("403 Forbidden", json!({"error": e, "code": "undeclared_key"})),
+        Ok(Err(schema::Refusal::Coded(code, e))) => return reply("403 Forbidden", json!({"error": e, "code": code})),
+        Err(e) => return reply("500 Internal Server Error", json!({"error": format!("check: {e}")})),
     };
     let Some((port, token)) = LOCAL.lock().clone() else {
         return reply("503 Service Unavailable", json!({"error": "this host's daemon address is not known yet"}));

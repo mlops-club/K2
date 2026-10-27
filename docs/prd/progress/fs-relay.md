@@ -336,6 +336,46 @@ enable. F1 (medium) is fixed here; F2–F6 (low) are still open.
 
 Both tests fail with the two checks taken out (checked by mutation).
 
+## Round 8 review of 02ea61653: F1(b) completed
+
+F1(a) (links inside the git dir) was confirmed fixed. F1(b) was partial.
+
+- **B1 (medium): every `.git` was skipped.** The work-tree walk skipped
+  any folder named `.git`, at any depth. An untracked `hide/.git/deep`
+  linking out, reached through a tracked `sub -> hide/.git`, let
+  abort-merge delete outside the root. Now only the repository's own git
+  dir is skipped, compared by its resolved path.
+- **B2 (medium): an in-root folder link leaving the work tree.** Such a
+  link was allowed but never walked, so a link out beneath its target was
+  never seen. Now any link in the walk to a folder (or a dangling one)
+  whose target is outside the repository's work tree is refused with 403
+  `link_outside_worktree`. The walk never follows a link. A link to a file
+  is still the checkout's to replace.
+- **C (low-medium): unbounded walk cost.** 2000 links with long `a/../`
+  chains took about 20 s for one check, on the link's task.
+  - The host now runs all its checks (`split_links`, `confine`) in
+    `spawn_blocking`.
+  - The checks share one budget per request: 500,000 steps (each step is
+    one link component resolved or one folder entry walked) and 5 s. Past
+    either, the request is refused with 403 `walk_budget`.
+- **Later (lows from the review, not now):**
+  - alternates are read one level deep;
+  - links among the object fan-out files;
+  - the 200k entry cap;
+  - self-loops;
+  - submodules.
+- **Test change:** r7's forced-checkout test also accepts
+  `outside_work_root`. Discard's `sub/f` is now refused as a repo-relative
+  path outside the work root before the walk runs.
+
+| Item | Test |
+|---|---|
+| B1 | `r8_b1_only_the_repositorys_own_git_dir_is_skipped` |
+| B2: abort-merge and a fast-forward merge-branch (with a control) | `r8_b2_a_folder_link_leaving_the_work_tree_is_refused` |
+| C: a small budget refuses; the default budget passes; the next request starts afresh | `r8_c_the_checks_stop_at_their_walk_budget` |
+
+Each of the three tests fails with its fix reverted (checked by mutation).
+
 ## Checks
 
 | Check | Result |

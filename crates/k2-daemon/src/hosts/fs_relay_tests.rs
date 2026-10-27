@@ -1508,7 +1508,9 @@ async fn r7_f1_a_forced_checkout_through_a_folder_link_is_refused() {
     std::fs::write(outside.join("f"), "theirs\n").unwrap();
     std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
     link(&outside, &d.ws.join("sub"));
-    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && r.1["code"] == "outside_work_root";
+    // Round 8: refused as a link leaving the work tree (discard's `sub/f`
+    // first, as a repo-relative path outside the work root).
+    let refused = |r: (String, Value)| r.0 == "403 Forbidden" && (r.1["code"] == "link_outside_worktree" || r.1["code"] == "outside_work_root");
     let p = json!(d.ws);
     for (route, body) in [
         ("/cli/git/abort-merge", json!({"path": p})),
@@ -1533,4 +1535,86 @@ async fn r7_f1_a_forced_checkout_through_a_folder_link_is_refused() {
     link(&d.ws.join("real-sub"), &d.ws.join("sub"));
     link(&outside.join("f"), &d.ws.join("file-link"));
     assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": p})).is_ok());
+}
+
+// ── round 8 ────────────────────────────────────────────────────────────
+
+/// R8 B1: a folder named `.git` that isn't the repository's own git dir is
+/// walked: an untracked `hide/.git/deep` linking out, reached through a
+/// tracked `sub` linked to `hide/.git` (inside the root), is refused, and
+/// nothing outside is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8_b1_only_the_repositorys_own_git_dir_is_skipped() {
+    let d = host_disk();
+    k2_core::git::init_repo(&d.ws.to_string_lossy()).unwrap();
+    std::fs::create_dir_all(d.ws.join("sub/deep")).unwrap();
+    std::fs::write(d.ws.join("sub/deep/f"), "tracked\n").unwrap();
+    host_git(&d.ws, &["add", "-A"]);
+    host_git(&d.ws, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-b1");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::create_dir_all(d.ws.join("hide/.git")).unwrap();
+    link(&outside, &d.ws.join("hide/.git/deep"));
+    std::fs::remove_dir_all(d.ws.join("sub")).unwrap();
+    link(&d.ws.join("hide/.git"), &d.ws.join("sub"));
+    let (st, v) = served("POST", "/cli/git/abort-merge", "", Some(json!({"path": d.ws}))).await;
+    assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("link_outside_worktree")), "{v}");
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+}
+
+/// R8 B2: a folder link inside the work root whose target is outside the
+/// work tree is refused, not followed: `sub -> ws/elsewhere`, with
+/// `elsewhere/deep` linking out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8_b2_a_folder_link_leaving_the_work_tree_is_refused() {
+    let d = host_disk();
+    let repo = d.ws.join("repo");
+    std::fs::create_dir_all(repo.join("sub/deep")).unwrap();
+    k2_core::git::init_repo(&repo.to_string_lossy()).unwrap();
+    std::fs::write(repo.join("sub/deep/f"), "tracked\n").unwrap();
+    host_git(&repo, &["add", "-A"]);
+    host_git(&repo, &["commit", "-qm", "first"]);
+    let outside = d.root.parent().unwrap().join("outside-b2");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("f"), "theirs\n").unwrap();
+    std::fs::create_dir_all(d.ws.join("elsewhere")).unwrap();
+    link(&outside, &d.ws.join("elsewhere/deep"));
+    std::fs::remove_dir_all(repo.join("sub")).unwrap();
+    link(&d.ws.join("elsewhere"), &repo.join("sub"));
+    for (route, body) in [
+        ("/cli/git/abort-merge", json!({"path": repo})),
+        ("/cli/git/merge-branch", json!({"path": repo, "branch": "main"})),
+    ] {
+        let (st, v) = served("POST", route, "", Some(body)).await;
+        assert_eq!((st.as_str(), &v["code"]), ("403 Forbidden", &json!("link_outside_worktree")), "{route}: {v}");
+    }
+    assert_eq!(std::fs::read_to_string(outside.join("f")).unwrap(), "theirs\n", "not deleted");
+    // The control: a folder link that stays in the work tree passes.
+    std::fs::remove_file(repo.join("sub")).unwrap();
+    std::fs::create_dir_all(repo.join("real-sub")).unwrap();
+    link(&repo.join("real-sub"), &repo.join("sub"));
+    assert!(schema::confine(&d.root, route_schema("POST", "/cli/git/abort-merge"), &[], &json!({"path": repo})).is_ok());
+}
+
+/// R8 C: the checks run within a walk budget: many links, each a long
+/// `a/../` chain, are refused with `walk_budget` past it (a small budget
+/// here); within the default budget the same tree passes.
+#[test]
+fn r8_c_the_checks_stop_at_their_walk_budget() {
+    let d = host_disk();
+    let repo = d.ws.join("repo");
+    std::fs::create_dir_all(repo.join("a")).unwrap();
+    k2_core::git::init_repo(&repo.to_string_lossy()).unwrap();
+    let chain = "a/../".repeat(40);
+    for i in 0..50 {
+        link(Path::new(&format!("{chain}a")), &repo.join(format!("l{i}")));
+    }
+    let abort = route_schema("POST", "/cli/git/abort-merge");
+    let body = json!({"path": repo});
+    let r = schema::confine_within(&d.root, abort, &[], &body, 1_000, Duration::from_secs(60));
+    assert!(matches!(r, Err(schema::Refusal::Coded("walk_budget", _))), "{r:?}");
+    assert!(schema::confine(&d.root, abort, &[], &body).is_ok(), "within the default budget");
+    // The budget is per request: the next check starts afresh.
+    assert!(schema::confine(&d.root, route_schema("GET", "/cli/fs/read-file"), &[("path".into(), repo.join("a").to_string_lossy().into())], &Value::Null).is_ok());
 }
