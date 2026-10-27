@@ -368,6 +368,47 @@ Both failures were the gate container, not the code (20dfc130d):
   (`k2-lab-gate:3`).
 - Proven: both pass in the gate run below.
 
+### S10 heavy chaos on the rc3 candidate, wave3 b60a9fd80 (K2-f.4)
+
+This used S10 per the PRD's 'node fails hard' (f59b63e94) and the stricter
+chaos excuse. `lab-runs/G2/2026-10-27T12-53-28Z` (seed 4117) and
+`2026-10-27T13-09-12Z` (seed 7).
+
+| Seed | Chaos SIGKILLs (host / controller / CLI) | Inside holds | S10 rounds | I1–I4 |
+|---|---|---|---|---|
+| 4117 | 21 / 15 / 4 | 3 | 5/5 | I1, I2, I4 pass; **I3 1 violation** (below) |
+| 7 | 19 / 12 / 6 | 9 | 5/5 | pass |
+
+- Turn three, in all 10 rounds: `failed outcome unknown: host lost
+  mid-turn`. Never answered, and never redelivered: its prompt is only on
+  the dead host.
+- The message sent while the host was down, in all 10: queued with a msg
+  id and delivered once on the new host. No chaos excuse was needed.
+- n4 failed loud once (`interrupted`, seed 7 round 4). The lab's check
+  that its turn never answered passed.
+- Holds are short now, about 22 s: the move comes at 20 s and nothing
+  waits for a 30 s redelivered turn. So far fewer chaos kills land inside
+  them (3 and 9, against about 47 before).
+
+(c) for home sync (P3 T2), seen by I3: a failed turn-end home save is
+never retried.
+
+- Seed 4117, round 3's first attempt, agent `05202046`: turn two ended on
+  host-1 at 13:03:00.076.
+- Its save failed 22 ms later (`host.home_save_failed`, "error sending
+  request"), because chaos had SIGKILLed the controller at 13:02:59.8.
+- The controller was back at 13:03:04–13:03:12 and from 13:03:17, but
+  host-1 made no further save.
+- host-1 was lost at 13:03:30 (CLI SIGKILLed by chaos at 13:03:27.9, then
+  S10's own kill). host-2 restored seq 1 (turn one), and the resumed CLI
+  started with turn one's MEMORY.md.
+- Turn two's memory was lost although that turn had ended 30 s before the
+  host died, with the controller up for most of that time.
+- S10 itself redid that attempt, because chaos had hit it. The global I3
+  check caught the rollback.
+- Suggested fix: retry a failed turn-end save when the controller links
+  again, rather than only at the next turn end or release.
+
 ### S10 on wave3 551942095 (K2-f.3): turn three is no longer redelivered
 
 Heavy chaos, with the same setup: `lab-runs/G2/2026-10-27T10-54-17Z` (seed
