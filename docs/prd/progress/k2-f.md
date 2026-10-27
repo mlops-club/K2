@@ -391,3 +391,60 @@ false failure):
 | `turn-snapshots.sh` `20261027T100447Z` | **7/7 PASS**, with real processes and the fake agent's hooks: host-1 matched turn three's message to its prompt. When host-1 was SIGKILLed and the agent moved, the cut failed it `outcome unknown: host lost mid-turn` while it was still `sent` (its ack died with host-1), and it was not resent (host-2's memory has turns one, two and four). In the run before the seed-7 fix (`20261027T083234Z`) the same cut failed nothing |
 | `drain-move.sh` `20261027T100623Z`, `three-process-msg.sh` `20261027T100750Z` | **4/4, 4/4 PASS** |
 | `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3` (throwaway HOME) | **5405 passed, 0 failed**, 6 ignored, 162 binaries |
+
+## K2-f.4: one message per prompt; mixed versions
+
+Branch `k2-dist/k2-f4`, from `k2-dist/wave3` 551942095. The review of
+0ef283d36 found the design sound and I2 holding, with one false positive
+and one mixed-version break.
+
+| # | Item | As built | Test |
+|---|---|---|---|
+| 1 | A prompt took every typed entry with its digest, and an unmatched (folded) entry stayed for good: a folded, answered M1 and a later identical M2 as its own prompt were both tied, and a cut failed M1 | Each typed entry records the pane's prompt count when it was typed. At each `UserPromptSubmit`, entries two prompts old are dropped (folded, or never submitted). A prompt then ties only the one entry with its digest. When two or more match (a folded M1 and an M2 with the same text, both recent), it can't be told which was submitted, so none is tied and they are dropped | `hosts::drain::tests::a_folded_message_is_never_tied_to_a_later_identical_prompt`: M2 as the very next prompt → neither tied, so M1 can't fail; M2 prompts later → M1 dropped, M2 tied; A and B typed back to back → each its own prompt |
+| 2 | A new host omitted `EndedPlacement.turn` for an agent without hooks, and a K2-f/f.1/f.2 controller requires it: the hello failed to decode and the host never linked | `turn` is always sent (`TurnCounts::default()`, not running). "No hooks" is a separate `hooked` flag, which a K2-f.2 host doesn't send and which defaults to true (it only reported agents it had counts for) | `proto::tests::a_new_hosts_hello_decodes_on_a_k2_f2_controller` (the new hello against copies of the K2-f.2 structs; a K2-f.2 ended entry reads as hooked) |
+| 3 | The migration kept K2-f.1/K2-f.2 lists, which were the controller's estimates | A row's counts and running state are kept; its old lists are not read | `older_turn_rows_keep_their_counts_and_drop_their_lists` (both adopted mid-turn; a crash fails none of the old lists' messages) |
+| – | An inject naming a message but with no `Write` step registered the digest of "" | Empty text is never registered | in the #1 test |
+
+**One change from the rule as specified.** "Drop entries registered
+before the previous prompt" would also drop the second of two messages
+typed back to back:
+1. B is typed before A's prompt.
+2. A is submitted.
+3. B is submitted next as its own prompt, but by then B was typed before
+   the previous prompt (A's), so it would be dropped.
+
+That would lose K2-f.3's #3. So an entry lasts until two prompts have
+passed, and two matches tie none. The cost: a third message typed before
+the first of three prompts isn't tied, which is on the safe side.
+
+**A hard loss and the other messages (coordinator).** Since K2-f.3, a
+message whose turn started on a host that is then lost hard ends
+`outcome unknown` at the move and is not delivered again. That matches the
+PRD ("node fails hard: the turn in progress is lost").
+
+Every other message still reaches the agent's new placement exactly once:
+one sent but never acked nor tied (it died in flight), and one queued
+during the outage. One acked but never tied (folded) stays delivered and
+isn't sent again.
+
+The test `after_a_hard_loss_only_untyped_messages_reach_the_new_placement_once`
+covers this. It passed on the code as it was; it pins the behavior.
+
+**Written down for later**
+- **#4 (unconfirmed):** a cut might fail a row that another host has
+  already re-delivered. The fix would fail a delivered row only if the cut
+  host delivered it (the delivering host id on the row).
+- **#5 (latent):** after a host restart, its absolute counts start from
+  zero again and are ignored until they pass the old totals. This matters
+  once ptyd S3 adopts sessions; the fix is to reset the turn when a host
+  restart is detected.
+
+### Results (K2-f.4)
+
+| Check | Result |
+|---|---|
+| `cargo test -p k2-daemon --lib -- hosts:: agent_host:: delivery_drain:: active_reaper:: workspace_msg:: hook_ingest::` | **354 passed** (with the hard-loss test) |
+| Mutations | no window → the #1 test fails; a prompt takes every match (K2-f.3) → the #1 test fails; `turn` optional again → the decode test fails |
+| `hosts:: agent_host:: delivery_drain:: active_reaper:: hook_ingest::` (the built test binary) 30 times in a row | **30/30** (269 tests each; before the hard-loss test was added) |
+| `turn-snapshots.sh` `20261027T115743Z`, `drain-move.sh` `20261027T115919Z`, `three-process-msg.sh` `20261027T120046Z` | **7/7, 4/4, 4/4 PASS** (procs, done before the Mac's disk filled at 12:03Z) |
+| `cargo test -p k2-daemon --no-fail-fast -- --test-threads=3` (throwaway HOME) | **5471 passed, 0 failed**, 6 ignored, 162 binaries. A first run overlapped the full disk (12:03–12:20Z) and was stopped and redone |

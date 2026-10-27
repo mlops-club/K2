@@ -431,7 +431,7 @@ impl PlacementStore {
             )
             .map_err(|e| format!("host placement tables: {e}"))?;
             // A table made by K2-f.1 (73fe2eb01) or K2-f.2 (c504e6819) lacks
-            // the later columns; its lists are migrated as it is read.
+            // the later columns; its old lists are not read (K2-f.4).
             for col in ["notes_json", "msgs_json"] {
                 let has = c
                     .prepare(&format!("SELECT 1 FROM pragma_table_info('host_turns') WHERE name = '{col}'"))
@@ -615,35 +615,24 @@ impl PlacementStore {
     fn load_turns(&self) -> Result<Vec<(String, Turn)>, String> {
         let c = self.db.lock();
         let mut st = c
-            .prepare("SELECT agent_id, pane, running, prompts, stops, msgs_json, current_json, notes_json FROM host_turns")
+            .prepare("SELECT agent_id, pane, running, prompts, stops, msgs_json FROM host_turns")
             .map_err(|e| e.to_string())?;
         let rows = st
             .query_map([], |r| {
-                let mut t = Turn {
-                    pane: r.get(1)?,
-                    running: r.get(2)?,
-                    prompts: r.get::<_, i64>(3)? as u64,
-                    stops: r.get::<_, i64>(4)? as u64,
-                    msgs: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
-                };
-                // K2-f.3 migration: an older row's messages in the running
-                // turn (K2-f.1 `current`, K2-f.2 notes for the running
-                // prompt) become this turn's; the rest are dropped.
-                if t.msgs.is_empty() && t.running {
-                    let current: Vec<String> = serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default();
-                    let notes: Vec<serde_json::Value> = serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default();
-                    t.msgs = current;
-                    for n in notes {
-                        if n.get("prompt").and_then(serde_json::Value::as_u64) == Some(t.prompts) {
-                            if let Some(id) = n.get("msg_id").and_then(serde_json::Value::as_str) {
-                                if !t.msgs.iter().any(|m| m == id) {
-                                    t.msgs.push(id.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok((r.get::<_, String>(0)?, t))
+                // K2-f.4: a K2-f.1/K2-f.2 row's lists (pending_json,
+                // current_json, notes_json) were this controller's estimates,
+                // not its host's evidence: only its counts and running state
+                // are kept (its msgs_json is empty).
+                Ok((
+                    r.get::<_, String>(0)?,
+                    Turn {
+                        pane: r.get(1)?,
+                        running: r.get(2)?,
+                        prompts: r.get::<_, i64>(3)? as u64,
+                        stops: r.get::<_, i64>(4)? as u64,
+                        msgs: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+                    },
+                ))
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
@@ -2753,10 +2742,10 @@ impl RemoteHost {
                 // outcome unknown.
                 let told = ended.get(agent.as_str()).filter(|e| e.epoch == epoch.0);
                 let how = if told.is_some() { crate::delivery_drain::Cut::Crashed } else { crate::delivery_drain::Cut::HostLost };
-                let host = told.and_then(|e| e.turn.as_ref());
+                let host = told.filter(|e| e.hooked).map(|e| &e.turn);
                 let cut = match told {
                     // Told it ended, and nothing of a turn: nothing to fail.
-                    Some(e) if e.turn.is_none() => {
+                    Some(e) if !e.hooked => {
                         self.take_cut(&mut inner, &agent, pane.as_deref(), None);
                         Vec::new()
                     }
