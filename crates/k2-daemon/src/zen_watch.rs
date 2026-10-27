@@ -166,8 +166,21 @@ fn sub_dirs(root: &Path, dir: &str) -> BTreeSet<PathBuf> {
 pub(crate) fn watch_loop(
     root: &Path,
     stop: &AtomicBool,
+    on_change: impl FnMut(),
+) -> Result<(), String> {
+    watch_loop_ready(root, stop, || {}, on_change)
+}
+
+/// [`watch_loop`], calling `ready` once its first watches are in place
+/// (`zen/` and those of its folders that exist): a change after that is
+/// seen. Tests wait for it rather than sleep.
+pub(crate) fn watch_loop_ready(
+    root: &Path,
+    stop: &AtomicBool,
+    ready: impl FnOnce(),
     mut on_change: impl FnMut(),
 ) -> Result<(), String> {
+    let mut ready = Some(ready);
     let (tx, rx) = mpsc::sync_channel::<notify::Result<Event>>(NOTIFY_CHANNEL_BOUND);
     let mut watcher = RecommendedWatcher::new(DroppingHandler::new(tx), Config::default())
         .map_err(|e| format!("create watcher: {e}"))?;
@@ -219,6 +232,9 @@ pub(crate) fn watch_loop(
                     pending = Some(Instant::now());
                 }
             }
+        }
+        if let Some(r) = ready.take() {
+            r();
         }
         match rx.recv_timeout(TICK) {
             Ok(Ok(ev)) => {
@@ -338,16 +354,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         let count = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
         let handle = {
             let (root, count, stop) = (root.clone(), count.clone(), stop.clone());
             std::thread::spawn(move || {
-                watch_loop(&root, &stop, || {
-                    count.fetch_add(1, Ordering::SeqCst);
-                })
+                watch_loop_ready(
+                    &root,
+                    &stop,
+                    move || {
+                        let _ = ready_tx.send(());
+                    },
+                    || {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
                 .expect("watch loop")
             })
         };
-        std::thread::sleep(Duration::from_millis(500));
+        // The watches are in place before the burst (a loaded machine may
+        // take longer than any fixed sleep to get there: the old flake).
+        ready_rx.recv().expect("the watcher started");
 
         let page = root.join(GARDENS_DIR).join("g-3f9a12c0.toml");
         for i in 0..500 {
