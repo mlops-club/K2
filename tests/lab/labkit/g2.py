@@ -1496,6 +1496,11 @@ def s10_attempt(c, sc, attempt):
                      ok3 or (bool(hit3) and state == "failed" and bool(why3) and len(on2) <= 1),
                      "on %s %d time(s); outbox state %s %s; chaos %s"
                      % (h2, len(on2), state, why3 or "", [(e["ts"], e.get("kind"), e.get("target")) for e in hit3]))
+            # K2-f: 'interrupted' means its turn never answered. A loud
+            # failure for a turn that did answer is a false one.
+            if state == "failed" and (why3 or "").startswith("interrupted"):
+                sc.check("turn three's 'interrupted' failure is real: its turn never answered",
+                         not c.replied(cwd, key3), why3)
             elsewhere = [p[0] for p in c.prompts_with(cwd, key3) if p[0] not in (h1, h2)]
             sc.check("turn three's message reached no third place (never doubled)",
                      not elsewhere and len([p for p in c.prompts_with(cwd, key3) if p[0] == h1]) == 1,
@@ -1540,6 +1545,8 @@ def s10_attempt(c, sc, attempt):
                                       or (state4 == "failed" and bool(why4) and len(at4) <= 1))
                 sc.info["n4_after_chaos"] = {"prompts": at4, "state": state4, "reason": why4,
                                              "chaos": [(e["ts"], e.get("kind"), e.get("target")) for e in hit4]}
+            if free and not ok4 and state4 == "failed" and (why4 or "").startswith("interrupted"):
+                sc.check("n4's 'interrupted' failure is real: its turn never answered", not c.replied(cwd, n4), why4)
             sc.check("a message after the move lands on %s and is answered" % h2, ok4,
                      "HTTP %s; prompts %s" % (st, at4))
             # One move, whatever chaos did meanwhile.
