@@ -3221,11 +3221,11 @@ fn k5_the_controller_records_a_relayed_worktree() {
     let ws_id = uuid::Uuid::new_v4().to_string();
     let req = json!({"projectPath": "/ctl/work/notes", "branch": "feat", "projectId": p.id}).to_string();
     let ans = Answer::json("200 OK", json!({"workspaceId": ws_id, "path": "/ctl/work/notes/.worktrees/feat", "branch": "feat"}));
-    mirror_worktree_rows("/cli/git/create-worktree", req.as_bytes(), &ans);
+    mirror_worktree_rows("/cli/git/create-worktree", req.as_bytes(), &ans, &|_| None);
     let row = k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), &ws_id).expect("recorded here");
     assert_eq!((row.project_id.as_str(), row.worktree_path.as_deref()), (p.id.as_str(), Some("/ctl/work/notes/.worktrees/feat")));
     let rm = json!({"projectPath": "/ctl/work/notes", "worktreePath": "/ctl/work/notes/.worktrees/feat", "workspaceId": ws_id}).to_string();
-    mirror_worktree_rows("/cli/git/remove-worktree", rm.as_bytes(), &Answer::json("200 OK", json!({"success": true})));
+    mirror_worktree_rows("/cli/git/remove-worktree", rm.as_bytes(), &Answer::json("200 OK", json!({"success": true})), &|_| None);
     assert!(k2_core::db::schema::Workspace::get(&k2_core::db::shared().lock(), &ws_id).is_err(), "removed here too");
 }
 
@@ -3245,4 +3245,45 @@ fn k5_a_fresh_host_gets_a_git_identity() {
     std::fs::write(home.path().join(".gitconfig"), "[user]\n\tname = Owner\n\temail = owner@example.com\n").unwrap();
     crate::hosts::host_git_identity();
     assert_eq!((get("user.name"), get("user.email")), ("Owner".to_string(), "owner@example.com".to_string()));
+}
+
+/// K5 (the gap): a prune on a host leaves no row on the controller for a
+/// worktree the host no longer lists; one it lists stays. When the host's
+/// list can't be had, or names paths outside the project's, nothing goes.
+/// A remove without a `workspaceId` goes by its path.
+#[test]
+fn k5_a_relayed_prune_or_remove_updates_the_controllers_registry() {
+    use k2_core::db::schema::Workspace;
+    let _home = crate::test_support::TempHome::new();
+    // Its own path: the test database is shared across tests.
+    let project = format!("/ctl/work/prune-{}", uuid::Uuid::new_v4().simple());
+    let project = project.as_str();
+    let p = k2_core::projects_ops::projects_create("notes", project, None).unwrap();
+    let ok = Answer::json("200 OK", json!({"success": true}));
+    let add = |branch: &str| {
+        let id = uuid::Uuid::new_v4().to_string();
+        let req = json!({"projectPath": project, "branch": branch, "projectId": p.id}).to_string();
+        let ans = Answer::json("200 OK", json!({"workspaceId": id, "path": format!("{project}/.worktrees/{branch}"), "branch": branch}));
+        mirror_worktree_rows("/cli/git/create-worktree", req.as_bytes(), &ans, &|_| None);
+        id
+    };
+    let has = |id: &str| Workspace::get(&k2_core::db::shared().lock(), id).is_ok();
+    let (a, b) = (add("a"), add("b"));
+    let prune = json!({"projectPath": project, "projectId": p.id}).to_string();
+    // The host's list can't be had, or isn't in this controller's names: kept.
+    mirror_worktree_rows("/cli/git/prune-worktrees", prune.as_bytes(), &ok, &|_| None);
+    mirror_worktree_rows("/cli/git/prune-worktrees", prune.as_bytes(), &ok, &|_| Some(vec!["/h1/work/elsewhere".into()]));
+    assert!(has(&a) && has(&b), "unsure: nothing removed");
+    // The host lists the project and a; b was pruned there.
+    mirror_worktree_rows("/cli/git/prune-worktrees", prune.as_bytes(), &ok, &|q| {
+        assert_eq!(q, project);
+        Some(vec![project.to_string(), format!("{project}/.worktrees/a")])
+    });
+    assert!(has(&a), "listed: kept");
+    assert!(!has(&b), "pruned on the host: gone here");
+    // A remove that names no workspace id: by its path.
+    let rm = json!({"projectPath": project, "worktreePath": format!("{project}/.worktrees/a/")}).to_string();
+    mirror_worktree_rows("/cli/git/remove-worktree", rm.as_bytes(), &ok, &|_| None);
+    assert!(!has(&a), "removed by its path");
+    assert!(Workspace::list(&k2_core::db::shared().lock(), &p.id).unwrap().iter().any(|w| w.type_ != "worktree"), "the project's own workspace stays");
 }
