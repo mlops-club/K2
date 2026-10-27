@@ -173,6 +173,10 @@ fn inside(root: &Path, what: &str, p: &Path) -> Result<PathBuf, String> {
     if r == root || !r.starts_with(root) {
         return Err(format!("{what} is not in a workspace under this host's work root"));
     }
+    // F5: and in the workspace the request was routed to.
+    if !r.starts_with(super::scope::within(root)) {
+        return Err(format!("{what} is not in the workspace this request was routed to"));
+    }
     Ok(r)
 }
 

@@ -1794,3 +1794,38 @@ fn f4_a_host_tells_nothing_about_outside_its_work_root() {
     assert_eq!(v["prefixes"], json!(["/h1/work/notes"]));
     assert!(!relayed("GET", "/cli/fs/info"));
 }
+
+/// F5: a request is confined to the workspace the controller routed it to
+/// (`k2_workspace`), not just the work root: a link from one workspace into
+/// another on the same host is refused, for a path and for resolve-links.
+#[test]
+fn f5_a_request_stays_in_its_routed_workspace() {
+    let d = host_disk();
+    let other = d.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("secret"), "s").unwrap();
+    link(&other, &d.ws.join("peek"));
+    std::fs::write(d.ws.join("own.md"), "o").unwrap();
+    let read = route_schema("GET", "/cli/fs/read-file");
+    let q = |p: &Path, scoped: bool| {
+        let mut q = vec![("path".to_string(), p.to_string_lossy().into_owned())];
+        if scoped {
+            q.push((SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned()));
+        }
+        q
+    };
+    let check = |q: Vec<(String, String)>| check_request(&d.root, read, &q, Value::Null, schema::WALK_STEPS, schema::WALK_TIME);
+    assert!(matches!(check(q(&d.ws.join("peek/secret"), true)), Err(schema::Refusal::Outside(_))), "into another workspace");
+    let ok = check(q(&d.ws.join("own.md"), true)).expect("its own file");
+    assert!(ok.0.query.iter().all(|(k, _)| k != SCOPE_KEY), "the daemon never sees k2_workspace");
+    assert!(check(q(&d.ws.join("peek/secret"), false)).is_ok(), "the control: the work root alone allows it");
+    // A scope that isn't a workspace under the root.
+    let bad = vec![("path".to_string(), d.ws.join("own.md").to_string_lossy().into_owned()), (SCOPE_KEY.to_string(), d.root.to_string_lossy().into_owned())];
+    assert!(check(bad).is_err(), "the root itself is no workspace");
+    // resolve-links: a candidate through the link into the other workspace.
+    let links = route_schema("POST", "/cli/fs/resolve-links");
+    let scoped = vec![(SCOPE_KEY.to_string(), d.ws.to_string_lossy().into_owned())];
+    let body = json!({"workspace": d.ws, "paths": ["peek/secret", "own.md"]});
+    let (_, refused) = check_request(&d.root, links, &scoped, body, schema::WALK_STEPS, schema::WALK_TIME).unwrap();
+    assert_eq!(refused, vec![(0, "peek/secret".to_string())]);
+}

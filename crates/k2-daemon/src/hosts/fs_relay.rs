@@ -364,7 +364,14 @@ fn safe_content_type(ct: &str) -> &'static str {
 /// One request relayed to `host` (its paths mapped there, the answer's
 /// back). Blocking.
 fn exchange(remote: &RemoteHost, host: &str, maps: &[(PathBuf, PathBuf)], method: &str, path: &str, query: &str, body: &[u8]) -> Answer {
-    let frame_query = map_query(query, maps);
+    let mut frame_query = map_query(query, maps);
+    // F5: the workspace it is routed to, on the host: the host confines
+    // the request to it (a client's own `k2_workspace` is undeclared and
+    // never gets here).
+    if let Some((_, ws)) = maps.first() {
+        let pair = format!("{SCOPE_KEY}={}", encode(&ws.to_string_lossy()));
+        frame_query = if frame_query.is_empty() { pair } else { format!("{frame_query}&{pair}") };
+    }
     let body_b64 = base64::engine::general_purpose::STANDARD.encode(map_body(body, maps));
     let (m, p) = (method.to_ascii_uppercase(), path.to_string());
     let probe = Frame::HttpRelay { req: u64::MAX, method: m.clone(), path: p.clone(), query: frame_query.clone(), body_b64: body_b64.clone() };
@@ -783,7 +790,8 @@ fn split_links(root: &Path, body: &Value) -> (Value, Vec<(usize, String)>) {
         } else {
             ws.as_ref().map(|w| w.join(&p))
         };
-        let inside = candidate.and_then(|c| resolve(&c)).is_some_and(|r| r.starts_with(root) && r != root);
+        let within = scope::within(root);
+        let inside = candidate.and_then(|c| resolve(&c)).is_some_and(|r| r.starts_with(&within) && r != root);
         if inside {
             kept.push(Value::String(p));
         } else {
@@ -934,6 +942,41 @@ pub(crate) fn read_dir_all(dir: &Path) -> Result<Vec<Entry>, String> {
     .collect()
 }
 
+/// F5: the query key a controller names a relayed request's workspace with
+/// (its path on the host). Never from the app: undeclared on every route.
+pub const SCOPE_KEY: &str = "k2_workspace";
+
+/// F5: the workspace a request is confined to on this thread (its checks),
+/// for as long as the guard lives; none: the work root.
+pub(crate) mod scope {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static SCOPE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    #[must_use]
+    pub struct Guard;
+
+    pub fn set(ws: Option<PathBuf>) -> Guard {
+        SCOPE.with(|s| *s.borrow_mut() = ws);
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCOPE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+
+    /// The folder a resolved path must be in: the request's workspace, or
+    /// `root`.
+    pub fn within(root: &Path) -> PathBuf {
+        SCOPE.with(|s| s.borrow().clone()).unwrap_or_else(|| root.to_path_buf())
+    }
+}
+
 /// The most resolve-links candidates a host checks one by one; the rest
 /// answer `linkable: false` unchecked (X3).
 const MAX_LINK_CANDIDATES: usize = 500;
@@ -950,6 +993,18 @@ pub(crate) fn check_request(
     time: Duration,
 ) -> Result<(schema::Confined, Vec<(usize, String)>), schema::Refusal> {
     let guard = budget::guard(steps, time);
+    // F5: the request's workspace (the controller's `k2_workspace`): under
+    // the work root, strictly; every path the request names is in it.
+    let ws = query.iter().find(|(k, _)| k == SCOPE_KEY).map(|(_, v)| v.clone());
+    let query: Vec<(String, String)> = query.iter().filter(|(k, _)| k != SCOPE_KEY).cloned().collect();
+    let ws = match ws {
+        Some(w) => {
+            let r = resolve(Path::new(&w)).filter(|r| w.starts_with('/') && !has_dot_dot(&w) && r.starts_with(root) && r != root);
+            Some(r.ok_or_else(|| schema::Refusal::Outside(format!("{w} is not a workspace under this host's work root")))?)
+        }
+        None => None,
+    };
+    let _scope = scope::set(ws);
     let mut refused_links = Vec::new();
     let body = if route.route == "/cli/fs/resolve-links" {
         let (b, refused) = split_links(root, &body);
@@ -958,7 +1013,7 @@ pub(crate) fn check_request(
     } else {
         body
     };
-    let r = schema::confine(root, route, query, &body);
+    let r = schema::confine(root, route, &query, &body);
     if guard.spent() {
         return Err(schema::Refusal::Coded("walk_budget", format!("checking {}'s paths took more than a relayed request may", route.route)));
     }
